@@ -1146,6 +1146,79 @@ contract ExecutorTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // P0 REGRESSION: Aave V3 profit gate when profitToken == loanToken
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_aave_profit_token_equals_loan_token_profit_gate_works() public {
+        // Scenario: flash loanToken from Aave V3, swap loanToken->collateralToken,
+        // Aave V2 liquidation pays collateralToken debt and receives loanToken collateral reward.
+        // Profit measured in loanToken (== flash asset).
+        //
+        // Flow:
+        //   1. Flash 1000 LOAN from Aave V3 (fee=1).
+        //   2. Swap 500 LOAN -> 550 COLL (rate=1.1).
+        //   3. Aave V2 liq: pay 550 COLL debt, get 600 LOAN collateral reward.
+        //   4. Aave pool pulls repayAmount = 1001 LOAN.
+        //
+        // Balance accounting (executor starts with 50 LOAN):
+        //   profitBefore = 50 + 1000 = 1050 (after flash received)
+        //   After swap: LOAN = 1050 - 500 = 550
+        //   After V2 liq: LOAN = 550 + 600 = 1150
+        //   profitAfter = 1150 (before Aave pulls)
+        //   Aave pulls 1001. Remaining = 149.
+        //   Net gain vs initial 50 = 99.
+        //
+        // Correct effectiveProfit = profitAfter + principal - profitBefore - repayAmount
+        //   = 1150 + 1000 - 1050 - 1001 = 99.
+        // Old buggy formula = profitAfter - profitBefore - repayAmount
+        //   = 1150 - 1050 - 1001 = -901 -> clamped to 0 -> InsufficientProfit.
+
+        // Clear executor loanToken balance and set precisely to 50
+        uint256 currentBal = loanToken.balanceOf(address(executor));
+        if (currentBal > 0) {
+            vm.prank(address(executor));
+            loanToken.transfer(address(1), currentBal);
+        }
+        uint256 executorInitialLoan = 50e18;
+        loanToken.mint(address(executor), executorInitialLoan);
+
+        aaveV2Pool.setCollateralReward(600e18);
+        loanToken.mint(address(aaveV2Pool), 100_000e18);
+
+        uint256 swapAmountIn = 500e18;
+        bytes memory targetAction = _buildAaveV2LiquidationAction(
+            address(loanToken), // collateralAsset (received)
+            address(collateralToken), // debtAsset (paid)
+            address(0x1234),
+            550e18, // debtToCover
+            false
+        );
+
+        uint256 expectedProfit = 99e18;
+        bytes memory plan = _buildPlan(
+            1, // Aave V3
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            3, // Aave V2 protocol
+            targetAction,
+            _buildSwapSpec(address(loanToken), address(collateralToken), swapAmountIn, 0),
+            address(loanToken), // profitToken == loanToken
+            expectedProfit // minProfit
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan); // must not revert
+
+        // Verify net gain
+        uint256 finalBal = loanToken.balanceOf(address(executor));
+        assertGe(finalBal - executorInitialLoan, expectedProfit);
+
+        // Approval hygiene
+        assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // P0 REGRESSION: Balancer profit gate when profitToken == loanToken
     // ═══════════════════════════════════════════════════════════════════
 

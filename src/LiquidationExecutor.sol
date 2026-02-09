@@ -369,9 +369,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         if (profitTkn == asset) {
             if (repayPending) {
-                // Aave: balance still includes repayAmount that pool will pull
-                effectiveProfit =
-                    profitAfter > profitBefore + repayAmount ? profitAfter - profitBefore - repayAmount : 0;
+                // Aave: profitBefore includes principal; profitAfter still includes repayAmount (pool pulls later)
+                effectiveProfit = profitAfter + principalAmount > profitBefore + repayAmount
+                    ? profitAfter + principalAmount - profitBefore - repayAmount
+                    : 0;
             } else {
                 // Balancer: repayAmount already transferred out; profitBefore included principal
                 effectiveProfit =
