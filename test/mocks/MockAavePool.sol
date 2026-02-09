@@ -81,6 +81,31 @@ contract MockAavePool {
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
     }
 
+    bool public liquidationReverts;
+    uint256 public liquidationCollateralReward;
+
+    function setLiquidationReverts(bool _reverts) external {
+        liquidationReverts = _reverts;
+    }
+
+    function setLiquidationCollateralReward(uint256 _reward) external {
+        liquidationCollateralReward = _reward;
+    }
+
+    function liquidationCall(
+        address collateralAsset,
+        address debtAsset,
+        address, /* user */
+        uint256 debtToCover,
+        bool /* receiveAToken */
+    )
+        external
+    {
+        require(!liquidationReverts, "MockAavePool: liquidation reverts");
+        IERC20(debtAsset).safeTransferFrom(msg.sender, address(this), debtToCover);
+        IERC20(collateralAsset).safeTransfer(msg.sender, liquidationCollateralReward);
+    }
+
     function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128) {
         return uint128(flashFee);
     }

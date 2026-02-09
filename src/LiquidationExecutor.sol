@@ -42,6 +42,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error SwapFailed();
     error InsufficientSwapOutput(uint256 actual, uint256 minimum);
     error InsufficientSrcBalance(uint256 required, uint256 available);
+    error TargetNotAllowed(address target);
+    error InvalidSwapSpec();
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
@@ -108,11 +110,17 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     // ─── Aave V3 target action ───────────────────────────────────────
     struct AaveV3Action {
-        uint8 actionType; // 1 = repay, 2 = withdraw, 3 = supply
+        uint8 actionType; // 1 = repay, 2 = withdraw, 3 = supply, 4 = liquidation
         address asset;
         uint256 amount;
         uint256 interestRateMode;
         address onBehalfOf;
+        // Liquidation fields (actionType == 4 only)
+        address collateralAsset;
+        address debtAsset;
+        address user;
+        uint256 debtToCover;
+        bool receiveAToken;
     }
 
     // ─── Morpho Blue target action ───────────────────────────────────
@@ -273,7 +281,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         _executeTargetAction(plan.targetProtocolId, plan.targetActionData);
 
         // Aave pulls repayment after we return true — approve exact amount
-        _finalizeAaveFlashloan(asset, amount + premium, plan.profitToken, profitBefore, plan.minProfit);
+        _finalizeAaveFlashloan(asset, amount, amount + premium, plan.profitToken, profitBefore, plan.minProfit);
         return true;
     }
 
@@ -305,13 +313,14 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Balancer expects funds returned by end of callback via transfer
         uint256 repayAmount = amounts[0] + feeAmounts[0];
         _finalizeBalancerFlashloan(
-            address(tokens[0]), repayAmount, msg.sender, plan.profitToken, profitBefore, plan.minProfit
+            address(tokens[0]), amounts[0], repayAmount, msg.sender, plan.profitToken, profitBefore, plan.minProfit
         );
     }
 
     // ─── Internal: Finalize Aave Flashloan ───────────────────────────
     function _finalizeAaveFlashloan(
         address asset,
+        uint256 principalAmount,
         uint256 repayAmount,
         address profitTkn,
         uint256 profitBefore,
@@ -323,12 +332,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Approve exact repay to Aave pool — pool pulls after we return true
         IERC20(asset).forceApprove(msg.sender, repayAmount);
 
-        _checkProfit(asset, repayAmount, profitTkn, profitBefore, minProfit, true);
+        _checkProfit(asset, principalAmount, repayAmount, profitTkn, profitBefore, minProfit, true);
     }
 
     // ─── Internal: Finalize Balancer Flashloan ───────────────────────
     function _finalizeBalancerFlashloan(
         address asset,
+        uint256 principalAmount,
         uint256 repayAmount,
         address vault,
         address profitTkn,
@@ -341,12 +351,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Balancer: transfer back to vault
         IERC20(asset).safeTransfer(vault, repayAmount);
 
-        _checkProfit(asset, repayAmount, profitTkn, profitBefore, minProfit, false);
+        _checkProfit(asset, principalAmount, repayAmount, profitTkn, profitBefore, minProfit, false);
     }
 
     // ─── Internal: Check Profit ──────────────────────────────────────
     function _checkProfit(
         address asset,
+        uint256 principalAmount,
         uint256 repayAmount,
         address profitTkn,
         uint256 profitBefore,
@@ -356,9 +367,16 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint256 profitAfter = IERC20(profitTkn).balanceOf(address(this));
         uint256 effectiveProfit;
 
-        if (profitTkn == asset && repayPending) {
-            // Aave: balance still includes repayAmount that pool will pull
-            effectiveProfit = profitAfter > profitBefore + repayAmount ? profitAfter - profitBefore - repayAmount : 0;
+        if (profitTkn == asset) {
+            if (repayPending) {
+                // Aave: balance still includes repayAmount that pool will pull
+                effectiveProfit =
+                    profitAfter > profitBefore + repayAmount ? profitAfter - profitBefore - repayAmount : 0;
+            } else {
+                // Balancer: repayAmount already transferred out; profitBefore included principal
+                effectiveProfit =
+                    profitAfter + principalAmount > profitBefore ? profitAfter + principalAmount - profitBefore : 0;
+            }
         } else {
             effectiveProfit = profitAfter > profitBefore ? profitAfter - profitBefore : 0;
         }
@@ -368,9 +386,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     // ─── Internal: Execute Swap (ParaSwap) ───────────────────────────
     function _executeSwap(SwapSpec memory spec) internal {
+        if (spec.srcToken == address(0) || spec.dstToken == address(0)) revert InvalidSwapSpec();
+        if (spec.amountIn == 0) revert InvalidSwapSpec();
+        if (spec.paraswapCalldata.length < 4) revert InvalidSwapSpec();
+
         address augustus = paraswapAugustusV6;
         if (augustus == address(0)) revert ZeroAddress();
-        if (!allowedTargets[augustus]) revert AssetNotAllowed(augustus);
+        if (!allowedTargets[augustus]) revert TargetNotAllowed(augustus);
         if (!allowedAssets[spec.srcToken]) revert AssetNotAllowed(spec.srcToken);
         if (!allowedAssets[spec.dstToken]) revert AssetNotAllowed(spec.dstToken);
 
@@ -411,7 +433,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         address pool = aavePool;
         if (pool == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pool]) revert AssetNotAllowed(pool);
+        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
+
+        if (action.actionType == 4) {
+            _executeAaveV3Liquidation(pool, action);
+            return;
+        }
+
         if (!allowedAssets[action.asset]) revert AssetNotAllowed(action.asset);
 
         if (action.actionType == 1) {
@@ -442,12 +470,28 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
     }
 
+    function _executeAaveV3Liquidation(address pool, AaveV3Action memory action) internal {
+        if (!allowedAssets[action.collateralAsset]) revert AssetNotAllowed(action.collateralAsset);
+        if (!allowedAssets[action.debtAsset]) revert AssetNotAllowed(action.debtAsset);
+        if (action.user == address(0)) revert ZeroAddress();
+        if (action.debtToCover == 0) revert InvalidPlan();
+
+        IERC20(action.debtAsset).forceApprove(pool, action.debtToCover);
+        IAaveV3Pool(pool)
+            .liquidationCall(
+                action.collateralAsset, action.debtAsset, action.user, action.debtToCover, action.receiveAToken
+            );
+        IERC20(action.debtAsset).forceApprove(pool, 0);
+
+        emit LiquidationExecuted(PROTOCOL_AAVE_V3, action.collateralAsset, action.debtAsset, action.debtToCover);
+    }
+
     function _executeMorphoBlueAction(bytes memory actionData) internal {
         MorphoBlueAction memory action = abi.decode(actionData, (MorphoBlueAction));
 
         address morpho = morphoBlue;
         if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert AssetNotAllowed(morpho);
+        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
         if (!allowedAssets[action.marketParams.loanToken]) revert AssetNotAllowed(action.marketParams.loanToken);
         if (!allowedAssets[action.marketParams.collateralToken]) {
             revert AssetNotAllowed(action.marketParams.collateralToken);
@@ -504,7 +548,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         address pool = aaveV2LendingPool;
         if (pool == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pool]) revert AssetNotAllowed(pool);
+        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
         if (!allowedAssets[liq.collateralAsset]) revert AssetNotAllowed(liq.collateralAsset);
         if (!allowedAssets[liq.debtAsset]) revert AssetNotAllowed(liq.debtAsset);
 

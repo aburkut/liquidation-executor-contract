@@ -18,6 +18,14 @@ interface IAaveV3Pool {
 
     function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
 
+    function liquidationCall(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool receiveAToken
+    ) external;
+
     function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
 }
 

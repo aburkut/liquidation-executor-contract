@@ -117,7 +117,39 @@ contract ExecutorTest is Test {
     {
         return abi.encode(
             LiquidationExecutor.AaveV3Action({
-                actionType: 1, asset: asset, amount: amount, interestRateMode: 2, onBehalfOf: onBehalfOf
+                actionType: 1,
+                asset: asset,
+                amount: amount,
+                interestRateMode: 2,
+                onBehalfOf: onBehalfOf,
+                collateralAsset: address(0),
+                debtAsset: address(0),
+                user: address(0),
+                debtToCover: 0,
+                receiveAToken: false
+            })
+        );
+    }
+
+    function _buildAaveV3LiquidationAction(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool receiveAToken
+    ) internal pure returns (bytes memory) {
+        return abi.encode(
+            LiquidationExecutor.AaveV3Action({
+                actionType: 4,
+                asset: address(0),
+                amount: 0,
+                interestRateMode: 0,
+                onBehalfOf: address(0),
+                collateralAsset: collateralAsset,
+                debtAsset: debtAsset,
+                user: user,
+                debtToCover: debtToCover,
+                receiveAToken: receiveAToken
             })
         );
     }
@@ -1112,6 +1144,211 @@ contract ExecutorTest is Test {
         emit LiquidationExecutor.FlashExecuted(2, address(loanToken), LOAN_AMOUNT);
         executor.execute(plan);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // P0 REGRESSION: Balancer profit gate when profitToken == loanToken
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_balancer_profit_token_equals_loan_token_profit_gate_works() public {
+        // Scenario: flash loanToken from Balancer, swap loanToken->collateralToken,
+        // use collateralToken in Aave V3 repay, profit measured in loanToken.
+        // The swap yields collateralToken and the Aave V3 repay consumes collateralToken,
+        // but we need net gain in loanToken. So we set up a scenario where executor
+        // starts with enough loanToken to cover repayment + profit.
+        //
+        // Flow: flash 1000 LOAN (fee=5) -> swap 1000 LOAN->COLL -> repay 500 COLL to Aave V3
+        // Executor starts with extra LOAN to cover flash repay. Net profit = initial extra - fee.
+
+        uint256 flashFee = 5e18;
+        balancerVault.setFlashFee(flashFee);
+
+        // Executor starts with 1100 LOAN (initial balance).
+        // Flash borrows 1000 LOAN. profitBefore = 1100 + 1000 = 2100.
+        // Swap 1000 LOAN -> 1100 COLL (rate=1.1). Executor LOAN = 1100, COLL = 1100.
+        // Aave V3 repay 500 COLL. Executor LOAN = 1100, COLL = 600.
+        // Repay Balancer: 1000 + 5 = 1005 LOAN. Executor LOAN = 95.
+        // profitAfter = 95. principalAmount = 1000.
+        // effectiveProfit = 95 + 1000 - 2100 = -1005?? That's wrong...
+
+        // Hmm, let me reconsider. The executor starts with LOAN_AMOUNT + FLASH_FEE + 100e18
+        // from setUp (line 83). Let me use a fresh scenario.
+
+        // Clear executor balance and set precisely.
+        uint256 executorInitialLoan = 50e18; // small initial balance
+        // Burn all existing executor loanToken, then mint exact amount
+        uint256 currentBal = loanToken.balanceOf(address(executor));
+        if (currentBal > 0) {
+            vm.prank(address(executor));
+            loanToken.transfer(address(1), currentBal);
+        }
+        loanToken.mint(address(executor), executorInitialLoan);
+
+        // Flash 1000 LOAN from Balancer (fee=5).
+        // Inside callback: profitBefore = 50 + 1000 = 1050.
+        // Swap 1000 LOAN -> 1100 COLL. Executor: LOAN=50, COLL=1100.
+        // Aave V3 repay 500 COLL. Executor: LOAN=50, COLL=600.
+        // Repay 1005 LOAN to Balancer. But executor only has 50 LOAN!
+        // Need more LOAN... The target action should yield LOAN.
+
+        // Better scenario: Aave V2 liquidation where we get loanToken as collateral reward.
+        // Flash 1000 LOAN, swap 1000 LOAN -> 1100 COLL, liquidate with COLL as debtAsset
+        // receiving LOAN as collateral. Then repay flash in LOAN.
+
+        // Simplest: skip swap entirely (amountIn=0 would fail sanity check).
+        // Let's use a different approach: the swap converts some loanToken to collateralToken,
+        // then the target action converts collateralToken back to loanToken (Aave V2 liq).
+
+        // Even simpler: Just make the mock swap go COLL->LOAN so the executor gains LOAN.
+        // Fund executor with collateralToken to swap.
+
+        // OK let me just do a clean scenario:
+        // 1. Executor has 0 COLL, some LOAN
+        // 2. Flash 1000 LOAN from Balancer
+        // 3. Aave V2 liquidation: spend LOAN as debt, get COLL as collateral reward
+        // 4. Swap COLL->LOAN to get back enough to repay
+        // 5. Profit measured in LOAN
+
+        // Wait, the order is swap first, then target action. Let me re-read the callback:
+        // _executeSwap then _executeTargetAction. OK so swap happens first.
+
+        // Plan: flash 1000 LOAN. Swap 500 LOAN -> 550 COLL. Aave V2 liq: pay 550 COLL debt, get 600 LOAN collateral.
+        // After: LOAN = 50 + 1000 - 500 + 600 = 1150. Repay 1005. Remaining = 145.
+        // profitBefore = 50 + 1000 = 1050. profitAfter = 145.
+        // effectiveProfit = 145 + 1000 - 1050 = 95. Which is correct: 145 - 50 = 95 net gain.
+
+        // Set up: executor has 50 LOAN, 0 COLL.
+        // Swap 500 LOAN -> 550 COLL (rate = 1.1).
+        // Aave V2 liq: debtAsset=COLL, collateralAsset=LOAN, debtToCover=550, collateralReward=600.
+        aaveV2Pool.setCollateralReward(600e18);
+        loanToken.mint(address(aaveV2Pool), 100_000e18); // for collateral reward
+
+        uint256 swapAmountIn = 500e18;
+        uint256 minOut = 0;
+
+        bytes memory targetAction = _buildAaveV2LiquidationAction(
+            address(loanToken), // collateral received
+            address(collateralToken), // debt paid
+            address(0x1234),
+            550e18, // debtToCover
+            false
+        );
+
+        uint256 netGain = 95e18; // expected profit
+        bytes memory plan = _buildPlan(
+            2, // Balancer
+            address(loanToken),
+            LOAN_AMOUNT,
+            flashFee,
+            3, // Aave V2
+            targetAction,
+            _buildSwapSpec(address(loanToken), address(collateralToken), swapAmountIn, minOut),
+            address(loanToken), // profitToken == loanToken
+            netGain // minProfit
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // Verify profit
+        uint256 finalBal = loanToken.balanceOf(address(executor));
+        assertGe(finalBal - executorInitialLoan, netGain - 1); // allow 1 wei rounding
+
+        // Approval hygiene
+        assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // FEATURE: Aave V3 liquidation
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_aave_v3_liquidation_executes_and_resets_allowance() public {
+        // Setup: flash loanToken, swap to collateralToken, Aave V3 liquidation
+        // Aave V3 liq: pay collateralToken as debt, receive loanToken as collateral reward
+        uint256 debtToCover = 500e18;
+        uint256 collateralReward = 600e18;
+
+        aavePool.setLiquidationCollateralReward(collateralReward);
+        loanToken.mint(address(aavePool), 100_000e18); // for collateral reward
+        collateralToken.mint(address(executor), 0); // executor starts with no extra COLL
+
+        bytes memory targetAction = _buildAaveV3LiquidationAction(
+            address(loanToken), // collateralAsset (received)
+            address(collateralToken), // debtAsset (paid)
+            address(0x1234), // user being liquidated
+            debtToCover,
+            false
+        );
+
+        bytes memory plan = _buildPlan(
+            1, // Aave V3 flash
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            1, // protocolId = Aave V3
+            targetAction,
+            _buildSwapSpec(address(loanToken), address(collateralToken), LOAN_AMOUNT, 0),
+            address(collateralToken), // profit in collateral
+            0 // minProfit
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // Assert allowance reset for debtAsset -> aavePool
+        assertEq(collateralToken.allowance(address(executor), address(aavePool)), 0);
+        // Assert allowance reset for swap
+        assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+
+        // Assert revert if collateralAsset not allowed
+        vm.prank(owner);
+        executor.setAssetAllowed(address(loanToken), false);
+
+        bytes memory plan2 = _buildPlan(
+            1,
+            address(collateralToken), // use collateralToken as loan this time
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            1,
+            _buildAaveV3LiquidationAction(
+                address(loanToken), address(collateralToken), address(0x1234), debtToCover, false
+            ),
+            _buildSwapSpec(address(collateralToken), address(loanToken), LOAN_AMOUNT, 0),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.AssetNotAllowed.selector, address(loanToken)));
+        executor.execute(plan2);
+
+        // Restore and test debtAsset not allowed
+        vm.startPrank(owner);
+        executor.setAssetAllowed(address(loanToken), true);
+        executor.setAssetAllowed(address(collateralToken), false);
+        vm.stopPrank();
+
+        bytes memory plan3 = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            1,
+            _buildAaveV3LiquidationAction(
+                address(loanToken), address(collateralToken), address(0x1234), debtToCover, false
+            ),
+            _buildSwapSpec(address(loanToken), address(collateralToken), LOAN_AMOUNT, 0),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.AssetNotAllowed.selector, address(collateralToken)));
+        executor.execute(plan3);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // EVENT EMISSION (preserved)
+    // ═══════════════════════════════════════════════════════════════════
 
     function test_emitsLiquidationExecuted() public {
         aaveV2Pool.setCollateralReward(COLLATERAL_REWARD);
