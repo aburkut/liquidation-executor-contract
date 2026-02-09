@@ -4,7 +4,8 @@
       "Bash(forge init:*)",
       "Bash(forge install:*)",
       "Bash(forge build:*)",
-      "Bash(forge test:*)"
+      "Bash(forge test:*)",
+      "Bash(chmod:*)"
     ]
   }
 }

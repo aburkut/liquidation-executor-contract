@@ -30,18 +30,21 @@ contract MockAavePool {
         uint256 amount,
         bytes calldata params,
         uint16 /* referralCode */
-    ) external {
+    )
+        external
+    {
         // Transfer loan amount to receiver
         IERC20(asset).safeTransfer(receiverAddress, amount);
 
         // Callback
-        bool success = IFlashLoanSimpleReceiver(receiverAddress).executeOperation(
-            asset,
-            amount,
-            flashFee,
-            receiverAddress, // initiator = receiverAddress in this mock
-            params
-        );
+        bool success = IFlashLoanSimpleReceiver(receiverAddress)
+            .executeOperation(
+                asset,
+                amount,
+                flashFee,
+                receiverAddress, // initiator = receiverAddress in this mock
+                params
+            );
         require(success, "MockAavePool: callback failed");
 
         // Pull repayment
@@ -53,17 +56,16 @@ contract MockAavePool {
         uint256 amount,
         uint256, /* interestRateMode */
         address /* onBehalfOf */
-    ) external returns (uint256) {
+    )
+        external
+        returns (uint256)
+    {
         require(!repayReverts, "MockAavePool: repay reverts");
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
         return amount;
     }
 
-    function withdraw(
-        address asset,
-        uint256 amount,
-        address to
-    ) external returns (uint256) {
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256) {
         IERC20(asset).safeTransfer(to, amount);
         return amount;
     }
@@ -73,8 +75,35 @@ contract MockAavePool {
         uint256 amount,
         address, /* onBehalfOf */
         uint16 /* referralCode */
-    ) external {
+    )
+        external
+    {
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
+    }
+
+    bool public liquidationReverts;
+    uint256 public liquidationCollateralReward;
+
+    function setLiquidationReverts(bool _reverts) external {
+        liquidationReverts = _reverts;
+    }
+
+    function setLiquidationCollateralReward(uint256 _reward) external {
+        liquidationCollateralReward = _reward;
+    }
+
+    function liquidationCall(
+        address collateralAsset,
+        address debtAsset,
+        address, /* user */
+        uint256 debtToCover,
+        bool /* receiveAToken */
+    )
+        external
+    {
+        require(!liquidationReverts, "MockAavePool: liquidation reverts");
+        IERC20(debtAsset).safeTransferFrom(msg.sender, address(this), debtToCover);
+        IERC20(collateralAsset).safeTransfer(msg.sender, liquidationCollateralReward);
     }
 
     function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128) {

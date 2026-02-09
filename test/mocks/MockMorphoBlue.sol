@@ -20,7 +20,10 @@ contract MockMorphoBlue {
         uint256, /* shares */
         address, /* onBehalfOf */
         bytes memory /* data */
-    ) external returns (uint256 assetsRepaid, uint256 sharesRepaid) {
+    )
+        external
+        returns (uint256 assetsRepaid, uint256 sharesRepaid)
+    {
         require(!repayReverts, "MockMorphoBlue: repay reverts");
         IERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), assets);
         return (assets, 0);
@@ -31,7 +34,9 @@ contract MockMorphoBlue {
         uint256 assets,
         address, /* onBehalfOf */
         address receiver
-    ) external {
+    )
+        external
+    {
         IERC20(marketParams.collateralToken).safeTransfer(receiver, assets);
     }
 
@@ -40,7 +45,9 @@ contract MockMorphoBlue {
         uint256 assets,
         address, /* onBehalfOf */
         bytes memory /* data */
-    ) external {
+    )
+        external
+    {
         IERC20(marketParams.collateralToken).safeTransferFrom(msg.sender, address(this), assets);
     }
 }

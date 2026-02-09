@@ -21,13 +21,7 @@ interface ISwapRouter {
         uint256 amountOutMinimum;
     }
 
-    function exactInputSingle(ExactInputSingleParams calldata params)
-        external
-        payable
-        returns (uint256 amountOut);
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 
-    function exactInput(ExactInputParams calldata params)
-        external
-        payable
-        returns (uint256 amountOut);
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
 }
