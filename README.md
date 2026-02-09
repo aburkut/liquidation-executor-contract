@@ -82,11 +82,17 @@ struct Plan {
 **Aave V3** (`protocolId = 1`):
 ```solidity
 struct AaveV3Action {
-    uint8 actionType;        // 1=repay, 2=withdraw, 3=supply
+    uint8 actionType;        // 1=repay, 2=withdraw, 3=supply, 4=liquidation
     address asset;
     uint256 amount;
     uint256 interestRateMode;
     address onBehalfOf;
+    // Liquidation fields (actionType == 4 only)
+    address collateralAsset;
+    address debtAsset;
+    address user;
+    uint256 debtToCover;
+    bool receiveAToken;
 }
 ```
 
@@ -209,7 +215,7 @@ forge test -vvv
 forge coverage
 ```
 
-## Test Suite (61 tests)
+## Test Suite (64 tests)
 
 | Category | Count |
 |---|---|
@@ -219,7 +225,8 @@ forge coverage
 | Callback validation (initiator, caller, plan hash) | 6 |
 | ParaSwap gating (swap revert, slippage, balance) | 3 |
 | Aave V2 liquidation (happy, revert, protocolId) | 3 |
-| Profit gate | 3 |
+| Aave V3 liquidation | 1 |
+| Profit gate (incl. profitToken==loanToken regression) | 5 |
 | Fee cap | 2 |
 | Partial failure / revert propagation | 2 |
 | Flash provider validation | 1 |
@@ -239,14 +246,185 @@ forge coverage
 
 ## Deployment
 
-1. Deploy the contract with the owner address:
-   ```solidity
-   new LiquidationExecutor(ownerAddress)
-   ```
-2. Owner accepts ownership via `acceptOwnership()` (Ownable2Step)
-3. Configure all protocol addresses via setter functions
-4. Whitelist assets, flash providers, and target contracts
-5. Set the operator bot address via `setOperator(address)`
+Контракт использует один и тот же байткод для всех чейнов. Адреса протоколов задаются после деплоя через owner-функции.
+
+### 1. Подготовка окружения
+
+Создайте `.env` файл (не коммитьте его):
+
+```bash
+# Приватный ключ деплоера (он же initial owner)
+PRIVATE_KEY=0x...
+
+# RPC endpoints
+ETHEREUM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
+BASE_RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_KEY
+OPTIMISM_RPC_URL=https://opt-mainnet.g.alchemy.com/v2/YOUR_KEY
+
+# Etherscan API keys (для верификации)
+ETHERSCAN_API_KEY=...
+BASESCAN_API_KEY=...
+OPTIMISTIC_ETHERSCAN_API_KEY=...
+```
+
+### 2. Деплой контракта
+
+```bash
+# Ethereum Mainnet
+forge create src/LiquidationExecutor.sol:LiquidationExecutor \
+  --rpc-url $ETHEREUM_RPC_URL \
+  --private-key $PRIVATE_KEY \
+  --constructor-args <OWNER_ADDRESS> \
+  --verify \
+  --etherscan-api-key $ETHERSCAN_API_KEY
+
+# Base
+forge create src/LiquidationExecutor.sol:LiquidationExecutor \
+  --rpc-url $BASE_RPC_URL \
+  --private-key $PRIVATE_KEY \
+  --constructor-args <OWNER_ADDRESS> \
+  --verify \
+  --etherscan-api-key $BASESCAN_API_KEY
+
+# Optimism
+forge create src/LiquidationExecutor.sol:LiquidationExecutor \
+  --rpc-url $OPTIMISM_RPC_URL \
+  --private-key $PRIVATE_KEY \
+  --constructor-args <OWNER_ADDRESS> \
+  --verify \
+  --etherscan-api-key $OPTIMISTIC_ETHERSCAN_API_KEY
+```
+
+### 3. Принятие ownership (Ownable2Step)
+
+Если `OWNER_ADDRESS` отличается от деплоера, owner должен вызвать:
+
+```bash
+cast send <EXECUTOR_ADDRESS> "acceptOwnership()" \
+  --rpc-url <RPC_URL> \
+  --private-key <OWNER_PRIVATE_KEY>
+```
+
+### 4. Конфигурация протоколов
+
+После деплоя owner настраивает адреса через `cast send`. Ниже пример для Ethereum Mainnet:
+
+```bash
+EXECUTOR=<DEPLOYED_ADDRESS>
+RPC=$ETHEREUM_RPC_URL
+PK=<OWNER_PRIVATE_KEY>
+
+# Протоколы
+cast send $EXECUTOR "setAavePool(address)" 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setBalancerVault(address)" 0xBA12222222228d8Ba445958a75a0704d566BF2C8 --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setParaswapAugustusV6(address)" 0x6A000F20005980200259B80c5102003040001068 --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setAaveV2LendingPool(address)" 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9 --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setMorphoBlue(address)" 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb --rpc-url $RPC --private-key $PK
+
+# Flash providers
+cast send $EXECUTOR "setFlashProvider(uint8,address)" 1 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setFlashProvider(uint8,address)" 2 0xBA12222222228d8Ba445958a75a0704d566BF2C8 --rpc-url $RPC --private-key $PK
+
+# Оператор (бот)
+cast send $EXECUTOR "setOperator(address)" <BOT_ADDRESS> --rpc-url $RPC --private-key $PK
+
+# Target allowlist
+cast send $EXECUTOR "setTargetAllowed(address,bool)" 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 true --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setTargetAllowed(address,bool)" 0xBA12222222228d8Ba445958a75a0704d566BF2C8 true --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setTargetAllowed(address,bool)" 0x6A000F20005980200259B80c5102003040001068 true --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setTargetAllowed(address,bool)" 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9 true --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setTargetAllowed(address,bool)" 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb true --rpc-url $RPC --private-key $PK
+
+# Asset allowlist (пример: WETH, USDC, USDT, DAI, WBTC)
+cast send $EXECUTOR "setAssetAllowed(address,bool)" 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 true --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setAssetAllowed(address,bool)" 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 true --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setAssetAllowed(address,bool)" 0xdAC17F958D2ee523a2206206994597C13D831ec7 true --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setAssetAllowed(address,bool)" 0x6B175474E89094C44Da98b954EedeAC495271d0F true --rpc-url $RPC --private-key $PK
+cast send $EXECUTOR "setAssetAllowed(address,bool)" 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599 true --rpc-url $RPC --private-key $PK
+```
+
+### 5. Адреса протоколов по чейнам
+
+#### Ethereum Mainnet
+
+| Protocol | Address |
+|---|---|
+| Aave V3 Pool | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` |
+| Aave V2 LendingPool | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` |
+| Balancer Vault | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` |
+| ParaSwap AugustusV6 | `0x6A000F20005980200259B80c5102003040001068` |
+| Morpho Blue | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` |
+| WETH | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` |
+| USDC | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` |
+| USDT | `0xdAC17F958D2ee523a2206206994597C13D831ec7` |
+| DAI | `0x6B175474E89094C44Da98b954EedeAC495271d0F` |
+| WBTC | `0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599` |
+
+#### Base
+
+| Protocol | Address |
+|---|---|
+| Aave V3 Pool | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5` |
+| Aave V2 LendingPool | -- (not deployed on Base) |
+| Balancer Vault | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` |
+| ParaSwap AugustusV6 | `0x6A000F20005980200259B80c5102003040001068` |
+| Morpho Blue | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` |
+| WETH | `0x4200000000000000000000000000000000000006` |
+| USDbC | `0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6Ca` |
+| USDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
+| cbETH | `0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22` |
+
+#### Optimism
+
+| Protocol | Address |
+|---|---|
+| Aave V3 Pool | `0x794a61358D6845594F94dc1DB02A252b5b4814aD` |
+| Aave V2 LendingPool | -- (not deployed on Optimism) |
+| Balancer Vault | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` |
+| ParaSwap AugustusV6 | `0x6A000F20005980200259B80c5102003040001068` |
+| Morpho Blue | -- (not deployed on Optimism) |
+| WETH | `0x4200000000000000000000000000000000000006` |
+| USDC | `0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85` |
+| USDT | `0x94b008aA00579c1307B0EF2c499aD98a8ce58e58` |
+| DAI | `0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1` |
+| WBTC | `0x68f180fcCe6836688e9084f035309E29Bf0A2095` |
+
+> **Важно**: Aave V2 и Morpho Blue доступны не на всех чейнах. Пропускайте вызовы `setAaveV2LendingPool` / `setMorphoBlue` и соответствующие `setTargetAllowed` на чейнах, где эти протоколы отсутствуют. Контракт не требует настройки всех протоколов -- неиспользуемые останутся `address(0)` и будут безопасно ревертить при попытке вызова.
+
+### 6. Проверка деплоя
+
+```bash
+# Проверить owner
+cast call $EXECUTOR "owner()(address)" --rpc-url $RPC
+
+# Проверить operator
+cast call $EXECUTOR "operator()(address)" --rpc-url $RPC
+
+# Проверить настроенный Aave Pool
+cast call $EXECUTOR "aavePool()(address)" --rpc-url $RPC
+
+# Проверить flash provider
+cast call $EXECUTOR "allowedFlashProviders(uint8)(address)" 1 --rpc-url $RPC
+
+# Проверить whitelist ассета
+cast call $EXECUTOR "allowedAssets(address)(bool)" 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --rpc-url $RPC
+
+# Проверить что контракт не на паузе
+cast call $EXECUTOR "paused()(bool)" --rpc-url $RPC
+```
+
+### 7. Тест на форке перед продакшном
+
+```bash
+# Ethereum mainnet fork
+forge test --fork-url $ETHEREUM_RPC_URL -vvv
+
+# Base fork
+forge test --fork-url $BASE_RPC_URL -vvv
+
+# Optimism fork
+forge test --fork-url $OPTIMISM_RPC_URL -vvv
+```
 
 ## License
 
