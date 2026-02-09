@@ -44,11 +44,7 @@ contract MockSwapRouter {
         IERC20(params.tokenOut).safeTransfer(params.recipient, amountOut);
     }
 
-    function exactInput(ISwapRouter.ExactInputParams calldata params)
-        external
-        payable
-        returns (uint256 amountOut)
-    {
+    function exactInput(ISwapRouter.ExactInputParams calldata params) external payable returns (uint256 amountOut) {
         require(!swapReverts, "MockSwapRouter: swap reverts");
 
         // Extract tokenIn from path (first 20 bytes)

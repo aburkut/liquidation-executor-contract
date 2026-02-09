@@ -16,13 +16,7 @@ import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
 /// @title LiquidationExecutor
 /// @notice Flashloan + Swap + Repay/Liquidation executor.
 /// @dev Fail-closed. No upgradeability. No arbitrary external calls.
-contract LiquidationExecutor is
-    Ownable2Step,
-    Pausable,
-    ReentrancyGuard,
-    IFlashLoanSimpleReceiver,
-    IFlashLoanRecipient
-{
+contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanSimpleReceiver, IFlashLoanRecipient {
     using SafeERC20 for IERC20;
 
     // ─── Custom Errors ───────────────────────────────────────────────
@@ -83,8 +77,12 @@ contract LiquidationExecutor is
     event TargetAllowed(address indexed target, bool allowed);
     event FlashExecuted(uint8 indexed providerId, address indexed loanToken, uint256 loanAmount);
     event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
-    event RepayExecuted(uint8 indexed protocolId, bytes32 indexed positionKeyHash, address indexed asset, uint256 amount);
-    event LiquidationExecuted(uint8 indexed protocolId, address indexed collateralAsset, address indexed debtAsset, uint256 debtToCover);
+    event RepayExecuted(
+        uint8 indexed protocolId, bytes32 indexed positionKeyHash, address indexed asset, uint256 amount
+    );
+    event LiquidationExecuted(
+        uint8 indexed protocolId, address indexed collateralAsset, address indexed debtAsset, uint256 debtToCover
+    );
     event Rescue(address indexed token, address indexed to, uint256 amount);
 
     // ─── Plan Struct ─────────────────────────────────────────────────
@@ -213,8 +211,13 @@ contract LiquidationExecutor is
         emit TargetAllowed(target, allowed);
     }
 
-    function pause() external onlyOwner { _pause(); }
-    function unpause() external onlyOwner { _unpause(); }
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
 
     // ─── Core Execute ────────────────────────────────────────────────
     function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
@@ -232,9 +235,7 @@ contract LiquidationExecutor is
         _activePlanHash = keccak256(planData);
 
         if (plan.flashProviderId == FLASH_PROVIDER_AAVE_V3) {
-            IAaveV3Pool(provider).flashLoanSimple(
-                address(this), plan.loanToken, plan.loanAmount, planData, 0
-            );
+            IAaveV3Pool(provider).flashLoanSimple(address(this), plan.loanToken, plan.loanAmount, planData, 0);
         } else if (plan.flashProviderId == FLASH_PROVIDER_BALANCER) {
             IERC20[] memory tokens = new IERC20[](1);
             tokens[0] = IERC20(plan.loanToken);
@@ -250,13 +251,11 @@ contract LiquidationExecutor is
     }
 
     // ─── Aave V3 Flashloan Callback ─────────────────────────────────
-    function executeOperation(
-        address asset,
-        uint256 amount,
-        uint256 premium,
-        address initiator,
-        bytes calldata params
-    ) external override returns (bool) {
+    function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes calldata params)
+        external
+        override
+        returns (bool)
+    {
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_AAVE_V3]) revert InvalidCallbackCaller();
         if (initiator != address(this)) revert InvalidInitiator();
         if (keccak256(params) != _activePlanHash) revert InvalidPlan();
@@ -285,7 +284,9 @@ contract LiquidationExecutor is
         uint256[] memory feeAmounts,
         bytes memory userData
     ) external override {
-        if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) revert InvalidCallbackCaller();
+        if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) {
+            revert InvalidCallbackCaller();
+        }
         if (keccak256(userData) != _activePlanHash) revert InvalidPlan();
         if (tokens.length != 1) revert BalancerSingleTokenOnly();
 
@@ -304,8 +305,7 @@ contract LiquidationExecutor is
         // Balancer expects funds returned by end of callback via transfer
         uint256 repayAmount = amounts[0] + feeAmounts[0];
         _finalizeBalancerFlashloan(
-            address(tokens[0]), repayAmount, msg.sender,
-            plan.profitToken, profitBefore, plan.minProfit
+            address(tokens[0]), repayAmount, msg.sender, plan.profitToken, profitBefore, plan.minProfit
         );
     }
 
@@ -358,13 +358,9 @@ contract LiquidationExecutor is
 
         if (profitTkn == asset && repayPending) {
             // Aave: balance still includes repayAmount that pool will pull
-            effectiveProfit = profitAfter > profitBefore + repayAmount
-                ? profitAfter - profitBefore - repayAmount
-                : 0;
+            effectiveProfit = profitAfter > profitBefore + repayAmount ? profitAfter - profitBefore - repayAmount : 0;
         } else {
-            effectiveProfit = profitAfter > profitBefore
-                ? profitAfter - profitBefore
-                : 0;
+            effectiveProfit = profitAfter > profitBefore ? profitAfter - profitBefore : 0;
         }
 
         if (effectiveProfit < minProfit) revert InsufficientProfit(effectiveProfit, minProfit);
@@ -420,21 +416,16 @@ contract LiquidationExecutor is
 
         if (action.actionType == 1) {
             IERC20(action.asset).forceApprove(pool, action.amount);
-            uint256 repaid = IAaveV3Pool(pool).repay(
-                action.asset, action.amount, action.interestRateMode, action.onBehalfOf
-            );
+            uint256 repaid =
+                IAaveV3Pool(pool).repay(action.asset, action.amount, action.interestRateMode, action.onBehalfOf);
             IERC20(action.asset).forceApprove(pool, 0);
             emit RepayExecuted(
-                PROTOCOL_AAVE_V3,
-                keccak256(abi.encodePacked(action.asset, action.onBehalfOf)),
-                action.asset, repaid
+                PROTOCOL_AAVE_V3, keccak256(abi.encodePacked(action.asset, action.onBehalfOf)), action.asset, repaid
             );
         } else if (action.actionType == 2) {
             uint256 withdrawn = IAaveV3Pool(pool).withdraw(action.asset, action.amount, address(this));
             emit RepayExecuted(
-                PROTOCOL_AAVE_V3,
-                keccak256(abi.encodePacked(action.asset, action.onBehalfOf)),
-                action.asset, withdrawn
+                PROTOCOL_AAVE_V3, keccak256(abi.encodePacked(action.asset, action.onBehalfOf)), action.asset, withdrawn
             );
         } else if (action.actionType == 3) {
             IERC20(action.asset).forceApprove(pool, action.amount);
@@ -443,7 +434,8 @@ contract LiquidationExecutor is
             emit RepayExecuted(
                 PROTOCOL_AAVE_V3,
                 keccak256(abi.encodePacked(action.asset, action.onBehalfOf)),
-                action.asset, action.amount
+                action.asset,
+                action.amount
             );
         } else {
             revert InvalidPlan();
@@ -474,38 +466,36 @@ contract LiquidationExecutor is
 
     function _morphoRepay(address morpho, MorphoBlueAction memory action) internal {
         IERC20(action.marketParams.loanToken).forceApprove(morpho, action.assets);
-        (uint256 assetsRepaid,) = IMorphoBlue(morpho).repay(
-            action.marketParams, action.assets, action.shares, action.onBehalfOf, ""
-        );
+        (uint256 assetsRepaid,) =
+            IMorphoBlue(morpho).repay(action.marketParams, action.assets, action.shares, action.onBehalfOf, "");
         IERC20(action.marketParams.loanToken).forceApprove(morpho, 0);
         emit RepayExecuted(
             PROTOCOL_MORPHO_BLUE,
             keccak256(abi.encode(action.marketParams)),
-            action.marketParams.loanToken, assetsRepaid
+            action.marketParams.loanToken,
+            assetsRepaid
         );
     }
 
     function _morphoWithdrawCollateral(address morpho, MorphoBlueAction memory action) internal {
-        IMorphoBlue(morpho).withdrawCollateral(
-            action.marketParams, action.assets, action.onBehalfOf, address(this)
-        );
+        IMorphoBlue(morpho).withdrawCollateral(action.marketParams, action.assets, action.onBehalfOf, address(this));
         emit RepayExecuted(
             PROTOCOL_MORPHO_BLUE,
             keccak256(abi.encode(action.marketParams)),
-            action.marketParams.collateralToken, action.assets
+            action.marketParams.collateralToken,
+            action.assets
         );
     }
 
     function _morphoSupplyCollateral(address morpho, MorphoBlueAction memory action) internal {
         IERC20(action.marketParams.collateralToken).forceApprove(morpho, action.assets);
-        IMorphoBlue(morpho).supplyCollateral(
-            action.marketParams, action.assets, action.onBehalfOf, ""
-        );
+        IMorphoBlue(morpho).supplyCollateral(action.marketParams, action.assets, action.onBehalfOf, "");
         IERC20(action.marketParams.collateralToken).forceApprove(morpho, 0);
         emit RepayExecuted(
             PROTOCOL_MORPHO_BLUE,
             keccak256(abi.encode(action.marketParams)),
-            action.marketParams.collateralToken, action.assets
+            action.marketParams.collateralToken,
+            action.assets
         );
     }
 
@@ -519,14 +509,11 @@ contract LiquidationExecutor is
         if (!allowedAssets[liq.debtAsset]) revert AssetNotAllowed(liq.debtAsset);
 
         IERC20(liq.debtAsset).forceApprove(pool, liq.debtToCover);
-        IAaveV2LendingPool(pool).liquidationCall(
-            liq.collateralAsset, liq.debtAsset, liq.user, liq.debtToCover, liq.receiveAToken
-        );
+        IAaveV2LendingPool(pool)
+            .liquidationCall(liq.collateralAsset, liq.debtAsset, liq.user, liq.debtToCover, liq.receiveAToken);
         IERC20(liq.debtAsset).forceApprove(pool, 0);
 
-        emit LiquidationExecuted(
-            PROTOCOL_AAVE_V2, liq.collateralAsset, liq.debtAsset, liq.debtToCover
-        );
+        emit LiquidationExecuted(PROTOCOL_AAVE_V2, liq.collateralAsset, liq.debtAsset, liq.debtToCover);
     }
 
     // ─── Rescue Functions ────────────────────────────────────────────

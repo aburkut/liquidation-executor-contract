@@ -4,12 +4,8 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 interface IBalancerVault {
-    function flashLoan(
-        address recipient,
-        IERC20[] memory tokens,
-        uint256[] memory amounts,
-        bytes memory userData
-    ) external;
+    function flashLoan(address recipient, IERC20[] memory tokens, uint256[] memory amounts, bytes memory userData)
+        external;
 }
 
 interface IFlashLoanRecipient {

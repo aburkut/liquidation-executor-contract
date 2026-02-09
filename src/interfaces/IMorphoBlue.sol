@@ -18,17 +18,9 @@ interface IMorphoBlue {
         bytes memory data
     ) external returns (uint256 assetsRepaid, uint256 sharesRepaid);
 
-    function withdrawCollateral(
-        MarketParams memory marketParams,
-        uint256 assets,
-        address onBehalfOf,
-        address receiver
-    ) external;
+    function withdrawCollateral(MarketParams memory marketParams, uint256 assets, address onBehalfOf, address receiver)
+        external;
 
-    function supplyCollateral(
-        MarketParams memory marketParams,
-        uint256 assets,
-        address onBehalfOf,
-        bytes memory data
-    ) external;
+    function supplyCollateral(MarketParams memory marketParams, uint256 assets, address onBehalfOf, bytes memory data)
+        external;
 }

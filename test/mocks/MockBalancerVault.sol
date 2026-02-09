@@ -18,12 +18,9 @@ contract MockBalancerVault {
         flashFee = _fee;
     }
 
-    function flashLoan(
-        address recipient,
-        IERC20[] memory tokens,
-        uint256[] memory amounts,
-        bytes memory userData
-    ) external {
+    function flashLoan(address recipient, IERC20[] memory tokens, uint256[] memory amounts, bytes memory userData)
+        external
+    {
         uint256[] memory feeAmounts = new uint256[](tokens.length);
         for (uint256 i = 0; i < tokens.length; i++) {
             feeAmounts[i] = flashFee;

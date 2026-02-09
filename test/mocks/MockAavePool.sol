@@ -30,18 +30,21 @@ contract MockAavePool {
         uint256 amount,
         bytes calldata params,
         uint16 /* referralCode */
-    ) external {
+    )
+        external
+    {
         // Transfer loan amount to receiver
         IERC20(asset).safeTransfer(receiverAddress, amount);
 
         // Callback
-        bool success = IFlashLoanSimpleReceiver(receiverAddress).executeOperation(
-            asset,
-            amount,
-            flashFee,
-            receiverAddress, // initiator = receiverAddress in this mock
-            params
-        );
+        bool success = IFlashLoanSimpleReceiver(receiverAddress)
+            .executeOperation(
+                asset,
+                amount,
+                flashFee,
+                receiverAddress, // initiator = receiverAddress in this mock
+                params
+            );
         require(success, "MockAavePool: callback failed");
 
         // Pull repayment
@@ -53,17 +56,16 @@ contract MockAavePool {
         uint256 amount,
         uint256, /* interestRateMode */
         address /* onBehalfOf */
-    ) external returns (uint256) {
+    )
+        external
+        returns (uint256)
+    {
         require(!repayReverts, "MockAavePool: repay reverts");
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
         return amount;
     }
 
-    function withdraw(
-        address asset,
-        uint256 amount,
-        address to
-    ) external returns (uint256) {
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256) {
         IERC20(asset).safeTransfer(to, amount);
         return amount;
     }
@@ -73,7 +75,9 @@ contract MockAavePool {
         uint256 amount,
         address, /* onBehalfOf */
         uint16 /* referralCode */
-    ) external {
+    )
+        external
+    {
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
     }
 

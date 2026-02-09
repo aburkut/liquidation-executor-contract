@@ -28,7 +28,9 @@ contract MockAaveV2LendingPool {
         address, /* user */
         uint256 debtToCover,
         bool /* receiveAToken */
-    ) external {
+    )
+        external
+    {
         require(!liquidationReverts, "MockAaveV2: liquidation reverts");
         // Pull debt tokens from caller
         IERC20(debtAsset).safeTransferFrom(msg.sender, address(this), debtToCover);
