@@ -8,17 +8,20 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {IAaveV3Pool, IFlashLoanSimpleReceiver} from "./interfaces/IAaveV3Pool.sol";
+import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IMorphoBlue, MarketParams} from "./interfaces/IMorphoBlue.sol";
+import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
 
 /// @title LiquidationExecutor
-/// @notice Flashloan + Swap + Repay executor for liquidation/repay workflows.
-/// @dev Fail-closed design. No upgradeability. No arbitrary external calls.
+/// @notice Flashloan + Swap + Repay/Liquidation executor.
+/// @dev Fail-closed. No upgradeability. No arbitrary external calls.
 contract LiquidationExecutor is
     Ownable2Step,
     Pausable,
     ReentrancyGuard,
-    IFlashLoanSimpleReceiver
+    IFlashLoanSimpleReceiver,
+    IFlashLoanRecipient
 {
     using SafeERC20 for IERC20;
 
@@ -39,11 +42,20 @@ contract LiquidationExecutor is
     error InsufficientRepayBalance(uint256 required, uint256 available);
     error InvalidSwapSelector();
     error RescueFailed();
+    error CallbackAssetMismatch();
+    error CallbackAmountMismatch();
+    error BalancerSingleTokenOnly();
+    error SwapFailed();
+    error InsufficientSwapOutput(uint256 actual, uint256 minimum);
+    error InsufficientSrcBalance(uint256 required, uint256 available);
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
+    uint8 public constant FLASH_PROVIDER_BALANCER = 2;
+
     uint8 public constant PROTOCOL_AAVE_V3 = 1;
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
+    uint8 public constant PROTOCOL_AAVE_V2 = 3;
 
     bytes4 private constant EXACT_INPUT_SINGLE_SELECTOR = ISwapRouter.exactInputSingle.selector;
     bytes4 private constant EXACT_INPUT_SELECTOR = ISwapRouter.exactInput.selector;
@@ -53,6 +65,9 @@ contract LiquidationExecutor is
     address public aavePool;
     address public morphoBlue;
     address public uniswapV3Router;
+    address public balancerVault;
+    address public paraswapAugustusV6;
+    address public aaveV2LendingPool;
 
     mapping(address => bool) public allowedAssets;
     mapping(uint8 => address) public allowedFlashProviders;
@@ -69,9 +84,18 @@ contract LiquidationExecutor is
     event FlashExecuted(uint8 indexed providerId, address indexed loanToken, uint256 loanAmount);
     event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
     event RepayExecuted(uint8 indexed protocolId, bytes32 indexed positionKeyHash, address indexed asset, uint256 amount);
+    event LiquidationExecuted(uint8 indexed protocolId, address indexed collateralAsset, address indexed debtAsset, uint256 debtToCover);
     event Rescue(address indexed token, address indexed to, uint256 amount);
 
     // ─── Plan Struct ─────────────────────────────────────────────────
+    struct SwapSpec {
+        address srcToken;
+        address dstToken;
+        uint256 amountIn;
+        uint256 minAmountOut;
+        bytes paraswapCalldata;
+    }
+
     struct Plan {
         uint8 flashProviderId;
         address loanToken;
@@ -79,7 +103,7 @@ contract LiquidationExecutor is
         uint256 maxFlashFee;
         uint8 targetProtocolId;
         bytes targetActionData;
-        bytes swapData;
+        SwapSpec swapSpec;
         address profitToken;
         uint256 minProfit;
     }
@@ -89,7 +113,7 @@ contract LiquidationExecutor is
         uint8 actionType; // 1 = repay, 2 = withdraw, 3 = supply
         address asset;
         uint256 amount;
-        uint256 interestRateMode; // for repay
+        uint256 interestRateMode;
         address onBehalfOf;
     }
 
@@ -98,13 +122,21 @@ contract LiquidationExecutor is
         uint8 actionType; // 1 = repay, 2 = withdrawCollateral, 3 = supplyCollateral
         MarketParams marketParams;
         uint256 assets;
-        uint256 shares; // for repay
+        uint256 shares;
         address onBehalfOf;
+    }
+
+    // ─── Aave V2 liquidation action ──────────────────────────────────
+    struct AaveV2Liquidation {
+        address collateralAsset;
+        address debtAsset;
+        address user;
+        uint256 debtToCover;
+        bool receiveAToken;
     }
 
     // ─── Constructor ─────────────────────────────────────────────────
     constructor(address initialOwner) Ownable(initialOwner) {}
-
 
     // ─── Modifiers ───────────────────────────────────────────────────
     modifier onlyOperator() {
@@ -141,6 +173,27 @@ contract LiquidationExecutor is
         emit ConfigUpdated("uniswapV3Router", old, router);
     }
 
+    function setBalancerVault(address vault) external onlyOwner {
+        if (vault == address(0)) revert ZeroAddress();
+        address old = balancerVault;
+        balancerVault = vault;
+        emit ConfigUpdated("balancerVault", old, vault);
+    }
+
+    function setParaswapAugustusV6(address augustus) external onlyOwner {
+        if (augustus == address(0)) revert ZeroAddress();
+        address old = paraswapAugustusV6;
+        paraswapAugustusV6 = augustus;
+        emit ConfigUpdated("paraswapAugustus", old, augustus);
+    }
+
+    function setAaveV2LendingPool(address pool) external onlyOwner {
+        if (pool == address(0)) revert ZeroAddress();
+        address old = aaveV2LendingPool;
+        aaveV2LendingPool = pool;
+        emit ConfigUpdated("aaveV2Pool", old, pool);
+    }
+
     function setAssetAllowed(address token, bool allowed) external onlyOwner {
         if (token == address(0)) revert ZeroAddress();
         allowedAssets[token] = allowed;
@@ -160,13 +213,8 @@ contract LiquidationExecutor is
         emit TargetAllowed(target, allowed);
     }
 
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    function unpause() external onlyOwner {
-        _unpause();
-    }
+    function pause() external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
 
     // ─── Core Execute ────────────────────────────────────────────────
     function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
@@ -185,18 +233,19 @@ contract LiquidationExecutor is
 
         if (plan.flashProviderId == FLASH_PROVIDER_AAVE_V3) {
             IAaveV3Pool(provider).flashLoanSimple(
-                address(this),
-                plan.loanToken,
-                plan.loanAmount,
-                planData,
-                0
+                address(this), plan.loanToken, plan.loanAmount, planData, 0
             );
+        } else if (plan.flashProviderId == FLASH_PROVIDER_BALANCER) {
+            IERC20[] memory tokens = new IERC20[](1);
+            tokens[0] = IERC20(plan.loanToken);
+            uint256[] memory amounts = new uint256[](1);
+            amounts[0] = plan.loanAmount;
+            IBalancerVault(provider).flashLoan(address(this), tokens, amounts, planData);
         } else {
             revert FlashProviderNotAllowed();
         }
 
         _activePlanHash = bytes32(0);
-
         emit FlashExecuted(plan.flashProviderId, plan.loanToken, plan.loanAmount);
     }
 
@@ -208,31 +257,60 @@ contract LiquidationExecutor is
         address initiator,
         bytes calldata params
     ) external override returns (bool) {
-        // Strict callback validation
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_AAVE_V3]) revert InvalidCallbackCaller();
         if (initiator != address(this)) revert InvalidInitiator();
         if (keccak256(params) != _activePlanHash) revert InvalidPlan();
 
         Plan memory plan = abi.decode(params, (Plan));
 
+        // P0 safety: strict asset/amount match
+        if (asset != plan.loanToken) revert CallbackAssetMismatch();
+        if (amount != plan.loanAmount) revert CallbackAmountMismatch();
         if (premium > plan.maxFlashFee) revert FlashFeeExceeded(premium, plan.maxFlashFee);
 
         uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
 
-        // Step 1: Swap
-        _executeSwap(plan.loanToken, plan.loanAmount, plan.swapData);
-
-        // Step 2: Target Action
+        _executeSwap(plan.swapSpec);
         _executeTargetAction(plan.targetProtocolId, plan.targetActionData);
 
-        // Step 3: Approve flashloan repay & check profit
-        _finalizeFlashloan(asset, amount + premium, plan.profitToken, profitBefore, plan.minProfit);
-
+        // Aave pulls repayment after we return true — approve exact amount
+        _finalizeAaveFlashloan(asset, amount + premium, plan.profitToken, profitBefore, plan.minProfit);
         return true;
     }
 
-    // ─── Internal: Finalize Flashloan ────────────────────────────────
-    function _finalizeFlashloan(
+    // ─── Balancer Flashloan Callback ─────────────────────────────────
+    function receiveFlashLoan(
+        IERC20[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external override {
+        if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) revert InvalidCallbackCaller();
+        if (keccak256(userData) != _activePlanHash) revert InvalidPlan();
+        if (tokens.length != 1) revert BalancerSingleTokenOnly();
+
+        Plan memory plan = abi.decode(userData, (Plan));
+
+        // P0 safety: strict token/amount match
+        if (address(tokens[0]) != plan.loanToken) revert CallbackAssetMismatch();
+        if (amounts[0] != plan.loanAmount) revert CallbackAmountMismatch();
+        if (feeAmounts[0] > plan.maxFlashFee) revert FlashFeeExceeded(feeAmounts[0], plan.maxFlashFee);
+
+        uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
+
+        _executeSwap(plan.swapSpec);
+        _executeTargetAction(plan.targetProtocolId, plan.targetActionData);
+
+        // Balancer expects funds returned by end of callback via transfer
+        uint256 repayAmount = amounts[0] + feeAmounts[0];
+        _finalizeBalancerFlashloan(
+            address(tokens[0]), repayAmount, msg.sender,
+            plan.profitToken, profitBefore, plan.minProfit
+        );
+    }
+
+    // ─── Internal: Finalize Aave Flashloan ───────────────────────────
+    function _finalizeAaveFlashloan(
         address asset,
         uint256 repayAmount,
         address profitTkn,
@@ -242,15 +320,44 @@ contract LiquidationExecutor is
         uint256 balance = IERC20(asset).balanceOf(address(this));
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
 
-        // Approve exact repay to caller (Aave pool) — pool pulls after we return true
+        // Approve exact repay to Aave pool — pool pulls after we return true
         IERC20(asset).forceApprove(msg.sender, repayAmount);
 
-        // Profit check: balance includes repayAmount that pool will pull
+        _checkProfit(asset, repayAmount, profitTkn, profitBefore, minProfit, true);
+    }
+
+    // ─── Internal: Finalize Balancer Flashloan ───────────────────────
+    function _finalizeBalancerFlashloan(
+        address asset,
+        uint256 repayAmount,
+        address vault,
+        address profitTkn,
+        uint256 profitBefore,
+        uint256 minProfit
+    ) internal {
+        uint256 balance = IERC20(asset).balanceOf(address(this));
+        if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
+
+        // Balancer: transfer back to vault
+        IERC20(asset).safeTransfer(vault, repayAmount);
+
+        _checkProfit(asset, repayAmount, profitTkn, profitBefore, minProfit, false);
+    }
+
+    // ─── Internal: Check Profit ──────────────────────────────────────
+    function _checkProfit(
+        address asset,
+        uint256 repayAmount,
+        address profitTkn,
+        uint256 profitBefore,
+        uint256 minProfit,
+        bool repayPending // true for Aave (pool pulls later), false for Balancer (already transferred)
+    ) internal view {
         uint256 profitAfter = IERC20(profitTkn).balanceOf(address(this));
         uint256 effectiveProfit;
 
-        if (profitTkn == asset) {
-            // Adjust for the repayAmount that will be pulled after we return
+        if (profitTkn == asset && repayPending) {
+            // Aave: balance still includes repayAmount that pool will pull
             effectiveProfit = profitAfter > profitBefore + repayAmount
                 ? profitAfter - profitBefore - repayAmount
                 : 0;
@@ -263,86 +370,31 @@ contract LiquidationExecutor is
         if (effectiveProfit < minProfit) revert InsufficientProfit(effectiveProfit, minProfit);
     }
 
-    // ─── Internal: Execute Swap ──────────────────────────────────────
-    function _executeSwap(
-        address loanToken,
-        uint256 expectedAmountIn,
-        bytes memory swapData
-    ) internal {
-        if (swapData.length < 4) revert InvalidSwapSelector();
+    // ─── Internal: Execute Swap (ParaSwap) ───────────────────────────
+    function _executeSwap(SwapSpec memory spec) internal {
+        address augustus = paraswapAugustusV6;
+        if (augustus == address(0)) revert ZeroAddress();
+        if (!allowedTargets[augustus]) revert AssetNotAllowed(augustus);
+        if (!allowedAssets[spec.srcToken]) revert AssetNotAllowed(spec.srcToken);
+        if (!allowedAssets[spec.dstToken]) revert AssetNotAllowed(spec.dstToken);
 
-        bytes4 sel;
-        assembly {
-            sel := mload(add(swapData, 32))
-        }
+        uint256 srcBal = IERC20(spec.srcToken).balanceOf(address(this));
+        if (srcBal < spec.amountIn) revert InsufficientSrcBalance(spec.amountIn, srcBal);
 
-        address router = uniswapV3Router;
-        if (router == address(0)) revert ZeroAddress();
+        uint256 dstBefore = IERC20(spec.dstToken).balanceOf(address(this));
 
-        if (sel == EXACT_INPUT_SINGLE_SELECTOR) {
-            _executeExactInputSingle(loanToken, expectedAmountIn, swapData, router);
-        } else if (sel == EXACT_INPUT_SELECTOR) {
-            _executeExactInput(loanToken, expectedAmountIn, swapData, router);
-        } else {
-            revert InvalidSwapSelector();
-        }
-    }
+        // Approve exact amountIn, call, reset
+        IERC20(spec.srcToken).forceApprove(augustus, spec.amountIn);
+        (bool ok,) = augustus.call(spec.paraswapCalldata);
+        IERC20(spec.srcToken).forceApprove(augustus, 0);
 
-    function _executeExactInputSingle(
-        address loanToken,
-        uint256 expectedAmountIn,
-        bytes memory swapData,
-        address router
-    ) internal {
-        ISwapRouter.ExactInputSingleParams memory p = abi.decode(
-            _sliceBytes(swapData, 4),
-            (ISwapRouter.ExactInputSingleParams)
-        );
+        if (!ok) revert SwapFailed();
 
-        if (p.recipient != address(this)) revert SwapRecipientInvalid(p.recipient);
-        if (p.deadline < block.timestamp) revert SwapDeadlineInvalid(p.deadline);
-        if (p.amountIn != expectedAmountIn) revert SwapAmountInMismatch(expectedAmountIn, p.amountIn);
-        if (!allowedAssets[p.tokenIn]) revert AssetNotAllowed(p.tokenIn);
-        if (!allowedAssets[p.tokenOut]) revert AssetNotAllowed(p.tokenOut);
+        uint256 dstAfter = IERC20(spec.dstToken).balanceOf(address(this));
+        uint256 amountOut = dstAfter - dstBefore;
+        if (amountOut < spec.minAmountOut) revert InsufficientSwapOutput(amountOut, spec.minAmountOut);
 
-        IERC20(loanToken).forceApprove(router, expectedAmountIn);
-        uint256 amountOut = ISwapRouter(router).exactInputSingle(p);
-        IERC20(loanToken).forceApprove(router, 0);
-
-        emit SwapExecuted(loanToken, p.tokenOut, expectedAmountIn, amountOut);
-    }
-
-    function _executeExactInput(
-        address loanToken,
-        uint256 expectedAmountIn,
-        bytes memory swapData,
-        address router
-    ) internal {
-        ISwapRouter.ExactInputParams memory p = abi.decode(
-            _sliceBytes(swapData, 4),
-            (ISwapRouter.ExactInputParams)
-        );
-
-        if (p.recipient != address(this)) revert SwapRecipientInvalid(p.recipient);
-        if (p.deadline < block.timestamp) revert SwapDeadlineInvalid(p.deadline);
-        if (p.amountIn != expectedAmountIn) revert SwapAmountInMismatch(expectedAmountIn, p.amountIn);
-        if (p.path.length < 43) revert InvalidPlan();
-
-        address tokenIn;
-        address tokenOut;
-        bytes memory path = p.path;
-        assembly {
-            tokenIn := shr(96, mload(add(path, 32)))
-            tokenOut := shr(96, mload(add(add(path, 32), sub(mload(path), 20))))
-        }
-        if (!allowedAssets[tokenIn]) revert AssetNotAllowed(tokenIn);
-        if (!allowedAssets[tokenOut]) revert AssetNotAllowed(tokenOut);
-
-        IERC20(loanToken).forceApprove(router, expectedAmountIn);
-        uint256 amountOut = ISwapRouter(router).exactInput(p);
-        IERC20(loanToken).forceApprove(router, 0);
-
-        emit SwapExecuted(loanToken, tokenOut, expectedAmountIn, amountOut);
+        emit SwapExecuted(spec.srcToken, spec.dstToken, spec.amountIn, amountOut);
     }
 
     // ─── Internal: Execute Target Action ─────────────────────────────
@@ -351,6 +403,8 @@ contract LiquidationExecutor is
             _executeAaveV3Action(actionData);
         } else if (protocolId == PROTOCOL_MORPHO_BLUE) {
             _executeMorphoBlueAction(actionData);
+        } else if (protocolId == PROTOCOL_AAVE_V2) {
+            _executeAaveV2Liquidation(actionData);
         } else {
             revert InvalidProtocolId(protocolId);
         }
@@ -373,16 +427,14 @@ contract LiquidationExecutor is
             emit RepayExecuted(
                 PROTOCOL_AAVE_V3,
                 keccak256(abi.encodePacked(action.asset, action.onBehalfOf)),
-                action.asset,
-                repaid
+                action.asset, repaid
             );
         } else if (action.actionType == 2) {
             uint256 withdrawn = IAaveV3Pool(pool).withdraw(action.asset, action.amount, address(this));
             emit RepayExecuted(
                 PROTOCOL_AAVE_V3,
                 keccak256(abi.encodePacked(action.asset, action.onBehalfOf)),
-                action.asset,
-                withdrawn
+                action.asset, withdrawn
             );
         } else if (action.actionType == 3) {
             IERC20(action.asset).forceApprove(pool, action.amount);
@@ -391,8 +443,7 @@ contract LiquidationExecutor is
             emit RepayExecuted(
                 PROTOCOL_AAVE_V3,
                 keccak256(abi.encodePacked(action.asset, action.onBehalfOf)),
-                action.asset,
-                action.amount
+                action.asset, action.amount
             );
         } else {
             revert InvalidPlan();
@@ -430,8 +481,7 @@ contract LiquidationExecutor is
         emit RepayExecuted(
             PROTOCOL_MORPHO_BLUE,
             keccak256(abi.encode(action.marketParams)),
-            action.marketParams.loanToken,
-            assetsRepaid
+            action.marketParams.loanToken, assetsRepaid
         );
     }
 
@@ -442,8 +492,7 @@ contract LiquidationExecutor is
         emit RepayExecuted(
             PROTOCOL_MORPHO_BLUE,
             keccak256(abi.encode(action.marketParams)),
-            action.marketParams.collateralToken,
-            action.assets
+            action.marketParams.collateralToken, action.assets
         );
     }
 
@@ -456,8 +505,27 @@ contract LiquidationExecutor is
         emit RepayExecuted(
             PROTOCOL_MORPHO_BLUE,
             keccak256(abi.encode(action.marketParams)),
-            action.marketParams.collateralToken,
-            action.assets
+            action.marketParams.collateralToken, action.assets
+        );
+    }
+
+    function _executeAaveV2Liquidation(bytes memory actionData) internal {
+        AaveV2Liquidation memory liq = abi.decode(actionData, (AaveV2Liquidation));
+
+        address pool = aaveV2LendingPool;
+        if (pool == address(0)) revert ZeroAddress();
+        if (!allowedTargets[pool]) revert AssetNotAllowed(pool);
+        if (!allowedAssets[liq.collateralAsset]) revert AssetNotAllowed(liq.collateralAsset);
+        if (!allowedAssets[liq.debtAsset]) revert AssetNotAllowed(liq.debtAsset);
+
+        IERC20(liq.debtAsset).forceApprove(pool, liq.debtToCover);
+        IAaveV2LendingPool(pool).liquidationCall(
+            liq.collateralAsset, liq.debtAsset, liq.user, liq.debtToCover, liq.receiveAToken
+        );
+        IERC20(liq.debtAsset).forceApprove(pool, 0);
+
+        emit LiquidationExecuted(
+            PROTOCOL_AAVE_V2, liq.collateralAsset, liq.debtAsset, liq.debtToCover
         );
     }
 
@@ -473,16 +541,6 @@ contract LiquidationExecutor is
         (bool success,) = to.call{value: amount}("");
         if (!success) revert RescueFailed();
         emit Rescue(address(0), to, amount);
-    }
-
-    // ─── Internal Helpers ────────────────────────────────────────────
-    function _sliceBytes(bytes memory data, uint256 start) internal pure returns (bytes memory) {
-        uint256 len = data.length - start;
-        bytes memory result = new bytes(len);
-        for (uint256 i = 0; i < len; i++) {
-            result[i] = data[start + i];
-        }
-        return result;
     }
 
     receive() external payable {}
