@@ -1018,6 +1018,30 @@ contract ExecutorTest is Test {
         executor.setFlashProvider(1, address(0));
     }
 
+    function test_setMorphoBlueRejectsNonWhitelisted() public {
+        address notWhitelisted = address(0xDEAD1);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        executor.setMorphoBlue(notWhitelisted);
+    }
+
+    function test_setAaveV2LendingPoolRejectsNonWhitelisted() public {
+        address notWhitelisted = address(0xDEAD2);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        executor.setAaveV2LendingPool(notWhitelisted);
+    }
+
+    function test_settersAcceptWhitelistedAddresses() public {
+        // morphoBlue and aaveV2Pool are in allowedTargets (set in setUp)
+        vm.startPrank(owner);
+        executor.setMorphoBlue(address(morphoBlue));
+        assertEq(executor.morphoBlue(), address(morphoBlue));
+        executor.setAaveV2LendingPool(address(aaveV2Pool));
+        assertEq(executor.aaveV2LendingPool(), address(aaveV2Pool));
+        vm.stopPrank();
+    }
+
     function test_rescueERC20ZeroToReverts() public {
         vm.prank(owner);
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);

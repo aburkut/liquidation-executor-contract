@@ -32,10 +32,10 @@ Operator Bot
 ### Execution Flow
 
 1. **Operator** calls `execute(bytes planData)` with an ABI-encoded `Plan`
-2. Contract validates swap invariants (`srcToken == dstToken == loanToken`) and Paraswap selector
+2. Contract validates swap invariant (`srcToken == loanToken`)
 3. Contract initiates a flash loan from the configured provider (Aave V3 or Balancer)
 4. Inside the callback:
-   - **Swap** loan token via ParaSwap AugustusV6 (only `exactInputSingle` / `exactInput` selectors allowed)
+   - **Swap** loan token via ParaSwap AugustusV6 (Augustus must be in `allowedTargets`)
    - Execute the **target action** (Aave V3 repay/withdraw/supply/liquidation, Morpho Blue repay/withdrawCollateral/supplyCollateral, or Aave V2 liquidation)
    - Enforce **minimum profit** gate
    - **Repay** the flash loan + fee
@@ -50,7 +50,7 @@ Operator Bot
 | Target | Aave V3 | `1` | repay (1), withdraw (2), supply (3), liquidation (4) |
 | Target | Morpho Blue | `2` | repay (1), withdrawCollateral (2), supplyCollateral (3) |
 | Target | Aave V2 | `3` | liquidationCall |
-| Swap | ParaSwap AugustusV6 | - | `exactInputSingle` / `exactInput` only |
+| Swap | ParaSwap AugustusV6 | - | Any selector (target must be in `allowedTargets`) |
 
 ## Plan Format
 
@@ -78,7 +78,7 @@ struct Plan {
 }
 ```
 
-**Swap invariants**: `swapSpec.srcToken` and `swapSpec.dstToken` must both equal `loanToken`. This guarantees the swap consumes and returns the flashloan token, keeping profit accounting correct.
+**Swap invariant**: `swapSpec.srcToken` must equal `loanToken`. This guarantees the swap consumes the flashloan token. The `dstToken` is unrestricted, allowing swaps into any token needed for the target action.
 
 ### Target Action Data Encoding
 
@@ -127,10 +127,10 @@ struct AaveV2Liquidation {
 - **No arbitrary external calls** -- only whitelisted target contracts
 - **No infinite approvals** -- exact `forceApprove` before each interaction, reset to 0 after
 - **Fail-closed** -- custom errors, all unknown states revert
-- **Constructor-based configuration** -- Aave pool, Balancer vault, ParaSwap Augustus, and allowed targets are set at deploy time (no post-deploy setters)
-- **Any ERC20 token accepted** -- no asset whitelist; safety enforced via swap invariants instead
-- **Swap invariants** -- `srcToken == dstToken == loanToken` ensures swaps always operate on the flashloan token
-- **Paraswap selector validation** -- only `exactInputSingle` and `exactInput` selectors are allowed; arbitrary router calls are rejected
+- **Constructor-based configuration** -- Aave pool, Balancer vault, ParaSwap Augustus, flash providers, operator, and allowed targets are set at deploy time
+- **Any ERC20 token accepted** -- no asset whitelist; safety enforced via swap invariant and `allowedTargets`
+- **Swap invariant** -- `srcToken == loanToken` ensures the swap consumes the flashloan token
+- **Fail-closed setters** -- `setMorphoBlue` and `setAaveV2LendingPool` require the address to be in `allowedTargets`; prevents configuring unwhitelisted addresses that would revert at runtime
 - **Strict callback validation**:
   - `msg.sender` must match the configured flash provider
   - `initiator` must be `address(this)`
@@ -160,8 +160,8 @@ struct AaveV2Liquidation {
 | Function | Description |
 |---|---|
 | `setOperator(address)` | Set the bot address authorized to call `execute` |
-| `setMorphoBlue(address)` | Configure Morpho Blue address |
-| `setAaveV2LendingPool(address)` | Configure Aave V2 Lending Pool address |
+| `setMorphoBlue(address)` | Configure Morpho Blue address (must be in `allowedTargets`) |
+| `setAaveV2LendingPool(address)` | Configure Aave V2 Lending Pool address (must be in `allowedTargets`) |
 | `setUniswapV3Router(address)` | Configure Uniswap V3 Router address |
 | `setFlashProvider(uint8, address)` | Register a flash provider by ID |
 | `pause()` / `unpause()` | Emergency pause toggle |
@@ -181,7 +181,7 @@ src/
     ISwapRouter.sol                    Uniswap V3 SwapRouter
 
 test/
-  Executor.t.sol                       58 tests + inline liar mocks
+  Executor.t.sol                       59 tests + inline liar mocks
   mocks/
     MockERC20.sol                      Standard ERC20 with mint/burn
     MockAavePool.sol                   Aave V3 mock
@@ -228,7 +228,7 @@ forge test -vvv
 forge coverage
 ```
 
-## Test Suite (58 tests)
+## Test Suite (59 tests)
 
 | Category | Count |
 |---|---|
@@ -243,9 +243,10 @@ forge coverage
 | Fee cap | 2 |
 | Partial failure / revert propagation | 2 |
 | Flash provider validation | 1 |
-| Swap invariants (srcToken, dstToken, selector) | 3 |
+| Swap invariants (srcToken) | 1 |
 | Invalid plan decoding | 3 |
 | Config zero-address checks | 8 |
+| Setter allowedTargets guards | 3 |
 | Events | 2 |
 | Rescue & Ownable | 2 |
 
@@ -337,24 +338,20 @@ cast send <EXECUTOR_ADDRESS> "acceptOwnership()" \
 
 ### 4. Post-Deploy Configuration
 
-Only the operator, flash providers, and optional protocol addresses (Morpho Blue, Aave V2) need post-deploy setup:
+The constructor initializes the operator (set to `owner_`), flash providers (Aave V3 and Balancer), and core `allowedTargets`. Only optional protocol addresses need post-deploy setup. **Important**: `setMorphoBlue` and `setAaveV2LendingPool` require the address to already be in `allowedTargets` (set at deploy time), otherwise the call reverts.
 
 ```bash
 EXECUTOR=<DEPLOYED_ADDRESS>
 RPC=$ETHEREUM_RPC_URL
 PK=<OWNER_PRIVATE_KEY>
 
-# Operator (bot)
+# Optional: Change operator to a different bot address (default is owner)
 cast send $EXECUTOR "setOperator(address)" <BOT_ADDRESS> --rpc-url $RPC --private-key $PK
 
-# Flash providers
-cast send $EXECUTOR "setFlashProvider(uint8,address)" 1 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setFlashProvider(uint8,address)" 2 0xBA12222222228d8Ba445958a75a0704d566BF2C8 --rpc-url $RPC --private-key $PK
-
-# Optional: Morpho Blue (if available on chain)
+# Optional: Morpho Blue (must be in allowedTargets deployed array)
 cast send $EXECUTOR "setMorphoBlue(address)" 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb --rpc-url $RPC --private-key $PK
 
-# Optional: Aave V2 (if available on chain)
+# Optional: Aave V2 (must be in allowedTargets deployed array)
 cast send $EXECUTOR "setAaveV2LendingPool(address)" 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9 --rpc-url $RPC --private-key $PK
 ```
 
@@ -404,7 +401,7 @@ cast send $EXECUTOR "setAaveV2LendingPool(address)" 0x7d2768dE32b0b80b7a3454c06B
 | DAI | `0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1` |
 | WBTC | `0x68f180fcCe6836688e9084f035309E29Bf0A2095` |
 
-> **Note**: Aave V2 and Morpho Blue are not available on all chains. Skip `setAaveV2LendingPool` / `setMorphoBlue` on chains where these protocols are absent. The contract does not require all protocols to be configured -- unconfigured ones remain `address(0)` and safely revert on attempted use.
+> **Note**: Aave V2 and Morpho Blue are not available on all chains. Skip `setAaveV2LendingPool` / `setMorphoBlue` on chains where these protocols are absent. The contract does not require all protocols to be configured -- unconfigured ones remain `address(0)` and safely revert on attempted use. Ensure the address is included in the `allowedTargets_` constructor array before calling the setter.
 
 ### 6. Verify Deployment
 

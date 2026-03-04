@@ -179,6 +179,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     function setMorphoBlue(address morpho) external onlyOwner {
         if (morpho == address(0)) revert ZeroAddress();
+        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
         address old = morphoBlue;
         morphoBlue = morpho;
         emit ConfigUpdated("morphoBlue", old, morpho);
@@ -193,6 +194,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     function setAaveV2LendingPool(address pool) external onlyOwner {
         if (pool == address(0)) revert ZeroAddress();
+        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
         address old = aaveV2LendingPool;
         aaveV2LendingPool = pool;
         emit ConfigUpdated("aaveV2Pool", old, pool);
