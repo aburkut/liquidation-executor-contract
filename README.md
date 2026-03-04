@@ -19,11 +19,11 @@ Operator Bot
 |    +-- Flash Loan              |
 |    |   +-- Aave V3 (id=1)     |
 |    |   +-- Balancer Vault(id=2)|
+|    +-- Swap via ParaSwap V6   |
 |    +-- Target Action           |
 |    |   +-- Aave V3 (id=1)     |
 |    |   +-- Morpho Blue (id=2) |
 |    |   +-- Aave V2 (id=3)     |
-|    +-- Swap via ParaSwap V6   |
 |    +-- Profit Check           |
 |    +-- Repay Flash Loan       |
 +--------------------------------+
@@ -32,13 +32,14 @@ Operator Bot
 ### Execution Flow
 
 1. **Operator** calls `execute(bytes planData)` with an ABI-encoded `Plan`
-2. Contract initiates a flash loan from the configured provider (Aave V3 or Balancer)
-3. Inside the callback:
-   - Execute the **target action** (Aave V3 repay/withdraw/supply, Morpho Blue repay/withdrawCollateral/supplyCollateral, or Aave V2 liquidation)
-   - **Swap** collateral to loan token via ParaSwap AugustusV6
+2. Contract validates swap invariants (`srcToken == dstToken == loanToken`) and Paraswap selector
+3. Contract initiates a flash loan from the configured provider (Aave V3 or Balancer)
+4. Inside the callback:
+   - **Swap** loan token via ParaSwap AugustusV6 (only `exactInputSingle` / `exactInput` selectors allowed)
+   - Execute the **target action** (Aave V3 repay/withdraw/supply/liquidation, Morpho Blue repay/withdrawCollateral/supplyCollateral, or Aave V2 liquidation)
    - Enforce **minimum profit** gate
    - **Repay** the flash loan + fee
-4. Remaining profit stays in the contract for the owner to rescue
+5. Remaining profit stays in the contract for the owner to rescue
 
 ## Supported Protocols
 
@@ -46,10 +47,10 @@ Operator Bot
 |---|---|---|---|
 | Flash Provider | Aave V3 | `1` | `flashLoanSimple` |
 | Flash Provider | Balancer Vault | `2` | `flashLoan` |
-| Target | Aave V3 | `1` | repay (1), withdraw (2), supply (3) |
+| Target | Aave V3 | `1` | repay (1), withdraw (2), supply (3), liquidation (4) |
 | Target | Morpho Blue | `2` | repay (1), withdrawCollateral (2), supplyCollateral (3) |
 | Target | Aave V2 | `3` | liquidationCall |
-| Swap | ParaSwap AugustusV6 | - | Arbitrary swap via pre-built calldata |
+| Swap | ParaSwap AugustusV6 | - | `exactInputSingle` / `exactInput` only |
 
 ## Plan Format
 
@@ -76,6 +77,8 @@ struct Plan {
     uint256 minProfit;          // Minimum profit required
 }
 ```
+
+**Swap invariants**: `swapSpec.srcToken` and `swapSpec.dstToken` must both equal `loanToken`. This guarantees the swap consumes and returns the flashloan token, keeping profit accounting correct.
 
 ### Target Action Data Encoding
 
@@ -121,15 +124,18 @@ struct AaveV2Liquidation {
 ## Security Model
 
 - **No upgradeability** -- immutable logic, no proxies
-- **No arbitrary external calls** -- only whitelisted protocols
+- **No arbitrary external calls** -- only whitelisted target contracts
 - **No infinite approvals** -- exact `forceApprove` before each interaction, reset to 0 after
 - **Fail-closed** -- custom errors, all unknown states revert
+- **Constructor-based configuration** -- Aave pool, Balancer vault, ParaSwap Augustus, and allowed targets are set at deploy time (no post-deploy setters)
+- **Any ERC20 token accepted** -- no asset whitelist; safety enforced via swap invariants instead
+- **Swap invariants** -- `srcToken == dstToken == loanToken` ensures swaps always operate on the flashloan token
+- **Paraswap selector validation** -- only `exactInputSingle` and `exactInput` selectors are allowed; arbitrary router calls are rejected
 - **Strict callback validation**:
   - `msg.sender` must match the configured flash provider
   - `initiator` must be `address(this)`
   - Plan hash must match `_activePlanHash`
   - Callback asset and amount must match the plan (prevents malicious provider spoofing)
-- **Allowlists** -- assets, flash providers, and target contracts are individually whitelisted
 - **Access control** -- `Ownable2Step` for config, `onlyOperator` for execution
 - **Pausable** -- owner can pause/unpause all execution
 - **ReentrancyGuard** -- prevents reentrant calls to `execute`
@@ -137,20 +143,27 @@ struct AaveV2Liquidation {
 - **Profit gate** -- `minProfit` enforced post-operations
 - **Swap output validation** -- `minAmountOut` checked via balance diff
 
-## Owner Configuration
+## Configuration
+
+### Constructor Parameters (set at deploy time)
+
+| Parameter | Description |
+|---|---|
+| `owner_` | Initial contract owner (Ownable2Step) |
+| `aavePool_` | Aave V3 Pool address |
+| `balancerVault_` | Balancer Vault address |
+| `paraswapAugustus_` | ParaSwap AugustusV6 router address |
+| `allowedTargets_` | Array of whitelisted target contract addresses |
+
+### Post-Deploy Owner Functions
 
 | Function | Description |
 |---|---|
 | `setOperator(address)` | Set the bot address authorized to call `execute` |
-| `setAavePool(address)` | Configure Aave V3 Pool address |
 | `setMorphoBlue(address)` | Configure Morpho Blue address |
-| `setBalancerVault(address)` | Configure Balancer Vault address |
-| `setParaswapAugustusV6(address)` | Configure ParaSwap router address |
 | `setAaveV2LendingPool(address)` | Configure Aave V2 Lending Pool address |
 | `setUniswapV3Router(address)` | Configure Uniswap V3 Router address |
-| `setAssetAllowed(address, bool)` | Whitelist/delist a token |
 | `setFlashProvider(uint8, address)` | Register a flash provider by ID |
-| `setTargetAllowed(address, bool)` | Whitelist/delist a target contract |
 | `pause()` / `unpause()` | Emergency pause toggle |
 | `rescueERC20(address, address, uint256)` | Recover stuck tokens |
 | `rescueETH(address, uint256)` | Recover stuck ETH |
@@ -168,7 +181,7 @@ src/
     ISwapRouter.sol                    Uniswap V3 SwapRouter
 
 test/
-  Executor.t.sol                       61 tests + inline liar mocks
+  Executor.t.sol                       58 tests + inline liar mocks
   mocks/
     MockERC20.sol                      Standard ERC20 with mint/burn
     MockAavePool.sol                   Aave V3 mock
@@ -215,26 +228,26 @@ forge test -vvv
 forge coverage
 ```
 
-## Test Suite (64 tests)
+## Test Suite (58 tests)
 
 | Category | Count |
 |---|---|
-| Access control | 14 |
+| Access control | 11 |
 | Pause mechanism | 2 |
 | Happy paths (all provider/target combos) | 4 |
 | Callback validation (initiator, caller, plan hash) | 6 |
 | ParaSwap gating (swap revert, slippage, balance) | 3 |
-| Aave V2 liquidation (happy, revert, protocolId) | 3 |
+| Aave V2 liquidation (happy, revert, approval) | 3 |
 | Aave V3 liquidation | 1 |
 | Profit gate (incl. profitToken==loanToken regression) | 5 |
 | Fee cap | 2 |
 | Partial failure / revert propagation | 2 |
 | Flash provider validation | 1 |
-| Asset allowlist | 1 |
+| Swap invariants (srcToken, dstToken, selector) | 3 |
 | Invalid plan decoding | 3 |
-| Config zero-address checks | 11 |
+| Config zero-address checks | 8 |
 | Events | 2 |
-| Rescue & Ownable | 4 |
+| Rescue & Ownable | 2 |
 
 ## Compiler Settings
 
@@ -246,7 +259,7 @@ forge coverage
 
 ## Deployment
 
-Same bytecode deploys to all chains. Protocol addresses are configured post-deploy via owner functions.
+The contract is **fully configured at deploy time** via constructor arguments. No post-deploy configuration setters are required for core protocol addresses and target allowlists.
 
 ### 1. Environment Setup
 
@@ -269,12 +282,19 @@ OPTIMISTIC_ETHERSCAN_API_KEY=...
 
 ### 2. Deploy
 
+The constructor requires: `owner`, `aavePool`, `balancerVault`, `paraswapAugustus`, and an array of `allowedTargets`.
+
 ```bash
 # Ethereum Mainnet
 forge create src/LiquidationExecutor.sol:LiquidationExecutor \
   --rpc-url $ETHEREUM_RPC_URL \
   --private-key $PRIVATE_KEY \
-  --constructor-args <OWNER_ADDRESS> \
+  --constructor-args \
+    <OWNER_ADDRESS> \
+    0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 \
+    0xBA12222222228d8Ba445958a75a0704d566BF2C8 \
+    0x6A000F20005980200259B80c5102003040001068 \
+    "[0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2,0xBA12222222228d8Ba445958a75a0704d566BF2C8,0x6A000F20005980200259B80c5102003040001068,0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9,0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb]" \
   --verify \
   --etherscan-api-key $ETHERSCAN_API_KEY
 
@@ -282,7 +302,12 @@ forge create src/LiquidationExecutor.sol:LiquidationExecutor \
 forge create src/LiquidationExecutor.sol:LiquidationExecutor \
   --rpc-url $BASE_RPC_URL \
   --private-key $PRIVATE_KEY \
-  --constructor-args <OWNER_ADDRESS> \
+  --constructor-args \
+    <OWNER_ADDRESS> \
+    0xA238Dd80C259a72e81d7e4664a9801593F98d1c5 \
+    0xBA12222222228d8Ba445958a75a0704d566BF2C8 \
+    0x6A000F20005980200259B80c5102003040001068 \
+    "[0xA238Dd80C259a72e81d7e4664a9801593F98d1c5,0xBA12222222228d8Ba445958a75a0704d566BF2C8,0x6A000F20005980200259B80c5102003040001068,0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb]" \
   --verify \
   --etherscan-api-key $BASESCAN_API_KEY
 
@@ -290,7 +315,12 @@ forge create src/LiquidationExecutor.sol:LiquidationExecutor \
 forge create src/LiquidationExecutor.sol:LiquidationExecutor \
   --rpc-url $OPTIMISM_RPC_URL \
   --private-key $PRIVATE_KEY \
-  --constructor-args <OWNER_ADDRESS> \
+  --constructor-args \
+    <OWNER_ADDRESS> \
+    0x794a61358D6845594F94dc1DB02A252b5b4814aD \
+    0xBA12222222228d8Ba445958a75a0704d566BF2C8 \
+    0x6A000F20005980200259B80c5102003040001068 \
+    "[0x794a61358D6845594F94dc1DB02A252b5b4814aD,0xBA12222222228d8Ba445958a75a0704d566BF2C8,0x6A000F20005980200259B80c5102003040001068]" \
   --verify \
   --etherscan-api-key $OPTIMISTIC_ETHERSCAN_API_KEY
 ```
@@ -307,40 +337,25 @@ cast send <EXECUTOR_ADDRESS> "acceptOwnership()" \
 
 ### 4. Post-Deploy Configuration
 
-After deployment, the owner configures addresses via `cast send`. Example for Ethereum Mainnet:
+Only the operator, flash providers, and optional protocol addresses (Morpho Blue, Aave V2) need post-deploy setup:
 
 ```bash
 EXECUTOR=<DEPLOYED_ADDRESS>
 RPC=$ETHEREUM_RPC_URL
 PK=<OWNER_PRIVATE_KEY>
 
-# Protocol addresses
-cast send $EXECUTOR "setAavePool(address)" 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setBalancerVault(address)" 0xBA12222222228d8Ba445958a75a0704d566BF2C8 --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setParaswapAugustusV6(address)" 0x6A000F20005980200259B80c5102003040001068 --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setAaveV2LendingPool(address)" 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9 --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setMorphoBlue(address)" 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb --rpc-url $RPC --private-key $PK
+# Operator (bot)
+cast send $EXECUTOR "setOperator(address)" <BOT_ADDRESS> --rpc-url $RPC --private-key $PK
 
 # Flash providers
 cast send $EXECUTOR "setFlashProvider(uint8,address)" 1 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 --rpc-url $RPC --private-key $PK
 cast send $EXECUTOR "setFlashProvider(uint8,address)" 2 0xBA12222222228d8Ba445958a75a0704d566BF2C8 --rpc-url $RPC --private-key $PK
 
-# Operator (bot)
-cast send $EXECUTOR "setOperator(address)" <BOT_ADDRESS> --rpc-url $RPC --private-key $PK
+# Optional: Morpho Blue (if available on chain)
+cast send $EXECUTOR "setMorphoBlue(address)" 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb --rpc-url $RPC --private-key $PK
 
-# Target allowlist
-cast send $EXECUTOR "setTargetAllowed(address,bool)" 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 true --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setTargetAllowed(address,bool)" 0xBA12222222228d8Ba445958a75a0704d566BF2C8 true --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setTargetAllowed(address,bool)" 0x6A000F20005980200259B80c5102003040001068 true --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setTargetAllowed(address,bool)" 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9 true --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setTargetAllowed(address,bool)" 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb true --rpc-url $RPC --private-key $PK
-
-# Asset allowlist (example: WETH, USDC, USDT, DAI, WBTC)
-cast send $EXECUTOR "setAssetAllowed(address,bool)" 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 true --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setAssetAllowed(address,bool)" 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 true --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setAssetAllowed(address,bool)" 0xdAC17F958D2ee523a2206206994597C13D831ec7 true --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setAssetAllowed(address,bool)" 0x6B175474E89094C44Da98b954EedeAC495271d0F true --rpc-url $RPC --private-key $PK
-cast send $EXECUTOR "setAssetAllowed(address,bool)" 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599 true --rpc-url $RPC --private-key $PK
+# Optional: Aave V2 (if available on chain)
+cast send $EXECUTOR "setAaveV2LendingPool(address)" 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9 --rpc-url $RPC --private-key $PK
 ```
 
 ### 5. Protocol Addresses by Chain
@@ -389,7 +404,7 @@ cast send $EXECUTOR "setAssetAllowed(address,bool)" 0x2260FAC5E5542a773Aa44fBCfe
 | DAI | `0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1` |
 | WBTC | `0x68f180fcCe6836688e9084f035309E29Bf0A2095` |
 
-> **Note**: Aave V2 and Morpho Blue are not available on all chains. Skip `setAaveV2LendingPool` / `setMorphoBlue` and their corresponding `setTargetAllowed` calls on chains where these protocols are absent. The contract does not require all protocols to be configured -- unconfigured ones remain `address(0)` and safely revert on attempted use.
+> **Note**: Aave V2 and Morpho Blue are not available on all chains. Skip `setAaveV2LendingPool` / `setMorphoBlue` on chains where these protocols are absent. The contract does not require all protocols to be configured -- unconfigured ones remain `address(0)` and safely revert on attempted use.
 
 ### 6. Verify Deployment
 
@@ -403,11 +418,17 @@ cast call $EXECUTOR "operator()(address)" --rpc-url $RPC
 # Check configured Aave Pool
 cast call $EXECUTOR "aavePool()(address)" --rpc-url $RPC
 
+# Check configured Balancer Vault
+cast call $EXECUTOR "balancerVault()(address)" --rpc-url $RPC
+
+# Check configured ParaSwap Augustus
+cast call $EXECUTOR "paraswapAugustusV6()(address)" --rpc-url $RPC
+
 # Check flash provider
 cast call $EXECUTOR "allowedFlashProviders(uint8)(address)" 1 --rpc-url $RPC
 
-# Check asset whitelist
-cast call $EXECUTOR "allowedAssets(address)(bool)" 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --rpc-url $RPC
+# Check target allowlist
+cast call $EXECUTOR "allowedTargets(address)(bool)" 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 --rpc-url $RPC
 
 # Check contract is not paused
 cast call $EXECUTOR "paused()(bool)" --rpc-url $RPC
