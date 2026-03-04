@@ -14,7 +14,8 @@ import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 
 /// @title LiquidationExecutor
 /// @notice Flashloan + Swap + Repay/Liquidation executor.
-/// @dev Fail-closed. No upgradeability. No arbitrary external calls.
+/// @dev Fail-closed. No upgradeability. External calls restricted to allowedTargets allowlist.
+/// Swaps are executed via Paraswap Augustus (a trusted generic router) using operator-supplied calldata.
 contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanSimpleReceiver, IFlashLoanRecipient {
     using SafeERC20 for IERC20;
 
@@ -209,6 +210,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     function setFlashProvider(uint8 providerId, address provider) external onlyOwner {
         if (provider == address(0)) revert ZeroAddress();
+        if (!allowedTargets[provider]) revert TargetNotAllowed(provider);
         address old = allowedFlashProviders[providerId];
         allowedFlashProviders[providerId] = provider;
         emit FlashProviderUpdated(providerId, old, provider);

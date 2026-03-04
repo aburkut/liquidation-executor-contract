@@ -124,13 +124,13 @@ struct AaveV2Liquidation {
 ## Security Model
 
 - **No upgradeability** -- immutable logic, no proxies
-- **No arbitrary external calls** -- only whitelisted target contracts
+- **External calls restricted to allowlist** -- all protocol interactions go through `allowedTargets`. Swaps are executed via Paraswap Augustus (a trusted generic router) using operator-supplied calldata; Augustus itself must be in `allowedTargets`
 - **No infinite approvals** -- exact `forceApprove` before each interaction, reset to 0 after
 - **Fail-closed** -- custom errors, all unknown states revert
 - **Constructor-based configuration** -- Aave pool, Balancer vault, ParaSwap Augustus, flash providers, operator, and allowed targets are set at deploy time
-- **Any ERC20 token accepted** -- no asset whitelist; safety enforced via swap invariant and `allowedTargets`
+- **Any standard ERC20 token accepted** -- no on-chain asset allowlist (`setAssetAllowed` has been removed); token usability is constrained by the selected flash provider's supported assets and the swap route (Paraswap). Fee-on-transfer, rebasing, and other non-standard ERC20 tokens are not supported and may break balance-diff accounting
 - **Swap invariant** -- `srcToken == loanToken` ensures the swap consumes the flashloan token
-- **Fail-closed setters** -- `setMorphoBlue` and `setAaveV2LendingPool` require the address to be in `allowedTargets`; prevents configuring unwhitelisted addresses that would revert at runtime
+- **Fail-closed setters** -- `setMorphoBlue`, `setAaveV2LendingPool`, and `setFlashProvider` require the address to be in `allowedTargets`; prevents configuring unwhitelisted addresses that would revert at runtime
 - **Strict callback validation**:
   - `msg.sender` must match the configured flash provider
   - `initiator` must be `address(this)`
@@ -163,7 +163,7 @@ struct AaveV2Liquidation {
 | `setMorphoBlue(address)` | Configure Morpho Blue address (must be in `allowedTargets`) |
 | `setAaveV2LendingPool(address)` | Configure Aave V2 Lending Pool address (must be in `allowedTargets`) |
 | `setUniswapV3Router(address)` | Configure Uniswap V3 Router address |
-| `setFlashProvider(uint8, address)` | Register a flash provider by ID |
+| `setFlashProvider(uint8, address)` | Register a flash provider by ID (must be in `allowedTargets`) |
 | `pause()` / `unpause()` | Emergency pause toggle |
 | `rescueERC20(address, address, uint256)` | Recover stuck tokens |
 | `rescueETH(address, uint256)` | Recover stuck ETH |
@@ -181,7 +181,7 @@ src/
     ISwapRouter.sol                    Uniswap V3 SwapRouter
 
 test/
-  Executor.t.sol                       59 tests + inline liar mocks
+  Executor.t.sol                       61 tests + inline liar mocks
   mocks/
     MockERC20.sol                      Standard ERC20 with mint/burn
     MockAavePool.sol                   Aave V3 mock
@@ -228,7 +228,7 @@ forge test -vvv
 forge coverage
 ```
 
-## Test Suite (59 tests)
+## Test Suite (61 tests)
 
 | Category | Count |
 |---|---|
@@ -246,7 +246,7 @@ forge coverage
 | Swap invariants (srcToken) | 1 |
 | Invalid plan decoding | 3 |
 | Config zero-address checks | 8 |
-| Setter allowedTargets guards | 3 |
+| Setter allowedTargets guards | 5 |
 | Events | 2 |
 | Rescue & Ownable | 2 |
 

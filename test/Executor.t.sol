@@ -760,9 +760,23 @@ contract ExecutorTest is Test {
         collateralToken.mint(address(liarPool), 100_000e18);
         loanToken.mint(address(liarPool), 100_000e18);
 
+        // Deploy a fresh executor with liarPool in allowedTargets
+        address[] memory targets = new address[](5);
+        targets[0] = address(aavePool);
+        targets[1] = address(morphoBlue);
+        targets[2] = address(augustus);
+        targets[3] = address(aaveV2Pool);
+        targets[4] = address(liarPool);
+        LiquidationExecutor exec2 =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+
         vm.startPrank(owner);
-        executor.setFlashProvider(1, address(liarPool));
+        exec2.setOperator(operatorAddr);
+        exec2.setFlashProvider(1, address(liarPool));
         vm.stopPrank();
+
+        loanToken.mint(address(exec2), LOAN_AMOUNT + FLASH_FEE + 100e18);
+        collateralToken.mint(address(exec2), 1000e18);
 
         bytes memory plan = _buildPlan(
             1,
@@ -778,20 +792,28 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.CallbackAssetMismatch.selector);
-        executor.execute(plan);
-
-        // Restore
-        vm.prank(owner);
-        executor.setFlashProvider(1, address(aavePool));
+        exec2.execute(plan);
     }
 
     function test_aaveV3CallbackRejectsAmountMismatch() public {
         MockAavePoolAmountLiar liarPool = new MockAavePoolAmountLiar(FLASH_FEE);
         loanToken.mint(address(liarPool), 100_000e18);
 
+        address[] memory targets = new address[](5);
+        targets[0] = address(aavePool);
+        targets[1] = address(morphoBlue);
+        targets[2] = address(augustus);
+        targets[3] = address(aaveV2Pool);
+        targets[4] = address(liarPool);
+        LiquidationExecutor exec2 =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+
         vm.startPrank(owner);
-        executor.setFlashProvider(1, address(liarPool));
+        exec2.setOperator(operatorAddr);
+        exec2.setFlashProvider(1, address(liarPool));
         vm.stopPrank();
+
+        loanToken.mint(address(exec2), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
         bytes memory plan = _buildPlan(
             1,
@@ -807,10 +829,7 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.CallbackAmountMismatch.selector);
-        executor.execute(plan);
-
-        vm.prank(owner);
-        executor.setFlashProvider(1, address(aavePool));
+        exec2.execute(plan);
     }
 
     function test_balancerCallbackRejectsTokenMismatch() public {
@@ -819,9 +838,22 @@ contract ExecutorTest is Test {
         loanToken.mint(address(liarVault), 100_000e18);
         collateralToken.mint(address(liarVault), 100_000e18);
 
+        address[] memory targets = new address[](5);
+        targets[0] = address(aavePool);
+        targets[1] = address(morphoBlue);
+        targets[2] = address(augustus);
+        targets[3] = address(aaveV2Pool);
+        targets[4] = address(liarVault);
+        LiquidationExecutor exec2 =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+
         vm.startPrank(owner);
-        executor.setFlashProvider(2, address(liarVault));
+        exec2.setOperator(operatorAddr);
+        exec2.setFlashProvider(2, address(liarVault));
         vm.stopPrank();
+
+        loanToken.mint(address(exec2), LOAN_AMOUNT + FLASH_FEE + 100e18);
+        collateralToken.mint(address(exec2), 1000e18);
 
         bytes memory plan = _buildPlan(
             2,
@@ -837,19 +869,28 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.CallbackAssetMismatch.selector);
-        executor.execute(plan);
-
-        vm.prank(owner);
-        executor.setFlashProvider(2, address(balancerVault));
+        exec2.execute(plan);
     }
 
     function test_balancerCallbackRejectsAmountMismatch() public {
         MockBalancerVaultAmountLiar liarVault = new MockBalancerVaultAmountLiar(FLASH_FEE);
         loanToken.mint(address(liarVault), 100_000e18);
 
+        address[] memory targets = new address[](5);
+        targets[0] = address(aavePool);
+        targets[1] = address(morphoBlue);
+        targets[2] = address(augustus);
+        targets[3] = address(aaveV2Pool);
+        targets[4] = address(liarVault);
+        LiquidationExecutor exec2 =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+
         vm.startPrank(owner);
-        executor.setFlashProvider(2, address(liarVault));
+        exec2.setOperator(operatorAddr);
+        exec2.setFlashProvider(2, address(liarVault));
         vm.stopPrank();
+
+        loanToken.mint(address(exec2), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
         bytes memory plan = _buildPlan(
             2,
@@ -865,10 +906,7 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.CallbackAmountMismatch.selector);
-        executor.execute(plan);
-
-        vm.prank(owner);
-        executor.setFlashProvider(2, address(balancerVault));
+        exec2.execute(plan);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1016,6 +1054,20 @@ contract ExecutorTest is Test {
         vm.prank(owner);
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         executor.setFlashProvider(1, address(0));
+    }
+
+    function test_setFlashProviderRejectsNonWhitelisted() public {
+        address notWhitelisted = address(0xDEAD3);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        executor.setFlashProvider(1, notWhitelisted);
+    }
+
+    function test_setFlashProviderAcceptsWhitelisted() public {
+        // aavePool is in allowedTargets (set in constructor)
+        vm.prank(owner);
+        executor.setFlashProvider(1, address(aavePool));
+        assertEq(executor.allowedFlashProviders(1), address(aavePool));
     }
 
     function test_setMorphoBlueRejectsNonWhitelisted() public {
