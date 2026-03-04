@@ -11,7 +11,6 @@ import {IAaveV3Pool, IFlashLoanSimpleReceiver} from "./interfaces/IAaveV3Pool.so
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IMorphoBlue, MarketParams} from "./interfaces/IMorphoBlue.sol";
 import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
-import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
 
 /// @title LiquidationExecutor
 /// @notice Flashloan + Swap + Repay/Liquidation executor.
@@ -50,9 +49,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     uint8 public constant PROTOCOL_AAVE_V3 = 1;
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 public constant PROTOCOL_AAVE_V2 = 3;
-
-    bytes4 private constant EXACT_INPUT_SINGLE_SELECTOR = ISwapRouter.exactInputSingle.selector;
-    bytes4 private constant EXACT_INPUT_SELECTOR = ISwapRouter.exactInput.selector;
 
     // ─── State ───────────────────────────────────────────────────────
     address public operator;
@@ -152,6 +148,15 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         balancerVault = balancerVault_;
         paraswapAugustusV6 = paraswapAugustus_;
 
+        operator = owner_;
+
+        allowedFlashProviders[FLASH_PROVIDER_AAVE_V3] = aavePool_;
+        allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
+
+        allowedTargets[aavePool_] = true;
+        allowedTargets[balancerVault_] = true;
+        allowedTargets[paraswapAugustus_] = true;
+
         for (uint256 i = 0; i < allowedTargets_.length; i++) {
             if (allowedTargets_[i] == address(0)) revert ZeroAddress();
             allowedTargets[allowedTargets_[i]] = true;
@@ -217,7 +222,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (plan.profitToken == address(0)) revert ZeroAddress();
 
         require(plan.swapSpec.srcToken == plan.loanToken, "INVALID_SWAP_SRC");
-        require(plan.swapSpec.dstToken == plan.loanToken, "INVALID_SWAP_DST");
 
         address provider = allowedFlashProviders[plan.flashProviderId];
         if (provider == address(0)) revert FlashProviderNotAllowed();
@@ -376,13 +380,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address augustus = paraswapAugustusV6;
         if (augustus == address(0)) revert ZeroAddress();
         if (!allowedTargets[augustus]) revert TargetNotAllowed(augustus);
-
-        bytes memory cd = spec.paraswapCalldata;
-        bytes4 selector;
-        assembly {
-            selector := mload(add(cd, 32))
-        }
-        require(selector == EXACT_INPUT_SINGLE_SELECTOR || selector == EXACT_INPUT_SELECTOR, "INVALID_SWAP_SELECTOR");
 
         uint256 srcBal = IERC20(spec.srcToken).balanceOf(address(this));
         if (srcBal < spec.amountIn) revert InsufficientSrcBalance(spec.amountIn, srcBal);

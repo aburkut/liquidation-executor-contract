@@ -9,8 +9,6 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 import {MarketParams} from "../src/interfaces/IMorphoBlue.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
-import {ISwapRouter} from "../src/interfaces/ISwapRouter.sol";
-
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockAavePool} from "./mocks/MockAavePool.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
@@ -41,8 +39,7 @@ contract ExecutorTest is Test {
     uint256 constant MIN_PROFIT = 5e18;
     uint256 constant COLLATERAL_REWARD = 600e18;
 
-    // Valid Paraswap selector (must pass selector validation)
-    bytes4 constant VALID_SWAP_SELECTOR = ISwapRouter.exactInputSingle.selector;
+    bytes4 constant MOCK_SWAP_SELECTOR = bytes4(0x12345678);
 
     function setUp() public {
         loanToken = new MockERC20("Loan Token", "LOAN", 18);
@@ -67,9 +64,6 @@ contract ExecutorTest is Test {
         executor.setMorphoBlue(address(morphoBlue));
         executor.setUniswapV3Router(address(0x1)); // placeholder, not used by new swap
         executor.setAaveV2LendingPool(address(aaveV2Pool));
-
-        executor.setFlashProvider(1, address(aavePool));
-        executor.setFlashProvider(2, address(balancerVault));
         vm.stopPrank();
 
         // Fund pools
@@ -91,7 +85,7 @@ contract ExecutorTest is Test {
         pure
         returns (bytes memory)
     {
-        return abi.encodeWithSelector(VALID_SWAP_SELECTOR, srcToken, dstToken, amountIn);
+        return abi.encodeWithSelector(MOCK_SWAP_SELECTOR, srcToken, dstToken, amountIn);
     }
 
     function _buildSwapSpec(address srcToken, address dstToken, uint256 amountIn, uint256 minAmountOut)
@@ -1271,54 +1265,6 @@ contract ExecutorTest is Test {
         );
         vm.prank(operatorAddr);
         vm.expectRevert("INVALID_SWAP_SRC");
-        executor.execute(plan);
-    }
-
-    function test_revertIfSwapDstTokenNotLoanToken() public {
-        // loanToken = loanToken, swapSpec.dstToken = collateralToken → INVALID_SWAP_DST
-        bytes memory plan = _buildPlan(
-            1,
-            address(loanToken),
-            LOAN_AMOUNT,
-            FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(collateralToken), LOAN_AMOUNT, 0),
-            address(loanToken),
-            0
-        );
-        vm.prank(operatorAddr);
-        vm.expectRevert("INVALID_SWAP_DST");
-        executor.execute(plan);
-    }
-
-    function test_revertIfInvalidParaswapSelector() public {
-        // Build calldata with invalid selector
-        bytes4 rugSelector = bytes4(keccak256("rug(address)"));
-        bytes memory badCalldata =
-            abi.encodeWithSelector(rugSelector, address(loanToken), address(loanToken), LOAN_AMOUNT);
-
-        LiquidationExecutor.SwapSpec memory swapSpec = LiquidationExecutor.SwapSpec({
-            srcToken: address(loanToken),
-            dstToken: address(loanToken),
-            amountIn: LOAN_AMOUNT,
-            minAmountOut: 0,
-            paraswapCalldata: badCalldata
-        });
-
-        bytes memory plan = _buildPlan(
-            1,
-            address(loanToken),
-            LOAN_AMOUNT,
-            FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            swapSpec,
-            address(loanToken),
-            0
-        );
-        vm.prank(operatorAddr);
-        vm.expectRevert("INVALID_SWAP_SELECTOR");
         executor.execute(plan);
     }
 }
