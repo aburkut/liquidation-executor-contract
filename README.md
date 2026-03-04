@@ -258,6 +258,64 @@ forge coverage
 | EVM Target | Shanghai |
 | Optimizer | Enabled (200 runs) |
 
+## Deployment Checklist
+
+Before deploying, verify every item below. Misconfiguration **cannot be fixed post-deploy** for `allowedTargets` (there is no setter).
+
+### 1. Constructor configuration
+
+The constructor requires:
+
+| Parameter | Description |
+|---|---|
+| `owner_` | Initial contract owner (receives Ownable2Step ownership). Also set as the initial `operator`. |
+| `aavePool_` | Aave V3 Pool address (also registered as flash provider for id=1) |
+| `balancerVault_` | Balancer Vault address (also registered as flash provider for id=2) |
+| `paraswapAugustus_` | ParaSwap AugustusV6 router address |
+| `allowedTargets_` | Array of whitelisted target contract addresses (see below) |
+
+### 2. Required targets in `allowedTargets`
+
+The constructor automatically whitelists `aavePool_`, `balancerVault_`, and `paraswapAugustus_`. The `allowedTargets_` array provides **additional** addresses to whitelist.
+
+**Required** (auto-whitelisted by constructor — no action needed):
+- Aave V3 Pool
+- Balancer Vault
+- ParaSwap Augustus
+
+**Optional but must be included in `allowedTargets_` if those protocols will be used:**
+- Morpho Blue — required before calling `setMorphoBlue`
+- Aave V2 LendingPool — required before calling `setAaveV2LendingPool`
+
+### 3. Why targets must be pre-whitelisted
+
+The executor enforces `allowedTargets[target] == true` before every external call to a protocol contract. If a protocol address is not in `allowedTargets`, execution reverts with:
+
+```
+TargetNotAllowed(address)
+```
+
+This applies at **runtime** (inside `_executeSwap`, `_executeAaveV3Action`, `_executeMorphoBlueAction`, `_executeAaveV2Liquidation`) **and at configuration time**:
+
+- `setMorphoBlue(address)` — reverts if the address is not in `allowedTargets`
+- `setAaveV2LendingPool(address)` — reverts if the address is not in `allowedTargets`
+
+There is **no post-deploy setter** for `allowedTargets`. If you forget to include an address, you must redeploy.
+
+### 4. No post-deploy asset configuration
+
+- `setAssetAllowed` has been **removed** — there is no asset whitelist
+- Any ERC20 token can be used as `loanToken`, `srcToken`, `dstToken`, or `profitToken`
+- Safety is enforced via the swap invariant (`srcToken == loanToken`) and the `allowedTargets` check on the swap router
+
+### 5. Operator configuration
+
+- `operator` is initialized to `owner_` in the constructor
+- The owner may change it later via `setOperator(address)`
+- Only the operator can call `execute(bytes)`
+
+---
+
 ## Deployment
 
 The contract is **fully configured at deploy time** via constructor arguments. No post-deploy configuration setters are required for core protocol addresses and target allowlists.

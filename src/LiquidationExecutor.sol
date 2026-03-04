@@ -54,6 +54,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     address public operator;
     address public aavePool;
     address public morphoBlue;
+    // NOTE: Legacy configuration field.
+    // The executor currently performs swaps via Paraswap Augustus.
+    // This variable is kept for backward compatibility but is not used
+    // in the current execution flow.
     address public uniswapV3Router;
     address public balancerVault;
     address public paraswapAugustusV6;
@@ -185,6 +189,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         emit ConfigUpdated("morphoBlue", old, morpho);
     }
 
+    // NOTE: Legacy setter. The executor currently performs swaps via Paraswap Augustus.
+    // This setter is kept for backward compatibility but the stored value is not used
+    // in the current execution flow.
     function setUniswapV3Router(address router) external onlyOwner {
         if (router == address(0)) revert ZeroAddress();
         address old = uniswapV3Router;
