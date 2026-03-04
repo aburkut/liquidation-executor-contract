@@ -11,11 +11,11 @@ import {IAaveV3Pool, IFlashLoanSimpleReceiver} from "./interfaces/IAaveV3Pool.so
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IMorphoBlue, MarketParams} from "./interfaces/IMorphoBlue.sol";
 import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
-import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
 
 /// @title LiquidationExecutor
 /// @notice Flashloan + Swap + Repay/Liquidation executor.
-/// @dev Fail-closed. No upgradeability. No arbitrary external calls.
+/// @dev Fail-closed. No upgradeability. External calls restricted to allowedTargets allowlist.
+/// Swaps are executed via Paraswap Augustus (a trusted generic router) using operator-supplied calldata.
 contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanSimpleReceiver, IFlashLoanRecipient {
     using SafeERC20 for IERC20;
 
@@ -28,13 +28,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error InsufficientProfit(uint256 actual, uint256 required);
     error InvalidCallbackCaller();
     error InvalidInitiator();
-    error AssetNotAllowed(address token);
     error SwapRecipientInvalid(address recipient);
     error SwapDeadlineInvalid(uint256 deadline);
     error SwapAmountInMismatch(uint256 expected, uint256 actual);
     error InvalidProtocolId(uint8 id);
     error InsufficientRepayBalance(uint256 required, uint256 available);
-    error InvalidSwapSelector();
     error RescueFailed();
     error CallbackAssetMismatch();
     error CallbackAmountMismatch();
@@ -53,19 +51,19 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 public constant PROTOCOL_AAVE_V2 = 3;
 
-    bytes4 private constant EXACT_INPUT_SINGLE_SELECTOR = ISwapRouter.exactInputSingle.selector;
-    bytes4 private constant EXACT_INPUT_SELECTOR = ISwapRouter.exactInput.selector;
-
     // ─── State ───────────────────────────────────────────────────────
     address public operator;
     address public aavePool;
     address public morphoBlue;
+    // NOTE: Legacy configuration field.
+    // The executor currently performs swaps via Paraswap Augustus.
+    // This variable is kept for backward compatibility but is not used
+    // in the current execution flow.
     address public uniswapV3Router;
     address public balancerVault;
     address public paraswapAugustusV6;
     address public aaveV2LendingPool;
 
-    mapping(address => bool) public allowedAssets;
     mapping(uint8 => address) public allowedFlashProviders;
     mapping(address => bool) public allowedTargets;
 
@@ -74,9 +72,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     // ─── Events ──────────────────────────────────────────────────────
     event OperatorUpdated(address indexed oldOperator, address indexed newOperator);
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
-    event AssetAllowed(address indexed token, bool allowed);
     event FlashProviderUpdated(uint8 indexed providerId, address indexed oldProvider, address indexed newProvider);
-    event TargetAllowed(address indexed target, bool allowed);
     event FlashExecuted(uint8 indexed providerId, address indexed loanToken, uint256 loanAmount);
     event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
     event RepayExecuted(
@@ -142,7 +138,35 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     }
 
     // ─── Constructor ─────────────────────────────────────────────────
-    constructor(address initialOwner) Ownable(initialOwner) {}
+    constructor(
+        address owner_,
+        address aavePool_,
+        address balancerVault_,
+        address paraswapAugustus_,
+        address[] memory allowedTargets_
+    ) Ownable(owner_) {
+        if (aavePool_ == address(0)) revert ZeroAddress();
+        if (balancerVault_ == address(0)) revert ZeroAddress();
+        if (paraswapAugustus_ == address(0)) revert ZeroAddress();
+
+        aavePool = aavePool_;
+        balancerVault = balancerVault_;
+        paraswapAugustusV6 = paraswapAugustus_;
+
+        operator = owner_;
+
+        allowedFlashProviders[FLASH_PROVIDER_AAVE_V3] = aavePool_;
+        allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
+
+        allowedTargets[aavePool_] = true;
+        allowedTargets[balancerVault_] = true;
+        allowedTargets[paraswapAugustus_] = true;
+
+        for (uint256 i = 0; i < allowedTargets_.length; i++) {
+            if (allowedTargets_[i] == address(0)) revert ZeroAddress();
+            allowedTargets[allowedTargets_[i]] = true;
+        }
+    }
 
     // ─── Modifiers ───────────────────────────────────────────────────
     modifier onlyOperator() {
@@ -158,20 +182,17 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         emit OperatorUpdated(old, newOperator);
     }
 
-    function setAavePool(address pool) external onlyOwner {
-        if (pool == address(0)) revert ZeroAddress();
-        address old = aavePool;
-        aavePool = pool;
-        emit ConfigUpdated("aavePool", old, pool);
-    }
-
     function setMorphoBlue(address morpho) external onlyOwner {
         if (morpho == address(0)) revert ZeroAddress();
+        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
         address old = morphoBlue;
         morphoBlue = morpho;
         emit ConfigUpdated("morphoBlue", old, morpho);
     }
 
+    // NOTE: Legacy setter. The executor currently performs swaps via Paraswap Augustus.
+    // This setter is kept for backward compatibility but the stored value is not used
+    // in the current execution flow.
     function setUniswapV3Router(address router) external onlyOwner {
         if (router == address(0)) revert ZeroAddress();
         address old = uniswapV3Router;
@@ -179,44 +200,20 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         emit ConfigUpdated("uniswapV3Router", old, router);
     }
 
-    function setBalancerVault(address vault) external onlyOwner {
-        if (vault == address(0)) revert ZeroAddress();
-        address old = balancerVault;
-        balancerVault = vault;
-        emit ConfigUpdated("balancerVault", old, vault);
-    }
-
-    function setParaswapAugustusV6(address augustus) external onlyOwner {
-        if (augustus == address(0)) revert ZeroAddress();
-        address old = paraswapAugustusV6;
-        paraswapAugustusV6 = augustus;
-        emit ConfigUpdated("paraswapAugustus", old, augustus);
-    }
-
     function setAaveV2LendingPool(address pool) external onlyOwner {
         if (pool == address(0)) revert ZeroAddress();
+        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
         address old = aaveV2LendingPool;
         aaveV2LendingPool = pool;
         emit ConfigUpdated("aaveV2Pool", old, pool);
     }
 
-    function setAssetAllowed(address token, bool allowed) external onlyOwner {
-        if (token == address(0)) revert ZeroAddress();
-        allowedAssets[token] = allowed;
-        emit AssetAllowed(token, allowed);
-    }
-
     function setFlashProvider(uint8 providerId, address provider) external onlyOwner {
         if (provider == address(0)) revert ZeroAddress();
+        if (!allowedTargets[provider]) revert TargetNotAllowed(provider);
         address old = allowedFlashProviders[providerId];
         allowedFlashProviders[providerId] = provider;
         emit FlashProviderUpdated(providerId, old, provider);
-    }
-
-    function setTargetAllowed(address target, bool allowed) external onlyOwner {
-        if (target == address(0)) revert ZeroAddress();
-        allowedTargets[target] = allowed;
-        emit TargetAllowed(target, allowed);
     }
 
     function pause() external onlyOwner {
@@ -234,8 +231,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
         if (plan.profitToken == address(0)) revert ZeroAddress();
-        if (!allowedAssets[plan.loanToken]) revert AssetNotAllowed(plan.loanToken);
-        if (!allowedAssets[plan.profitToken]) revert AssetNotAllowed(plan.profitToken);
+
+        require(plan.swapSpec.srcToken == plan.loanToken, "INVALID_SWAP_SRC");
 
         address provider = allowedFlashProviders[plan.flashProviderId];
         if (provider == address(0)) revert FlashProviderNotAllowed();
@@ -394,8 +391,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address augustus = paraswapAugustusV6;
         if (augustus == address(0)) revert ZeroAddress();
         if (!allowedTargets[augustus]) revert TargetNotAllowed(augustus);
-        if (!allowedAssets[spec.srcToken]) revert AssetNotAllowed(spec.srcToken);
-        if (!allowedAssets[spec.dstToken]) revert AssetNotAllowed(spec.dstToken);
 
         uint256 srcBal = IERC20(spec.srcToken).balanceOf(address(this));
         if (srcBal < spec.amountIn) revert InsufficientSrcBalance(spec.amountIn, srcBal);
@@ -441,8 +436,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             return;
         }
 
-        if (!allowedAssets[action.asset]) revert AssetNotAllowed(action.asset);
-
         if (action.actionType == 1) {
             IERC20(action.asset).forceApprove(pool, action.amount);
             uint256 repaid =
@@ -472,8 +465,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     }
 
     function _executeAaveV3Liquidation(address pool, AaveV3Action memory action) internal {
-        if (!allowedAssets[action.collateralAsset]) revert AssetNotAllowed(action.collateralAsset);
-        if (!allowedAssets[action.debtAsset]) revert AssetNotAllowed(action.debtAsset);
         if (action.user == address(0)) revert ZeroAddress();
         if (action.debtToCover == 0) revert InvalidPlan();
 
@@ -493,10 +484,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address morpho = morphoBlue;
         if (morpho == address(0)) revert ZeroAddress();
         if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
-        if (!allowedAssets[action.marketParams.loanToken]) revert AssetNotAllowed(action.marketParams.loanToken);
-        if (!allowedAssets[action.marketParams.collateralToken]) {
-            revert AssetNotAllowed(action.marketParams.collateralToken);
-        }
 
         if (action.actionType == 1) {
             _morphoRepay(morpho, action);
@@ -550,8 +537,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address pool = aaveV2LendingPool;
         if (pool == address(0)) revert ZeroAddress();
         if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
-        if (!allowedAssets[liq.collateralAsset]) revert AssetNotAllowed(liq.collateralAsset);
-        if (!allowedAssets[liq.debtAsset]) revert AssetNotAllowed(liq.debtAsset);
 
         IERC20(liq.debtAsset).forceApprove(pool, liq.debtToCover);
         IAaveV2LendingPool(pool)
