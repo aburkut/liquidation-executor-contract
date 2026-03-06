@@ -42,6 +42,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error InsufficientSrcBalance(uint256 required, uint256 available);
     error TargetNotAllowed(address target);
     error InvalidSwapSpec();
+    error InvalidSwapSelector();
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
@@ -50,6 +51,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     uint8 public constant PROTOCOL_AAVE_V3 = 1;
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 public constant PROTOCOL_AAVE_V2 = 3;
+
+    /// @dev Paraswap Augustus V6 supported selectors (GenericData layout)
+    bytes4 private constant _SWAP_EXACT_AMOUNT_IN = bytes4(
+        keccak256(
+            "swapExactAmountIn(address,(address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes,bytes)"
+        )
+    );
+    bytes4 private constant _SWAP_EXACT_AMOUNT_OUT = bytes4(
+        keccak256(
+            "swapExactAmountOut(address,(address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes,bytes)"
+        )
+    );
 
     // ─── State ───────────────────────────────────────────────────────
     address public operator;
@@ -89,6 +102,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address dstToken;
         uint256 amountIn;
         uint256 minAmountOut;
+        uint256 deadline;
         bytes paraswapCalldata;
     }
 
@@ -387,6 +401,35 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (spec.srcToken == address(0) || spec.dstToken == address(0)) revert InvalidSwapSpec();
         if (spec.amountIn == 0) revert InvalidSwapSpec();
         if (spec.paraswapCalldata.length < 4) revert InvalidSwapSpec();
+
+        // ── Deadline validation ──
+        if (spec.deadline < block.timestamp) revert SwapDeadlineInvalid(spec.deadline);
+
+        // ── Selector & calldata validation ──
+        bytes memory cd = spec.paraswapCalldata;
+        bytes4 selector;
+        assembly {
+            selector := mload(add(cd, 32))
+        }
+
+        if (selector != _SWAP_EXACT_AMOUNT_IN && selector != _SWAP_EXACT_AMOUNT_OUT) {
+            revert InvalidSwapSelector();
+        }
+
+        // Both selectors share the same GenericData layout (7 static fields after executor).
+        // Minimum: selector(4) + executor(32) + 7 GenericData fields(224) = 260 bytes.
+        if (cd.length < 260) revert InvalidSwapSpec();
+
+        address beneficiary;
+        uint256 fromAmount;
+        assembly {
+            let p := add(cd, 36) // skip length prefix (32) + selector (4)
+            fromAmount := mload(add(p, 96)) // GenericData.fromAmount
+            beneficiary := and(mload(add(p, 224)), 0xffffffffffffffffffffffffffffffffffffffff) // GenericData.beneficiary
+        }
+
+        if (beneficiary != address(this)) revert SwapRecipientInvalid(beneficiary);
+        if (fromAmount != spec.amountIn) revert SwapAmountInMismatch(spec.amountIn, fromAmount);
 
         address augustus = paraswapAugustusV6;
         if (augustus == address(0)) revert ZeroAddress();

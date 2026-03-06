@@ -22,22 +22,20 @@ contract MockParaswapAugustus {
         swapReverts = _reverts;
     }
 
-    /// @dev Generic fallback that decodes (srcToken, dstToken, amountIn) from calldata prefix
-    /// and performs a mock swap. The test builds calldata as:
-    ///   abi.encodeWithSelector(bytes4(0x12345678), srcToken, dstToken, amountIn)
-    /// This keeps the mock simple while testing the contract's exact-approve + balance-check logic.
+    /// @dev Generic fallback that decodes (srcToken, dstToken, amountIn) from Paraswap
+    /// GenericData layout: selector(4) + executor(32) + srcToken(32) + destToken(32) + fromAmount(32) ...
     fallback() external payable {
         require(!swapReverts, "MockParaswapAugustus: swap reverts");
 
-        // Decode srcToken, dstToken, amountIn from calldata after 4-byte selector
-        require(msg.data.length >= 100, "MockParaswapAugustus: bad calldata");
+        // Decode srcToken, dstToken, fromAmount from GenericData after selector + executor
+        require(msg.data.length >= 132, "MockParaswapAugustus: bad calldata");
         address srcToken;
         address dstToken;
         uint256 amountIn;
         assembly {
-            srcToken := calldataload(4)
-            dstToken := calldataload(36)
-            amountIn := calldataload(68)
+            srcToken := calldataload(36) // GenericData.srcToken
+            dstToken := calldataload(68) // GenericData.destToken
+            amountIn := calldataload(100) // GenericData.fromAmount
         }
 
         IERC20(srcToken).safeTransferFrom(msg.sender, address(this), amountIn);

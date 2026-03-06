@@ -39,7 +39,11 @@ contract ExecutorTest is Test {
     uint256 constant MIN_PROFIT = 5e18;
     uint256 constant COLLATERAL_REWARD = 600e18;
 
-    bytes4 constant MOCK_SWAP_SELECTOR = bytes4(0x12345678);
+    bytes4 constant SWAP_EXACT_IN_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountIn(address,(address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes,bytes)"
+        )
+    );
 
     function setUp() public {
         loanToken = new MockERC20("Loan Token", "LOAN", 18);
@@ -80,25 +84,52 @@ contract ExecutorTest is Test {
 
     // ─── Helpers ──────────────────────────────────────────────────────
 
-    function _buildParaswapCalldata(address srcToken, address dstToken, uint256 amountIn)
+    function _buildParaswapCalldata(address srcToken, address dstToken, uint256 amountIn, address beneficiary)
         internal
         pure
         returns (bytes memory)
     {
-        return abi.encodeWithSelector(MOCK_SWAP_SELECTOR, srcToken, dstToken, amountIn);
+        // Encode as Paraswap Augustus V6 swapExactAmountIn with GenericData layout
+        return abi.encodeWithSelector(
+            SWAP_EXACT_IN_SELECTOR,
+            address(0), // executor
+            srcToken, // GenericData.srcToken
+            dstToken, // GenericData.destToken
+            amountIn, // GenericData.fromAmount
+            uint256(0), // GenericData.toAmount
+            uint256(0), // GenericData.quotedAmount
+            bytes32(0), // GenericData.metadata
+            beneficiary, // GenericData.beneficiary
+            uint256(0), // partnerAndFee
+            bytes(""), // permit
+            bytes("") // executorData
+        );
     }
 
+    /// @dev Default overload: beneficiary = executor, deadline = block.timestamp + 1 hour
     function _buildSwapSpec(address srcToken, address dstToken, uint256 amountIn, uint256 minAmountOut)
         internal
-        pure
+        view
         returns (LiquidationExecutor.SwapSpec memory)
     {
+        return _buildSwapSpec(srcToken, dstToken, amountIn, minAmountOut, block.timestamp + 3600, address(executor));
+    }
+
+    function _buildSwapSpec(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint256 deadline,
+        address beneficiary
+    ) internal pure returns (LiquidationExecutor.SwapSpec memory) {
         return LiquidationExecutor.SwapSpec({
             srcToken: srcToken,
             dstToken: dstToken,
             amountIn: amountIn,
             minAmountOut: minAmountOut,
-            paraswapCalldata: _buildParaswapCalldata(srcToken, dstToken, amountIn)
+            deadline: deadline,
+            paraswapCalldata: _buildParaswapCalldata(srcToken, dstToken, amountIn, beneficiary)
         });
     }
 
@@ -1324,6 +1355,133 @@ contract ExecutorTest is Test {
 
     // ═══════════════════════════════════════════════════════════════════
     // SWAP INVARIANTS: srcToken and dstToken must equal loanToken
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PARASWAP CALLDATA VALIDATION
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_revertIfSwapRecipientInvalid() public {
+        address badRecipient = address(0xBAAD);
+        LiquidationExecutor.SwapSpec memory spec = _buildSwapSpec(
+            address(loanToken), address(loanToken), LOAN_AMOUNT, 0, block.timestamp + 3600, badRecipient
+        );
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            1,
+            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
+            spec,
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.SwapRecipientInvalid.selector, badRecipient));
+        executor.execute(plan);
+    }
+
+    function test_revertIfSwapDeadlineExpired() public {
+        uint256 expiredDeadline = block.timestamp - 1;
+        LiquidationExecutor.SwapSpec memory spec =
+            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0, expiredDeadline, address(executor));
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            1,
+            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
+            spec,
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.SwapDeadlineInvalid.selector, expiredDeadline));
+        executor.execute(plan);
+    }
+
+    function test_revertIfSwapAmountInMismatch() public {
+        // Build calldata with fromAmount = LOAN_AMOUNT but spec.amountIn = LOAN_AMOUNT / 2
+        uint256 specAmountIn = LOAN_AMOUNT / 2;
+        bytes memory cd = _buildParaswapCalldata(address(loanToken), address(loanToken), LOAN_AMOUNT, address(executor));
+        LiquidationExecutor.SwapSpec memory spec = LiquidationExecutor.SwapSpec({
+            srcToken: address(loanToken),
+            dstToken: address(loanToken),
+            amountIn: specAmountIn,
+            minAmountOut: 0,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd
+        });
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            1,
+            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
+            spec,
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.SwapAmountInMismatch.selector, specAmountIn, LOAN_AMOUNT)
+        );
+        executor.execute(plan);
+    }
+
+    function test_revertIfUnsupportedSwapSelector() public {
+        // Build calldata with an unknown selector but valid length
+        bytes memory badCalldata = abi.encodeWithSelector(
+            bytes4(0xdeadbeef),
+            address(0),
+            address(loanToken),
+            address(loanToken),
+            LOAN_AMOUNT,
+            uint256(0),
+            uint256(0),
+            bytes32(0),
+            address(executor),
+            uint256(0),
+            bytes(""),
+            bytes("")
+        );
+        LiquidationExecutor.SwapSpec memory spec = LiquidationExecutor.SwapSpec({
+            srcToken: address(loanToken),
+            dstToken: address(loanToken),
+            amountIn: LOAN_AMOUNT,
+            minAmountOut: 0,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: badCalldata
+        });
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            1,
+            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
+            spec,
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidSwapSelector.selector);
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SWAP INVARIANTS: srcToken must equal loanToken
     // ═══════════════════════════════════════════════════════════════════
 
     function test_revertIfSwapSrcTokenNotLoanToken() public {
