@@ -5,7 +5,19 @@
       "Bash(forge install:*)",
       "Bash(forge build:*)",
       "Bash(forge test:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(curl:*)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "WebFetch(domain:developers.paraswap.network)",
+      "WebFetch(domain:developers.velora.xyz)",
+      "WebFetch(domain:www.codeslaw.app)",
+      "WebFetch(domain:etherscan.io)",
+      "WebFetch(domain:polygonscan.com)",
+      "WebFetch(domain:optimistic.etherscan.io)",
+      "WebFetch(domain:api.etherscan.io)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:help.velora.xyz)"
     ]
   }
 }
