@@ -1618,6 +1618,145 @@ contract ExecutorTest is Test {
         uint256 expectedProfit = (collateralReward * SWAP_RATE / 1e18) - debtToCover - flashFee;
         assertEq(profit, expectedProfit, "Profit must match expected calculation");
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // NEGATIVE: swap slippage causes revert
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice If the swap returns less than required to repay the flash loan,
+    /// the entire transaction must revert. No tokens should remain stuck.
+    function test_liquidation_reverts_on_insufficient_swap_output() public {
+        // ── Fresh executor with ZERO balances ──
+        address[] memory targets = new address[](2);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        LiquidationExecutor freshExecutor =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        vm.prank(owner);
+        freshExecutor.setOperator(operatorAddr);
+
+        uint256 debtToCover = 500e18;
+        uint256 collateralReward = 600e18;
+        uint256 flashFee = 1e18;
+        uint256 repayRequired = debtToCover + flashFee; // 501e18
+
+        aavePool.setLiquidationCollateralReward(collateralReward);
+
+        // Fund pools only
+        loanToken.mint(address(aavePool), 100_000e18);
+        collateralToken.mint(address(aavePool), 100_000e18);
+        loanToken.mint(address(augustus), 100_000e18);
+
+        // Set swap rate so output is LESS than repay amount.
+        // At rate 0.6: 600e18 * 0.6 = 360e18 loanToken < 501e18 required
+        augustus.setRate(0.6e18);
+
+        bytes memory targetAction = _buildAaveV3LiquidationAction(
+            address(collateralToken), address(loanToken), address(0x1234), debtToCover, false
+        );
+
+        // minAmountOut set to repayRequired — swap will not meet this
+        LiquidationExecutor.SwapSpec memory swapSpec = _buildSwapSpec(
+            address(collateralToken),
+            address(loanToken),
+            collateralReward,
+            repayRequired, // minAmountOut = 501e18, but swap returns 360e18
+            block.timestamp + 3600,
+            address(freshExecutor)
+        );
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), debtToCover, flashFee, 1, targetAction, swapSpec, address(loanToken), 0);
+
+        // Must revert — InsufficientSwapOutput (360e18 < 501e18)
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        freshExecutor.execute(plan);
+
+        // Reset rate for other tests
+        augustus.setRate(SWAP_RATE);
+
+        // Executor must have no leftover tokens (tx reverted = state rolled back)
+        assertEq(loanToken.balanceOf(address(freshExecutor)), 0, "No loanToken stuck after revert");
+        assertEq(collateralToken.balanceOf(address(freshExecutor)), 0, "No collateralToken stuck after revert");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // NEGATIVE: non-profitable liquidation with minProfit > 0
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice If liquidation + swap produces less profit than minProfit,
+    /// execution must revert with InsufficientProfit.
+    function test_liquidation_reverts_on_non_profitable_execution() public {
+        // ── Fresh executor with ZERO balances ──
+        address[] memory targets = new address[](2);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        LiquidationExecutor freshExecutor =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        vm.prank(owner);
+        freshExecutor.setOperator(operatorAddr);
+
+        uint256 debtToCover = 500e18;
+        uint256 collateralReward = 600e18;
+        uint256 flashFee = 1e18;
+
+        aavePool.setLiquidationCollateralReward(collateralReward);
+
+        // Fund pools only
+        loanToken.mint(address(aavePool), 100_000e18);
+        collateralToken.mint(address(aavePool), 100_000e18);
+        loanToken.mint(address(augustus), 100_000e18);
+
+        // Set swap rate so output is barely enough to repay but not enough for profit.
+        // At rate 0.836: 600e18 * 0.836 = 501.6e18 → repay 501e18 → profit 0.6e18
+        // Set minProfit to 10e18 → insufficient profit → revert
+        augustus.setRate(0.836e18);
+
+        bytes memory targetAction = _buildAaveV3LiquidationAction(
+            address(collateralToken), address(loanToken), address(0x1234), debtToCover, false
+        );
+
+        uint256 swapOutput = collateralReward * 0.836e18 / 1e18; // 501.6e18
+        LiquidationExecutor.SwapSpec memory swapSpec = _buildSwapSpec(
+            address(collateralToken),
+            address(loanToken),
+            collateralReward,
+            debtToCover + flashFee, // minAmountOut = 501e18 (swap passes this check)
+            block.timestamp + 3600,
+            address(freshExecutor)
+        );
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            debtToCover,
+            flashFee,
+            1,
+            targetAction,
+            swapSpec,
+            address(loanToken),
+            10e18 // minProfit = 10e18, but actual profit ≈ 0.6e18
+        );
+
+        // Must revert — InsufficientProfit(0.6e18, 10e18)
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.InsufficientProfit.selector,
+                swapOutput - debtToCover - flashFee, // actual profit
+                10e18 // required profit
+            )
+        );
+        freshExecutor.execute(plan);
+
+        // Reset rate for other tests
+        augustus.setRate(SWAP_RATE);
+
+        // Executor must have no leftover tokens
+        assertEq(loanToken.balanceOf(address(freshExecutor)), 0, "No loanToken stuck after revert");
+        assertEq(collateralToken.balanceOf(address(freshExecutor)), 0, "No collateralToken stuck after revert");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
