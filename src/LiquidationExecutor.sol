@@ -246,7 +246,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (plan.loanAmount == 0) revert InvalidPlan();
         if (plan.profitToken == address(0)) revert ZeroAddress();
 
-        require(plan.swapSpec.srcToken == plan.loanToken, "INVALID_SWAP_SRC");
+        // After reorder: target action runs first, swap converts result back to loanToken.
+        // Swap dstToken must equal loanToken (to repay flash loan).
+        require(plan.swapSpec.dstToken == plan.loanToken, "SWAP_DST_MUST_BE_LOAN_TOKEN");
 
         address provider = allowedFlashProviders[plan.flashProviderId];
         if (provider == address(0)) revert FlashProviderNotAllowed();
@@ -288,8 +290,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
 
-        _executeSwap(plan.swapSpec);
+        // Target action first (e.g. liquidation: pay debt, receive collateral),
+        // then swap (e.g. convert received collateral back to loanToken for repay).
         _executeTargetAction(plan.targetProtocolId, plan.targetActionData);
+        _executeSwap(plan.swapSpec);
 
         // Aave pulls repayment after we return true — approve exact amount
         _finalizeAaveFlashloan(asset, amount, amount + premium, plan.profitToken, profitBefore, plan.minProfit);
@@ -318,8 +322,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
 
-        _executeSwap(plan.swapSpec);
         _executeTargetAction(plan.targetProtocolId, plan.targetActionData);
+        _executeSwap(plan.swapSpec);
 
         // Balancer expects funds returned by end of callback via transfer
         uint256 repayAmount = amounts[0] + feeAmounts[0];

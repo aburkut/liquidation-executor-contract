@@ -19,11 +19,11 @@ Operator Bot
 |    +-- Flash Loan              |
 |    |   +-- Aave V3 (id=1)     |
 |    |   +-- Balancer Vault(id=2)|
-|    +-- Swap via ParaSwap V6   |
 |    +-- Target Action           |
 |    |   +-- Aave V3 (id=1)     |
 |    |   +-- Morpho Blue (id=2) |
 |    |   +-- Aave V2 (id=3)     |
+|    +-- Swap via ParaSwap V6   |
 |    +-- Profit Check           |
 |    +-- Repay Flash Loan       |
 +--------------------------------+
@@ -32,14 +32,25 @@ Operator Bot
 ### Execution Flow
 
 1. **Operator** calls `execute(bytes planData)` with an ABI-encoded `Plan`
-2. Contract validates swap invariant (`srcToken == loanToken`)
+2. Contract validates swap invariant (`swapSpec.dstToken == loanToken`)
 3. Contract initiates a flash loan from the configured provider (Aave V3 or Balancer)
 4. Inside the callback:
-   - **Swap** loan token via ParaSwap AugustusV6 (Augustus must be in `allowedTargets`)
    - Execute the **target action** (Aave V3 repay/withdraw/supply/liquidation, Morpho Blue repay/withdrawCollateral/supplyCollateral, or Aave V2 liquidation)
+   - **Swap** received tokens back to loan token via ParaSwap AugustusV6 (Augustus must be in `allowedTargets`)
    - Enforce **minimum profit** gate
    - **Repay** the flash loan + fee
 5. Remaining profit stays in the contract for the owner to rescue
+
+#### Liquidation Example
+
+```
+Flash loan debtAsset (e.g. USDC)
+  → liquidationCall(collateral=WETH, debt=USDC, user, amount)
+    → pays USDC debt, receives WETH collateral (with bonus)
+  → swap WETH → USDC via ParaSwap
+  → repay flash loan (USDC + fee)
+  → profit = remaining USDC
+```
 
 ## Supported Protocols
 
@@ -78,7 +89,7 @@ struct Plan {
 }
 ```
 
-**Swap invariant**: `swapSpec.srcToken` must equal `loanToken`. This guarantees the swap consumes the flashloan token. The `dstToken` is unrestricted, allowing swaps into any token needed for the target action.
+**Swap invariant**: `swapSpec.dstToken` must equal `loanToken`. This guarantees the swap produces the token needed to repay the flash loan. The `srcToken` is unrestricted, allowing swaps from any token received by the target action (e.g. collateral received from a liquidation).
 
 ### Target Action Data Encoding
 
@@ -129,7 +140,7 @@ struct AaveV2Liquidation {
 - **Fail-closed** -- custom errors, all unknown states revert
 - **Constructor-based configuration** -- Aave pool, Balancer vault, ParaSwap Augustus, flash providers, operator, and allowed targets are set at deploy time
 - **Any standard ERC20 token accepted** -- no on-chain asset allowlist (`setAssetAllowed` has been removed); token usability is constrained by the selected flash provider's supported assets and the swap route (Paraswap). Fee-on-transfer, rebasing, and other non-standard ERC20 tokens are not supported and may break balance-diff accounting
-- **Swap invariant** -- `srcToken == loanToken` ensures the swap consumes the flashloan token
+- **Swap invariant** -- `dstToken == loanToken` ensures the swap produces the token needed to repay the flash loan
 - **Fail-closed setters** -- `setMorphoBlue`, `setAaveV2LendingPool`, and `setFlashProvider` require the address to be in `allowedTargets`; prevents configuring unwhitelisted addresses that would revert at runtime
 - **Strict callback validation**:
   - `msg.sender` must match the configured flash provider
@@ -181,7 +192,7 @@ src/
     ISwapRouter.sol                    Uniswap V3 SwapRouter
 
 test/
-  Executor.t.sol                       61 tests + inline liar mocks
+  Executor.t.sol                       66 tests + inline liar mocks
   mocks/
     MockERC20.sol                      Standard ERC20 with mint/burn
     MockAavePool.sol                   Aave V3 mock
@@ -228,7 +239,7 @@ forge test -vvv
 forge coverage
 ```
 
-## Test Suite (61 tests)
+## Test Suite (66 tests)
 
 | Category | Count |
 |---|---|
@@ -238,12 +249,13 @@ forge coverage
 | Callback validation (initiator, caller, plan hash) | 6 |
 | ParaSwap gating (swap revert, slippage, balance) | 3 |
 | Aave V2 liquidation (happy, revert, approval) | 3 |
-| Aave V3 liquidation | 1 |
+| Aave V3 liquidation | 2 |
+| Full liquidation flow (flash → liquidate → swap → repay) | 1 |
 | Profit gate (incl. profitToken==loanToken regression) | 5 |
 | Fee cap | 2 |
 | Partial failure / revert propagation | 2 |
 | Flash provider validation | 1 |
-| Swap invariants (srcToken) | 1 |
+| Swap invariants (dstToken) | 1 |
 | Invalid plan decoding | 3 |
 | Config zero-address checks | 8 |
 | Setter allowedTargets guards | 5 |
@@ -306,7 +318,7 @@ There is **no post-deploy setter** for `allowedTargets`. If you forget to includ
 
 - `setAssetAllowed` has been **removed** — there is no asset whitelist
 - Any ERC20 token can be used as `loanToken`, `srcToken`, `dstToken`, or `profitToken`
-- Safety is enforced via the swap invariant (`srcToken == loanToken`) and the `allowedTargets` check on the swap router
+- Safety is enforced via the swap invariant (`dstToken == loanToken`) and the `allowedTargets` check on the swap router
 
 ### 5. Operator configuration
 
