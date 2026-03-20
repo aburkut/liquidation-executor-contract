@@ -1484,8 +1484,8 @@ contract ExecutorTest is Test {
     // SWAP INVARIANTS: srcToken must equal loanToken
     // ═══════════════════════════════════════════════════════════════════
 
-    function test_revertIfSwapSrcTokenNotLoanToken() public {
-        // loanToken = loanToken, swapSpec.srcToken = collateralToken → INVALID_SWAP_SRC
+    function test_revertIfSwapDstTokenNotLoanToken() public {
+        // loanToken = loanToken, swapSpec.dstToken = collateralToken → SWAP_DST_MUST_BE_LOAN_TOKEN
         bytes memory plan = _buildPlan(
             1,
             address(loanToken),
@@ -1493,13 +1493,61 @@ contract ExecutorTest is Test {
             FLASH_FEE,
             1,
             _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(collateralToken), address(loanToken), LOAN_AMOUNT, 0),
+            _buildSwapSpec(address(loanToken), address(collateralToken), LOAN_AMOUNT, 0),
             address(loanToken),
             0
         );
         vm.prank(operatorAddr);
-        vm.expectRevert("INVALID_SWAP_SRC");
+        vm.expectRevert("SWAP_DST_MUST_BE_LOAN_TOKEN");
         executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LIQUIDATION FLOW: flash debtAsset → liquidate → swap collateral → repay
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_aaveV3_liquidation_full_flow() public {
+        // Real flow: flash loan debtAsset → liquidation (pay debt, receive collateral) → swap collateral → loanToken → repay
+        uint256 debtToCover = 500e18;
+        uint256 collateralReward = 600e18;
+
+        aavePool.setLiquidationCollateralReward(collateralReward);
+
+        // Flash loan collateralToken (which is the debtAsset in liquidation)
+        // Liquidation: pay collateralToken (debt), receive loanToken (collateral)
+        // Swap: loanToken → collateralToken (to repay flash loan)
+        bytes memory targetAction = _buildAaveV3LiquidationAction(
+            address(loanToken), // collateralAsset (what we receive)
+            address(collateralToken), // debtAsset (what we pay)
+            address(0x1234), // user being liquidated
+            debtToCover,
+            false
+        );
+
+        // Swap: received loanToken (600e18 collateral reward) → collateralToken (to repay flash loan)
+        bytes memory plan = _buildPlan(
+            1, // Aave V3 flash
+            address(collateralToken), // loanToken = flash loan the debt asset
+            debtToCover, // borrow exactly what we need to pay debt
+            FLASH_FEE,
+            1, // Aave V3
+            targetAction,
+            _buildSwapSpec(address(loanToken), address(collateralToken), collateralReward, debtToCover + FLASH_FEE),
+            address(collateralToken), // profit in the loan token
+            0 // minProfit
+        );
+
+        // Fund: flash pool needs collateralToken, augustus needs collateralToken for swap output
+        collateralToken.mint(address(aavePool), 100_000e18);
+        collateralToken.mint(address(augustus), 100_000e18);
+
+        uint256 balBefore = collateralToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 balAfter = collateralToken.balanceOf(address(executor));
+
+        // Should have some profit (collateral reward > debt + fee after swap)
+        assertGe(balAfter, balBefore, "Executor should not lose funds");
     }
 }
 
