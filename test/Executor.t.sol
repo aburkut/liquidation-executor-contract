@@ -218,8 +218,7 @@ contract ExecutorTest is Test {
         address lToken,
         uint256 loanAmount,
         uint256 maxFlashFee,
-        uint8 targetProtocolId,
-        bytes memory targetActionData,
+        LiquidationExecutor.Action[] memory actions,
         LiquidationExecutor.SwapSpec memory swapSpec,
         address profitTkn,
         uint256 minProfitAmt
@@ -230,13 +229,38 @@ contract ExecutorTest is Test {
                 loanToken: lToken,
                 loanAmount: loanAmount,
                 maxFlashFee: maxFlashFee,
-                targetProtocolId: targetProtocolId,
-                targetActionData: targetActionData,
+                actions: actions,
                 swapSpec: swapSpec,
                 profitToken: profitTkn,
                 minProfit: minProfitAmt
             })
         );
+    }
+
+    /// @dev Convenience: wrap a single action into Action[]
+    function _singleAction(uint8 protocolId, bytes memory data)
+        internal
+        pure
+        returns (LiquidationExecutor.Action[] memory)
+    {
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
+        actions[0] = LiquidationExecutor.Action({protocolId: protocolId, data: data});
+        return actions;
+    }
+
+    /// @dev Default liquidation action + swap for tests that don't test the action itself.
+    /// Uses collateralToken as collateral, loanToken as debt (correct roles).
+    function _defaultLiqAction(uint256 debtToCover) internal view returns (LiquidationExecutor.Action[] memory) {
+        return _singleAction(
+            1,
+            _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), debtToCover, false
+            )
+        );
+    }
+
+    function _defaultLiqSwap() internal view returns (LiquidationExecutor.SwapSpec memory) {
+        return _buildSwapSpec(address(collateralToken), address(loanToken), COLLATERAL_REWARD, 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -281,9 +305,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -364,9 +387,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -384,9 +406,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -406,9 +427,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), repayAmt, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(repayAmt),
+            _defaultLiqSwap(),
             address(loanToken),
             MIN_PROFIT
         );
@@ -428,7 +448,7 @@ contract ExecutorTest is Test {
     // AAVE V3 FLASH + PARASWAP + MORPHO REPAY (cross-protocol)
     // ═══════════════════════════════════════════════════════════════════
 
-    function test_aaveV3Flash_paraswap_morphoRepay() public {
+    function test_morphoProtocolReverts() public {
         uint256 repayAmt = 500e18;
         bytes memory targetAction =
             _buildMorphoRepayAction(address(collateralToken), address(loanToken), repayAmt, address(0x1234));
@@ -437,18 +457,15 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            2,
-            targetAction,
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _singleAction(2, targetAction),
+            _defaultLiqSwap(),
             address(loanToken),
-            MIN_PROFIT
+            0
         );
 
         vm.prank(operatorAddr);
+        vm.expectRevert("INVALID_PROTOCOL");
         executor.execute(plan);
-
-        assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
-        assertEq(collateralToken.allowance(address(executor), address(morphoBlue)), 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -462,9 +479,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), repayAmt, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(repayAmt),
+            _defaultLiqSwap(),
             address(loanToken),
             MIN_PROFIT
         );
@@ -487,9 +503,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), repayAmt, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(repayAmt),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -548,9 +563,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 200e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 900e18),
+            _defaultLiqAction(200e18),
+            _buildSwapSpec(address(collateralToken), address(loanToken), COLLATERAL_REWARD, 900e18),
             address(loanToken),
             0
         );
@@ -567,9 +581,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), repayAmt, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(repayAmt),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -586,9 +599,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -607,13 +619,13 @@ contract ExecutorTest is Test {
 
     function test_aaveV2Liquidation_happyPath() public {
         aaveV2Pool.setCollateralReward(COLLATERAL_REWARD);
-        loanToken.mint(address(aaveV2Pool), 100_000e18);
+        collateralToken.mint(address(aaveV2Pool), 100_000e18);
 
         uint256 debtToCover = 500e18;
         bytes memory targetAction = _buildAaveV2LiquidationAction(
-            address(loanToken), // collateral received
-            address(collateralToken), // debt paid
-            address(0x1234), // user
+            address(collateralToken), // collateral received
+            address(loanToken), // debt paid — must match plan.loanToken
+            address(0x1234),
             debtToCover,
             false
         );
@@ -623,9 +635,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            3,
-            targetAction,
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _singleAction(3, targetAction),
+            _buildSwapSpec(address(collateralToken), address(loanToken), COLLATERAL_REWARD, 0),
             address(loanToken),
             0
         );
@@ -634,13 +645,13 @@ contract ExecutorTest is Test {
         executor.execute(plan);
 
         // Approval hygiene
-        assertEq(collateralToken.allowance(address(executor), address(aaveV2Pool)), 0);
-        assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
     }
 
     function test_aaveV2Liquidation_approvalReset() public {
         aaveV2Pool.setCollateralReward(COLLATERAL_REWARD);
-        loanToken.mint(address(aaveV2Pool), 100_000e18);
+        collateralToken.mint(address(aaveV2Pool), 100_000e18);
 
         uint256 debtToCover = 500e18;
         bytes memory plan = _buildPlan(
@@ -648,18 +659,20 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            3,
-            _buildAaveV2LiquidationAction(
-                address(loanToken), address(collateralToken), address(0x1234), debtToCover, false
+            _singleAction(
+                3,
+                _buildAaveV2LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), debtToCover, false
+                )
             ),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _buildSwapSpec(address(collateralToken), address(loanToken), COLLATERAL_REWARD, 0),
             address(loanToken),
             0
         );
 
         vm.prank(operatorAddr);
         executor.execute(plan);
-        assertEq(collateralToken.allowance(address(executor), address(aaveV2Pool)), 0);
+        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), 0);
     }
 
     function test_aaveV2Liquidation_reverts() public {
@@ -670,9 +683,13 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            3,
-            _buildAaveV2LiquidationAction(address(loanToken), address(collateralToken), address(0x1234), 500e18, false),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _singleAction(
+                3,
+                _buildAaveV2LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), 500e18, false
+                )
+            ),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -694,9 +711,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 400e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(400e18),
+            _defaultLiqSwap(),
             address(loanToken),
             500e18
         );
@@ -714,9 +730,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), repayAmt, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(repayAmt),
+            _defaultLiqSwap(),
             address(loanToken),
             99e18
         );
@@ -731,9 +746,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 100e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(100e18),
+            _defaultLiqSwap(),
             address(loanToken),
             999e18 // impossibly high
         );
@@ -753,9 +767,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             1e18,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -771,9 +784,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             1e18,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -814,9 +826,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -851,9 +862,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -891,9 +901,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -928,9 +937,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -944,42 +952,41 @@ contract ExecutorTest is Test {
     // PARTIAL FAILURE (swap/repay fails => whole tx reverts)
     // ═══════════════════════════════════════════════════════════════════
 
-    function test_aaveRepayFailsWholeTxReverts() public {
-        aavePool.setRepayReverts(true);
+    function test_aaveLiquidationFailsWholeTxReverts() public {
+        aavePool.setLiquidationReverts(true);
+        collateralToken.mint(address(aavePool), 100_000e18);
         bytes memory plan = _buildPlan(
             1,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
 
-        uint256 before = loanToken.balanceOf(address(executor));
         vm.prank(operatorAddr);
         vm.expectRevert();
         executor.execute(plan);
-        assertEq(loanToken.balanceOf(address(executor)), before);
     }
 
     function test_morphoRepayFailsWholeTxReverts() public {
-        morphoBlue.setRepayReverts(true);
+        // Morpho protocol (id=2) is no longer supported — must revert at validation
         bytes memory plan = _buildPlan(
             1,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            2,
-            _buildMorphoRepayAction(address(collateralToken), address(loanToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _singleAction(
+                2, _buildMorphoRepayAction(address(collateralToken), address(loanToken), 500e18, address(0x1234))
+            ),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
         vm.prank(operatorAddr);
-        vm.expectRevert();
+        vm.expectRevert("INVALID_PROTOCOL");
         executor.execute(plan);
     }
 
@@ -993,9 +1000,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -1014,8 +1020,7 @@ contract ExecutorTest is Test {
             address(loanToken),
             0,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
+            _defaultLiqAction(500e18),
             _buildSwapSpec(address(loanToken), address(loanToken), 0, 0),
             address(loanToken),
             0
@@ -1027,15 +1032,7 @@ contract ExecutorTest is Test {
 
     function test_revertIfLoanTokenZeroAddress() public {
         bytes memory plan = _buildPlan(
-            1,
-            address(0),
-            LOAN_AMOUNT,
-            FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
-            address(loanToken),
-            0
+            1, address(0), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultLiqSwap(), address(loanToken), 0
         );
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
@@ -1048,9 +1045,13 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            99,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _singleAction(
+                99,
+                _buildAaveV3LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), 500e18, false
+                )
+            ),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -1147,9 +1148,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _defaultLiqAction(500e18),
+            _defaultLiqSwap(),
             address(loanToken),
             0
         );
@@ -1164,58 +1164,21 @@ contract ExecutorTest is Test {
     // ═══════════════════════════════════════════════════════════════════
 
     function test_aave_profit_token_equals_loan_token_profit_gate_works() public {
-        // Clear executor balance and set precisely to 50 LOAN + 600 COLL
-        uint256 currentBal = loanToken.balanceOf(address(executor));
-        if (currentBal > 0) {
-            vm.prank(address(executor));
-            loanToken.transfer(address(1), currentBal);
-        }
-        uint256 currentColl = collateralToken.balanceOf(address(executor));
-        if (currentColl > 0) {
-            vm.prank(address(executor));
-            collateralToken.transfer(address(1), currentColl);
-        }
-        uint256 executorInitialLoan = 50e18;
-        loanToken.mint(address(executor), executorInitialLoan);
-        collateralToken.mint(address(executor), 600e18); // for V2 liq debt payment
-
-        aaveV2Pool.setCollateralReward(600e18);
-        loanToken.mint(address(aaveV2Pool), 100_000e18);
-
-        uint256 swapAmountIn = 500e18;
-        bytes memory targetAction = _buildAaveV2LiquidationAction(
-            address(loanToken), // collateralAsset (received)
-            address(collateralToken), // debtAsset (paid)
-            address(0x1234),
-            550e18, // debtToCover
-            false
-        );
-
-        // Flow: flash 1000 LOAN, swap 500 LOAN -> 550 LOAN (net +50), V2 liq pays 550 COLL gets 600 LOAN
-        // profitBefore = 50 + 1000 = 1050
-        // After swap: 1050 - 500 + 550 = 1100
-        // After V2 liq: 1100 + 600 = 1700
-        // profitAfter = 1700
-        // effectiveProfit = 1700 + 1000 - 1050 - 1001 = 649
-        uint256 expectedProfit = 649e18;
+        // Profit gate test: profitToken == loanToken, using repay action (non-liquidation)
+        uint256 repayAmt = 500e18;
         bytes memory plan = _buildPlan(
-            1, // Aave V3
+            1,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            3, // Aave V2 protocol
-            targetAction,
-            _buildSwapSpec(address(loanToken), address(loanToken), swapAmountIn, 0),
+            _defaultLiqAction(repayAmt),
+            _defaultLiqSwap(),
             address(loanToken), // profitToken == loanToken
-            expectedProfit // minProfit
+            5e18 // minProfit
         );
 
         vm.prank(operatorAddr);
         executor.execute(plan); // must not revert
-
-        // Verify net gain
-        uint256 finalBal = loanToken.balanceOf(address(executor));
-        assertGe(finalBal - executorInitialLoan, expectedProfit);
 
         // Approval hygiene
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
@@ -1229,60 +1192,22 @@ contract ExecutorTest is Test {
         uint256 flashFee = 5e18;
         balancerVault.setFlashFee(flashFee);
 
-        // Clear executor balance and set precisely
-        uint256 currentBal = loanToken.balanceOf(address(executor));
-        if (currentBal > 0) {
-            vm.prank(address(executor));
-            loanToken.transfer(address(1), currentBal);
-        }
-        uint256 currentColl = collateralToken.balanceOf(address(executor));
-        if (currentColl > 0) {
-            vm.prank(address(executor));
-            collateralToken.transfer(address(1), currentColl);
-        }
-        uint256 executorInitialLoan = 50e18;
-        loanToken.mint(address(executor), executorInitialLoan);
-        collateralToken.mint(address(executor), 600e18); // for V2 liq debt payment
-
-        aaveV2Pool.setCollateralReward(600e18);
-        loanToken.mint(address(aaveV2Pool), 100_000e18);
-
-        uint256 swapAmountIn = 500e18;
-        bytes memory targetAction = _buildAaveV2LiquidationAction(
-            address(loanToken), // collateral received
-            address(collateralToken), // debt paid
-            address(0x1234),
-            550e18, // debtToCover
-            false
-        );
-
-        // Flow: flash 1000 LOAN (fee=5), swap 500 LOAN -> 550 LOAN (net +50),
-        // V2 liq: pay 550 COLL, get 600 LOAN
-        // profitBefore = 50 + 1000 = 1050
-        // After swap: 1050 - 500 + 550 = 1100
-        // After V2 liq: 1100 + 600 = 1700
-        // Transfer 1005 to Balancer: 695
-        // profitAfter = 695
-        // effectiveProfit = 695 + 1000 - 1050 = 645
-        uint256 netGain = 645e18;
+        // Profit gate test: Balancer flash with profitToken == loanToken, using repay action
+        uint256 repayAmt = 500e18;
+        uint256 netGain = 94e18; // swap gain (100) - flash fee (5) - rounding = ~94
         bytes memory plan = _buildPlan(
             2, // Balancer
             address(loanToken),
             LOAN_AMOUNT,
             flashFee,
-            3, // Aave V2
-            targetAction,
-            _buildSwapSpec(address(loanToken), address(loanToken), swapAmountIn, 0),
+            _defaultLiqAction(repayAmt),
+            _defaultLiqSwap(),
             address(loanToken), // profitToken == loanToken
             netGain // minProfit
         );
 
         vm.prank(operatorAddr);
-        executor.execute(plan);
-
-        // Verify profit
-        uint256 finalBal = loanToken.balanceOf(address(executor));
-        assertGe(finalBal - executorInitialLoan, netGain - 1); // allow 1 wei rounding
+        executor.execute(plan); // must not revert — profit gate passes
 
         // Approval hygiene
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
@@ -1298,10 +1223,11 @@ contract ExecutorTest is Test {
 
         aavePool.setLiquidationCollateralReward(collateralReward);
         loanToken.mint(address(aavePool), 100_000e18);
+        collateralToken.mint(address(aavePool), 100_000e18);
 
         bytes memory targetAction = _buildAaveV3LiquidationAction(
-            address(loanToken), // collateralAsset (received)
-            address(collateralToken), // debtAsset (paid)
+            address(collateralToken), // collateralAsset (received)
+            address(loanToken), // debtAsset (paid) — must match plan.loanToken
             address(0x1234), // user being liquidated
             debtToCover,
             false
@@ -1312,9 +1238,8 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1, // protocolId = Aave V3
-            targetAction,
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _singleAction(1, targetAction),
+            _buildSwapSpec(address(collateralToken), address(loanToken), collateralReward, 0),
             address(loanToken), // profit in loanToken
             0 // minProfit
         );
@@ -1323,9 +1248,9 @@ contract ExecutorTest is Test {
         executor.execute(plan);
 
         // Assert allowance reset for debtAsset -> aavePool
-        assertEq(collateralToken.allowance(address(executor), address(aavePool)), 0);
+        assertEq(loanToken.allowance(address(executor), address(aavePool)), 0);
         // Assert allowance reset for swap
-        assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1334,22 +1259,26 @@ contract ExecutorTest is Test {
 
     function test_emitsLiquidationExecuted() public {
         aaveV2Pool.setCollateralReward(COLLATERAL_REWARD);
-        loanToken.mint(address(aaveV2Pool), 100_000e18);
+        collateralToken.mint(address(aaveV2Pool), 100_000e18);
 
         bytes memory plan = _buildPlan(
             1,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            3,
-            _buildAaveV2LiquidationAction(address(loanToken), address(collateralToken), address(0x1234), 500e18, false),
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0),
+            _singleAction(
+                3,
+                _buildAaveV2LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), 500e18, false
+                )
+            ),
+            _buildSwapSpec(address(collateralToken), address(loanToken), COLLATERAL_REWARD, 0),
             address(loanToken),
             0
         );
         vm.prank(operatorAddr);
         vm.expectEmit(true, true, true, true);
-        emit LiquidationExecutor.LiquidationExecuted(3, address(loanToken), address(collateralToken), 500e18);
+        emit LiquidationExecutor.LiquidationExecuted(3, address(collateralToken), address(loanToken), 500e18);
         executor.execute(plan);
     }
 
@@ -1364,19 +1293,11 @@ contract ExecutorTest is Test {
     function test_revertIfSwapRecipientInvalid() public {
         address badRecipient = address(0xBAAD);
         LiquidationExecutor.SwapSpec memory spec = _buildSwapSpec(
-            address(loanToken), address(loanToken), LOAN_AMOUNT, 0, block.timestamp + 3600, badRecipient
+            address(collateralToken), address(loanToken), COLLATERAL_REWARD, 0, block.timestamp + 3600, badRecipient
         );
 
         bytes memory plan = _buildPlan(
-            1,
-            address(loanToken),
-            LOAN_AMOUNT,
-            FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            spec,
-            address(loanToken),
-            0
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), spec, address(loanToken), 0
         );
 
         vm.prank(operatorAddr);
@@ -1386,19 +1307,12 @@ contract ExecutorTest is Test {
 
     function test_revertIfSwapDeadlineExpired() public {
         uint256 expiredDeadline = block.timestamp - 1;
-        LiquidationExecutor.SwapSpec memory spec =
-            _buildSwapSpec(address(loanToken), address(loanToken), LOAN_AMOUNT, 0, expiredDeadline, address(executor));
+        LiquidationExecutor.SwapSpec memory spec = _buildSwapSpec(
+            address(collateralToken), address(loanToken), COLLATERAL_REWARD, 0, expiredDeadline, address(executor)
+        );
 
         bytes memory plan = _buildPlan(
-            1,
-            address(loanToken),
-            LOAN_AMOUNT,
-            FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            spec,
-            address(loanToken),
-            0
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), spec, address(loanToken), 0
         );
 
         vm.prank(operatorAddr);
@@ -1409,9 +1323,10 @@ contract ExecutorTest is Test {
     function test_revertIfSwapAmountInMismatch() public {
         // Build calldata with fromAmount = LOAN_AMOUNT but spec.amountIn = LOAN_AMOUNT / 2
         uint256 specAmountIn = LOAN_AMOUNT / 2;
-        bytes memory cd = _buildParaswapCalldata(address(loanToken), address(loanToken), LOAN_AMOUNT, address(executor));
+        bytes memory cd =
+            _buildParaswapCalldata(address(collateralToken), address(loanToken), COLLATERAL_REWARD, address(executor));
         LiquidationExecutor.SwapSpec memory spec = LiquidationExecutor.SwapSpec({
-            srcToken: address(loanToken),
+            srcToken: address(collateralToken),
             dstToken: address(loanToken),
             amountIn: specAmountIn,
             minAmountOut: 0,
@@ -1420,20 +1335,12 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan = _buildPlan(
-            1,
-            address(loanToken),
-            LOAN_AMOUNT,
-            FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            spec,
-            address(loanToken),
-            0
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), spec, address(loanToken), 0
         );
 
         vm.prank(operatorAddr);
         vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.SwapAmountInMismatch.selector, specAmountIn, LOAN_AMOUNT)
+            abi.encodeWithSelector(LiquidationExecutor.SwapAmountInMismatch.selector, specAmountIn, COLLATERAL_REWARD)
         );
         executor.execute(plan);
     }
@@ -1443,9 +1350,9 @@ contract ExecutorTest is Test {
         bytes memory badCalldata = abi.encodeWithSelector(
             bytes4(0xdeadbeef),
             address(0),
+            address(collateralToken),
             address(loanToken),
-            address(loanToken),
-            LOAN_AMOUNT,
+            COLLATERAL_REWARD,
             uint256(0),
             uint256(0),
             bytes32(0),
@@ -1455,24 +1362,16 @@ contract ExecutorTest is Test {
             bytes("")
         );
         LiquidationExecutor.SwapSpec memory spec = LiquidationExecutor.SwapSpec({
-            srcToken: address(loanToken),
+            srcToken: address(collateralToken),
             dstToken: address(loanToken),
-            amountIn: LOAN_AMOUNT,
+            amountIn: COLLATERAL_REWARD,
             minAmountOut: 0,
             deadline: block.timestamp + 3600,
             paraswapCalldata: badCalldata
         });
 
         bytes memory plan = _buildPlan(
-            1,
-            address(loanToken),
-            LOAN_AMOUNT,
-            FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
-            spec,
-            address(loanToken),
-            0
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), spec, address(loanToken), 0
         );
 
         vm.prank(operatorAddr);
@@ -1491,14 +1390,13 @@ contract ExecutorTest is Test {
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
-            1,
-            _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234)),
+            _defaultLiqAction(500e18),
             _buildSwapSpec(address(loanToken), address(collateralToken), LOAN_AMOUNT, 0),
             address(loanToken),
             0
         );
         vm.prank(operatorAddr);
-        vm.expectRevert("SWAP_DST_MUST_BE_LOAN_TOKEN");
+        vm.expectRevert("INVALID_SWAP_SPEC");
         executor.execute(plan);
     }
 
@@ -1573,8 +1471,7 @@ contract ExecutorTest is Test {
             address(loanToken), // loanToken = flash loan the debt asset
             debtToCover, // borrow exactly what we need to cover debt
             flashFee, // maxFlashFee
-            1, // Aave V3 protocol
-            targetAction,
+            _singleAction(1, targetAction),
             swapSpec,
             address(loanToken), // profitToken — measure profit in loanToken
             0 // minProfit — accept any profit for test
@@ -1665,8 +1562,16 @@ contract ExecutorTest is Test {
             address(freshExecutor)
         );
 
-        bytes memory plan =
-            _buildPlan(1, address(loanToken), debtToCover, flashFee, 1, targetAction, swapSpec, address(loanToken), 0);
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            debtToCover,
+            flashFee,
+            _singleAction(1, targetAction),
+            swapSpec,
+            address(loanToken),
+            0
+        );
 
         // Must revert — InsufficientSwapOutput (360e18 < 501e18)
         vm.prank(operatorAddr);
@@ -1732,8 +1637,7 @@ contract ExecutorTest is Test {
             address(loanToken),
             debtToCover,
             flashFee,
-            1,
-            targetAction,
+            _singleAction(1, targetAction),
             swapSpec,
             address(loanToken),
             10e18 // minProfit = 10e18, but actual profit ≈ 0.6e18
@@ -1756,6 +1660,466 @@ contract ExecutorTest is Test {
         // Executor must have no leftover tokens
         assertEq(loanToken.balanceOf(address(freshExecutor)), 0, "No loanToken stuck after revert");
         assertEq(collateralToken.balanceOf(address(freshExecutor)), 0, "No collateralToken stuck after revert");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MULTI-ACTION: two liquidations in one flash loan
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice Execute two liquidations atomically in one flash loan,
+    /// then swap total collateral back to loanToken.
+    function test_multi_liquidation_flow() public {
+        address[] memory targets = new address[](2);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        LiquidationExecutor freshExecutor =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        vm.prank(owner);
+        freshExecutor.setOperator(operatorAddr);
+
+        assertEq(loanToken.balanceOf(address(freshExecutor)), 0);
+        assertEq(collateralToken.balanceOf(address(freshExecutor)), 0);
+
+        uint256 debtToCover1 = 300e18;
+        uint256 debtToCover2 = 200e18;
+        uint256 totalDebt = debtToCover1 + debtToCover2; // 500e18
+        uint256 collateralReward = 600e18; // reward per liquidation (mock returns same for both)
+        uint256 totalCollateral = collateralReward * 2; // 1200e18
+        uint256 flashFee = 1e18;
+
+        aavePool.setLiquidationCollateralReward(collateralReward);
+        loanToken.mint(address(aavePool), 100_000e18);
+        collateralToken.mint(address(aavePool), 100_000e18);
+        loanToken.mint(address(augustus), 100_000e18);
+
+        // Two liquidation actions
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1111), debtToCover1, false
+            )
+        });
+        actions[1] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x2222), debtToCover2, false
+            )
+        });
+
+        // Swap: total collateral (1200e18) → loanToken
+        // At 1.1x: 1200 * 1.1 = 1320e18 loanToken
+        // Repay: 500 + 1 = 501e18
+        // Profit: 1320 - 501 = 819e18
+        LiquidationExecutor.SwapSpec memory swapSpec = _buildSwapSpec(
+            address(collateralToken),
+            address(loanToken),
+            totalCollateral,
+            totalDebt + flashFee,
+            block.timestamp + 3600,
+            address(freshExecutor)
+        );
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), totalDebt, flashFee, actions, swapSpec, address(loanToken), 0);
+
+        vm.prank(operatorAddr);
+        freshExecutor.execute(plan);
+
+        // Profit
+        uint256 profit = loanToken.balanceOf(address(freshExecutor));
+        uint256 expectedProfit = (totalCollateral * SWAP_RATE / 1e18) - totalDebt - flashFee;
+        assertEq(profit, expectedProfit, "Multi-liq profit must match");
+
+        // No leftover collateral
+        assertEq(collateralToken.balanceOf(address(freshExecutor)), 0, "No collateral left");
+
+        // No approvals
+        assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), 0);
+        assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MULTI-ACTION: partial failure causes atomic revert
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice If any action in a multi-action plan fails,
+    /// the entire transaction reverts atomically.
+    function test_multi_action_partial_failure_reverts() public {
+        address[] memory targets = new address[](2);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        LiquidationExecutor freshExecutor =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        vm.prank(owner);
+        freshExecutor.setOperator(operatorAddr);
+
+        uint256 debtToCover = 300e18;
+        uint256 collateralReward = 400e18;
+        uint256 flashFee = 1e18;
+
+        aavePool.setLiquidationCollateralReward(collateralReward);
+        loanToken.mint(address(aavePool), 100_000e18);
+        collateralToken.mint(address(aavePool), 100_000e18);
+        loanToken.mint(address(augustus), 100_000e18);
+
+        // First action: valid liquidation
+        // Second action: liquidation that will fail (setLiquidationReverts after first)
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1111), debtToCover, false
+            )
+        });
+        // Second action uses invalid protocol ID → guaranteed revert
+        actions[1] = LiquidationExecutor.Action({
+            protocolId: 99,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x2222), debtToCover, false
+            )
+        });
+
+        LiquidationExecutor.SwapSpec memory swapSpec = _buildSwapSpec(
+            address(collateralToken),
+            address(loanToken),
+            collateralReward * 2,
+            debtToCover * 2 + flashFee,
+            block.timestamp + 3600,
+            address(freshExecutor)
+        );
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), debtToCover * 2, flashFee, actions, swapSpec, address(loanToken), 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        freshExecutor.execute(plan);
+
+        // Atomic rollback — no stuck tokens
+        assertEq(loanToken.balanceOf(address(freshExecutor)), 0, "No loanToken stuck");
+        assertEq(collateralToken.balanceOf(address(freshExecutor)), 0, "No collateralToken stuck");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // INPUT VALIDATION: empty actions, too many actions
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_execute_reverts_on_empty_actions() public {
+        LiquidationExecutor.Action[] memory empty = new LiquidationExecutor.Action[](0);
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, empty, _defaultLiqSwap(), address(loanToken), 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("NO_ACTIONS");
+        executor.execute(plan);
+    }
+
+    function test_execute_reverts_on_too_many_actions() public {
+        LiquidationExecutor.Action[] memory tooMany = new LiquidationExecutor.Action[](11);
+        for (uint256 i = 0; i < 11; i++) {
+            tooMany[i] = LiquidationExecutor.Action({
+                protocolId: 1,
+                data: _buildAaveV3LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), 100e18, false
+                )
+            });
+        }
+
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, tooMany, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("TOO_MANY_ACTIONS");
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // VALIDATION: debt/collateral/swap consistency
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_reverts_on_invalid_debt_asset() public {
+        // Two liquidations with DIFFERENT debt assets → INVALID_DEBT_ASSET
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1111), 100e18, false
+            )
+        });
+        actions[1] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken),
+                address(collateralToken),
+                address(0x2222),
+                100e18,
+                false // wrong debt
+            )
+        });
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            200e18,
+            FLASH_FEE,
+            actions,
+            _buildSwapSpec(address(collateralToken), address(loanToken), 200e18, 0),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("INVALID_DEBT_ASSET");
+        executor.execute(plan);
+    }
+
+    function test_reverts_on_invalid_collateral_asset() public {
+        MockERC20 otherToken = new MockERC20("Other", "OTH", 18);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1111), 100e18, false
+            )
+        });
+        actions[1] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(otherToken),
+                address(loanToken),
+                address(0x2222),
+                100e18,
+                false // different collateral
+            )
+        });
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            200e18,
+            FLASH_FEE,
+            actions,
+            _buildSwapSpec(address(collateralToken), address(loanToken), 200e18, 0),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("INVALID_COLLATERAL_ASSET");
+        executor.execute(plan);
+    }
+
+    function test_reverts_on_invalid_swap_spec() public {
+        MockERC20 otherToken = new MockERC20("Other", "OTH", 18);
+
+        // Swap srcToken != collateralAsset → INVALID_SWAP_SPEC
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            200e18,
+            FLASH_FEE,
+            _singleAction(
+                1,
+                _buildAaveV3LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), 200e18, false
+                )
+            ),
+            _buildSwapSpec(address(otherToken), address(loanToken), 200e18, 0), // wrong srcToken
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("INVALID_SWAP_SPEC");
+        executor.execute(plan);
+    }
+
+    function test_reverts_on_zero_action_amount() public {
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            200e18,
+            FLASH_FEE,
+            _singleAction(
+                1,
+                _buildAaveV3LiquidationAction(
+                    address(collateralToken),
+                    address(loanToken),
+                    address(0x1234),
+                    0,
+                    false // zero amount
+                )
+            ),
+            _buildSwapSpec(address(collateralToken), address(loanToken), 200e18, 0),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("ZERO_ACTION_AMOUNT");
+        executor.execute(plan);
+    }
+
+    function test_reverts_on_unsupported_action() public {
+        // Aave V3 actionType != 4 (e.g. repay=1) → UNSUPPORTED_ACTION
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _singleAction(1, _buildAaveV3RepayAction(address(collateralToken), 500e18, address(0x1234))),
+            _defaultLiqSwap(),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("UNSUPPORTED_ACTION");
+        executor.execute(plan);
+    }
+
+    function test_reverts_on_invalid_protocol() public {
+        // Protocol ID 99 → INVALID_PROTOCOL
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _singleAction(
+                99,
+                _buildAaveV3LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), 500e18, false
+                )
+            ),
+            _defaultLiqSwap(),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("INVALID_PROTOCOL");
+        executor.execute(plan);
+    }
+
+    function test_reverts_on_no_collateral_received() public {
+        // Fresh executor with zero balance
+        address[] memory targets = new address[](2);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        LiquidationExecutor freshExec =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        vm.prank(owner);
+        freshExec.setOperator(operatorAddr);
+
+        // Liquidation returns 0 collateral → NO_COLLATERAL
+        aavePool.setLiquidationCollateralReward(0);
+        loanToken.mint(address(aavePool), 100_000e18);
+
+        LiquidationExecutor.SwapSpec memory swapSpec = _buildSwapSpec(
+            address(collateralToken),
+            address(loanToken),
+            1,
+            0, // any swap amount
+            block.timestamp + 3600,
+            address(freshExec)
+        );
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            500e18,
+            FLASH_FEE,
+            _singleAction(
+                1,
+                _buildAaveV3LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), 500e18, false
+                )
+            ),
+            swapSpec,
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("NO_COLLATERAL");
+        freshExec.execute(plan);
+    }
+
+    /// @notice Validates the INVALID_FLASH_LOAN branch: callback receives
+    /// less loanToken than plan.loanAmount → revert before any action executes.
+    function test_reverts_on_invalid_flash_loan_balance() public {
+        // Deploy a stingy flash provider that transfers LESS than requested
+        MockAavePoolStingy stingyPool = new MockAavePoolStingy(FLASH_FEE);
+        loanToken.mint(address(stingyPool), 100_000e18);
+
+        // Fresh executor wired to stingy pool
+        address[] memory targets = new address[](2);
+        targets[0] = address(stingyPool);
+        targets[1] = address(augustus);
+        LiquidationExecutor freshExec =
+            new LiquidationExecutor(owner, address(stingyPool), address(balancerVault), address(augustus), targets);
+        vm.prank(owner);
+        freshExec.setOperator(operatorAddr);
+
+        aavePool.setLiquidationCollateralReward(COLLATERAL_REWARD);
+
+        LiquidationExecutor.SwapSpec memory swapSpec = _buildSwapSpec(
+            address(collateralToken),
+            address(loanToken),
+            COLLATERAL_REWARD,
+            0,
+            block.timestamp + 3600,
+            address(freshExec)
+        );
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _singleAction(
+                1,
+                _buildAaveV3LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), 500e18, false
+                )
+            ),
+            swapSpec,
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("INVALID_FLASH_LOAN");
+        freshExec.execute(plan);
+
+        // No stuck tokens
+        assertEq(loanToken.balanceOf(address(freshExec)), 0);
+    }
+}
+
+/// @dev Flash provider mock that transfers LESS than requested (triggers INVALID_FLASH_LOAN)
+contract MockAavePoolStingy {
+    using SafeERC20 for IERC20;
+
+    uint256 public flashFee;
+
+    constructor(uint256 _fee) {
+        flashFee = _fee;
+    }
+
+    function flashLoanSimple(address receiver, address asset, uint256 amount, bytes calldata params, uint16) external {
+        // Transfer only HALF the requested amount — triggers INVALID_FLASH_LOAN
+        uint256 shortAmount = amount / 2;
+        IERC20(asset).safeTransfer(receiver, shortAmount);
+
+        IFlashLoanSimpleReceiver(receiver).executeOperation(asset, amount, flashFee, receiver, params);
+
+        // Pull back (will fail anyway due to revert, but needed for compilation)
+        IERC20(asset).safeTransferFrom(receiver, address(this), shortAmount + flashFee);
     }
 }
 

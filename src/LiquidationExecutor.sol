@@ -106,17 +106,23 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         bytes paraswapCalldata;
     }
 
+    struct Action {
+        uint8 protocolId;
+        bytes data;
+    }
+
     struct Plan {
         uint8 flashProviderId;
         address loanToken;
         uint256 loanAmount;
         uint256 maxFlashFee;
-        uint8 targetProtocolId;
-        bytes targetActionData;
+        Action[] actions;
         SwapSpec swapSpec;
         address profitToken;
         uint256 minProfit;
     }
+
+    uint8 private constant MAX_ACTIONS = 10;
 
     // ─── Aave V3 target action ───────────────────────────────────────
     struct AaveV3Action {
@@ -238,6 +244,51 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         _unpause();
     }
 
+    // ─── Internal: Validate Actions ─────────────────────────────────
+    /// @dev Validates all actions share the same debt/collateral assets and have non-zero amounts.
+    /// Returns the common collateralAsset for swap validation.
+    /// Gas-efficient: reads only the required fields from ABI-encoded action data.
+    function _validateActions(Action[] memory actions, address loanToken)
+        internal
+        pure
+        returns (address collateralAsset)
+    {
+        for (uint256 i = 0; i < actions.length; ++i) {
+            uint8 protocolId = actions[i].protocolId;
+            bytes memory data = actions[i].data;
+
+            address actionDebt;
+            address actionCollateral;
+            uint256 actionAmount;
+
+            if (protocolId == PROTOCOL_AAVE_V3) {
+                AaveV3Action memory a = abi.decode(data, (AaveV3Action));
+                require(a.actionType == 4, "UNSUPPORTED_ACTION");
+                actionDebt = a.debtAsset;
+                actionCollateral = a.collateralAsset;
+                actionAmount = a.debtToCover;
+            } else if (protocolId == PROTOCOL_AAVE_V2) {
+                AaveV2Liquidation memory a = abi.decode(data, (AaveV2Liquidation));
+                actionDebt = a.debtAsset;
+                actionCollateral = a.collateralAsset;
+                actionAmount = a.debtToCover;
+            } else {
+                revert("INVALID_PROTOCOL");
+            }
+
+            require(actionAmount > 0, "ZERO_ACTION_AMOUNT");
+            require(actionDebt == loanToken, "INVALID_DEBT_ASSET");
+
+            if (actionCollateral != address(0)) {
+                if (collateralAsset == address(0)) {
+                    collateralAsset = actionCollateral;
+                } else {
+                    require(actionCollateral == collateralAsset, "INVALID_COLLATERAL_ASSET");
+                }
+            }
+        }
+    }
+
     // ─── Core Execute ────────────────────────────────────────────────
     function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
         Plan memory plan = abi.decode(planData, (Plan));
@@ -245,10 +296,19 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
         if (plan.profitToken == address(0)) revert ZeroAddress();
+        require(plan.actions.length > 0, "NO_ACTIONS");
+        require(plan.actions.length <= MAX_ACTIONS, "TOO_MANY_ACTIONS");
 
-        // After reorder: target action runs first, swap converts result back to loanToken.
+        // Validate all actions use same debt/collateral assets
+        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
+
         // Swap dstToken must equal loanToken (to repay flash loan).
-        require(plan.swapSpec.dstToken == plan.loanToken, "SWAP_DST_MUST_BE_LOAN_TOKEN");
+        require(plan.swapSpec.dstToken == plan.loanToken, "INVALID_SWAP_SPEC");
+
+        // Swap srcToken must equal collateral (if liquidation actions produce collateral)
+        if (collateralAsset != address(0)) {
+            require(plan.swapSpec.srcToken == collateralAsset, "INVALID_SWAP_SPEC");
+        }
 
         address provider = allowedFlashProviders[plan.flashProviderId];
         if (provider == address(0)) revert FlashProviderNotAllowed();
@@ -288,11 +348,21 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (amount != plan.loanAmount) revert CallbackAmountMismatch();
         if (premium > plan.maxFlashFee) revert FlashFeeExceeded(premium, plan.maxFlashFee);
 
+        // Pre-execution: verify flash loan funds received
+        require(IERC20(plan.loanToken).balanceOf(address(this)) >= plan.loanAmount, "INVALID_FLASH_LOAN");
+
         uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
 
-        // Target action first (e.g. liquidation: pay debt, receive collateral),
-        // then swap (e.g. convert received collateral back to loanToken for repay).
-        _executeTargetAction(plan.targetProtocolId, plan.targetActionData);
+        // Execute all actions in order, then swap result back to loanToken for repay.
+        for (uint256 i = 0; i < plan.actions.length; ++i) {
+            _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+        }
+
+        // Post-action: verify collateral was received (if swap expects it)
+        if (plan.swapSpec.srcToken != plan.loanToken) {
+            require(IERC20(plan.swapSpec.srcToken).balanceOf(address(this)) > 0, "NO_COLLATERAL");
+        }
+
         _executeSwap(plan.swapSpec);
 
         // Aave pulls repayment after we return true — approve exact amount
@@ -320,9 +390,20 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (amounts[0] != plan.loanAmount) revert CallbackAmountMismatch();
         if (feeAmounts[0] > plan.maxFlashFee) revert FlashFeeExceeded(feeAmounts[0], plan.maxFlashFee);
 
+        // Pre-execution: verify flash loan funds received
+        require(IERC20(plan.loanToken).balanceOf(address(this)) >= plan.loanAmount, "INVALID_FLASH_LOAN");
+
         uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
 
-        _executeTargetAction(plan.targetProtocolId, plan.targetActionData);
+        for (uint256 i = 0; i < plan.actions.length; ++i) {
+            _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+        }
+
+        // Post-action: verify collateral was received
+        if (plan.swapSpec.srcToken != plan.loanToken) {
+            require(IERC20(plan.swapSpec.srcToken).balanceOf(address(this)) > 0, "NO_COLLATERAL");
+        }
+
         _executeSwap(plan.swapSpec);
 
         // Balancer expects funds returned by end of callback via transfer
