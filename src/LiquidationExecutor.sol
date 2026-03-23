@@ -43,6 +43,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error TargetNotAllowed(address target);
     error InvalidSwapSpec();
     error InvalidSwapSelector();
+    error ZeroBalance();
+    error EmptyArray();
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
@@ -686,6 +688,27 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         (bool success,) = to.call{value: amount}("");
         if (!success) revert RescueFailed();
         emit Rescue(address(0), to, amount);
+    }
+
+    function rescueAllERC20(address token, address to) external onlyOwner {
+        if (token == address(0)) revert ZeroAddress();
+        if (to == address(0)) revert ZeroAddress();
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        if (balance == 0) revert ZeroBalance();
+        IERC20(token).safeTransfer(to, balance);
+        emit Rescue(token, to, balance);
+    }
+
+    function rescueERC20Batch(address[] calldata tokens, address to) external onlyOwner {
+        if (tokens.length == 0) revert EmptyArray();
+        if (to == address(0)) revert ZeroAddress();
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            uint256 balance = IERC20(tokens[i]).balanceOf(address(this));
+            if (balance > 0) {
+                IERC20(tokens[i]).safeTransfer(to, balance);
+                emit Rescue(tokens[i], to, balance);
+            }
+        }
     }
 
     receive() external payable {}

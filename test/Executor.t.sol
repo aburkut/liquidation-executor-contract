@@ -1139,6 +1139,139 @@ contract ExecutorTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // RESCUE ALL ERC20
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_rescueAllERC20TransfersFullBalance() public {
+        loanToken.mint(address(executor), 200e18);
+        uint256 fullBalance = loanToken.balanceOf(address(executor));
+        uint256 ownerBefore = loanToken.balanceOf(owner);
+        vm.prank(owner);
+        executor.rescueAllERC20(address(loanToken), owner);
+        assertEq(loanToken.balanceOf(address(executor)), 0);
+        assertEq(loanToken.balanceOf(owner) - ownerBefore, fullBalance);
+    }
+
+    function test_rescueAllERC20RevertsOnZeroBalance() public {
+        MockERC20 emptyToken = new MockERC20("Empty", "EMP", 18);
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.ZeroBalance.selector);
+        executor.rescueAllERC20(address(emptyToken), owner);
+    }
+
+    function test_rescueAllERC20RevertsIfNotOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert();
+        executor.rescueAllERC20(address(loanToken), attacker);
+    }
+
+    function test_rescueAllERC20RevertsOnZeroToken() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.rescueAllERC20(address(0), owner);
+    }
+
+    function test_rescueAllERC20RevertsOnZeroTo() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.rescueAllERC20(address(loanToken), address(0));
+    }
+
+    function test_rescueAllERC20EmitsEvent() public {
+        loanToken.mint(address(executor), 50e18);
+        uint256 fullBalance = loanToken.balanceOf(address(executor));
+        vm.prank(owner);
+        vm.expectEmit(true, true, false, true);
+        emit LiquidationExecutor.Rescue(address(loanToken), owner, fullBalance);
+        executor.rescueAllERC20(address(loanToken), owner);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // RESCUE ERC20 BATCH
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_rescueERC20BatchTransfersMultipleTokens() public {
+        MockERC20 tokenA = new MockERC20("A", "A", 18);
+        MockERC20 tokenB = new MockERC20("B", "B", 18);
+        tokenA.mint(address(executor), 100e18);
+        tokenB.mint(address(executor), 200e18);
+
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+
+        vm.prank(owner);
+        executor.rescueERC20Batch(tokens, owner);
+
+        assertEq(tokenA.balanceOf(address(executor)), 0);
+        assertEq(tokenB.balanceOf(address(executor)), 0);
+        assertEq(tokenA.balanceOf(owner), 100e18);
+        assertEq(tokenB.balanceOf(owner), 200e18);
+    }
+
+    function test_rescueERC20BatchSkipsZeroBalanceTokens() public {
+        MockERC20 tokenA = new MockERC20("A", "A", 18);
+        MockERC20 tokenB = new MockERC20("B", "B", 18);
+        tokenA.mint(address(executor), 100e18);
+        // tokenB has zero balance
+
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+
+        vm.prank(owner);
+        executor.rescueERC20Batch(tokens, owner);
+
+        assertEq(tokenA.balanceOf(address(executor)), 0);
+        assertEq(tokenA.balanceOf(owner), 100e18);
+        assertEq(tokenB.balanceOf(owner), 0);
+    }
+
+    function test_rescueERC20BatchMixedBalances() public {
+        MockERC20 tokenA = new MockERC20("A", "A", 18);
+        MockERC20 tokenB = new MockERC20("B", "B", 18);
+        MockERC20 tokenC = new MockERC20("C", "C", 18);
+        tokenA.mint(address(executor), 50e18);
+        // tokenB has zero balance
+        tokenC.mint(address(executor), 300e18);
+
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+        tokens[2] = address(tokenC);
+
+        vm.prank(owner);
+        executor.rescueERC20Batch(tokens, owner);
+
+        assertEq(tokenA.balanceOf(owner), 50e18);
+        assertEq(tokenB.balanceOf(owner), 0);
+        assertEq(tokenC.balanceOf(owner), 300e18);
+    }
+
+    function test_rescueERC20BatchRevertsOnEmptyArray() public {
+        address[] memory tokens = new address[](0);
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.EmptyArray.selector);
+        executor.rescueERC20Batch(tokens, owner);
+    }
+
+    function test_rescueERC20BatchRevertsIfNotOwner() public {
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(loanToken);
+        vm.prank(attacker);
+        vm.expectRevert();
+        executor.rescueERC20Batch(tokens, attacker);
+    }
+
+    function test_rescueERC20BatchRevertsOnZeroTo() public {
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(loanToken);
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.rescueERC20Batch(tokens, address(0));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // EVENT EMISSION
     // ═══════════════════════════════════════════════════════════════════
 
