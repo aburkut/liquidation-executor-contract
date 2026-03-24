@@ -202,11 +202,11 @@ struct AaveV2Liquidation {
 
 | Parameter | Description |
 |---|---|
-| `owner_` | Initial contract owner (Ownable2Step) |
-| `aavePool_` | Aave V3 Pool address |
-| `balancerVault_` | Balancer Vault address |
-| `paraswapAugustus_` | ParaSwap AugustusV6 router address |
-| `allowedTargets_` | Array of whitelisted target contract addresses |
+| `owner_` | Initial contract owner (Ownable2Step). Also becomes initial `operator`. |
+| `aavePool_` | Aave V3 Pool address (auto-whitelisted in `allowedTargets`) |
+| `balancerVault_` | Balancer Vault address (auto-whitelisted in `allowedTargets`) |
+| `paraswapAugustus_` | ParaSwap AugustusV6 router address (auto-whitelisted in `allowedTargets`) |
+| `allowedTargets_` | Array of additional whitelisted target contract addresses |
 
 ### Post-Deploy Owner Functions
 
@@ -218,14 +218,16 @@ struct AaveV2Liquidation {
 | `setUniswapV3Router(address)` | Legacy setter (not used in current execution flow) |
 | `setFlashProvider(uint8, address)` | Register a flash provider by ID (must be in `allowedTargets`) |
 | `pause()` / `unpause()` | Emergency pause toggle |
-| `rescueERC20(address, address, uint256)` | Recover stuck tokens |
-| `rescueETH(address, uint256)` | Recover stuck ETH |
+| `rescueERC20(token, to, amount)` | Recover specific amount of stuck tokens |
+| `rescueAllERC20(token, to)` | Recover full balance of a stuck token |
+| `rescueERC20Batch(tokens[], to)` | Recover full balances of multiple stuck tokens |
+| `rescueETH(to, amount)` | Recover stuck ETH |
 
 ## Project Structure
 
 ```
 src/
-  LiquidationExecutor.sol              Main contract
+  LiquidationExecutor.sol              Main contract (716 lines)
   interfaces/
     IAaveV3Pool.sol                    Aave V3 Pool + IFlashLoanSimpleReceiver
     IBalancerVault.sol                 Balancer Vault + IFlashLoanRecipient
@@ -234,7 +236,7 @@ src/
     ISwapRouter.sol                    Uniswap V3 SwapRouter (legacy)
 
 test/
-  Executor.t.sol                       80 tests + inline helper mocks
+  Executor.t.sol                       92 tests + inline helper mocks
   mocks/
     MockERC20.sol                      Standard ERC20 with mint/burn
     MockAavePool.sol                   Aave V3 mock (flash + liquidation)
@@ -281,18 +283,18 @@ forge test -vvv
 forge coverage
 ```
 
-## Test Suite (80 tests)
+## Test Suite (92 tests)
 
 | Category | Count |
 |---|---|
-| Access control | 11 |
+| Access control (onlyOwner, onlyOperator, Ownable2Step) | 11 |
 | Pause mechanism | 2 |
 | Happy paths (Aave V3/V2, Aave/Balancer flash) | 4 |
 | Real liquidation flow (zero pre-funding) | 1 |
 | Multi-liquidation flow (2 actions, 1 flash loan) | 1 |
 | Callback validation (initiator, caller, plan hash, asset, amount) | 6 |
 | ParaSwap gating (swap revert, slippage, approval reset) | 3 |
-| Aave V2 liquidation (happy, revert, approval) | 3 |
+| Aave V2 liquidation (happy, revert, approval reset) | 3 |
 | Aave V3 liquidation + allowance reset | 1 |
 | Profit gate (Aave V3, Balancer, profitToken==loanToken) | 5 |
 | Fee cap (Aave V3, Balancer) | 2 |
@@ -307,10 +309,10 @@ forge coverage
 | Swap slippage revert | 1 |
 | Non-profitable execution revert | 1 |
 | Multi-action partial failure (atomicity) | 1 |
-| Config zero-address checks | 8 |
-| Setter allowedTargets guards | 5 |
+| Config zero-address checks (operator, morpho, aaveV2, uniswap, flashProvider, owner) | 8 |
+| Setter allowedTargets guards (morpho, aaveV2, flashProvider rejected if not whitelisted) | 5 |
 | Events (FlashExecuted, LiquidationExecuted) | 2 |
-| Rescue (ERC20, ETH) | 2 |
+| Rescue — ERC20 (single, all, batch), ETH, validations | 13 |
 
 ## Compiler Settings
 
@@ -332,18 +334,18 @@ Before deploying, verify every item below. Misconfiguration **cannot be fixed po
 | `aavePool_` | Aave V3 Pool address (also registered as flash provider for id=1) |
 | `balancerVault_` | Balancer Vault address (also registered as flash provider for id=2) |
 | `paraswapAugustus_` | ParaSwap AugustusV6 router address |
-| `allowedTargets_` | Array of whitelisted target contract addresses (see below) |
+| `allowedTargets_` | Array of additional whitelisted target contract addresses (see below) |
 
 ### 2. Required targets in `allowedTargets`
 
 The constructor automatically whitelists `aavePool_`, `balancerVault_`, and `paraswapAugustus_`. The `allowedTargets_` array provides **additional** addresses to whitelist.
 
-**Required** (auto-whitelisted by constructor — no action needed):
+**Auto-whitelisted by constructor (no action needed):**
 - Aave V3 Pool
 - Balancer Vault
 - ParaSwap Augustus
 
-**Optional but must be included in `allowedTargets_` if those protocols will be used:**
+**Must be included in `allowedTargets_` if those protocols will be used:**
 - Aave V2 LendingPool — required before calling `setAaveV2LendingPool`
 
 ### 3. Why targets must be pre-whitelisted
@@ -431,7 +433,8 @@ cast send $EXECUTOR "setAaveV2LendingPool(address)" 0x7d2768dE32b0b80b7a3454c06B
 ```bash
 cast call $EXECUTOR "owner()(address)" --rpc-url $RPC
 cast call $EXECUTOR "operator()(address)" --rpc-url $RPC
-cast call $EXECUTOR "aavePool()(address)" --rpc-url $RPC
+cast call $EXECUTOR "allowedFlashProviders(uint8)(address)" 1 --rpc-url $RPC
+cast call $EXECUTOR "allowedFlashProviders(uint8)(address)" 2 --rpc-url $RPC
 cast call $EXECUTOR "allowedTargets(address)(bool)" 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 --rpc-url $RPC
 cast call $EXECUTOR "paused()(bool)" --rpc-url $RPC
 ```
