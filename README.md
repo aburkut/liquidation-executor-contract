@@ -1,5 +1,22 @@
 # LiquidationExecutor
 
+## Deployment (Ethereum Mainnet)
+
+| Parameter | Value |
+|---|---|
+| **Contract** | `0x1aaED107C21B389a38a632129dC0Cb362819bC8D` |
+| **Deploy tx** | `0xbe130e75f1bc317cbab9875c13ec64bab3ac3dd6abc98d0e5574d66cd1267456` |
+| **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
+| **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` |
+| **Deployer** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` |
+| **Aave V3 Pool** | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` |
+| **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` |
+| **ParaSwap Augustus** | `0x6A000F20005980200259B80c5102003040001068` |
+| **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (whitelisted, not yet configured) |
+| **Solidity** | 0.8.24, Shanghai, optimizer 200 runs |
+
+---
+
 Production-grade **Flashloan → Multi-Liquidation → Swap → Repay** execution contract for DeFi liquidation bots.
 
 Single deployable bytecode targeting **Ethereum Mainnet**, **Base**, and **Optimism**.
