@@ -4,16 +4,21 @@
 
 | Parameter | Value |
 |---|---|
-| **Contract** | `0x1aaED107C21B389a38a632129dC0Cb362819bC8D` |
-| **Deploy tx** | `0xbe130e75f1bc317cbab9875c13ec64bab3ac3dd6abc98d0e5574d66cd1267456` |
+| **Contract** | `0x38F4473C077c014786037cC3d82fce52510b9089` |
+| **Deploy tx** | `0x0da58098a540a127b98e7b8ae7e783134236cb2e4ec870260b156dc62808db6b` |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
-| **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` |
+| **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
+| **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
 | **Deployer** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` |
 | **Aave V3 Pool** | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` |
 | **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` |
 | **ParaSwap Augustus** | `0x6A000F20005980200259B80c5102003040001068` |
 | **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (whitelisted, not yet configured) |
 | **Solidity** | 0.8.24, Shanghai, optimizer 200 runs |
+
+| Previous deployment | |
+|---|---|
+| **V1 Contract** | `0x1aaED107C21B389a38a632129dC0Cb362819bC8D` (deprecated) |
 
 ---
 
@@ -219,7 +224,9 @@ struct AaveV2Liquidation {
 
 | Parameter | Description |
 |---|---|
-| `owner_` | Initial contract owner (Ownable2Step). Also becomes initial `operator`. |
+| `owner_` | Initial contract owner (Ownable2Step) |
+| `operator_` | Bot address authorized to call `execute` (**immutable**) |
+| `weth_` | WETH token address for coinbase payment auto-unwrap (**immutable**) |
 | `aavePool_` | Aave V3 Pool address (auto-whitelisted in `allowedTargets`) |
 | `balancerVault_` | Balancer Vault address (auto-whitelisted in `allowedTargets`) |
 | `paraswapAugustus_` | ParaSwap AugustusV6 router address (auto-whitelisted in `allowedTargets`) |
@@ -229,7 +236,6 @@ struct AaveV2Liquidation {
 
 | Function | Description |
 |---|---|
-| `setOperator(address)` | Set the bot address authorized to call `execute` |
 | `setMorphoBlue(address)` | Configure Morpho Blue address (must be in `allowedTargets`) |
 | `setAaveV2LendingPool(address)` | Configure Aave V2 Lending Pool address (must be in `allowedTargets`) |
 | `setUniswapV3Router(address)` | Legacy setter (not used in current execution flow) |
@@ -300,7 +306,7 @@ forge test -vvv
 forge coverage
 ```
 
-## Test Suite (92 tests)
+## Test Suite (120 tests)
 
 | Category | Count |
 |---|---|
@@ -382,9 +388,9 @@ There is **no post-deploy setter** for `allowedTargets`. If you forget to includ
 
 ### 5. Operator configuration
 
-- `operator` is initialized to `owner_` in the constructor
-- The owner may change it later via `setOperator(address)`
+- `operator` is set in the constructor and is **immutable** (cannot be changed post-deploy)
 - Only the operator can call `execute(bytes)`
+- To change operator, redeploy the contract
 
 ---
 
@@ -412,14 +418,15 @@ ETHERSCAN_API_KEY=...
 forge create src/LiquidationExecutor.sol:LiquidationExecutor \
   --rpc-url $ETHEREUM_RPC_URL \
   --private-key $PRIVATE_KEY \
+  --broadcast \
   --constructor-args \
     <OWNER_ADDRESS> \
+    <OPERATOR_ADDRESS> \
+    0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 \
     0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 \
     0xBA12222222228d8Ba445958a75a0704d566BF2C8 \
     0x6A000F20005980200259B80c5102003040001068 \
-    "[0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9]" \
-  --verify \
-  --etherscan-api-key $ETHERSCAN_API_KEY
+    "[0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9]"
 ```
 
 ### 3. Post-Deploy Configuration
@@ -428,9 +435,6 @@ forge create src/LiquidationExecutor.sol:LiquidationExecutor \
 EXECUTOR=<DEPLOYED_ADDRESS>
 RPC=$ETHEREUM_RPC_URL
 PK=<OWNER_PRIVATE_KEY>
-
-# Optional: Change operator to bot address
-cast send $EXECUTOR "setOperator(address)" <BOT_ADDRESS> --rpc-url $RPC --private-key $PK
 
 # Optional: Aave V2 (must be in allowedTargets deployed array)
 cast send $EXECUTOR "setAaveV2LendingPool(address)" 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9 --rpc-url $RPC --private-key $PK
@@ -450,6 +454,7 @@ cast send $EXECUTOR "setAaveV2LendingPool(address)" 0x7d2768dE32b0b80b7a3454c06B
 ```bash
 cast call $EXECUTOR "owner()(address)" --rpc-url $RPC
 cast call $EXECUTOR "operator()(address)" --rpc-url $RPC
+cast call $EXECUTOR "weth()(address)" --rpc-url $RPC
 cast call $EXECUTOR "allowedFlashProviders(uint8)(address)" 1 --rpc-url $RPC
 cast call $EXECUTOR "allowedFlashProviders(uint8)(address)" 2 --rpc-url $RPC
 cast call $EXECUTOR "allowedTargets(address)(bool)" 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 --rpc-url $RPC
