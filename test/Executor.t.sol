@@ -64,14 +64,20 @@ contract ExecutorTest is Test {
         targets[2] = address(augustus);
         targets[3] = address(aaveV2Pool);
 
-        executor = new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        executor = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         vm.startPrank(owner);
-        executor.setOperator(operatorAddr);
         executor.setMorphoBlue(address(morphoBlue));
         executor.setUniswapV3Router(address(0x1)); // placeholder, not used by new swap
         executor.setAaveV2LendingPool(address(aaveV2Pool));
-        executor.setWeth(address(mockWeth));
         vm.stopPrank();
 
         // Fund pools
@@ -317,12 +323,6 @@ contract ExecutorTest is Test {
     // ACCESS CONTROL (preserved from original)
     // ═══════════════════════════════════════════════════════════════════
 
-    function test_onlyOwnerCanSetOperator() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.setOperator(attacker);
-    }
-
     function test_onlyOwnerCanSetMorphoBlue() public {
         vm.prank(attacker);
         vm.expectRevert();
@@ -365,19 +365,6 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
-    function test_setOperatorZeroReverts() public {
-        vm.prank(owner);
-        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
-        executor.setOperator(address(0));
-    }
-
-    function test_ownerCanSetOperator() public {
-        address newOp = address(0xCAFE);
-        vm.prank(owner);
-        executor.setOperator(newOp);
-        assertEq(executor.operator(), newOp);
-    }
-
     function test_ownable2Step() public {
         address newOwner = address(0xBEEF);
         vm.prank(owner);
@@ -391,7 +378,7 @@ contract ExecutorTest is Test {
     function test_constructorRevertsOnZeroOwner() public {
         address[] memory targets = new address[](0);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new LiquidationExecutor(address(0), address(1), address(2), address(3), targets);
+        new LiquidationExecutor(address(0), address(1), address(2), address(3), address(4), address(5), targets);
     }
 
     function test_rescueERC20() public {
@@ -860,13 +847,18 @@ contract ExecutorTest is Test {
         targets[2] = address(augustus);
         targets[3] = address(aaveV2Pool);
         targets[4] = address(liarPool);
-        LiquidationExecutor exec2 =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        LiquidationExecutor exec2 = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
-        vm.startPrank(owner);
-        exec2.setOperator(operatorAddr);
+        vm.prank(owner);
         exec2.setFlashProvider(1, address(liarPool));
-        vm.stopPrank();
 
         loanToken.mint(address(exec2), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(exec2), 1000e18);
@@ -897,11 +889,17 @@ contract ExecutorTest is Test {
         targets[2] = address(augustus);
         targets[3] = address(aaveV2Pool);
         targets[4] = address(liarPool);
-        LiquidationExecutor exec2 =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        LiquidationExecutor exec2 = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         vm.startPrank(owner);
-        exec2.setOperator(operatorAddr);
         exec2.setFlashProvider(1, address(liarPool));
         vm.stopPrank();
 
@@ -935,11 +933,17 @@ contract ExecutorTest is Test {
         targets[2] = address(augustus);
         targets[3] = address(aaveV2Pool);
         targets[4] = address(liarVault);
-        LiquidationExecutor exec2 =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        LiquidationExecutor exec2 = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         vm.startPrank(owner);
-        exec2.setOperator(operatorAddr);
         exec2.setFlashProvider(2, address(liarVault));
         vm.stopPrank();
 
@@ -972,11 +976,17 @@ contract ExecutorTest is Test {
         targets[2] = address(augustus);
         targets[3] = address(aaveV2Pool);
         targets[4] = address(liarVault);
-        LiquidationExecutor exec2 =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        LiquidationExecutor exec2 = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         vm.startPrank(owner);
-        exec2.setOperator(operatorAddr);
         exec2.setFlashProvider(2, address(liarVault));
         vm.stopPrank();
 
@@ -1600,10 +1610,15 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
-        vm.prank(owner);
-        freshExecutor.setOperator(operatorAddr);
+        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         // Verify executor starts with zero balances
         assertEq(loanToken.balanceOf(address(freshExecutor)), 0, "Executor must start with zero loanToken");
@@ -1710,10 +1725,15 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
-        vm.prank(owner);
-        freshExecutor.setOperator(operatorAddr);
+        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         uint256 debtToCover = 500e18;
         uint256 collateralReward = 600e18;
@@ -1780,10 +1800,15 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
-        vm.prank(owner);
-        freshExecutor.setOperator(operatorAddr);
+        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         uint256 debtToCover = 500e18;
         uint256 collateralReward = 600e18;
@@ -1855,10 +1880,15 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
-        vm.prank(owner);
-        freshExecutor.setOperator(operatorAddr);
+        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         assertEq(loanToken.balanceOf(address(freshExecutor)), 0);
         assertEq(collateralToken.balanceOf(address(freshExecutor)), 0);
@@ -1932,10 +1962,15 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
-        vm.prank(owner);
-        freshExecutor.setOperator(operatorAddr);
+        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         uint256 debtToCover = 300e18;
         uint256 collateralReward = 400e18;
@@ -2193,10 +2228,15 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExec =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
-        vm.prank(owner);
-        freshExec.setOperator(operatorAddr);
+        LiquidationExecutor freshExec = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         // Liquidation returns 0 collateral → NO_COLLATERAL
         aavePool.setLiquidationCollateralReward(0);
@@ -2243,10 +2283,15 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(stingyPool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExec =
-            new LiquidationExecutor(owner, address(stingyPool), address(balancerVault), address(augustus), targets);
-        vm.prank(owner);
-        freshExec.setOperator(operatorAddr);
+        LiquidationExecutor freshExec = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(stingyPool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
 
         aavePool.setLiquidationCollateralReward(COLLATERAL_REWARD);
 
@@ -2422,51 +2467,6 @@ contract ExecutorTest is Test {
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.CoinbasePaymentRequiresWethProfit.selector);
         executor.execute(plan);
-    }
-
-    /// @notice Coinbase payment reverts when weth is not configured.
-    function test_coinbasePayment_revertsWhenWethNotConfigured() public {
-        vm.coinbase(address(0xC01B));
-
-        // Deploy fresh executor without weth configured
-        address[] memory targets = new address[](2);
-        targets[0] = address(aavePool);
-        targets[1] = address(augustus);
-        LiquidationExecutor noWethExec =
-            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
-        vm.prank(owner);
-        noWethExec.setOperator(operatorAddr);
-
-        // Fund it
-        loanToken.mint(address(noWethExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
-        collateralToken.mint(address(noWethExec), 1000e18);
-        vm.deal(address(noWethExec), 1 ether);
-
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
-            protocolId: 1,
-            data: _buildAaveV3LiquidationAction(
-                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
-            )
-        });
-        actions[1] = _buildCoinbasePaymentAction(0.5 ether);
-
-        // Build swap with correct beneficiary for noWethExec
-        LiquidationExecutor.SwapSpec memory swapSpec = _buildSwapSpec(
-            address(collateralToken),
-            address(loanToken),
-            COLLATERAL_REWARD,
-            0,
-            block.timestamp + 3600,
-            address(noWethExec)
-        );
-
-        bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, swapSpec, address(loanToken), 0);
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.WethNotConfigured.selector);
-        noWethExec.execute(plan);
     }
 
     // ═══════════════════════════════════════════════════════════════════

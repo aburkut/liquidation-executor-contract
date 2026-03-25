@@ -51,7 +51,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error ZeroBalance();
     error EmptyArray();
     error CoinbasePaymentRequiresWethProfit();
-    error WethNotConfigured();
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
@@ -78,7 +77,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     );
 
     // ─── State ───────────────────────────────────────────────────────
-    address public operator;
+    address public immutable operator;
+    address public immutable weth;
     address public aavePool;
     address public morphoBlue;
     // NOTE: Legacy configuration field.
@@ -89,7 +89,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     address public balancerVault;
     address public paraswapAugustusV6;
     address public aaveV2LendingPool;
-    address public weth;
 
     mapping(uint8 => address) public allowedFlashProviders;
     mapping(address => bool) public allowedTargets;
@@ -97,7 +96,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     bytes32 private _activePlanHash;
 
     // ─── Events ──────────────────────────────────────────────────────
-    event OperatorUpdated(address indexed oldOperator, address indexed newOperator);
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
     event FlashProviderUpdated(uint8 indexed providerId, address indexed oldProvider, address indexed newProvider);
     event FlashExecuted(uint8 indexed providerId, address indexed loanToken, uint256 loanAmount);
@@ -176,20 +174,24 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     // ─── Constructor ─────────────────────────────────────────────────
     constructor(
         address owner_,
+        address operator_,
+        address weth_,
         address aavePool_,
         address balancerVault_,
         address paraswapAugustus_,
         address[] memory allowedTargets_
     ) Ownable(owner_) {
+        if (operator_ == address(0)) revert ZeroAddress();
+        if (weth_ == address(0)) revert ZeroAddress();
         if (aavePool_ == address(0)) revert ZeroAddress();
         if (balancerVault_ == address(0)) revert ZeroAddress();
         if (paraswapAugustus_ == address(0)) revert ZeroAddress();
 
+        operator = operator_;
+        weth = weth_;
         aavePool = aavePool_;
         balancerVault = balancerVault_;
         paraswapAugustusV6 = paraswapAugustus_;
-
-        operator = owner_;
 
         allowedFlashProviders[FLASH_PROVIDER_AAVE_V3] = aavePool_;
         allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
@@ -211,13 +213,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     }
 
     // ─── Owner Config Functions ──────────────────────────────────────
-    function setOperator(address newOperator) external onlyOwner {
-        if (newOperator == address(0)) revert ZeroAddress();
-        address old = operator;
-        operator = newOperator;
-        emit OperatorUpdated(old, newOperator);
-    }
-
     function setMorphoBlue(address morpho) external onlyOwner {
         if (morpho == address(0)) revert ZeroAddress();
         if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
@@ -242,13 +237,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address old = aaveV2LendingPool;
         aaveV2LendingPool = pool;
         emit ConfigUpdated("aaveV2Pool", old, pool);
-    }
-
-    function setWeth(address weth_) external onlyOwner {
-        if (weth_ == address(0)) revert ZeroAddress();
-        address old = weth;
-        weth = weth_;
-        emit ConfigUpdated("weth", old, weth_);
     }
 
     function setFlashProvider(uint8 providerId, address provider) external onlyOwner {
@@ -799,7 +787,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (actionType == ACTION_PAY_COINBASE) {
             // Coinbase payment is ETH-denominated — only valid when profit is in WETH
             // so that the subtraction in _checkProfit uses consistent units.
-            if (weth == address(0)) revert WethNotConfigured();
             if (profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
 
             (, uint256 amount) = abi.decode(actionData, (uint8, uint256));
