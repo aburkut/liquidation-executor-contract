@@ -50,6 +50,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error InvalidSwapSelector();
     error ZeroBalance();
     error EmptyArray();
+    error CoinbasePaymentRequiresWethProfit();
+    error WethNotConfigured();
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
@@ -795,6 +797,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint8 actionType = abi.decode(actionData, (uint8));
 
         if (actionType == ACTION_PAY_COINBASE) {
+            // Coinbase payment is ETH-denominated — only valid when profit is in WETH
+            // so that the subtraction in _checkProfit uses consistent units.
+            if (weth == address(0)) revert WethNotConfigured();
+            if (profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
+
             (, uint256 amount) = abi.decode(actionData, (uint8, uint256));
             wethUnwrapped = _payCoinbase(amount);
             coinbasePaid = amount;
@@ -824,8 +831,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         emit BuilderPaid(builder, token, amount);
     }
 
-    /// @dev Send ETH to block.coinbase. Auto-unwraps WETH if insufficient ETH and WETH is configured.
-    /// Returns the amount of WETH unwrapped (for profit accounting).
+    /// @dev Send ETH to block.coinbase. Only reachable when profitToken == weth (enforced by caller).
+    /// Auto-unwraps WETH if insufficient ETH. Returns the amount unwrapped (for profit accounting).
     function _payCoinbase(uint256 amount) internal returns (uint256 wethUnwrapped) {
         if (amount == 0) return 0;
 
