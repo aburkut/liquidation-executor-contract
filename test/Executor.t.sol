@@ -2232,7 +2232,234 @@ contract ExecutorTest is Test {
         // No stuck tokens
         assertEq(loanToken.balanceOf(address(freshExec)), 0);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // COINBASE PAYMENT
+    // ═══════════════════════════════════════════════════════════════════
+
+    function _buildCoinbasePaymentAction(uint256 amount) internal pure returns (LiquidationExecutor.Action memory) {
+        return LiquidationExecutor.Action({
+            protocolId: 100, // PROTOCOL_INTERNAL
+            data: abi.encode(uint8(1), amount) // ACTION_PAY_COINBASE
+        });
+    }
+
+    function _defaultLiqActionWithCoinbase(uint256 debtToCover, uint256 coinbaseAmount)
+        internal
+        view
+        returns (LiquidationExecutor.Action[] memory)
+    {
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), debtToCover, false
+            )
+        });
+        actions[1] = _buildCoinbasePaymentAction(coinbaseAmount);
+        return actions;
+    }
+
+    function test_coinbasePayment_sendsETH() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        vm.deal(address(executor), 1 ether);
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqActionWithCoinbase(400e18, 0.5 ether),
+            _defaultLiqSwap(),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(coinbase.balance, 0.5 ether);
+        assertEq(address(executor).balance, 0.5 ether);
+    }
+
+    function test_coinbasePayment_revertsInsufficientETH() public {
+        vm.coinbase(address(0xC01B));
+        // executor has no ETH
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqActionWithCoinbase(400e18, 1 ether),
+            _defaultLiqSwap(),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("INSUFFICIENT_ETH");
+        executor.execute(plan);
+    }
+
+    function test_coinbasePayment_revertsOnFailedCall() public {
+        ETHRejecter rejecter = new ETHRejecter();
+        vm.coinbase(address(rejecter));
+        vm.deal(address(executor), 1 ether);
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqActionWithCoinbase(400e18, 0.5 ether),
+            _defaultLiqSwap(),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("COINBASE_PAYMENT_FAILED");
+        executor.execute(plan);
+    }
+
+    function test_coinbasePayment_zeroAmountNoOp() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqActionWithCoinbase(400e18, 0),
+            _defaultLiqSwap(),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(coinbase.balance, 0);
+    }
+
+    function test_coinbasePayment_profitStillChecked() public {
+        vm.coinbase(address(0xC01B));
+        vm.deal(address(executor), 1 ether);
+
+        // Payment sends ETH; profit is checked in ERC20 — both work independently
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqActionWithCoinbase(400e18, 0.1 ether),
+            _defaultLiqSwap(),
+            address(loanToken),
+            99e18
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan); // should not revert
+    }
+
+    function test_coinbasePayment_minProfitFailsIfUnprofitable() public {
+        vm.coinbase(address(0xC01B));
+        vm.deal(address(executor), 1 ether);
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqActionWithCoinbase(400e18, 0.1 ether),
+            _defaultLiqSwap(),
+            address(loanToken),
+            500e18 // impossibly high — revert on InsufficientProfit
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_coinbasePayment_invalidActionTypeReverts() public {
+        vm.coinbase(address(0xC01B));
+        vm.deal(address(executor), 1 ether);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = LiquidationExecutor.Action({
+            protocolId: 100, // PROTOCOL_INTERNAL
+            data: abi.encode(uint8(99), uint256(0.5 ether)) // invalid action type
+        });
+
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidAction.selector, 99));
+        executor.execute(plan);
+    }
+
+    function test_coinbasePayment_emitsEvent() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        vm.deal(address(executor), 1 ether);
+
+        bytes memory plan = _buildPlan(
+            1,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqActionWithCoinbase(400e18, 0.5 ether),
+            _defaultLiqSwap(),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectEmit(true, false, false, true);
+        emit LiquidationExecutor.CoinbasePaid(coinbase, 0.5 ether);
+        executor.execute(plan);
+    }
+
+    function test_coinbasePayment_balancerProvider() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        vm.deal(address(executor), 1 ether);
+
+        bytes memory plan = _buildPlan(
+            2, // Balancer
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqActionWithCoinbase(400e18, 0.5 ether),
+            _defaultLiqSwap(),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(coinbase.balance, 0.5 ether);
+    }
 }
+
+/// @dev Contract that rejects ETH — used to test coinbase payment failure
+contract ETHRejecter {
+    // No receive() or fallback() — rejects all ETH transfers
+
+    }
 
 /// @dev Flash provider mock that transfers LESS than requested (triggers INVALID_FLASH_LOAN)
 contract MockAavePoolStingy {

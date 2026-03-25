@@ -32,6 +32,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error SwapDeadlineInvalid(uint256 deadline);
     error SwapAmountInMismatch(uint256 expected, uint256 actual);
     error InvalidProtocolId(uint8 id);
+    error InvalidAction(uint8 actionType);
     error InsufficientRepayBalance(uint256 required, uint256 available);
     error RescueFailed();
     error CallbackAssetMismatch();
@@ -53,6 +54,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     uint8 public constant PROTOCOL_AAVE_V3 = 1;
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 public constant PROTOCOL_AAVE_V2 = 3;
+    uint8 public constant PROTOCOL_INTERNAL = 100;
+
+    uint8 public constant ACTION_PAY_COINBASE = 1;
 
     /// @dev Paraswap Augustus V6 supported selectors (GenericData layout)
     bytes4 private constant _SWAP_EXACT_AMOUNT_IN = bytes4(
@@ -96,6 +100,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     event LiquidationExecuted(
         uint8 indexed protocolId, address indexed collateralAsset, address indexed debtAsset, uint256 debtToCover
     );
+    event CoinbasePaid(address indexed coinbase, uint256 amount);
     event Rescue(address indexed token, address indexed to, uint256 amount);
 
     // ─── Plan Struct ─────────────────────────────────────────────────
@@ -257,6 +262,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     {
         for (uint256 i = 0; i < actions.length; ++i) {
             uint8 protocolId = actions[i].protocolId;
+
+            // Internal actions (e.g. coinbase payment) are not liquidation actions
+            if (protocolId == PROTOCOL_INTERNAL) continue;
+
             bytes memory data = actions[i].data;
 
             address actionDebt;
@@ -355,9 +364,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
 
-        // Execute all actions in order, then swap result back to loanToken for repay.
+        // Execute protocol actions (liquidations), then swap result back to loanToken for repay.
         for (uint256 i = 0; i < plan.actions.length; ++i) {
-            _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
+                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            }
         }
 
         // Post-action: verify collateral was received (if swap expects it)
@@ -366,6 +377,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         _executeSwap(plan.swapSpec);
+
+        // Execute internal actions (e.g. coinbase payment) after swap
+        for (uint256 i = 0; i < plan.actions.length; ++i) {
+            if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
+                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            }
+        }
 
         // Aave pulls repayment after we return true — approve exact amount
         _finalizeAaveFlashloan(asset, amount, amount + premium, plan.profitToken, profitBefore, plan.minProfit);
@@ -397,8 +415,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
 
+        // Execute protocol actions (liquidations)
         for (uint256 i = 0; i < plan.actions.length; ++i) {
-            _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
+                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            }
         }
 
         // Post-action: verify collateral was received
@@ -407,6 +428,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         _executeSwap(plan.swapSpec);
+
+        // Execute internal actions (e.g. coinbase payment) after swap
+        for (uint256 i = 0; i < plan.actions.length; ++i) {
+            if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
+                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            }
+        }
 
         // Balancer expects funds returned by end of callback via transfer
         uint256 repayAmount = amounts[0] + feeAmounts[0];
@@ -549,6 +577,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             _executeMorphoBlueAction(actionData);
         } else if (protocolId == PROTOCOL_AAVE_V2) {
             _executeAaveV2Liquidation(actionData);
+        } else if (protocolId == PROTOCOL_INTERNAL) {
+            _executeInternalAction(actionData);
         } else {
             revert InvalidProtocolId(protocolId);
         }
@@ -674,6 +704,29 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         IERC20(liq.debtAsset).forceApprove(pool, 0);
 
         emit LiquidationExecuted(PROTOCOL_AAVE_V2, liq.collateralAsset, liq.debtAsset, liq.debtToCover);
+    }
+
+    // ─── Internal: Execute Internal Action ──────────────────────────
+    function _executeInternalAction(bytes memory actionData) internal {
+        (uint8 actionType, uint256 amount) = abi.decode(actionData, (uint8, uint256));
+
+        if (actionType == ACTION_PAY_COINBASE) {
+            _payCoinbase(amount);
+        } else {
+            revert InvalidAction(actionType);
+        }
+    }
+
+    /// @dev Send ETH to block.coinbase. Reverts on failure or insufficient balance.
+    function _payCoinbase(uint256 amount) internal {
+        if (amount == 0) return;
+
+        require(address(this).balance >= amount, "INSUFFICIENT_ETH");
+
+        (bool success,) = block.coinbase.call{value: amount}("");
+        require(success, "COINBASE_PAYMENT_FAILED");
+
+        emit CoinbasePaid(block.coinbase, amount);
     }
 
     // ─── Rescue Functions ────────────────────────────────────────────
