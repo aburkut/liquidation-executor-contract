@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -28,6 +29,7 @@ contract ExecutorTest is Test {
     MockBalancerVault public balancerVault;
     MockParaswapAugustus public augustus;
     MockAaveV2LendingPool public aaveV2Pool;
+    MockWETH public mockWeth;
 
     address public owner = address(0xA11CE);
     address public operatorAddr = address(0xB0B);
@@ -54,6 +56,7 @@ contract ExecutorTest is Test {
         balancerVault = new MockBalancerVault(FLASH_FEE);
         augustus = new MockParaswapAugustus(SWAP_RATE);
         aaveV2Pool = new MockAaveV2LendingPool(COLLATERAL_REWARD);
+        mockWeth = new MockWETH();
 
         address[] memory targets = new address[](4);
         targets[0] = address(aavePool);
@@ -68,6 +71,7 @@ contract ExecutorTest is Test {
         executor.setMorphoBlue(address(morphoBlue));
         executor.setUniswapV3Router(address(0x1)); // placeholder, not used by new swap
         executor.setAaveV2LendingPool(address(aaveV2Pool));
+        executor.setWeth(address(mockWeth));
         vm.stopPrank();
 
         // Fund pools
@@ -80,6 +84,13 @@ contract ExecutorTest is Test {
         collateralToken.mint(address(morphoBlue), 100_000e18);
         collateralToken.mint(address(aaveV2Pool), 100_000e18);
         loanToken.mint(address(aaveV2Pool), 100_000e18);
+
+        // Fund pools with mockWeth for WETH-denominated coinbase tests
+        mockWeth.mint(address(aavePool), 100_000e18);
+        mockWeth.mint(address(balancerVault), 100_000e18);
+        mockWeth.mint(address(augustus), 100_000e18);
+        mockWeth.mint(address(executor), LOAN_AMOUNT + FLASH_FEE + 100e18);
+        vm.deal(address(mockWeth), 100_000 ether);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────
@@ -261,6 +272,45 @@ contract ExecutorTest is Test {
 
     function _defaultLiqSwap() internal view returns (LiquidationExecutor.SwapSpec memory) {
         return _buildSwapSpec(address(collateralToken), address(loanToken), COLLATERAL_REWARD, 0);
+    }
+
+    // ─── WETH-denominated helpers (for coinbase payment tests) ───────
+
+    function _wethLiqSwap() internal view returns (LiquidationExecutor.SwapSpec memory) {
+        return _buildSwapSpec(address(collateralToken), address(mockWeth), COLLATERAL_REWARD, 0);
+    }
+
+    function _wethLiqActionWithCoinbase(uint256 debtToCover, uint256 coinbaseAmount)
+        internal
+        view
+        returns (LiquidationExecutor.Action[] memory)
+    {
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(mockWeth), address(0x1234), debtToCover, false
+            )
+        });
+        actions[1] = _buildCoinbasePaymentAction(coinbaseAmount);
+        return actions;
+    }
+
+    function _buildWethPlan(uint8 flashProviderId, LiquidationExecutor.Action[] memory actions, uint256 minProfitAmt)
+        internal
+        view
+        returns (bytes memory)
+    {
+        return _buildPlan(
+            flashProviderId,
+            address(mockWeth),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            actions,
+            _wethLiqSwap(),
+            address(mockWeth),
+            minProfitAmt
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -2232,6 +2282,584 @@ contract ExecutorTest is Test {
         // No stuck tokens
         assertEq(loanToken.balanceOf(address(freshExec)), 0);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // COINBASE PAYMENT (requires profitToken == weth)
+    // ═══════════════════════════════════════════════════════════════════
+
+    function _buildCoinbasePaymentAction(uint256 amount) internal pure returns (LiquidationExecutor.Action memory) {
+        return LiquidationExecutor.Action({
+            protocolId: 100, // PROTOCOL_INTERNAL
+            data: abi.encode(uint8(1), amount) // ACTION_PAY_COINBASE
+        });
+    }
+
+    function test_coinbasePayment_sendsETH() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        vm.deal(address(executor), 1 ether);
+
+        vm.prank(operatorAddr);
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
+
+        assertEq(coinbase.balance, 0.5 ether);
+        assertEq(address(executor).balance, 0.5 ether);
+    }
+
+    function test_coinbasePayment_revertsInsufficientETH() public {
+        vm.coinbase(address(0xC01B));
+        // No pre-funded ETH. Auto-unwrap gets ~2361e18 wei from WETH.
+        // Payment of 100_000 ether exceeds that → INSUFFICIENT_ETH.
+        vm.prank(operatorAddr);
+        vm.expectRevert("INSUFFICIENT_ETH");
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 100_000 ether), 0));
+    }
+
+    function test_coinbasePayment_revertsOnFailedCall() public {
+        ETHRejecter rejecter = new ETHRejecter();
+        vm.coinbase(address(rejecter));
+        vm.deal(address(executor), 1 ether);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("COINBASE_PAYMENT_FAILED");
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
+    }
+
+    function test_coinbasePayment_zeroAmountNoOp() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+
+        vm.prank(operatorAddr);
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0), 0));
+
+        assertEq(coinbase.balance, 0);
+    }
+
+    function test_coinbasePayment_profitStillChecked() public {
+        vm.coinbase(address(0xC01B));
+        vm.deal(address(executor), 1 ether);
+
+        // Raw profit = 259e18. Coinbase = 0.1e18 (from pre-funded ETH).
+        // coinbaseCostNotInDelta = 0.1e18 (pre-funded, not in delta).
+        // effectiveProfit = 259 - 0.1 = 258.9 > 99 → passes.
+        vm.prank(operatorAddr);
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.1 ether), 99e18));
+    }
+
+    function test_coinbasePayment_minProfitFailsIfUnprofitable() public {
+        vm.coinbase(address(0xC01B));
+        vm.deal(address(executor), 1 ether);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.1 ether), 500e18));
+    }
+
+    function test_coinbasePayment_invalidActionTypeReverts() public {
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = LiquidationExecutor.Action({protocolId: 100, data: abi.encode(uint8(99), uint256(0.5 ether))});
+
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidAction.selector, 99));
+        executor.execute(plan);
+    }
+
+    function test_coinbasePayment_emitsEvent() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        vm.deal(address(executor), 1 ether);
+
+        vm.prank(operatorAddr);
+        vm.expectEmit(true, false, false, true);
+        emit LiquidationExecutor.CoinbasePaid(coinbase, 0.5 ether);
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
+    }
+
+    function test_coinbasePayment_balancerProvider() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        vm.deal(address(executor), 1 ether);
+
+        vm.prank(operatorAddr);
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
+
+        assertEq(coinbase.balance, 0.5 ether);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // COINBASE PAYMENT — UNIT RESTRICTION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice Coinbase payment reverts when profitToken != weth.
+    function test_coinbasePayment_revertsWhenProfitTokenNotWeth() public {
+        vm.coinbase(address(0xC01B));
+        vm.deal(address(executor), 1 ether);
+
+        // Build plan using loanToken as profitToken (not weth)
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildCoinbasePaymentAction(0.5 ether);
+
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.CoinbasePaymentRequiresWethProfit.selector);
+        executor.execute(plan);
+    }
+
+    /// @notice Coinbase payment reverts when weth is not configured.
+    function test_coinbasePayment_revertsWhenWethNotConfigured() public {
+        vm.coinbase(address(0xC01B));
+
+        // Deploy fresh executor without weth configured
+        address[] memory targets = new address[](2);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        LiquidationExecutor noWethExec =
+            new LiquidationExecutor(owner, address(aavePool), address(balancerVault), address(augustus), targets);
+        vm.prank(owner);
+        noWethExec.setOperator(operatorAddr);
+
+        // Fund it
+        loanToken.mint(address(noWethExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
+        collateralToken.mint(address(noWethExec), 1000e18);
+        vm.deal(address(noWethExec), 1 ether);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildCoinbasePaymentAction(0.5 ether);
+
+        // Build swap with correct beneficiary for noWethExec
+        LiquidationExecutor.SwapSpec memory swapSpec = _buildSwapSpec(
+            address(collateralToken),
+            address(loanToken),
+            COLLATERAL_REWARD,
+            0,
+            block.timestamp + 3600,
+            address(noWethExec)
+        );
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, swapSpec, address(loanToken), 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.WethNotConfigured.selector);
+        noWethExec.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // COINBASE PAYMENT — PROFIT ACCOUNTING
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice Trade profitable before coinbase payment FAILS minProfit after subtraction.
+    function test_coinbasePayment_subtractsFromProfit() public {
+        vm.coinbase(address(0xC01B));
+
+        // Raw profit = 259e18. Coinbase = 1e18 (from WETH unwrap, in delta).
+        // effectiveProfit = 258e18. minProfit = 259 → 258 < 259 → reverts.
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 1e18), 259e18));
+    }
+
+    /// @notice Exact boundary: effectiveProfit == minProfit after subtraction → passes.
+    function test_coinbasePayment_exactProfitBoundaryPasses() public {
+        vm.coinbase(address(0xC01B));
+
+        // effectiveProfit = 258e18. minProfit = 258 → passes.
+        vm.prank(operatorAddr);
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 1e18), 258e18));
+    }
+
+    /// @notice Pre-funded ETH does NOT bypass profit accounting.
+    function test_coinbasePayment_prefundedETH_subtracted() public {
+        vm.coinbase(address(0xC01B));
+        vm.deal(address(executor), 1000 ether);
+
+        // Raw profit = 259e18. Coinbase = 100e18 (from pre-funded ETH).
+        // coinbaseCostNotInDelta = 100 - 0 = 100 (no WETH unwrap since ETH available).
+        // effectiveProfit = 259 - 100 = 159. minProfit = 200 → reverts.
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 100e18), 200e18));
+    }
+
+    /// @notice Multiple coinbase payments are accumulated correctly.
+    function test_coinbasePayment_multiplePaymentsAccumulated() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        vm.deal(address(executor), 10 ether);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](3);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildCoinbasePaymentAction(1e18);
+        actions[2] = _buildCoinbasePaymentAction(2e18);
+
+        // Total coinbase = 3e18 (from pre-funded ETH). effectiveProfit = 259 - 3 = 256.
+        vm.prank(operatorAddr);
+        executor.execute(_buildWethPlan(1, actions, 256e18));
+
+        assertEq(coinbase.balance, 3 ether);
+    }
+
+    /// @notice Multiple payments exceed threshold → reverts.
+    function test_coinbasePayment_multiplePaymentsExceedProfit() public {
+        vm.coinbase(address(0xC01B));
+        vm.deal(address(executor), 10 ether);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](3);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildCoinbasePaymentAction(1e18);
+        actions[2] = _buildCoinbasePaymentAction(2e18);
+
+        // effectiveProfit = 256. minProfit = 257 → reverts.
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(_buildWethPlan(1, actions, 257e18));
+    }
+
+    /// @notice WETH auto-unwrap: no pre-funded ETH, payment funded from WETH.
+    function test_coinbasePayment_wethUnwrap() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        // No vm.deal → executor has 0 ETH, must unwrap WETH
+
+        vm.prank(operatorAddr);
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 1 ether), 0));
+
+        // Coinbase received ETH that could only have come from WETH unwrap
+        assertEq(coinbase.balance, 1 ether);
+        // Executor has no remaining ETH (all unwrapped ETH went to coinbase)
+        assertEq(address(executor).balance, 0);
+    }
+
+    /// @notice No double-counting when profitToken == WETH and payment is from WETH unwrap.
+    function test_coinbasePayment_wethProfitNoDoubleCount() public {
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        // No pre-funded ETH → payment entirely from WETH unwrap → captured in delta.
+        // coinbaseCostNotInDelta = totalCoinbasePayment - totalWethUnwrapped = 0.
+        // effectiveProfit = rawProfit - coinbaseAmount (from delta only, no subtraction).
+        // 259 - 1 = 258. minProfit = 258 → passes.
+        // If double-counted: 259 - 1 (delta) - 1 (subtraction) = 257 < 258 → would revert.
+
+        vm.prank(operatorAddr);
+        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 1e18), 258e18));
+
+        assertEq(coinbase.balance, 1 ether);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // ERC20 BUILDER PAYMENT
+    // ═══════════════════════════════════════════════════════════════════
+
+    function _buildBuilderERC20PaymentAction(address token, address builder, uint256 amount)
+        internal
+        pure
+        returns (LiquidationExecutor.Action memory)
+    {
+        return LiquidationExecutor.Action({
+            protocolId: 100, // PROTOCOL_INTERNAL
+            data: abi.encode(uint8(2), token, builder, amount) // ACTION_PAY_BUILDER_ERC20
+        });
+    }
+
+    /// @notice ERC20 builder payment transfers correct amount.
+    function test_builderERC20_transfersAmount() public {
+        address builder = address(0xBEEF);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildBuilderERC20PaymentAction(address(loanToken), builder, 5e18);
+
+        // profitToken = loanToken, raw profit = 259e18, ERC20 payment = 5e18
+        // ERC20 payment is in profitToken → automatically in delta
+        // effectiveProfit = 259 - 5 = 254e18
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(loanToken.balanceOf(builder), 5e18);
+    }
+
+    /// @notice ERC20 builder payment reverts on insufficient token balance.
+    function test_builderERC20_revertsInsufficientBalance() public {
+        address builder = address(0xBEEF);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        // Payment larger than total balance
+        actions[1] = _buildBuilderERC20PaymentAction(address(loanToken), builder, 999_999e18);
+
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("INSUFFICIENT_TOKEN");
+        executor.execute(plan);
+    }
+
+    /// @notice ERC20 payment must use profitToken — mismatched token reverts.
+    function test_builderERC20_revertsTokenMismatch() public {
+        address builder = address(0xBEEF);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        // Use collateralToken instead of profitToken (loanToken)
+        actions[1] = _buildBuilderERC20PaymentAction(address(collateralToken), builder, 1e18);
+
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("BUILDER_PAYMENT_TOKEN_MISMATCH");
+        executor.execute(plan);
+    }
+
+    /// @notice ERC20 payment with zero builder address reverts.
+    function test_builderERC20_revertsZeroBuilder() public {
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildBuilderERC20PaymentAction(address(loanToken), address(0), 1e18);
+
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert("INVALID_BUILDER");
+        executor.execute(plan);
+    }
+
+    /// @notice Zero-amount ERC20 payment is a safe no-op.
+    function test_builderERC20_zeroAmountNoOp() public {
+        address builder = address(0xBEEF);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildBuilderERC20PaymentAction(address(loanToken), builder, 0);
+
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(loanToken.balanceOf(builder), 0);
+    }
+
+    /// @notice ERC20 builder payment reduces effective profit and can fail minProfit.
+    function test_builderERC20_reducesEffectiveProfit() public {
+        address builder = address(0xBEEF);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        // ERC20 payment = 10e18 in profitToken → effectiveProfit = 259 - 10 = 249
+        actions[1] = _buildBuilderERC20PaymentAction(address(loanToken), builder, 10e18);
+
+        // minProfit = 250 > 249 → reverts
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 250e18
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    /// @notice Combined coinbase + ERC20 payments both reduce effective profit.
+    /// Both payments must use WETH-denominated path (profitToken == weth).
+    function test_combinedPayments_reducesProfit() public {
+        address builder = address(0xBEEF);
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+        vm.deal(address(executor), 10 ether);
+
+        // 3 actions: liquidation + coinbase(1e18) + ERC20(5e18 mockWeth)
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](3);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildCoinbasePaymentAction(1e18);
+        actions[2] = _buildBuilderERC20PaymentAction(address(mockWeth), builder, 5e18);
+
+        // Raw profit = 259. Coinbase = 1 (pre-funded ETH, subtracted in _checkProfit).
+        // ERC20 = 5 (in delta). effectiveProfit = 259 - 5 - 1 = 253.
+        vm.prank(operatorAddr);
+        executor.execute(_buildWethPlan(1, actions, 253e18));
+
+        assertEq(coinbase.balance, 1 ether);
+        assertEq(mockWeth.balanceOf(builder), 5e18);
+    }
+
+    /// @notice Combined payments exceed profit threshold.
+    function test_combinedPayments_exceedsProfitReverts() public {
+        address builder = address(0xBEEF);
+        vm.coinbase(address(0xC01B));
+        vm.deal(address(executor), 10 ether);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](3);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildCoinbasePaymentAction(1e18);
+        actions[2] = _buildBuilderERC20PaymentAction(address(mockWeth), builder, 5e18);
+
+        // effectiveProfit = 253. minProfit = 254 → reverts.
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(_buildWethPlan(1, actions, 254e18));
+    }
+
+    /// @notice ERC20 builder payment emits BuilderPaid event.
+    function test_builderERC20_emitsEvent() public {
+        address builder = address(0xBEEF);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildBuilderERC20PaymentAction(address(loanToken), builder, 5e18);
+
+        bytes memory plan = _buildPlan(
+            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultLiqSwap(), address(loanToken), 0
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectEmit(true, true, false, true);
+        emit LiquidationExecutor.BuilderPaid(builder, address(loanToken), 5e18);
+        executor.execute(plan);
+    }
+
+    /// @notice ERC20 builder payment works with Balancer flash provider.
+    function test_builderERC20_balancerProvider() public {
+        address builder = address(0xBEEF);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 400e18, false
+            )
+        });
+        actions[1] = _buildBuilderERC20PaymentAction(address(loanToken), builder, 5e18);
+
+        bytes memory plan = _buildPlan(
+            2, // Balancer
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            actions,
+            _defaultLiqSwap(),
+            address(loanToken),
+            0
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(loanToken.balanceOf(builder), 5e18);
+    }
+}
+
+/// @dev Contract that rejects ETH — used to test coinbase payment failure
+contract ETHRejecter {
+    // No receive() or fallback() — rejects all ETH transfers
+
+    }
+
+/// @dev Mock WETH for testing auto-unwrap in coinbase payment
+contract MockWETH is ERC20 {
+    constructor() ERC20("Wrapped Ether", "WETH") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function withdraw(uint256 amount) external {
+        _burn(msg.sender, amount);
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        require(success, "WETH: ETH transfer failed");
+    }
+
+    receive() external payable {}
 }
 
 /// @dev Flash provider mock that transfers LESS than requested (triggers INVALID_FLASH_LOAN)

@@ -12,6 +12,10 @@ import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.s
 import {IMorphoBlue, MarketParams} from "./interfaces/IMorphoBlue.sol";
 import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 
+interface IWETH {
+    function withdraw(uint256 amount) external;
+}
+
 /// @title LiquidationExecutor
 /// @notice Flashloan + Swap + Repay/Liquidation executor.
 /// @dev Fail-closed. No upgradeability. External calls restricted to allowedTargets allowlist.
@@ -32,6 +36,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error SwapDeadlineInvalid(uint256 deadline);
     error SwapAmountInMismatch(uint256 expected, uint256 actual);
     error InvalidProtocolId(uint8 id);
+    error InvalidAction(uint8 actionType);
     error InsufficientRepayBalance(uint256 required, uint256 available);
     error RescueFailed();
     error CallbackAssetMismatch();
@@ -45,6 +50,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error InvalidSwapSelector();
     error ZeroBalance();
     error EmptyArray();
+    error CoinbasePaymentRequiresWethProfit();
+    error WethNotConfigured();
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
@@ -53,6 +60,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     uint8 public constant PROTOCOL_AAVE_V3 = 1;
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 public constant PROTOCOL_AAVE_V2 = 3;
+    uint8 public constant PROTOCOL_INTERNAL = 100;
+
+    uint8 public constant ACTION_PAY_COINBASE = 1;
+    uint8 public constant ACTION_PAY_BUILDER_ERC20 = 2;
 
     /// @dev Paraswap Augustus V6 supported selectors (GenericData layout)
     bytes4 private constant _SWAP_EXACT_AMOUNT_IN = bytes4(
@@ -78,6 +89,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     address public balancerVault;
     address public paraswapAugustusV6;
     address public aaveV2LendingPool;
+    address public weth;
 
     mapping(uint8 => address) public allowedFlashProviders;
     mapping(address => bool) public allowedTargets;
@@ -96,6 +108,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     event LiquidationExecuted(
         uint8 indexed protocolId, address indexed collateralAsset, address indexed debtAsset, uint256 debtToCover
     );
+    event CoinbasePaid(address indexed coinbase, uint256 amount);
+    event BuilderPaid(address indexed builder, address indexed token, uint256 amount);
     event Rescue(address indexed token, address indexed to, uint256 amount);
 
     // ─── Plan Struct ─────────────────────────────────────────────────
@@ -230,6 +244,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         emit ConfigUpdated("aaveV2Pool", old, pool);
     }
 
+    function setWeth(address weth_) external onlyOwner {
+        if (weth_ == address(0)) revert ZeroAddress();
+        address old = weth;
+        weth = weth_;
+        emit ConfigUpdated("weth", old, weth_);
+    }
+
     function setFlashProvider(uint8 providerId, address provider) external onlyOwner {
         if (provider == address(0)) revert ZeroAddress();
         if (!allowedTargets[provider]) revert TargetNotAllowed(provider);
@@ -257,6 +278,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     {
         for (uint256 i = 0; i < actions.length; ++i) {
             uint8 protocolId = actions[i].protocolId;
+
+            // Internal actions (e.g. coinbase payment) are not liquidation actions
+            if (protocolId == PROTOCOL_INTERNAL) continue;
+
             bytes memory data = actions[i].data;
 
             address actionDebt;
@@ -355,9 +380,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
 
-        // Execute all actions in order, then swap result back to loanToken for repay.
+        // Execute protocol actions (liquidations), then swap result back to loanToken for repay.
         for (uint256 i = 0; i < plan.actions.length; ++i) {
-            _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
+                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            }
         }
 
         // Post-action: verify collateral was received (if swap expects it)
@@ -367,8 +394,28 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         _executeSwap(plan.swapSpec);
 
+        // Execute internal actions (payments) after swap, with accounting
+        uint256 totalCoinbasePayment;
+        uint256 totalWethUnwrapped;
+        for (uint256 i = 0; i < plan.actions.length; ++i) {
+            if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
+                (uint256 cbPaid, uint256 wethUsed) = _executeInternalAction(plan.actions[i].data, plan.profitToken);
+                totalCoinbasePayment += cbPaid;
+                totalWethUnwrapped += wethUsed;
+            }
+        }
+
         // Aave pulls repayment after we return true — approve exact amount
-        _finalizeAaveFlashloan(asset, amount, amount + premium, plan.profitToken, profitBefore, plan.minProfit);
+        _finalizeAaveFlashloan(
+            asset,
+            amount,
+            amount + premium,
+            plan.profitToken,
+            profitBefore,
+            plan.minProfit,
+            totalCoinbasePayment,
+            totalWethUnwrapped
+        );
         return true;
     }
 
@@ -397,8 +444,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
 
+        // Execute protocol actions (liquidations)
         for (uint256 i = 0; i < plan.actions.length; ++i) {
-            _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
+                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            }
         }
 
         // Post-action: verify collateral was received
@@ -408,10 +458,29 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         _executeSwap(plan.swapSpec);
 
+        // Execute internal actions (payments) after swap, with accounting
+        uint256 totalCoinbasePayment;
+        uint256 totalWethUnwrapped;
+        for (uint256 i = 0; i < plan.actions.length; ++i) {
+            if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
+                (uint256 cbPaid, uint256 wethUsed) = _executeInternalAction(plan.actions[i].data, plan.profitToken);
+                totalCoinbasePayment += cbPaid;
+                totalWethUnwrapped += wethUsed;
+            }
+        }
+
         // Balancer expects funds returned by end of callback via transfer
         uint256 repayAmount = amounts[0] + feeAmounts[0];
         _finalizeBalancerFlashloan(
-            address(tokens[0]), amounts[0], repayAmount, msg.sender, plan.profitToken, profitBefore, plan.minProfit
+            address(tokens[0]),
+            amounts[0],
+            repayAmount,
+            msg.sender,
+            plan.profitToken,
+            profitBefore,
+            plan.minProfit,
+            totalCoinbasePayment,
+            totalWethUnwrapped
         );
     }
 
@@ -422,7 +491,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint256 repayAmount,
         address profitTkn,
         uint256 profitBefore,
-        uint256 minProfit
+        uint256 minProfit,
+        uint256 totalCoinbasePayment,
+        uint256 totalWethUnwrapped
     ) internal {
         uint256 balance = IERC20(asset).balanceOf(address(this));
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
@@ -430,7 +501,17 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Approve exact repay to Aave pool — pool pulls after we return true
         IERC20(asset).forceApprove(msg.sender, repayAmount);
 
-        _checkProfit(asset, principalAmount, repayAmount, profitTkn, profitBefore, minProfit, true);
+        _checkProfit(
+            asset,
+            principalAmount,
+            repayAmount,
+            profitTkn,
+            profitBefore,
+            minProfit,
+            true,
+            totalCoinbasePayment,
+            totalWethUnwrapped
+        );
     }
 
     // ─── Internal: Finalize Balancer Flashloan ───────────────────────
@@ -441,7 +522,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address vault,
         address profitTkn,
         uint256 profitBefore,
-        uint256 minProfit
+        uint256 minProfit,
+        uint256 totalCoinbasePayment,
+        uint256 totalWethUnwrapped
     ) internal {
         uint256 balance = IERC20(asset).balanceOf(address(this));
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
@@ -449,7 +532,17 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Balancer: transfer back to vault
         IERC20(asset).safeTransfer(vault, repayAmount);
 
-        _checkProfit(asset, principalAmount, repayAmount, profitTkn, profitBefore, minProfit, false);
+        _checkProfit(
+            asset,
+            principalAmount,
+            repayAmount,
+            profitTkn,
+            profitBefore,
+            minProfit,
+            false,
+            totalCoinbasePayment,
+            totalWethUnwrapped
+        );
     }
 
     // ─── Internal: Check Profit ──────────────────────────────────────
@@ -460,7 +553,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address profitTkn,
         uint256 profitBefore,
         uint256 minProfit,
-        bool repayPending // true for Aave (pool pulls later), false for Balancer (already transferred)
+        bool repayPending, // true for Aave (pool pulls later), false for Balancer (already transferred)
+        uint256 totalCoinbasePayment,
+        uint256 totalWethUnwrapped
     ) internal view {
         uint256 profitAfter = IERC20(profitTkn).balanceOf(address(this));
         uint256 effectiveProfit;
@@ -478,6 +573,22 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             }
         } else {
             effectiveProfit = profitAfter > profitBefore ? profitAfter - profitBefore : 0;
+        }
+
+        // Subtract coinbase payment cost not already captured in ERC20 delta.
+        // When profitToken is WETH and WETH was unwrapped to fund payment,
+        // that portion already reduced profitAfter — only subtract the remainder
+        // (ETH paid from pre-funded balance, invisible to ERC20 delta).
+        if (totalCoinbasePayment > 0) {
+            uint256 coinbaseCostNotInDelta;
+            address wethAddr = weth;
+            if (wethAddr != address(0) && profitTkn == wethAddr) {
+                coinbaseCostNotInDelta =
+                    totalCoinbasePayment > totalWethUnwrapped ? totalCoinbasePayment - totalWethUnwrapped : 0;
+            } else {
+                coinbaseCostNotInDelta = totalCoinbasePayment;
+            }
+            effectiveProfit = effectiveProfit > coinbaseCostNotInDelta ? effectiveProfit - coinbaseCostNotInDelta : 0;
         }
 
         if (effectiveProfit < minProfit) revert InsufficientProfit(effectiveProfit, minProfit);
@@ -674,6 +785,77 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         IERC20(liq.debtAsset).forceApprove(pool, 0);
 
         emit LiquidationExecuted(PROTOCOL_AAVE_V2, liq.collateralAsset, liq.debtAsset, liq.debtToCover);
+    }
+
+    // ─── Internal: Execute Internal Action ──────────────────────────
+    /// @dev Centralized dispatch for PROTOCOL_INTERNAL actions.
+    /// Returns coinbase payment accounting for profit validation.
+    function _executeInternalAction(bytes memory actionData, address profitToken)
+        internal
+        returns (uint256 coinbasePaid, uint256 wethUnwrapped)
+    {
+        uint8 actionType = abi.decode(actionData, (uint8));
+
+        if (actionType == ACTION_PAY_COINBASE) {
+            // Coinbase payment is ETH-denominated — only valid when profit is in WETH
+            // so that the subtraction in _checkProfit uses consistent units.
+            if (weth == address(0)) revert WethNotConfigured();
+            if (profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
+
+            (, uint256 amount) = abi.decode(actionData, (uint8, uint256));
+            wethUnwrapped = _payCoinbase(amount);
+            coinbasePaid = amount;
+        } else if (actionType == ACTION_PAY_BUILDER_ERC20) {
+            (, address token, address builder, uint256 amount) =
+                abi.decode(actionData, (uint8, address, address, uint256));
+            _payBuilderERC20(token, builder, amount, profitToken);
+        } else {
+            revert InvalidAction(actionType);
+        }
+    }
+
+    /// @dev Transfer ERC20 to builder. Token must match profitToken so the cost
+    /// is automatically captured in the ERC20 balance delta used by _checkProfit.
+    function _payBuilderERC20(address token, address builder, uint256 amount, address profitToken) internal {
+        if (amount == 0) return;
+
+        require(builder != address(0), "INVALID_BUILDER");
+        require(token != address(0), "INVALID_TOKEN");
+        require(token == profitToken, "BUILDER_PAYMENT_TOKEN_MISMATCH");
+
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        require(balance >= amount, "INSUFFICIENT_TOKEN");
+
+        IERC20(token).safeTransfer(builder, amount);
+
+        emit BuilderPaid(builder, token, amount);
+    }
+
+    /// @dev Send ETH to block.coinbase. Only reachable when profitToken == weth (enforced by caller).
+    /// Auto-unwraps WETH if insufficient ETH. Returns the amount unwrapped (for profit accounting).
+    function _payCoinbase(uint256 amount) internal returns (uint256 wethUnwrapped) {
+        if (amount == 0) return 0;
+
+        // Auto-unwrap WETH if insufficient ETH and WETH is configured
+        if (address(this).balance < amount) {
+            address wethAddr = weth;
+            if (wethAddr != address(0)) {
+                uint256 deficit = amount - address(this).balance;
+                uint256 wethBal = IERC20(wethAddr).balanceOf(address(this));
+                uint256 toUnwrap = deficit < wethBal ? deficit : wethBal;
+                if (toUnwrap > 0) {
+                    IWETH(wethAddr).withdraw(toUnwrap);
+                    wethUnwrapped = toUnwrap;
+                }
+            }
+        }
+
+        require(address(this).balance >= amount, "INSUFFICIENT_ETH");
+
+        (bool success,) = block.coinbase.call{value: amount}("");
+        require(success, "COINBASE_PAYMENT_FAILED");
+
+        emit CoinbasePaid(block.coinbase, amount);
     }
 
     // ─── Rescue Functions ────────────────────────────────────────────
