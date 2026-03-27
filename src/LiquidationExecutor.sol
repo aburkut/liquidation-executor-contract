@@ -17,9 +17,9 @@ interface IWETH {
 }
 
 /// @title LiquidationExecutor
-/// @notice Flashloan + Swap + Repay/Liquidation executor.
+/// @notice Flashloan + multi-swap + liquidation executor.
 /// @dev Fail-closed. No upgradeability. External calls restricted to allowedTargets allowlist.
-/// Swaps are executed via Paraswap Augustus (a trusted generic router) using operator-supplied calldata.
+/// Supports Paraswap single/double swaps and Bebop multi-output swaps.
 contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanSimpleReceiver, IFlashLoanRecipient {
     using SafeERC20 for IERC20;
 
@@ -29,28 +29,55 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error InvalidPlan();
     error FlashProviderNotAllowed();
     error FlashFeeExceeded(uint256 actual, uint256 max);
-    error InsufficientProfit(uint256 actual, uint256 required);
     error InvalidCallbackCaller();
     error InvalidInitiator();
-    error SwapRecipientInvalid(address recipient);
-    error SwapDeadlineInvalid(uint256 deadline);
-    error SwapAmountInMismatch(uint256 expected, uint256 actual);
     error InvalidProtocolId(uint8 id);
     error InvalidAction(uint8 actionType);
-    error InsufficientRepayBalance(uint256 required, uint256 available);
     error RescueFailed();
     error CallbackAssetMismatch();
     error CallbackAmountMismatch();
     error BalancerSingleTokenOnly();
-    error SwapFailed();
-    error InsufficientSwapOutput(uint256 actual, uint256 minimum);
-    error InsufficientSrcBalance(uint256 required, uint256 available);
-    error TargetNotAllowed(address target);
-    error InvalidSwapSpec();
-    error InvalidSwapSelector();
     error ZeroBalance();
     error EmptyArray();
+
+    // Swap errors
+    error InvalidSwapMode();
+    error InvalidDoubleSwapPattern();
+    error SwapDeadlineExpired(uint256 deadline, uint256 current);
+    error InsufficientRepayOutput(uint256 actual, uint256 required);
+    error RepayTokenMismatch(address expected, address actual);
+
+    // Paraswap errors
+    error InvalidParaswapCalldata();
+    error InvalidSwapSelector();
+    error SwapRecipientInvalid(address recipient);
+    error ParaswapSwapFailed();
+    error ParaswapSrcTokenMismatch(address expected, address actual);
+    error ParaswapAmountInMismatch(uint256 expected, uint256 actual);
+    error ParaswapDstTokenUnexpected(address dstToken);
+
+    // Bebop errors
+    error InvalidBebopTarget();
+    error InvalidBebopCalldata();
+    error BebopTargetNotContract();
+    error BebopSwapFailed();
+
+    // Double swap errors
+    error SplitSrcTokenMismatch(address src1, address src2);
+    error SplitDstTokensMustDiffer(address dst);
+    error SplitNoRepayLeg();
+    error SplitRepayLegInsufficient(uint256 actual, uint256 required);
+    error SplitDstTokenUnexpected(address dst1, address dst2);
+    error ChainLinkMismatch(address dst1, address src2);
+    error ChainDstNotRepay(address dst2, address repayToken);
+    error Leg1SrcNotCollateral(address src1, address collateral);
+
+    // Profit / payment errors
+    error InsufficientProfit(uint256 actual, uint256 required);
     error CoinbasePaymentRequiresWethProfit();
+    error InsufficientRepayBalance(uint256 required, uint256 available);
+    error InsufficientSrcBalance(uint256 required, uint256 available);
+    error TargetNotAllowed(address target);
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
@@ -62,7 +89,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     uint8 public constant PROTOCOL_INTERNAL = 100;
 
     uint8 public constant ACTION_PAY_COINBASE = 1;
-    uint8 public constant ACTION_PAY_BUILDER_ERC20 = 2;
 
     /// @dev Paraswap Augustus V6 supported selectors (GenericData layout)
     bytes4 private constant _SWAP_EXACT_AMOUNT_IN = bytes4(
@@ -82,9 +108,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     address public aavePool;
     address public morphoBlue;
     // NOTE: Legacy configuration field.
-    // The executor currently performs swaps via Paraswap Augustus.
-    // This variable is kept for backward compatibility but is not used
-    // in the current execution flow.
     address public uniswapV3Router;
     address public balancerVault;
     address public paraswapAugustusV6;
@@ -94,12 +117,12 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     mapping(address => bool) public allowedTargets;
 
     bytes32 private _activePlanHash;
+    address private _collateralAsset;
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
     event FlashProviderUpdated(uint8 indexed providerId, address indexed oldProvider, address indexed newProvider);
     event FlashExecuted(uint8 indexed providerId, address indexed loanToken, uint256 loanAmount);
-    event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
     event RepayExecuted(
         uint8 indexed protocolId, bytes32 indexed positionKeyHash, address indexed asset, uint256 amount
     );
@@ -107,17 +130,57 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint8 indexed protocolId, address indexed collateralAsset, address indexed debtAsset, uint256 debtToCover
     );
     event CoinbasePaid(address indexed coinbase, uint256 amount);
-    event BuilderPaid(address indexed builder, address indexed token, uint256 amount);
     event Rescue(address indexed token, address indexed to, uint256 amount);
 
-    // ─── Plan Struct ─────────────────────────────────────────────────
-    struct SwapSpec {
+    // Swap events
+    event ParaswapSwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
+    event BebopSwapExecuted(
+        address indexed target, address indexed srcToken, uint256 amountIn, uint256 repayDelta, uint256 profitDelta
+    );
+    event DoubleSwapExecuted(
+        DoubleSwapPattern indexed pattern,
+        address srcToken1,
+        address dstToken1,
+        uint256 amountIn1,
+        uint256 amountOut1,
+        address srcToken2,
+        address dstToken2,
+        uint256 amountIn2,
+        uint256 amountOut2
+    );
+
+    // ─── Enums ────────────────────────────────────────────────────────
+    enum SwapMode {
+        PARASWAP_SINGLE,
+        BEBOP_MULTI,
+        PARASWAP_DOUBLE
+    }
+
+    enum DoubleSwapPattern {
+        SPLIT,
+        CHAINED
+    }
+
+    // ─── Plan Structs ─────────────────────────────────────────────────
+    struct SwapPlan {
+        SwapMode mode;
+        // PARASWAP_SINGLE and BEBOP_MULTI only (ignored by PARASWAP_DOUBLE):
         address srcToken;
-        address dstToken;
         uint256 amountIn;
-        uint256 minAmountOut;
+        // All modes:
         uint256 deadline;
+        // PARASWAP_SINGLE: single swap calldata. PARASWAP_DOUBLE: swap 1 calldata.
         bytes paraswapCalldata;
+        // BEBOP_MULTI only:
+        address bebopTarget;
+        bytes bebopCalldata;
+        // PARASWAP_DOUBLE only:
+        DoubleSwapPattern doubleSwapPattern;
+        bytes paraswapCalldata2;
+        // Output validation:
+        address repayToken;
+        address profitToken;
+        uint256 minProfitAmount;
     }
 
     struct Action {
@@ -131,9 +194,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint256 loanAmount;
         uint256 maxFlashFee;
         Action[] actions;
-        SwapSpec swapSpec;
-        address profitToken;
-        uint256 minProfit;
+        SwapPlan swapPlan;
     }
 
     uint8 private constant MAX_ACTIONS = 10;
@@ -221,9 +282,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         emit ConfigUpdated("morphoBlue", old, morpho);
     }
 
-    // NOTE: Legacy setter. The executor currently performs swaps via Paraswap Augustus.
-    // This setter is kept for backward compatibility but the stored value is not used
-    // in the current execution flow.
+    // NOTE: Legacy setter.
     function setUniswapV3Router(address router) external onlyOwner {
         if (router == address(0)) revert ZeroAddress();
         address old = uniswapV3Router;
@@ -258,7 +317,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     // ─── Internal: Validate Actions ─────────────────────────────────
     /// @dev Validates all actions share the same debt/collateral assets and have non-zero amounts.
     /// Returns the common collateralAsset for swap validation.
-    /// Gas-efficient: reads only the required fields from ABI-encoded action data.
     function _validateActions(Action[] memory actions, address loanToken)
         internal
         pure
@@ -310,19 +368,37 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
-        if (plan.profitToken == address(0)) revert ZeroAddress();
+        if (plan.swapPlan.profitToken == address(0)) revert ZeroAddress();
         require(plan.actions.length > 0, "NO_ACTIONS");
         require(plan.actions.length <= MAX_ACTIONS, "TOO_MANY_ACTIONS");
 
+        // Repay token must equal loan token
+        if (plan.swapPlan.repayToken != plan.loanToken) {
+            revert RepayTokenMismatch(plan.loanToken, plan.swapPlan.repayToken);
+        }
+
         // Validate all actions use same debt/collateral assets
         address collateralAsset = _validateActions(plan.actions, plan.loanToken);
+        _collateralAsset = collateralAsset;
 
-        // Swap dstToken must equal loanToken (to repay flash loan).
-        require(plan.swapSpec.dstToken == plan.loanToken, "INVALID_SWAP_SPEC");
+        // Collateral linkage for SINGLE/BEBOP (DOUBLE validated after calldata extraction)
+        if (plan.swapPlan.mode != SwapMode.PARASWAP_DOUBLE) {
+            if (collateralAsset != address(0)) {
+                require(plan.swapPlan.srcToken == collateralAsset, "SRC_NOT_COLLATERAL");
+            }
+        }
 
-        // Swap srcToken must equal collateral (if liquidation actions produce collateral)
-        if (collateralAsset != address(0)) {
-            require(plan.swapSpec.srcToken == collateralAsset, "INVALID_SWAP_SPEC");
+        // Mode-specific validation
+        if (plan.swapPlan.mode == SwapMode.PARASWAP_SINGLE) {
+            if (plan.swapPlan.paraswapCalldata.length < 4) revert InvalidParaswapCalldata();
+        } else if (plan.swapPlan.mode == SwapMode.BEBOP_MULTI) {
+            if (plan.swapPlan.bebopTarget == address(0)) revert InvalidBebopTarget();
+            if (plan.swapPlan.bebopCalldata.length < 4) revert InvalidBebopCalldata();
+        } else if (plan.swapPlan.mode == SwapMode.PARASWAP_DOUBLE) {
+            if (plan.swapPlan.paraswapCalldata.length < 4) revert InvalidParaswapCalldata();
+            if (plan.swapPlan.paraswapCalldata2.length < 4) revert InvalidParaswapCalldata();
+        } else {
+            revert InvalidSwapMode();
         }
 
         address provider = allowedFlashProviders[plan.flashProviderId];
@@ -343,6 +419,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         _activePlanHash = bytes32(0);
+        _collateralAsset = address(0);
         emit FlashExecuted(plan.flashProviderId, plan.loanToken, plan.loanAmount);
     }
 
@@ -366,28 +443,32 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Pre-execution: verify flash loan funds received
         require(IERC20(plan.loanToken).balanceOf(address(this)) >= plan.loanAmount, "INVALID_FLASH_LOAN");
 
-        uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
+        uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
 
-        // Execute protocol actions (liquidations), then swap result back to loanToken for repay.
+        // Execute protocol actions (liquidations), skip INTERNAL
         for (uint256 i = 0; i < plan.actions.length; ++i) {
             if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
                 _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
             }
         }
 
-        // Post-action: verify collateral was received (if swap expects it)
-        if (plan.swapSpec.srcToken != plan.loanToken) {
-            require(IERC20(plan.swapSpec.srcToken).balanceOf(address(this)) > 0, "NO_COLLATERAL");
+        // Post-action: verify collateral received (SINGLE/BEBOP only; DOUBLE checks per-leg)
+        if (plan.swapPlan.mode != SwapMode.PARASWAP_DOUBLE) {
+            if (plan.swapPlan.srcToken != plan.loanToken) {
+                require(IERC20(plan.swapPlan.srcToken).balanceOf(address(this)) > 0, "NO_COLLATERAL");
+            }
         }
 
-        _executeSwap(plan.swapSpec);
+        uint256 flashRepayAmount = amount + premium;
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount);
 
-        // Execute internal actions (payments) after swap, with accounting
+        // Execute internal actions (coinbase payment) after swap
         uint256 totalCoinbasePayment;
         uint256 totalWethUnwrapped;
         for (uint256 i = 0; i < plan.actions.length; ++i) {
             if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
-                (uint256 cbPaid, uint256 wethUsed) = _executeInternalAction(plan.actions[i].data, plan.profitToken);
+                (uint256 cbPaid, uint256 wethUsed) =
+                    _executeInternalAction(plan.actions[i].data, plan.swapPlan.profitToken);
                 totalCoinbasePayment += cbPaid;
                 totalWethUnwrapped += wethUsed;
             }
@@ -397,10 +478,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         _finalizeAaveFlashloan(
             asset,
             amount,
-            amount + premium,
-            plan.profitToken,
+            flashRepayAmount,
+            plan.swapPlan.profitToken,
             profitBefore,
-            plan.minProfit,
+            plan.swapPlan.minProfitAmount,
             totalCoinbasePayment,
             totalWethUnwrapped
         );
@@ -430,7 +511,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Pre-execution: verify flash loan funds received
         require(IERC20(plan.loanToken).balanceOf(address(this)) >= plan.loanAmount, "INVALID_FLASH_LOAN");
 
-        uint256 profitBefore = IERC20(plan.profitToken).balanceOf(address(this));
+        uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
 
         // Execute protocol actions (liquidations)
         for (uint256 i = 0; i < plan.actions.length; ++i) {
@@ -439,34 +520,37 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             }
         }
 
-        // Post-action: verify collateral was received
-        if (plan.swapSpec.srcToken != plan.loanToken) {
-            require(IERC20(plan.swapSpec.srcToken).balanceOf(address(this)) > 0, "NO_COLLATERAL");
+        // Post-action: verify collateral received (SINGLE/BEBOP only)
+        if (plan.swapPlan.mode != SwapMode.PARASWAP_DOUBLE) {
+            if (plan.swapPlan.srcToken != plan.loanToken) {
+                require(IERC20(plan.swapPlan.srcToken).balanceOf(address(this)) > 0, "NO_COLLATERAL");
+            }
         }
 
-        _executeSwap(plan.swapSpec);
+        uint256 flashRepayAmount = amounts[0] + feeAmounts[0];
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount);
 
-        // Execute internal actions (payments) after swap, with accounting
+        // Execute internal actions (coinbase payment) after swap
         uint256 totalCoinbasePayment;
         uint256 totalWethUnwrapped;
         for (uint256 i = 0; i < plan.actions.length; ++i) {
             if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
-                (uint256 cbPaid, uint256 wethUsed) = _executeInternalAction(plan.actions[i].data, plan.profitToken);
+                (uint256 cbPaid, uint256 wethUsed) =
+                    _executeInternalAction(plan.actions[i].data, plan.swapPlan.profitToken);
                 totalCoinbasePayment += cbPaid;
                 totalWethUnwrapped += wethUsed;
             }
         }
 
         // Balancer expects funds returned by end of callback via transfer
-        uint256 repayAmount = amounts[0] + feeAmounts[0];
         _finalizeBalancerFlashloan(
             address(tokens[0]),
             amounts[0],
-            repayAmount,
+            flashRepayAmount,
             msg.sender,
-            plan.profitToken,
+            plan.swapPlan.profitToken,
             profitBefore,
-            plan.minProfit,
+            plan.swapPlan.minProfitAmount,
             totalCoinbasePayment,
             totalWethUnwrapped
         );
@@ -479,7 +563,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint256 repayAmount,
         address profitTkn,
         uint256 profitBefore,
-        uint256 minProfit,
+        uint256 minProfitAmount,
         uint256 totalCoinbasePayment,
         uint256 totalWethUnwrapped
     ) internal {
@@ -495,7 +579,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             repayAmount,
             profitTkn,
             profitBefore,
-            minProfit,
+            minProfitAmount,
             true,
             totalCoinbasePayment,
             totalWethUnwrapped
@@ -510,7 +594,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address vault,
         address profitTkn,
         uint256 profitBefore,
-        uint256 minProfit,
+        uint256 minProfitAmount,
         uint256 totalCoinbasePayment,
         uint256 totalWethUnwrapped
     ) internal {
@@ -526,7 +610,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             repayAmount,
             profitTkn,
             profitBefore,
-            minProfit,
+            minProfitAmount,
             false,
             totalCoinbasePayment,
             totalWethUnwrapped
@@ -540,7 +624,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint256 repayAmount,
         address profitTkn,
         uint256 profitBefore,
-        uint256 minProfit,
+        uint256 minProfitAmount,
         bool repayPending, // true for Aave (pool pulls later), false for Balancer (already transferred)
         uint256 totalCoinbasePayment,
         uint256 totalWethUnwrapped
@@ -565,8 +649,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         // Subtract coinbase payment cost not already captured in ERC20 delta.
         // When profitToken is WETH and WETH was unwrapped to fund payment,
-        // that portion already reduced profitAfter — only subtract the remainder
-        // (ETH paid from pre-funded balance, invisible to ERC20 delta).
+        // that portion already reduced profitAfter — only subtract the remainder.
         if (totalCoinbasePayment > 0) {
             uint256 coinbaseCostNotInDelta;
             address wethAddr = weth;
@@ -579,20 +662,139 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             effectiveProfit = effectiveProfit > coinbaseCostNotInDelta ? effectiveProfit - coinbaseCostNotInDelta : 0;
         }
 
-        if (effectiveProfit < minProfit) revert InsufficientProfit(effectiveProfit, minProfit);
+        if (effectiveProfit < minProfitAmount) revert InsufficientProfit(effectiveProfit, minProfitAmount);
     }
 
-    // ─── Internal: Execute Swap (ParaSwap) ───────────────────────────
-    function _executeSwap(SwapSpec memory spec) internal {
-        if (spec.srcToken == address(0) || spec.dstToken == address(0)) revert InvalidSwapSpec();
-        if (spec.amountIn == 0) revert InvalidSwapSpec();
-        if (spec.paraswapCalldata.length < 4) revert InvalidSwapSpec();
+    // ─── Internal: Execute Swap Plan ─────────────────────────────────
+    /// @dev Dispatches swap by mode, validates repay output covers flash loan obligation.
+    function _executeSwapPlan(SwapPlan memory plan, uint256 flashRepayAmount) internal {
+        if (block.timestamp > plan.deadline) revert SwapDeadlineExpired(plan.deadline, block.timestamp);
 
-        // ── Deadline validation ──
-        if (spec.deadline < block.timestamp) revert SwapDeadlineInvalid(spec.deadline);
+        uint256 repayBefore = IERC20(plan.repayToken).balanceOf(address(this));
 
-        // ── Selector & calldata validation ──
-        bytes memory cd = spec.paraswapCalldata;
+        if (plan.mode == SwapMode.PARASWAP_SINGLE) {
+            _executeParaswapSingle(plan);
+        } else if (plan.mode == SwapMode.BEBOP_MULTI) {
+            _executeBebopMulti(plan, repayBefore);
+        } else if (plan.mode == SwapMode.PARASWAP_DOUBLE) {
+            _executeParaswapDouble(plan, flashRepayAmount);
+        } else {
+            revert InvalidSwapMode();
+        }
+
+        uint256 repayDelta = IERC20(plan.repayToken).balanceOf(address(this)) - repayBefore;
+        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+    }
+
+    // ─── Internal: Paraswap Single ───────────────────────────────────
+    function _executeParaswapSingle(SwapPlan memory plan) internal {
+        if (plan.srcToken == address(0)) revert ZeroAddress();
+        if (plan.amountIn == 0) revert InvalidPlan();
+
+        (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut) =
+            _executeParaswapCall(plan.paraswapCalldata);
+
+        if (srcToken != plan.srcToken) revert ParaswapSrcTokenMismatch(plan.srcToken, srcToken);
+        if (amountIn != plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
+        if (dstToken != plan.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
+
+        emit ParaswapSwapExecuted(srcToken, dstToken, amountIn, amountOut);
+    }
+
+    // ─── Internal: Bebop Multi ───────────────────────────────────────
+    /// @dev Executes opaque Bebop settlement call. Security: allowlist + exact approval + output delta checks.
+    function _executeBebopMulti(SwapPlan memory plan, uint256 repayBefore) internal {
+        address target = plan.bebopTarget;
+        if (target == address(0)) revert InvalidBebopTarget();
+        if (target.code.length == 0) revert BebopTargetNotContract();
+        if (!allowedTargets[target]) revert TargetNotAllowed(target);
+        if (plan.srcToken == address(0)) revert ZeroAddress();
+        if (plan.amountIn == 0) revert InvalidPlan();
+        if (plan.bebopCalldata.length < 4) revert InvalidBebopCalldata();
+
+        uint256 srcBal = IERC20(plan.srcToken).balanceOf(address(this));
+        if (srcBal < plan.amountIn) revert InsufficientSrcBalance(plan.amountIn, srcBal);
+
+        // Snapshot profitToken for event (separate from repayToken if different)
+        uint256 profitSnapBefore;
+        if (plan.repayToken != plan.profitToken) {
+            profitSnapBefore = IERC20(plan.profitToken).balanceOf(address(this));
+        }
+
+        // Exact approval, call, reset
+        IERC20(plan.srcToken).forceApprove(target, plan.amountIn);
+        (bool ok,) = target.call(plan.bebopCalldata);
+        IERC20(plan.srcToken).forceApprove(target, 0);
+
+        if (!ok) revert BebopSwapFailed();
+
+        // Compute deltas for event
+        uint256 repayDelta = IERC20(plan.repayToken).balanceOf(address(this)) - repayBefore;
+        uint256 profitDelta = plan.repayToken == plan.profitToken
+            ? repayDelta
+            : IERC20(plan.profitToken).balanceOf(address(this)) - profitSnapBefore;
+
+        emit BebopSwapExecuted(target, plan.srcToken, plan.amountIn, repayDelta, profitDelta);
+    }
+
+    // ─── Internal: Paraswap Double ───────────────────────────────────
+    /// @dev PARASWAP_DOUBLE supports two routing patterns:
+    ///
+    /// Split pattern (same srcToken, different dstTokens):
+    ///   collateral ──┬── swap1 ──→ repayToken
+    ///                └── swap2 ──→ profitToken
+    ///
+    /// Chained pattern (swap1 output feeds swap2 input):
+    ///   collateral ── swap1 ──→ intermediate ── swap2 ──→ repayToken
+    ///
+    /// Each leg is self-contained: srcToken and amountIn extracted from calldata.
+    function _executeParaswapDouble(SwapPlan memory plan, uint256 flashRepayAmount) internal {
+        (address src1, address dst1, uint256 amountIn1, uint256 amountOut1) =
+            _executeParaswapCall(plan.paraswapCalldata);
+        (address src2, address dst2, uint256 amountIn2, uint256 amountOut2) =
+            _executeParaswapCall(plan.paraswapCalldata2);
+
+        // Collateral linkage: leg 1 must consume liquidation collateral
+        address collateral = _collateralAsset;
+        if (collateral != address(0)) {
+            if (src1 != collateral) revert Leg1SrcNotCollateral(src1, collateral);
+        }
+
+        if (plan.doubleSwapPattern == DoubleSwapPattern.SPLIT) {
+            if (src1 != src2) revert SplitSrcTokenMismatch(src1, src2);
+            if (dst1 == dst2) revert SplitDstTokensMustDiffer(dst1);
+
+            // Identify repay leg and validate output
+            if (dst1 == plan.repayToken) {
+                if (amountOut1 < flashRepayAmount) revert SplitRepayLegInsufficient(amountOut1, flashRepayAmount);
+                if (dst2 != plan.profitToken) revert SplitDstTokenUnexpected(dst1, dst2);
+            } else if (dst2 == plan.repayToken) {
+                if (amountOut2 < flashRepayAmount) revert SplitRepayLegInsufficient(amountOut2, flashRepayAmount);
+                if (dst1 != plan.profitToken) revert SplitDstTokenUnexpected(dst1, dst2);
+            } else {
+                revert SplitNoRepayLeg();
+            }
+        } else if (plan.doubleSwapPattern == DoubleSwapPattern.CHAINED) {
+            if (dst1 != src2) revert ChainLinkMismatch(dst1, src2);
+            if (dst2 != plan.repayToken) revert ChainDstNotRepay(dst2, plan.repayToken);
+        } else {
+            revert InvalidDoubleSwapPattern();
+        }
+
+        emit DoubleSwapExecuted(
+            plan.doubleSwapPattern, src1, dst1, amountIn1, amountOut1, src2, dst2, amountIn2, amountOut2
+        );
+    }
+
+    // ─── Internal: Execute Single Paraswap Call ──────────────────────
+    /// @dev Executes a single Paraswap swap with full calldata validation.
+    /// Extracted from the original _executeSwap. Keeps all existing validation.
+    function _executeParaswapCall(bytes memory cd)
+        internal
+        returns (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut)
+    {
+        if (cd.length < 260) revert InvalidParaswapCalldata();
+
         bytes4 selector;
         assembly {
             selector := mload(add(cd, 32))
@@ -602,42 +804,39 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             revert InvalidSwapSelector();
         }
 
-        // Both selectors share the same GenericData layout (7 static fields after executor).
-        // Minimum: selector(4) + executor(32) + 7 GenericData fields(224) = 260 bytes.
-        if (cd.length < 260) revert InvalidSwapSpec();
-
         address beneficiary;
         uint256 fromAmount;
         assembly {
             let p := add(cd, 36) // skip length prefix (32) + selector (4)
+            srcToken := and(mload(add(p, 32)), 0xffffffffffffffffffffffffffffffffffffffff) // GenericData.srcToken
+            dstToken := and(mload(add(p, 64)), 0xffffffffffffffffffffffffffffffffffffffff) // GenericData.destToken
             fromAmount := mload(add(p, 96)) // GenericData.fromAmount
             beneficiary := and(mload(add(p, 224)), 0xffffffffffffffffffffffffffffffffffffffff) // GenericData.beneficiary
         }
 
         if (beneficiary != address(this)) revert SwapRecipientInvalid(beneficiary);
-        if (fromAmount != spec.amountIn) revert SwapAmountInMismatch(spec.amountIn, fromAmount);
+        if (srcToken == address(0)) revert ZeroAddress();
+        if (dstToken == address(0)) revert ZeroAddress();
+        amountIn = fromAmount;
 
         address augustus = paraswapAugustusV6;
         if (augustus == address(0)) revert ZeroAddress();
         if (!allowedTargets[augustus]) revert TargetNotAllowed(augustus);
 
-        uint256 srcBal = IERC20(spec.srcToken).balanceOf(address(this));
-        if (srcBal < spec.amountIn) revert InsufficientSrcBalance(spec.amountIn, srcBal);
+        uint256 srcBal = IERC20(srcToken).balanceOf(address(this));
+        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
 
-        uint256 dstBefore = IERC20(spec.dstToken).balanceOf(address(this));
+        uint256 dstBefore = IERC20(dstToken).balanceOf(address(this));
 
         // Approve exact amountIn, call, reset
-        IERC20(spec.srcToken).forceApprove(augustus, spec.amountIn);
-        (bool ok,) = augustus.call(spec.paraswapCalldata);
-        IERC20(spec.srcToken).forceApprove(augustus, 0);
+        IERC20(srcToken).forceApprove(augustus, amountIn);
+        (bool ok,) = augustus.call(cd);
+        IERC20(srcToken).forceApprove(augustus, 0);
 
-        if (!ok) revert SwapFailed();
+        if (!ok) revert ParaswapSwapFailed();
 
-        uint256 dstAfter = IERC20(spec.dstToken).balanceOf(address(this));
-        uint256 amountOut = dstAfter - dstBefore;
-        if (amountOut < spec.minAmountOut) revert InsufficientSwapOutput(amountOut, spec.minAmountOut);
-
-        emit SwapExecuted(spec.srcToken, spec.dstToken, spec.amountIn, amountOut);
+        uint256 dstAfter = IERC20(dstToken).balanceOf(address(this));
+        amountOut = dstAfter - dstBefore;
     }
 
     // ─── Internal: Execute Target Action ─────────────────────────────
@@ -777,7 +976,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     // ─── Internal: Execute Internal Action ──────────────────────────
     /// @dev Centralized dispatch for PROTOCOL_INTERNAL actions.
-    /// Returns coinbase payment accounting for profit validation.
+    /// Only supports ACTION_PAY_COINBASE. Returns coinbase payment accounting.
     function _executeInternalAction(bytes memory actionData, address profitToken)
         internal
         returns (uint256 coinbasePaid, uint256 wethUnwrapped)
@@ -786,36 +985,14 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         if (actionType == ACTION_PAY_COINBASE) {
             // Coinbase payment is ETH-denominated — only valid when profit is in WETH
-            // so that the subtraction in _checkProfit uses consistent units.
             if (profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
 
             (, uint256 amount) = abi.decode(actionData, (uint8, uint256));
             wethUnwrapped = _payCoinbase(amount);
             coinbasePaid = amount;
-        } else if (actionType == ACTION_PAY_BUILDER_ERC20) {
-            (, address token, address builder, uint256 amount) =
-                abi.decode(actionData, (uint8, address, address, uint256));
-            _payBuilderERC20(token, builder, amount, profitToken);
         } else {
             revert InvalidAction(actionType);
         }
-    }
-
-    /// @dev Transfer ERC20 to builder. Token must match profitToken so the cost
-    /// is automatically captured in the ERC20 balance delta used by _checkProfit.
-    function _payBuilderERC20(address token, address builder, uint256 amount, address profitToken) internal {
-        if (amount == 0) return;
-
-        require(builder != address(0), "INVALID_BUILDER");
-        require(token != address(0), "INVALID_TOKEN");
-        require(token == profitToken, "BUILDER_PAYMENT_TOKEN_MISMATCH");
-
-        uint256 balance = IERC20(token).balanceOf(address(this));
-        require(balance >= amount, "INSUFFICIENT_TOKEN");
-
-        IERC20(token).safeTransfer(builder, amount);
-
-        emit BuilderPaid(builder, token, amount);
     }
 
     /// @dev Send ETH to block.coinbase. Only reachable when profitToken == weth (enforced by caller).
@@ -823,7 +1000,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     function _payCoinbase(uint256 amount) internal returns (uint256 wethUnwrapped) {
         if (amount == 0) return 0;
 
-        // Auto-unwrap WETH if insufficient ETH and WETH is configured
+        // Auto-unwrap WETH if insufficient ETH
         if (address(this).balance < amount) {
             address wethAddr = weth;
             if (wethAddr != address(0)) {

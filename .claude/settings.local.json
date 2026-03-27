@@ -17,7 +17,8 @@
       "WebFetch(domain:optimistic.etherscan.io)",
       "WebFetch(domain:api.etherscan.io)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:help.velora.xyz)"
+      "WebFetch(domain:help.velora.xyz)",
+      "Bash(git add:*)"
     ]
   }
 }
