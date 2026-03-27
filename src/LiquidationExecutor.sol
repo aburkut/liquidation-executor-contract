@@ -52,6 +52,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error InvalidSwapSelector();
     error SwapRecipientInvalid(address recipient);
     error ParaswapSwapFailed();
+    error ZeroSwapOutput();
     error ParaswapSrcTokenMismatch(address expected, address actual);
     error ParaswapAmountInMismatch(uint256 expected, uint256 actual);
     error ParaswapDstTokenUnexpected(address dstToken);
@@ -117,7 +118,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     mapping(address => bool) public allowedTargets;
 
     bytes32 private _activePlanHash;
-    address private _collateralAsset;
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
@@ -366,6 +366,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
         Plan memory plan = abi.decode(planData, (Plan));
 
+        // Early deadline check — reject stale plans before any state changes
+        if (block.timestamp > plan.swapPlan.deadline) {
+            revert SwapDeadlineExpired(plan.swapPlan.deadline, block.timestamp);
+        }
+
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
         if (plan.swapPlan.profitToken == address(0)) revert ZeroAddress();
@@ -379,7 +384,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         // Validate all actions use same debt/collateral assets
         address collateralAsset = _validateActions(plan.actions, plan.loanToken);
-        _collateralAsset = collateralAsset;
 
         // Collateral linkage for SINGLE/BEBOP (DOUBLE validated after calldata extraction)
         if (plan.swapPlan.mode != SwapMode.PARASWAP_DOUBLE) {
@@ -419,7 +423,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         _activePlanHash = bytes32(0);
-        _collateralAsset = address(0);
         emit FlashExecuted(plan.flashProviderId, plan.loanToken, plan.loanAmount);
     }
 
@@ -460,7 +463,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         uint256 flashRepayAmount = amount + premium;
-        _executeSwapPlan(plan.swapPlan, flashRepayAmount);
+        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset);
 
         // Execute internal actions (coinbase payment) after swap
         uint256 totalCoinbasePayment;
@@ -528,7 +532,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         uint256 flashRepayAmount = amounts[0] + feeAmounts[0];
-        _executeSwapPlan(plan.swapPlan, flashRepayAmount);
+        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset);
 
         // Execute internal actions (coinbase payment) after swap
         uint256 totalCoinbasePayment;
@@ -667,7 +672,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     // ─── Internal: Execute Swap Plan ─────────────────────────────────
     /// @dev Dispatches swap by mode, validates repay output covers flash loan obligation.
-    function _executeSwapPlan(SwapPlan memory plan, uint256 flashRepayAmount) internal {
+    function _executeSwapPlan(SwapPlan memory plan, uint256 flashRepayAmount, address collateralAsset) internal {
         if (block.timestamp > plan.deadline) revert SwapDeadlineExpired(plan.deadline, block.timestamp);
 
         uint256 repayBefore = IERC20(plan.repayToken).balanceOf(address(this));
@@ -675,9 +680,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (plan.mode == SwapMode.PARASWAP_SINGLE) {
             _executeParaswapSingle(plan);
         } else if (plan.mode == SwapMode.BEBOP_MULTI) {
-            _executeBebopMulti(plan, repayBefore);
+            _executeBebopMulti(plan, repayBefore, flashRepayAmount);
         } else if (plan.mode == SwapMode.PARASWAP_DOUBLE) {
-            _executeParaswapDouble(plan, flashRepayAmount);
+            _executeParaswapDouble(plan, flashRepayAmount, collateralAsset);
         } else {
             revert InvalidSwapMode();
         }
@@ -703,7 +708,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     // ─── Internal: Bebop Multi ───────────────────────────────────────
     /// @dev Executes opaque Bebop settlement call. Security: allowlist + exact approval + output delta checks.
-    function _executeBebopMulti(SwapPlan memory plan, uint256 repayBefore) internal {
+    function _executeBebopMulti(SwapPlan memory plan, uint256 repayBefore, uint256 flashRepayAmount) internal {
         address target = plan.bebopTarget;
         if (target == address(0)) revert InvalidBebopTarget();
         if (target.code.length == 0) revert BebopTargetNotContract();
@@ -728,8 +733,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         if (!ok) revert BebopSwapFailed();
 
-        // Compute deltas for event
+        // Early output check — validate repay coverage immediately after call
         uint256 repayDelta = IERC20(plan.repayToken).balanceOf(address(this)) - repayBefore;
+        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+
         uint256 profitDelta = plan.repayToken == plan.profitToken
             ? repayDelta
             : IERC20(plan.profitToken).balanceOf(address(this)) - profitSnapBefore;
@@ -748,16 +755,15 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     ///   collateral ── swap1 ──→ intermediate ── swap2 ──→ repayToken
     ///
     /// Each leg is self-contained: srcToken and amountIn extracted from calldata.
-    function _executeParaswapDouble(SwapPlan memory plan, uint256 flashRepayAmount) internal {
+    function _executeParaswapDouble(SwapPlan memory plan, uint256 flashRepayAmount, address collateralAsset) internal {
         (address src1, address dst1, uint256 amountIn1, uint256 amountOut1) =
             _executeParaswapCall(plan.paraswapCalldata);
         (address src2, address dst2, uint256 amountIn2, uint256 amountOut2) =
             _executeParaswapCall(plan.paraswapCalldata2);
 
         // Collateral linkage: leg 1 must consume liquidation collateral
-        address collateral = _collateralAsset;
-        if (collateral != address(0)) {
-            if (src1 != collateral) revert Leg1SrcNotCollateral(src1, collateral);
+        if (collateralAsset != address(0)) {
+            if (src1 != collateralAsset) revert Leg1SrcNotCollateral(src1, collateralAsset);
         }
 
         if (plan.doubleSwapPattern == DoubleSwapPattern.SPLIT) {
@@ -837,6 +843,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         uint256 dstAfter = IERC20(dstToken).balanceOf(address(this));
         amountOut = dstAfter - dstBefore;
+        if (amountOut == 0) revert ZeroSwapOutput();
     }
 
     // ─── Internal: Execute Target Action ─────────────────────────────
