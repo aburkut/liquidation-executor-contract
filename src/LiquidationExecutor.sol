@@ -9,7 +9,6 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 import {IAaveV3Pool, IFlashLoanSimpleReceiver} from "./interfaces/IAaveV3Pool.sol";
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
-import {IMorphoBlue, MarketParams} from "./interfaces/IMorphoBlue.sol";
 import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 
 interface IWETH {
@@ -39,6 +38,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error BalancerSingleTokenOnly();
     error ZeroBalance();
     error EmptyArray();
+    error NoLiquidationAction();
+    error NoCollateralReceived();
+    error UnsupportedActionType(uint8 actionType);
+    error ZeroActionAmount();
+    error DebtAssetMismatch(address expected, address actual);
+    error CollateralAssetMismatch(address expected, address actual);
+    error SrcTokenNotCollateral(address expected, address actual);
+    error NoActions();
+    error TooManyActions(uint256 count);
+    error InvalidFlashLoan();
+    error InsufficientEth(uint256 required, uint256 available);
+    error CoinbasePaymentFailed();
 
     // Swap errors
     error InvalidSwapMode();
@@ -214,15 +225,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         bool receiveAToken;
     }
 
-    // ─── Morpho Blue target action ───────────────────────────────────
-    struct MorphoBlueAction {
-        uint8 actionType; // 1 = repay, 2 = withdrawCollateral, 3 = supplyCollateral
-        MarketParams marketParams;
-        uint256 assets;
-        uint256 shares;
-        address onBehalfOf;
-    }
-
     // ─── Aave V2 liquidation action ──────────────────────────────────
     struct AaveV2Liquidation {
         address collateralAsset;
@@ -315,13 +317,15 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     }
 
     // ─── Internal: Validate Actions ─────────────────────────────────
-    /// @dev Validates all actions share the same debt/collateral assets and have non-zero amounts.
-    /// Returns the common collateralAsset for swap validation.
+    /// @dev Validates all liquidation actions share the same debt/collateral assets.
+    /// Requires at least one liquidation action. Returns the common collateralAsset.
     function _validateActions(Action[] memory actions, address loanToken)
         internal
         pure
         returns (address collateralAsset)
     {
+        uint256 liquidationCount;
+
         for (uint256 i = 0; i < actions.length; ++i) {
             uint8 protocolId = actions[i].protocolId;
 
@@ -336,7 +340,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
             if (protocolId == PROTOCOL_AAVE_V3) {
                 AaveV3Action memory a = abi.decode(data, (AaveV3Action));
-                require(a.actionType == 4, "UNSUPPORTED_ACTION");
+                if (a.actionType != 4) revert UnsupportedActionType(a.actionType);
                 actionDebt = a.debtAsset;
                 actionCollateral = a.collateralAsset;
                 actionAmount = a.debtToCover;
@@ -346,20 +350,26 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
                 actionCollateral = a.collateralAsset;
                 actionAmount = a.debtToCover;
             } else {
-                revert("INVALID_PROTOCOL");
+                revert InvalidProtocolId(protocolId);
             }
 
-            require(actionAmount > 0, "ZERO_ACTION_AMOUNT");
-            require(actionDebt == loanToken, "INVALID_DEBT_ASSET");
+            if (actionAmount == 0) revert ZeroActionAmount();
+            if (actionDebt != loanToken) revert DebtAssetMismatch(loanToken, actionDebt);
 
             if (actionCollateral != address(0)) {
                 if (collateralAsset == address(0)) {
                     collateralAsset = actionCollateral;
                 } else {
-                    require(actionCollateral == collateralAsset, "INVALID_COLLATERAL_ASSET");
+                    if (actionCollateral != collateralAsset) {
+                        revert CollateralAssetMismatch(collateralAsset, actionCollateral);
+                    }
                 }
             }
+
+            liquidationCount++;
         }
+
+        if (liquidationCount == 0) revert NoLiquidationAction();
     }
 
     // ─── Core Execute ────────────────────────────────────────────────
@@ -374,8 +384,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
         if (plan.swapPlan.profitToken == address(0)) revert ZeroAddress();
-        require(plan.actions.length > 0, "NO_ACTIONS");
-        require(plan.actions.length <= MAX_ACTIONS, "TOO_MANY_ACTIONS");
+        if (plan.actions.length == 0) revert NoActions();
+        if (plan.actions.length > MAX_ACTIONS) revert TooManyActions(plan.actions.length);
 
         // Repay token must equal loan token
         if (plan.swapPlan.repayToken != plan.loanToken) {
@@ -388,7 +398,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Collateral linkage for SINGLE/BEBOP (DOUBLE validated after calldata extraction)
         if (plan.swapPlan.mode != SwapMode.PARASWAP_DOUBLE) {
             if (collateralAsset != address(0)) {
-                require(plan.swapPlan.srcToken == collateralAsset, "SRC_NOT_COLLATERAL");
+                if (plan.swapPlan.srcToken != collateralAsset) {
+                    revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.srcToken);
+                }
             }
         }
 
@@ -444,9 +456,17 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (premium > plan.maxFlashFee) revert FlashFeeExceeded(premium, plan.maxFlashFee);
 
         // Pre-execution: verify flash loan funds received
-        require(IERC20(plan.loanToken).balanceOf(address(this)) >= plan.loanAmount, "INVALID_FLASH_LOAN");
+        if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
+        // Derive collateralAsset for delta check and swap plan
+        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
+
+        // Snapshot BEFORE protocol actions
         uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
+        uint256 collateralBefore;
+        if (collateralAsset != address(0)) {
+            collateralBefore = IERC20(collateralAsset).balanceOf(address(this));
+        }
 
         // Execute protocol actions (liquidations), skip INTERNAL
         for (uint256 i = 0; i < plan.actions.length; ++i) {
@@ -455,15 +475,12 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             }
         }
 
-        // Post-action: verify collateral received (SINGLE/BEBOP only; DOUBLE checks per-leg)
-        if (plan.swapPlan.mode != SwapMode.PARASWAP_DOUBLE) {
-            if (plan.swapPlan.srcToken != plan.loanToken) {
-                require(IERC20(plan.swapPlan.srcToken).balanceOf(address(this)) > 0, "NO_COLLATERAL");
-            }
+        // Post-action: verify liquidation produced collateral (delta-based, all modes)
+        if (collateralAsset != address(0)) {
+            if (IERC20(collateralAsset).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
         }
 
         uint256 flashRepayAmount = amount + premium;
-        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
         _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset);
 
         // Execute internal actions (coinbase payment) after swap
@@ -513,9 +530,17 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (feeAmounts[0] > plan.maxFlashFee) revert FlashFeeExceeded(feeAmounts[0], plan.maxFlashFee);
 
         // Pre-execution: verify flash loan funds received
-        require(IERC20(plan.loanToken).balanceOf(address(this)) >= plan.loanAmount, "INVALID_FLASH_LOAN");
+        if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
+        // Derive collateralAsset for delta check and swap plan
+        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
+
+        // Snapshot BEFORE protocol actions
         uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
+        uint256 collateralBefore;
+        if (collateralAsset != address(0)) {
+            collateralBefore = IERC20(collateralAsset).balanceOf(address(this));
+        }
 
         // Execute protocol actions (liquidations)
         for (uint256 i = 0; i < plan.actions.length; ++i) {
@@ -524,15 +549,12 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             }
         }
 
-        // Post-action: verify collateral received (SINGLE/BEBOP only)
-        if (plan.swapPlan.mode != SwapMode.PARASWAP_DOUBLE) {
-            if (plan.swapPlan.srcToken != plan.loanToken) {
-                require(IERC20(plan.swapPlan.srcToken).balanceOf(address(this)) > 0, "NO_COLLATERAL");
-            }
+        // Post-action: verify liquidation produced collateral (delta-based, all modes)
+        if (collateralAsset != address(0)) {
+            if (IERC20(collateralAsset).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
         }
 
         uint256 flashRepayAmount = amounts[0] + feeAmounts[0];
-        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
         _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset);
 
         // Execute internal actions (coinbase payment) after swap
@@ -849,9 +871,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     // ─── Internal: Execute Target Action ─────────────────────────────
     function _executeTargetAction(uint8 protocolId, bytes memory actionData) internal {
         if (protocolId == PROTOCOL_AAVE_V3) {
-            _executeAaveV3Action(actionData);
-        } else if (protocolId == PROTOCOL_MORPHO_BLUE) {
-            _executeMorphoBlueAction(actionData);
+            _executeAaveV3Liquidation(actionData);
         } else if (protocolId == PROTOCOL_AAVE_V2) {
             _executeAaveV2Liquidation(actionData);
         } else {
@@ -859,47 +879,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
     }
 
-    function _executeAaveV3Action(bytes memory actionData) internal {
+    function _executeAaveV3Liquidation(bytes memory actionData) internal {
         AaveV3Action memory action = abi.decode(actionData, (AaveV3Action));
 
         address pool = aavePool;
         if (pool == address(0)) revert ZeroAddress();
         if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
-
-        if (action.actionType == 4) {
-            _executeAaveV3Liquidation(pool, action);
-            return;
-        }
-
-        if (action.actionType == 1) {
-            IERC20(action.asset).forceApprove(pool, action.amount);
-            uint256 repaid =
-                IAaveV3Pool(pool).repay(action.asset, action.amount, action.interestRateMode, action.onBehalfOf);
-            IERC20(action.asset).forceApprove(pool, 0);
-            emit RepayExecuted(
-                PROTOCOL_AAVE_V3, keccak256(abi.encodePacked(action.asset, action.onBehalfOf)), action.asset, repaid
-            );
-        } else if (action.actionType == 2) {
-            uint256 withdrawn = IAaveV3Pool(pool).withdraw(action.asset, action.amount, address(this));
-            emit RepayExecuted(
-                PROTOCOL_AAVE_V3, keccak256(abi.encodePacked(action.asset, action.onBehalfOf)), action.asset, withdrawn
-            );
-        } else if (action.actionType == 3) {
-            IERC20(action.asset).forceApprove(pool, action.amount);
-            IAaveV3Pool(pool).supply(action.asset, action.amount, action.onBehalfOf, 0);
-            IERC20(action.asset).forceApprove(pool, 0);
-            emit RepayExecuted(
-                PROTOCOL_AAVE_V3,
-                keccak256(abi.encodePacked(action.asset, action.onBehalfOf)),
-                action.asset,
-                action.amount
-            );
-        } else {
-            revert InvalidPlan();
-        }
-    }
-
-    function _executeAaveV3Liquidation(address pool, AaveV3Action memory action) internal {
+        if (action.actionType != 4) revert UnsupportedActionType(action.actionType);
         if (action.user == address(0)) revert ZeroAddress();
         if (action.debtToCover == 0) revert InvalidPlan();
 
@@ -911,59 +897,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         IERC20(action.debtAsset).forceApprove(pool, 0);
 
         emit LiquidationExecuted(PROTOCOL_AAVE_V3, action.collateralAsset, action.debtAsset, action.debtToCover);
-    }
-
-    function _executeMorphoBlueAction(bytes memory actionData) internal {
-        MorphoBlueAction memory action = abi.decode(actionData, (MorphoBlueAction));
-
-        address morpho = morphoBlue;
-        if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
-
-        if (action.actionType == 1) {
-            _morphoRepay(morpho, action);
-        } else if (action.actionType == 2) {
-            _morphoWithdrawCollateral(morpho, action);
-        } else if (action.actionType == 3) {
-            _morphoSupplyCollateral(morpho, action);
-        } else {
-            revert InvalidPlan();
-        }
-    }
-
-    function _morphoRepay(address morpho, MorphoBlueAction memory action) internal {
-        IERC20(action.marketParams.loanToken).forceApprove(morpho, action.assets);
-        (uint256 assetsRepaid,) =
-            IMorphoBlue(morpho).repay(action.marketParams, action.assets, action.shares, action.onBehalfOf, "");
-        IERC20(action.marketParams.loanToken).forceApprove(morpho, 0);
-        emit RepayExecuted(
-            PROTOCOL_MORPHO_BLUE,
-            keccak256(abi.encode(action.marketParams)),
-            action.marketParams.loanToken,
-            assetsRepaid
-        );
-    }
-
-    function _morphoWithdrawCollateral(address morpho, MorphoBlueAction memory action) internal {
-        IMorphoBlue(morpho).withdrawCollateral(action.marketParams, action.assets, action.onBehalfOf, address(this));
-        emit RepayExecuted(
-            PROTOCOL_MORPHO_BLUE,
-            keccak256(abi.encode(action.marketParams)),
-            action.marketParams.collateralToken,
-            action.assets
-        );
-    }
-
-    function _morphoSupplyCollateral(address morpho, MorphoBlueAction memory action) internal {
-        IERC20(action.marketParams.collateralToken).forceApprove(morpho, action.assets);
-        IMorphoBlue(morpho).supplyCollateral(action.marketParams, action.assets, action.onBehalfOf, "");
-        IERC20(action.marketParams.collateralToken).forceApprove(morpho, 0);
-        emit RepayExecuted(
-            PROTOCOL_MORPHO_BLUE,
-            keccak256(abi.encode(action.marketParams)),
-            action.marketParams.collateralToken,
-            action.assets
-        );
     }
 
     function _executeAaveV2Liquidation(bytes memory actionData) internal {
@@ -1021,10 +954,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             }
         }
 
-        require(address(this).balance >= amount, "INSUFFICIENT_ETH");
+        if (address(this).balance < amount) revert InsufficientEth(amount, address(this).balance);
 
         (bool success,) = block.coinbase.call{value: amount}("");
-        require(success, "COINBASE_PAYMENT_FAILED");
+        if (!success) revert CoinbasePaymentFailed();
 
         emit CoinbasePaid(block.coinbase, amount);
     }
