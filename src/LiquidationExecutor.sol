@@ -10,6 +10,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IAaveV3Pool, IFlashLoanSimpleReceiver} from "./interfaces/IAaveV3Pool.sol";
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
+import {IMorphoBlue, MarketParams} from "./interfaces/IMorphoBlue.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -50,6 +51,15 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error InvalidFlashLoan();
     error InsufficientEth(uint256 required, uint256 available);
     error CoinbasePaymentFailed();
+    error ATokenAddressRequired();
+    error InvalidATokenAddress(address provided, address canonical);
+    error MixedReceiveAToken();
+    error MorphoExecutionFailed();
+    error UnwrapFailed();
+    error ReceiveATokenV2Unsupported();
+    error MorphoInvalidMarketParams();
+    error MorphoShareModeUnsupported();
+    error InvalidExecutionPhase();
 
     // Swap errors
     error InvalidSwapMode();
@@ -82,6 +92,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error SplitDstTokenUnexpected(address dst1, address dst2);
     error ChainLinkMismatch(address dst1, address src2);
     error ChainDstNotRepay(address dst2, address repayToken);
+    error ChainedProfitMustMatchRepay();
     error Leg1SrcNotCollateral(address src1, address collateral);
 
     // Profit / payment errors
@@ -119,8 +130,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     address public immutable weth;
     address public aavePool;
     address public morphoBlue;
-    // NOTE: Legacy configuration field.
-    address public uniswapV3Router;
     address public balancerVault;
     address public paraswapAugustusV6;
     address public aaveV2LendingPool;
@@ -129,6 +138,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     mapping(address => bool) public allowedTargets;
 
     bytes32 private _activePlanHash;
+
+    /// @dev Execution phase guard — prevents unexpected callbacks
+    enum ExecutionPhase {
+        Idle,
+        FlashLoanActive
+    }
+    ExecutionPhase private _executionPhase;
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
@@ -212,7 +228,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     // ─── Aave V3 target action ───────────────────────────────────────
     struct AaveV3Action {
-        uint8 actionType; // 1 = repay, 2 = withdraw, 3 = supply, 4 = liquidation
+        uint8 actionType; // 4 = liquidation (only supported type)
         address asset;
         uint256 amount;
         uint256 interestRateMode;
@@ -223,15 +239,28 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address user;
         uint256 debtToCover;
         bool receiveAToken;
+        address aTokenAddress;
     }
 
     // ─── Aave V2 liquidation action ──────────────────────────────────
+    /// @dev V2 receiveAToken=true is explicitly unsupported (no canonical on-chain verification).
     struct AaveV2Liquidation {
         address collateralAsset;
         address debtAsset;
         address user;
         uint256 debtToCover;
-        bool receiveAToken;
+        bool receiveAToken; // must be false — validated in _validateActions
+    }
+
+    // ─── Morpho Blue liquidation action ─────────────────────────────
+    struct MorphoLiquidation {
+        MarketParams marketParams;
+        address borrower;
+        uint256 seizedAssets;
+        uint256 repaidShares;
+        /// @dev Max loan-token amount to approve for repayment (loan-token units, NOT collateral units).
+        /// Must be >= actual assetsRepaid returned by Morpho. Operator computes this off-chain.
+        uint256 maxRepayAssets;
     }
 
     // ─── Constructor ─────────────────────────────────────────────────
@@ -284,14 +313,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         emit ConfigUpdated("morphoBlue", old, morpho);
     }
 
-    // NOTE: Legacy setter.
-    function setUniswapV3Router(address router) external onlyOwner {
-        if (router == address(0)) revert ZeroAddress();
-        address old = uniswapV3Router;
-        uniswapV3Router = router;
-        emit ConfigUpdated("uniswapV3Router", old, router);
-    }
-
     function setAaveV2LendingPool(address pool) external onlyOwner {
         if (pool == address(0)) revert ZeroAddress();
         if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
@@ -318,13 +339,30 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     // ─── Internal: Validate Actions ─────────────────────────────────
     /// @dev Validates all liquidation actions share the same debt/collateral assets.
-    /// Requires at least one liquidation action. Returns the common collateralAsset.
+    /// Requires at least one liquidation action. Returns the common collateralAsset
+    /// and the trackingToken (aToken when receiveAToken=true, underlying otherwise).
+    ///
+    /// ┌───────────────────┬──────────────┬────────────────┬──────────────────────────┐
+    /// │ Protocol          │ receiveAToken│ Canonical      │ Status                   │
+    /// │                   │              │ verification   │                          │
+    /// ├───────────────────┼──────────────┼────────────────┼──────────────────────────┤
+    /// │ AAVE_V3 (1)       │ false        │ n/a            │ SUPPORTED                │
+    /// │ AAVE_V3 (1)       │ true         │ getReserveData │ SUPPORTED (verified)     │
+    /// │ AAVE_V2 (3)       │ false        │ n/a            │ SUPPORTED                │
+    /// │ AAVE_V2 (3)       │ true         │ —              │ BLOCKED (no on-chain     │
+    /// │                   │              │                │ verification available)  │
+    /// │ MORPHO_BLUE (2)   │ n/a          │ n/a            │ SUPPORTED                │
+    /// │ Other             │ —            │ —              │ REVERTS InvalidProtocolId│
+    /// └───────────────────┴──────────────┴────────────────┴──────────────────────────┘
     function _validateActions(Action[] memory actions, address loanToken)
         internal
         pure
-        returns (address collateralAsset)
+        returns (address collateralAsset, address trackingToken)
     {
         uint256 liquidationCount;
+        bool receiveATokenSet;
+        bool receiveAToken;
+        address aTokenAddr;
 
         for (uint256 i = 0; i < actions.length; ++i) {
             uint8 protocolId = actions[i].protocolId;
@@ -337,6 +375,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             address actionDebt;
             address actionCollateral;
             uint256 actionAmount;
+            bool actionReceiveAToken;
+            address actionATokenAddress;
 
             if (protocolId == PROTOCOL_AAVE_V3) {
                 AaveV3Action memory a = abi.decode(data, (AaveV3Action));
@@ -344,11 +384,25 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
                 actionDebt = a.debtAsset;
                 actionCollateral = a.collateralAsset;
                 actionAmount = a.debtToCover;
+                actionReceiveAToken = a.receiveAToken;
+                actionATokenAddress = a.aTokenAddress;
             } else if (protocolId == PROTOCOL_AAVE_V2) {
                 AaveV2Liquidation memory a = abi.decode(data, (AaveV2Liquidation));
+                // V2 receiveAToken=true is not supported — no canonical on-chain verification
+                if (a.receiveAToken) revert ReceiveATokenV2Unsupported();
                 actionDebt = a.debtAsset;
                 actionCollateral = a.collateralAsset;
                 actionAmount = a.debtToCover;
+            } else if (protocolId == PROTOCOL_MORPHO_BLUE) {
+                MorphoLiquidation memory a = abi.decode(data, (MorphoLiquidation));
+                if (a.marketParams.loanToken == address(0)) revert MorphoInvalidMarketParams();
+                if (a.marketParams.collateralToken == address(0)) revert MorphoInvalidMarketParams();
+                // Share-based liquidation (seizedAssets=0, repaidShares>0) is explicitly unsupported
+                if (a.seizedAssets == 0) revert MorphoShareModeUnsupported();
+                if (a.maxRepayAssets == 0) revert InvalidPlan();
+                actionDebt = a.marketParams.loanToken;
+                actionCollateral = a.marketParams.collateralToken;
+                actionAmount = a.seizedAssets;
             } else {
                 revert InvalidProtocolId(protocolId);
             }
@@ -366,10 +420,30 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
                 }
             }
 
+            // receiveAToken consistency check (Aave V3 only — V2 receiveAToken=true is blocked above)
+            if (protocolId == PROTOCOL_AAVE_V3) {
+                if (!receiveATokenSet) {
+                    receiveAToken = actionReceiveAToken;
+                    receiveATokenSet = true;
+                    if (receiveAToken) {
+                        if (actionATokenAddress == address(0)) revert ATokenAddressRequired();
+                        aTokenAddr = actionATokenAddress;
+                    }
+                } else {
+                    if (actionReceiveAToken != receiveAToken) revert MixedReceiveAToken();
+                    if (receiveAToken && actionATokenAddress != aTokenAddr) {
+                        revert CollateralAssetMismatch(aTokenAddr, actionATokenAddress);
+                    }
+                }
+            }
+
             liquidationCount++;
         }
 
         if (liquidationCount == 0) revert NoLiquidationAction();
+
+        // Set trackingToken: aToken when receiveAToken=true, underlying otherwise
+        trackingToken = (receiveAToken && aTokenAddr != address(0)) ? aTokenAddr : collateralAsset;
     }
 
     // ─── Core Execute ────────────────────────────────────────────────
@@ -393,7 +467,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         // Validate all actions use same debt/collateral assets
-        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
+        (address collateralAsset,) = _validateActions(plan.actions, plan.loanToken);
 
         // Collateral linkage for SINGLE/BEBOP (DOUBLE validated after calldata extraction)
         if (plan.swapPlan.mode != SwapMode.PARASWAP_DOUBLE) {
@@ -421,6 +495,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (provider == address(0)) revert FlashProviderNotAllowed();
 
         _activePlanHash = keccak256(planData);
+        _executionPhase = ExecutionPhase.FlashLoanActive;
 
         if (plan.flashProviderId == FLASH_PROVIDER_AAVE_V3) {
             IAaveV3Pool(provider).flashLoanSimple(address(this), plan.loanToken, plan.loanAmount, planData, 0);
@@ -435,6 +510,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         _activePlanHash = bytes32(0);
+        _executionPhase = ExecutionPhase.Idle;
         emit FlashExecuted(plan.flashProviderId, plan.loanToken, plan.loanAmount);
     }
 
@@ -444,6 +520,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         override
         returns (bool)
     {
+        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_AAVE_V3]) revert InvalidCallbackCaller();
         if (initiator != address(this)) revert InvalidInitiator();
         if (keccak256(params) != _activePlanHash) revert InvalidPlan();
@@ -458,14 +535,19 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Pre-execution: verify flash loan funds received
         if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
-        // Derive collateralAsset for delta check and swap plan
-        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
+        // Derive collateralAsset and trackingToken for delta check and swap plan
+        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
+
+        // Verify aToken address against canonical source when receiveAToken=true
+        if (trackingToken != address(0) && trackingToken != collateralAsset) {
+            _verifyATokenAddress(plan.actions, collateralAsset, trackingToken);
+        }
 
         // Snapshot BEFORE protocol actions
         uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
         uint256 collateralBefore;
-        if (collateralAsset != address(0)) {
-            collateralBefore = IERC20(collateralAsset).balanceOf(address(this));
+        if (trackingToken != address(0)) {
+            collateralBefore = IERC20(trackingToken).balanceOf(address(this));
         }
 
         // Execute protocol actions (liquidations), skip INTERNAL
@@ -476,8 +558,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         // Post-action: verify liquidation produced collateral (delta-based, all modes)
-        if (collateralAsset != address(0)) {
-            if (IERC20(collateralAsset).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
+        if (trackingToken != address(0)) {
+            if (IERC20(trackingToken).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
+        }
+
+        // Unwrap aTokens to underlying if receiveAToken was used — delta only
+        if (trackingToken != address(0) && trackingToken != collateralAsset) {
+            uint256 aTokenDelta = IERC20(trackingToken).balanceOf(address(this)) - collateralBefore;
+            if (aTokenDelta > 0) {
+                uint256 underlyingBefore = IERC20(collateralAsset).balanceOf(address(this));
+                _unwrapATokens(collateralAsset, aTokenDelta);
+                if (IERC20(collateralAsset).balanceOf(address(this)) <= underlyingBefore) revert UnwrapFailed();
+            }
         }
 
         uint256 flashRepayAmount = amount + premium;
@@ -516,6 +608,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint256[] memory feeAmounts,
         bytes memory userData
     ) external override {
+        if (_executionPhase != ExecutionPhase.FlashLoanActive) {
+            revert InvalidExecutionPhase();
+        }
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) {
             revert InvalidCallbackCaller();
         }
@@ -532,14 +627,19 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Pre-execution: verify flash loan funds received
         if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
-        // Derive collateralAsset for delta check and swap plan
-        address collateralAsset = _validateActions(plan.actions, plan.loanToken);
+        // Derive collateralAsset and trackingToken for delta check and swap plan
+        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
+
+        // Verify aToken address against canonical source when receiveAToken=true
+        if (trackingToken != address(0) && trackingToken != collateralAsset) {
+            _verifyATokenAddress(plan.actions, collateralAsset, trackingToken);
+        }
 
         // Snapshot BEFORE protocol actions
         uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
         uint256 collateralBefore;
-        if (collateralAsset != address(0)) {
-            collateralBefore = IERC20(collateralAsset).balanceOf(address(this));
+        if (trackingToken != address(0)) {
+            collateralBefore = IERC20(trackingToken).balanceOf(address(this));
         }
 
         // Execute protocol actions (liquidations)
@@ -550,8 +650,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         // Post-action: verify liquidation produced collateral (delta-based, all modes)
-        if (collateralAsset != address(0)) {
-            if (IERC20(collateralAsset).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
+        if (trackingToken != address(0)) {
+            if (IERC20(trackingToken).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
+        }
+
+        // Unwrap aTokens to underlying if receiveAToken was used — delta only
+        if (trackingToken != address(0) && trackingToken != collateralAsset) {
+            uint256 aTokenDelta = IERC20(trackingToken).balanceOf(address(this)) - collateralBefore;
+            if (aTokenDelta > 0) {
+                uint256 underlyingBefore = IERC20(collateralAsset).balanceOf(address(this));
+                _unwrapATokens(collateralAsset, aTokenDelta);
+                if (IERC20(collateralAsset).balanceOf(address(this)) <= underlyingBefore) revert UnwrapFailed();
+            }
         }
 
         uint256 flashRepayAmount = amounts[0] + feeAmounts[0];
@@ -674,26 +784,28 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             effectiveProfit = profitAfter > profitBefore ? profitAfter - profitBefore : 0;
         }
 
-        // Subtract coinbase payment cost not already captured in ERC20 delta.
-        // When profitToken is WETH and WETH was unwrapped to fund payment,
-        // that portion already reduced profitAfter — only subtract the remainder.
+        // Coinbase payment accounting:
+        // - When profitToken == WETH: any WETH unwrapped for payment already reduced profitAfter
+        //   (captured in the ERC20 delta). Pre-existing native ETH is a separate asset — NOT
+        //   deducted from WETH profit. So coinbaseCostNotInDelta = 0 always.
+        // - When profitToken != WETH: unreachable (CoinbasePaymentRequiresWethProfit enforced).
+        //   Kept as defense-in-depth: deduct full payment from non-WETH profit.
         if (totalCoinbasePayment > 0) {
-            uint256 coinbaseCostNotInDelta;
             address wethAddr = weth;
-            if (wethAddr != address(0) && profitTkn == wethAddr) {
-                coinbaseCostNotInDelta =
-                    totalCoinbasePayment > totalWethUnwrapped ? totalCoinbasePayment - totalWethUnwrapped : 0;
-            } else {
-                coinbaseCostNotInDelta = totalCoinbasePayment;
+            if (wethAddr == address(0) || profitTkn != wethAddr) {
+                // Defense-in-depth: unreachable since coinbase requires profitToken == weth
+                effectiveProfit = effectiveProfit > totalCoinbasePayment ? effectiveProfit - totalCoinbasePayment : 0;
             }
-            effectiveProfit = effectiveProfit > coinbaseCostNotInDelta ? effectiveProfit - coinbaseCostNotInDelta : 0;
+            // When profitToken == weth: WETH unwrap already reduced profitAfter. No additional deduction.
         }
 
         if (effectiveProfit < minProfitAmount) revert InsufficientProfit(effectiveProfit, minProfitAmount);
     }
 
     // ─── Internal: Execute Swap Plan ─────────────────────────────────
-    /// @dev Dispatches swap by mode, validates repay output covers flash loan obligation.
+    /// @dev Dispatches swap by mode, validates absolute repay balance covers flash loan obligation.
+    /// Uses absolute balance (not delta) because partial liquidations may leave residual loanToken
+    /// that legitimately contributes to repayment.
     function _executeSwapPlan(SwapPlan memory plan, uint256 flashRepayAmount, address collateralAsset) internal {
         if (block.timestamp > plan.deadline) revert SwapDeadlineExpired(plan.deadline, block.timestamp);
 
@@ -702,15 +814,16 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (plan.mode == SwapMode.PARASWAP_SINGLE) {
             _executeParaswapSingle(plan);
         } else if (plan.mode == SwapMode.BEBOP_MULTI) {
-            _executeBebopMulti(plan, repayBefore, flashRepayAmount);
+            _executeBebopMulti(plan, repayBefore);
         } else if (plan.mode == SwapMode.PARASWAP_DOUBLE) {
             _executeParaswapDouble(plan, flashRepayAmount, collateralAsset);
         } else {
             revert InvalidSwapMode();
         }
 
-        uint256 repayDelta = IERC20(plan.repayToken).balanceOf(address(this)) - repayBefore;
-        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+        // Absolute balance check: total repayToken must cover flash loan obligation
+        uint256 repayBalance = IERC20(plan.repayToken).balanceOf(address(this));
+        if (repayBalance < flashRepayAmount) revert InsufficientRepayOutput(repayBalance, flashRepayAmount);
     }
 
     // ─── Internal: Paraswap Single ───────────────────────────────────
@@ -730,7 +843,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     // ─── Internal: Bebop Multi ───────────────────────────────────────
     /// @dev Executes opaque Bebop settlement call. Security: allowlist + exact approval + output delta checks.
-    function _executeBebopMulti(SwapPlan memory plan, uint256 repayBefore, uint256 flashRepayAmount) internal {
+    function _executeBebopMulti(SwapPlan memory plan, uint256 repayBefore) internal {
         address target = plan.bebopTarget;
         if (target == address(0)) revert InvalidBebopTarget();
         if (target.code.length == 0) revert BebopTargetNotContract();
@@ -755,10 +868,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         if (!ok) revert BebopSwapFailed();
 
-        // Early output check — validate repay coverage immediately after call
+        // Compute deltas for event only — repay sufficiency is checked by _executeSwapPlan
+        // using absolute balance (not delta) to avoid false reverts with pre-existing balance.
         uint256 repayDelta = IERC20(plan.repayToken).balanceOf(address(this)) - repayBefore;
-        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
-
         uint256 profitDelta = plan.repayToken == plan.profitToken
             ? repayDelta
             : IERC20(plan.profitToken).balanceOf(address(this)) - profitSnapBefore;
@@ -805,6 +917,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         } else if (plan.doubleSwapPattern == DoubleSwapPattern.CHAINED) {
             if (dst1 != src2) revert ChainLinkMismatch(dst1, src2);
             if (dst2 != plan.repayToken) revert ChainDstNotRepay(dst2, plan.repayToken);
+            // CHAINED produces only repayToken — profit must come from the same token
+            if (plan.profitToken != plan.repayToken) revert ChainedProfitMustMatchRepay();
         } else {
             revert InvalidDoubleSwapPattern();
         }
@@ -874,6 +988,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             _executeAaveV3Liquidation(actionData);
         } else if (protocolId == PROTOCOL_AAVE_V2) {
             _executeAaveV2Liquidation(actionData);
+        } else if (protocolId == PROTOCOL_MORPHO_BLUE) {
+            _executeMorphoLiquidation(actionData);
         } else {
             revert InvalidProtocolId(protocolId);
         }
@@ -912,6 +1028,68 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         IERC20(liq.debtAsset).forceApprove(pool, 0);
 
         emit LiquidationExecuted(PROTOCOL_AAVE_V2, liq.collateralAsset, liq.debtAsset, liq.debtToCover);
+    }
+
+    function _executeMorphoLiquidation(bytes memory actionData) internal {
+        MorphoLiquidation memory liq = abi.decode(actionData, (MorphoLiquidation));
+
+        address morpho = morphoBlue;
+        if (morpho == address(0)) revert ZeroAddress();
+        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
+        if (liq.borrower == address(0)) revert ZeroAddress();
+        if (liq.seizedAssets == 0) revert MorphoShareModeUnsupported();
+        if (liq.maxRepayAssets == 0) revert InvalidPlan();
+        if (liq.marketParams.loanToken == address(0)) revert MorphoInvalidMarketParams();
+        if (liq.marketParams.collateralToken == address(0)) revert MorphoInvalidMarketParams();
+
+        // Approve maxRepayAssets — loan-token denominated bound (NOT collateral-side seizedAssets).
+        // seizedAssets is collateral units; assetsRepaid (what Morpho actually pulls) is loan-token units.
+        // These are different dimensions — approval must match the repay side.
+        IERC20(liq.marketParams.loanToken).forceApprove(morpho, liq.maxRepayAssets);
+        (, uint256 assetsRepaid) =
+            IMorphoBlue(morpho).liquidate(liq.marketParams, liq.borrower, liq.seizedAssets, liq.repaidShares, "");
+        IERC20(liq.marketParams.loanToken).forceApprove(morpho, 0);
+
+        // Verify Morpho didn't pull more than the operator authorized
+        if (assetsRepaid > liq.maxRepayAssets) revert InsufficientRepayBalance(assetsRepaid, liq.maxRepayAssets);
+
+        emit LiquidationExecuted(
+            PROTOCOL_MORPHO_BLUE, liq.marketParams.collateralToken, liq.marketParams.loanToken, assetsRepaid
+        );
+    }
+
+    /// @dev Verifies operator-supplied aTokenAddress matches the canonical aToken from the Aave pool.
+    /// Uses low-level call + assembly to avoid stack-too-deep with getReserveData's 15 return values.
+    function _verifyATokenAddress(Action[] memory actions, address collateralAsset, address suppliedAToken)
+        internal
+        view
+    {
+        for (uint256 i = 0; i < actions.length; ++i) {
+            if (actions[i].protocolId == PROTOCOL_AAVE_V3) {
+                address pool = aavePool;
+                // getReserveData(address) selector = 0x35ea6a75
+                // aTokenAddress is the 9th return value (offset 8*32 = 256 in returndata)
+                address canonical;
+                assembly {
+                    let ptr := mload(0x40)
+                    mstore(ptr, 0x35ea6a7500000000000000000000000000000000000000000000000000000000)
+                    mstore(add(ptr, 4), collateralAsset)
+                    let ok := staticcall(gas(), pool, ptr, 36, ptr, 480)
+                    if iszero(ok) { revert(0, 0) }
+                    canonical := mload(add(ptr, 256)) // 9th slot
+                }
+                if (suppliedAToken != canonical) revert InvalidATokenAddress(suppliedAToken, canonical);
+                return;
+            }
+            // V2 receiveAToken=true is blocked in _validateActions — unreachable here
+        }
+    }
+
+    /// @dev Unwraps aTokens to underlying via the appropriate Aave pool.
+    /// @dev Unwraps aTokens to underlying via Aave V3 pool withdraw.
+    /// Only V3 supports receiveAToken=true (V2 is blocked in validation).
+    function _unwrapATokens(address collateralAsset, uint256 amount) internal {
+        IAaveV3Pool(aavePool).withdraw(collateralAsset, amount, address(this));
     }
 
     // ─── Internal: Execute Internal Action ──────────────────────────

@@ -9,4 +9,6 @@ interface IAaveV2LendingPool {
         uint256 debtToCover,
         bool receiveAToken
     ) external;
+
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
 }

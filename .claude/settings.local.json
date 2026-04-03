@@ -18,7 +18,9 @@
       "WebFetch(domain:api.etherscan.io)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:help.velora.xyz)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(mktemp:*)",
+      "Bash(grep -n 'test_morpho_approvalReset\\\\|^}$' test/Executor.t.sol)"
     ]
   }
 }
