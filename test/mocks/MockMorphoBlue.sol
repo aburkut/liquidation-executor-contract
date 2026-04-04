@@ -9,9 +9,26 @@ contract MockMorphoBlue {
     using SafeERC20 for IERC20;
 
     bool public repayReverts;
+    bool public liquidationReverts;
+    uint256 public liquidationCollateralReward;
+    bool public liquidationCollateralRewardSet;
+    uint256 public liquidationDebtAmount;
 
     function setRepayReverts(bool _reverts) external {
         repayReverts = _reverts;
+    }
+
+    function setLiquidationReverts(bool _reverts) external {
+        liquidationReverts = _reverts;
+    }
+
+    function setLiquidationCollateralReward(uint256 _reward) external {
+        liquidationCollateralReward = _reward;
+        liquidationCollateralRewardSet = true;
+    }
+
+    function setLiquidationDebtAmount(uint256 _amount) external {
+        liquidationDebtAmount = _amount;
     }
 
     function repay(
@@ -49,5 +66,23 @@ contract MockMorphoBlue {
         external
     {
         IERC20(marketParams.collateralToken).safeTransferFrom(msg.sender, address(this), assets);
+    }
+
+    function liquidate(
+        MarketParams memory marketParams,
+        address, /* borrower */
+        uint256 seizedAssets,
+        uint256, /* repaidShares */
+        bytes memory /* data */
+    )
+        external
+        returns (uint256, uint256)
+    {
+        require(!liquidationReverts, "MockMorphoBlue: liquidation reverts");
+        uint256 collateral = liquidationCollateralRewardSet ? liquidationCollateralReward : seizedAssets;
+        uint256 debt = liquidationDebtAmount > 0 ? liquidationDebtAmount : seizedAssets;
+        IERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), debt);
+        IERC20(marketParams.collateralToken).safeTransfer(msg.sender, collateral);
+        return (collateral, debt);
     }
 }

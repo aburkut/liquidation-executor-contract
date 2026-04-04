@@ -23,4 +23,12 @@ interface IMorphoBlue {
 
     function supplyCollateral(MarketParams memory marketParams, uint256 assets, address onBehalfOf, bytes memory data)
         external;
+
+    function liquidate(
+        MarketParams memory marketParams,
+        address borrower,
+        uint256 seizedAssets,
+        uint256 repaidShares,
+        bytes memory data
+    ) external returns (uint256 assetsSeized, uint256 assetsRepaid);
 }

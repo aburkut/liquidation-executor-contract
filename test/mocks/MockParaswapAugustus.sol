@@ -9,6 +9,7 @@ contract MockParaswapAugustus {
 
     uint256 public rate; // 1e18 = 1:1
     bool public swapReverts;
+    uint256 public partialFillPct; // 0 = use full amountIn, else = consume (amountIn * pct / 100)
 
     constructor(uint256 _rate) {
         rate = _rate;
@@ -20,6 +21,11 @@ contract MockParaswapAugustus {
 
     function setSwapReverts(bool _reverts) external {
         swapReverts = _reverts;
+    }
+
+    /// @dev Set partial fill: consume only (amountIn * pct / 100) of declared input. 0 = full fill.
+    function setPartialFillPct(uint256 pct) external {
+        partialFillPct = pct;
     }
 
     /// @dev Generic fallback that decodes (srcToken, dstToken, amountIn) from Paraswap
@@ -38,8 +44,9 @@ contract MockParaswapAugustus {
             amountIn := calldataload(100) // GenericData.fromAmount
         }
 
-        IERC20(srcToken).safeTransferFrom(msg.sender, address(this), amountIn);
-        uint256 amountOut = amountIn * rate / 1e18;
+        uint256 actualIn = partialFillPct > 0 ? amountIn * partialFillPct / 100 : amountIn;
+        IERC20(srcToken).safeTransferFrom(msg.sender, address(this), actualIn);
+        uint256 amountOut = actualIn * rate / 1e18;
         IERC20(dstToken).safeTransfer(msg.sender, amountOut);
     }
 

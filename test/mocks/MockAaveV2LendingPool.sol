@@ -9,6 +9,7 @@ contract MockAaveV2LendingPool {
 
     bool public liquidationReverts;
     uint256 public collateralReward; // how much collateral to send back
+    address public aToken;
 
     constructor(uint256 _collateralReward) {
         collateralReward = _collateralReward;
@@ -22,19 +23,30 @@ contract MockAaveV2LendingPool {
         collateralReward = _reward;
     }
 
+    function setAToken(address _aToken) external {
+        aToken = _aToken;
+    }
+
     function liquidationCall(
         address collateralAsset,
         address debtAsset,
         address, /* user */
         uint256 debtToCover,
-        bool /* receiveAToken */
-    )
-        external
-    {
+        bool receiveAToken
+    ) external {
         require(!liquidationReverts, "MockAaveV2: liquidation reverts");
         // Pull debt tokens from caller
         IERC20(debtAsset).safeTransferFrom(msg.sender, address(this), debtToCover);
         // Send collateral reward back
-        IERC20(collateralAsset).safeTransfer(msg.sender, collateralReward);
+        if (receiveAToken && aToken != address(0)) {
+            IERC20(aToken).safeTransfer(msg.sender, collateralReward);
+        } else {
+            IERC20(collateralAsset).safeTransfer(msg.sender, collateralReward);
+        }
+    }
+
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256) {
+        IERC20(asset).safeTransfer(to, amount);
+        return amount;
     }
 }

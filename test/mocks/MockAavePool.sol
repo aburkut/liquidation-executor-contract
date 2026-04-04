@@ -83,6 +83,7 @@ contract MockAavePool {
 
     bool public liquidationReverts;
     uint256 public liquidationCollateralReward;
+    address public aToken;
 
     function setLiquidationReverts(bool _reverts) external {
         liquidationReverts = _reverts;
@@ -92,18 +93,52 @@ contract MockAavePool {
         liquidationCollateralReward = _reward;
     }
 
+    function setAToken(address _aToken) external {
+        aToken = _aToken;
+    }
+
     function liquidationCall(
         address collateralAsset,
         address debtAsset,
         address, /* user */
         uint256 debtToCover,
-        bool /* receiveAToken */
-    )
-        external
-    {
+        bool receiveAToken
+    ) external {
         require(!liquidationReverts, "MockAavePool: liquidation reverts");
         IERC20(debtAsset).safeTransferFrom(msg.sender, address(this), debtToCover);
-        IERC20(collateralAsset).safeTransfer(msg.sender, liquidationCollateralReward);
+        if (receiveAToken && aToken != address(0)) {
+            IERC20(aToken).safeTransfer(msg.sender, liquidationCollateralReward);
+        } else {
+            IERC20(collateralAsset).safeTransfer(msg.sender, liquidationCollateralReward);
+        }
+    }
+
+    // Maps collateralAsset → aToken for getReserveData verification
+    mapping(address => address) public reserveATokens;
+
+    function setReserveAToken(address asset, address _aToken) external {
+        reserveATokens[asset] = _aToken;
+    }
+
+    /// @dev Implements getReserveData — returns 480 bytes with aTokenAddress at offset 256.
+    /// Uses assembly fallback matching selector 0x35ea6a75 to avoid stack-too-deep.
+    fallback() external {
+        bytes4 sig;
+        assembly { sig := calldataload(0) }
+        if (sig == bytes4(0x35ea6a75)) {
+            // getReserveData(address asset)
+            address asset;
+            assembly { asset := calldataload(4) }
+            address aAddr = reserveATokens[asset];
+            assembly {
+                let ptr := mload(0x40)
+                // Zero 480 bytes
+                calldatacopy(ptr, calldatasize(), 480)
+                // Set 9th slot to aAddr
+                mstore(add(ptr, 256), aAddr)
+                return(ptr, 480)
+            }
+        }
     }
 
     function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128) {
