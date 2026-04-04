@@ -60,6 +60,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error MorphoInvalidMarketParams();
     error MorphoShareModeUnsupported();
     error InvalidExecutionPhase();
+    error InvalidCollateralAsset();
+    error NoActivePlan();
+    error ChainedInputExceedsOutput(uint256 amountIn2, uint256 amountOut1);
+    error InvalidCoinbase();
+    error MorphoMixedModeUnsupported();
 
     // Swap errors
     error InvalidSwapMode();
@@ -175,6 +180,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint256 amountIn2,
         uint256 amountOut2
     );
+    event ChainedRemainder(address indexed token, uint256 amount);
 
     // ─── Enums ────────────────────────────────────────────────────────
     enum SwapMode {
@@ -381,6 +387,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             if (protocolId == PROTOCOL_AAVE_V3) {
                 AaveV3Action memory a = abi.decode(data, (AaveV3Action));
                 if (a.actionType != 4) revert UnsupportedActionType(a.actionType);
+                if (a.collateralAsset == address(0)) revert InvalidCollateralAsset();
                 actionDebt = a.debtAsset;
                 actionCollateral = a.collateralAsset;
                 actionAmount = a.debtToCover;
@@ -388,8 +395,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
                 actionATokenAddress = a.aTokenAddress;
             } else if (protocolId == PROTOCOL_AAVE_V2) {
                 AaveV2Liquidation memory a = abi.decode(data, (AaveV2Liquidation));
-                // V2 receiveAToken=true is not supported — no canonical on-chain verification
                 if (a.receiveAToken) revert ReceiveATokenV2Unsupported();
+                if (a.collateralAsset == address(0)) revert InvalidCollateralAsset();
                 actionDebt = a.debtAsset;
                 actionCollateral = a.collateralAsset;
                 actionAmount = a.debtToCover;
@@ -397,8 +404,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
                 MorphoLiquidation memory a = abi.decode(data, (MorphoLiquidation));
                 if (a.marketParams.loanToken == address(0)) revert MorphoInvalidMarketParams();
                 if (a.marketParams.collateralToken == address(0)) revert MorphoInvalidMarketParams();
-                // Share-based liquidation (seizedAssets=0, repaidShares>0) is explicitly unsupported
+                // Only seized-assets mode is supported. Share mode and mixed mode are rejected.
                 if (a.seizedAssets == 0) revert MorphoShareModeUnsupported();
+                if (a.repaidShares != 0) revert MorphoMixedModeUnsupported();
                 if (a.maxRepayAssets == 0) revert InvalidPlan();
                 actionDebt = a.marketParams.loanToken;
                 actionCollateral = a.marketParams.collateralToken;
@@ -611,6 +619,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (_executionPhase != ExecutionPhase.FlashLoanActive) {
             revert InvalidExecutionPhase();
         }
+        if (_activePlanHash == bytes32(0)) revert NoActivePlan();
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) {
             revert InvalidCallbackCaller();
         }
@@ -784,19 +793,14 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             effectiveProfit = profitAfter > profitBefore ? profitAfter - profitBefore : 0;
         }
 
-        // Coinbase payment accounting:
-        // - When profitToken == WETH: any WETH unwrapped for payment already reduced profitAfter
-        //   (captured in the ERC20 delta). Pre-existing native ETH is a separate asset — NOT
-        //   deducted from WETH profit. So coinbaseCostNotInDelta = 0 always.
-        // - When profitToken != WETH: unreachable (CoinbasePaymentRequiresWethProfit enforced).
-        //   Kept as defense-in-depth: deduct full payment from non-WETH profit.
+        // Coinbase payment accounting: always deduct the cost NOT already in the ERC20 delta.
+        // - WETH unwrapped: already reduced profitAfter (in delta), no additional deduction needed.
+        // - Pre-existing ETH: NOT in the ERC20 delta, MUST be deducted explicitly.
+        // Formula: deduct = totalCoinbasePayment - totalWethUnwrapped (the native ETH portion).
         if (totalCoinbasePayment > 0) {
-            address wethAddr = weth;
-            if (wethAddr == address(0) || profitTkn != wethAddr) {
-                // Defense-in-depth: unreachable since coinbase requires profitToken == weth
-                effectiveProfit = effectiveProfit > totalCoinbasePayment ? effectiveProfit - totalCoinbasePayment : 0;
-            }
-            // When profitToken == weth: WETH unwrap already reduced profitAfter. No additional deduction.
+            uint256 costNotInDelta =
+                totalCoinbasePayment > totalWethUnwrapped ? totalCoinbasePayment - totalWethUnwrapped : 0;
+            effectiveProfit = effectiveProfit > costNotInDelta ? effectiveProfit - costNotInDelta : 0;
         }
 
         if (effectiveProfit < minProfitAmount) revert InsufficientProfit(effectiveProfit, minProfitAmount);
@@ -835,7 +839,21 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             _executeParaswapCall(plan.paraswapCalldata);
 
         if (srcToken != plan.srcToken) revert ParaswapSrcTokenMismatch(plan.srcToken, srcToken);
-        if (amountIn != plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
+
+        // For swapExactAmountIn: actual consumed must equal declared (exact spend).
+        // For swapExactAmountOut: actual consumed must be <= declared max (partial spend OK).
+        bytes4 selector;
+        bytes memory cd = plan.paraswapCalldata;
+        assembly {
+            selector := mload(add(cd, 32))
+        }
+        if (selector == _SWAP_EXACT_AMOUNT_IN) {
+            if (amountIn != plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
+        } else {
+            // swapExactAmountOut: plan.amountIn is the declared maximum
+            if (amountIn > plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
+        }
+
         if (dstToken != plan.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
 
         emit ParaswapSwapExecuted(srcToken, dstToken, amountIn, amountOut);
@@ -868,12 +886,17 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         if (!ok) revert BebopSwapFailed();
 
-        // Compute deltas for event only — repay sufficiency is checked by _executeSwapPlan
-        // using absolute balance (not delta) to avoid false reverts with pre-existing balance.
-        uint256 repayDelta = IERC20(plan.repayToken).balanceOf(address(this)) - repayBefore;
-        uint256 profitDelta = plan.repayToken == plan.profitToken
-            ? repayDelta
-            : IERC20(plan.profitToken).balanceOf(address(this)) - profitSnapBefore;
+        // Compute deltas for event only (safe subtraction — never reverts).
+        // Repay sufficiency is checked by _executeSwapPlan via absolute balance.
+        uint256 repayAfter = IERC20(plan.repayToken).balanceOf(address(this));
+        uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
+        uint256 profitDelta;
+        if (plan.repayToken == plan.profitToken) {
+            profitDelta = repayDelta;
+        } else {
+            uint256 profitAfter = IERC20(plan.profitToken).balanceOf(address(this));
+            profitDelta = profitAfter > profitSnapBefore ? profitAfter - profitSnapBefore : 0;
+        }
 
         emit BebopSwapExecuted(target, plan.srcToken, plan.amountIn, repayDelta, profitDelta);
     }
@@ -890,8 +913,23 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     ///
     /// Each leg is self-contained: srcToken and amountIn extracted from calldata.
     function _executeParaswapDouble(SwapPlan memory plan, uint256 flashRepayAmount, address collateralAsset) internal {
+        // Execute leg 1
         (address src1, address dst1, uint256 amountIn1, uint256 amountOut1) =
             _executeParaswapCall(plan.paraswapCalldata);
+
+        // For CHAINED: validate leg 2 input <= leg 1 output BEFORE executing leg 2
+        if (plan.doubleSwapPattern == DoubleSwapPattern.CHAINED) {
+            bytes memory cd2 = plan.paraswapCalldata2;
+            // Ensure calldata is long enough for assembly read at offset 132 (36+96)
+            if (cd2.length < 132) revert InvalidParaswapCalldata();
+            uint256 leg2FromAmount;
+            assembly {
+                leg2FromAmount := mload(add(add(cd2, 36), 96)) // same offset as _executeParaswapCall
+            }
+            if (leg2FromAmount > amountOut1) revert ChainedInputExceedsOutput(leg2FromAmount, amountOut1);
+        }
+
+        // Execute leg 2
         (address src2, address dst2, uint256 amountIn2, uint256 amountOut2) =
             _executeParaswapCall(plan.paraswapCalldata2);
 
@@ -904,12 +942,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             if (src1 != src2) revert SplitSrcTokenMismatch(src1, src2);
             if (dst1 == dst2) revert SplitDstTokensMustDiffer(dst1);
 
-            // Identify repay leg and validate output
+            // Validate repay/profit leg routing — repay sufficiency checked by _executeSwapPlan
+            // via absolute balance (not per-leg delta) to support pre-existing repayToken balance.
             if (dst1 == plan.repayToken) {
-                if (amountOut1 < flashRepayAmount) revert SplitRepayLegInsufficient(amountOut1, flashRepayAmount);
                 if (dst2 != plan.profitToken) revert SplitDstTokenUnexpected(dst1, dst2);
             } else if (dst2 == plan.repayToken) {
-                if (amountOut2 < flashRepayAmount) revert SplitRepayLegInsufficient(amountOut2, flashRepayAmount);
                 if (dst1 != plan.profitToken) revert SplitDstTokenUnexpected(dst1, dst2);
             } else {
                 revert SplitNoRepayLeg();
@@ -917,8 +954,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         } else if (plan.doubleSwapPattern == DoubleSwapPattern.CHAINED) {
             if (dst1 != src2) revert ChainLinkMismatch(dst1, src2);
             if (dst2 != plan.repayToken) revert ChainDstNotRepay(dst2, plan.repayToken);
-            // CHAINED produces only repayToken — profit must come from the same token
             if (plan.profitToken != plan.repayToken) revert ChainedProfitMustMatchRepay();
+
+            // Signal any leftover intermediate tokens for off-chain observability
+            uint256 intermediateBalance = IERC20(dst1).balanceOf(address(this));
+            if (intermediateBalance > 0) {
+                emit ChainedRemainder(dst1, intermediateBalance);
+            }
         } else {
             revert InvalidDoubleSwapPattern();
         }
@@ -968,14 +1010,19 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         uint256 srcBal = IERC20(srcToken).balanceOf(address(this));
         if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
 
+        uint256 srcBefore = srcBal;
         uint256 dstBefore = IERC20(dstToken).balanceOf(address(this));
 
-        // Approve exact amountIn, call, reset
+        // Approve declared max input, call, reset
         IERC20(srcToken).forceApprove(augustus, amountIn);
         (bool ok,) = augustus.call(cd);
         IERC20(srcToken).forceApprove(augustus, 0);
 
         if (!ok) revert ParaswapSwapFailed();
+
+        // Compute actual consumed input (handles swapExactAmountOut where actual < declared max)
+        uint256 srcAfter = IERC20(srcToken).balanceOf(address(this));
+        amountIn = srcBefore > srcAfter ? srcBefore - srcAfter : 0;
 
         uint256 dstAfter = IERC20(dstToken).balanceOf(address(this));
         amountOut = dstAfter - dstBefore;
@@ -1038,6 +1085,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
         if (liq.borrower == address(0)) revert ZeroAddress();
         if (liq.seizedAssets == 0) revert MorphoShareModeUnsupported();
+        if (liq.repaidShares != 0) revert MorphoMixedModeUnsupported();
         if (liq.maxRepayAssets == 0) revert InvalidPlan();
         if (liq.marketParams.loanToken == address(0)) revert MorphoInvalidMarketParams();
         if (liq.marketParams.collateralToken == address(0)) revert MorphoInvalidMarketParams();
@@ -1117,6 +1165,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     /// Auto-unwraps WETH if insufficient ETH. Returns the amount unwrapped (for profit accounting).
     function _payCoinbase(uint256 amount) internal returns (uint256 wethUnwrapped) {
         if (amount == 0) return 0;
+        if (block.coinbase == address(0)) revert InvalidCoinbase();
 
         // Auto-unwrap WETH if insufficient ETH
         if (address(this).balance < amount) {
