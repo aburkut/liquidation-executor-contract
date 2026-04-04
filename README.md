@@ -4,8 +4,8 @@
 
 | Parameter | Value |
 |---|---|
-| **Contract** | `0x38F4473C077c014786037cC3d82fce52510b9089` |
-| **Deploy tx** | `0x0da58098a540a127b98e7b8ae7e783134236cb2e4ec870260b156dc62808db6b` |
+| **Contract** | `0xbdBcDAa6C667582298ca70dE2CD6647d6ab105e5` |
+| **Deploy tx** | `0x132b93b032ced2f1f2874c8836b90ba45fa81ba0f947f75e222f67d192a69468` |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
 | **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
 | **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
@@ -13,11 +13,13 @@
 | **Aave V3 Pool** | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` |
 | **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` |
 | **ParaSwap Augustus** | `0x6A000F20005980200259B80c5102003040001068` |
-| **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (whitelisted, not yet configured) |
+| **Bebop Settlement** | `0xbbbbbBB520d69a9775E85b458C58c648259FAD5F` (whitelisted) |
+| **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (whitelisted) |
 | **Solidity** | 0.8.24, Shanghai, optimizer 200 runs |
 
-| Previous deployment | |
+| Previous deployments | |
 |---|---|
+| **V2 Contract** | `0x38F4473C077c014786037cC3d82fce52510b9089` (deprecated — no Bebop, had ERC20 payment) |
 | **V1 Contract** | `0x1aaED107C21B389a38a632129dC0Cb362819bC8D` (deprecated) |
 
 ---
