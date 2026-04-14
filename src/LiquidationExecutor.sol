@@ -343,6 +343,29 @@ contract LiquidationExecutor is
         emit FlashProviderUpdated(providerId, old, provider);
     }
 
+    /// @notice Atomic config helper that pins both Morpho roles to the same address.
+    /// @dev `morphoBlue` (used as liquidation target via PROTOCOL_MORPHO_BLUE) and
+    /// `allowedFlashProviders[FLASH_PROVIDER_MORPHO]` (used as the flashloan source +
+    /// the only authorized `onMorphoFlashLoan` caller) are independent storage slots.
+    /// Setting them via the legacy single-purpose setters in two transactions creates
+    /// a window where the two halves disagree. This helper writes both slots in one
+    /// call. Validation (zero address, allowedTargets gate) and events
+    /// (ConfigUpdated, FlashProviderUpdated) match the legacy setters exactly so that
+    /// off-chain consumers see the same signals. Legacy setters remain available for
+    /// the rare case the two roles intentionally diverge (testnets, migrations).
+    function configureMorpho(address morpho) external onlyOwner {
+        if (morpho == address(0)) revert ZeroAddress();
+        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
+
+        address oldMorpho = morphoBlue;
+        morphoBlue = morpho;
+        emit ConfigUpdated("morphoBlue", oldMorpho, morpho);
+
+        address oldProvider = allowedFlashProviders[FLASH_PROVIDER_MORPHO];
+        allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho;
+        emit FlashProviderUpdated(FLASH_PROVIDER_MORPHO, oldProvider, morpho);
+    }
+
     function pause() external onlyOwner {
         _pause();
     }

@@ -615,6 +615,83 @@ contract ExecutorTest is Test {
         executor.onMorphoFlashLoan(LOAN_AMOUNT, "");
     }
 
+    /// Strict caller-auth proof: even when the phase guard and plan-hash guard are
+    /// both forced to "valid" via direct storage manipulation, the callback MUST
+    /// still revert with InvalidCallbackCaller for any sender other than the
+    /// configured FLASH_PROVIDER_MORPHO. This catches a regression where the caller
+    /// check is accidentally weakened or removed in a refactor — relying on
+    /// InvalidExecutionPhase alone would mask such a bug whenever an attacker
+    /// finds any way to land mid-flashloan (e.g. cross-callback re-entry).
+    function test_morphoCallbackRejectsCallerEvenWithValidPhaseAndHash() public {
+        // Register Morpho as the flashloan provider so the auth check has a concrete
+        // address to compare against.
+        uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
+        vm.prank(owner);
+        executor.setFlashProvider(morphoFlashId, address(morphoBlue));
+
+        // Build a real plan and abi-encode it; the plan hash must match what we
+        // plant into _activePlanHash for the hash check to pass.
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
+        LiquidationExecutor.Action[] memory liqAction = _singleAction(
+            2, // PROTOCOL_MORPHO_BLUE
+            _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), 500e18)
+        );
+        bytes memory planBytes = _buildPlan(3, address(loanToken), LOAN_AMOUNT, FLASH_FEE, liqAction, swapPlan);
+        bytes32 planHash = keccak256(planBytes);
+
+        // Storage layout (forge inspect LiquidationExecutor storage):
+        //   slot 9  = _activePlanHash    (bytes32)
+        //   slot 10 = _executionPhase    (uint8 enum, low byte)
+        // Force both into the "during flashloan" state so neither guard short-circuits.
+        vm.store(address(executor), bytes32(uint256(9)), planHash);
+        vm.store(address(executor), bytes32(uint256(10)), bytes32(uint256(1))); // FlashLoanActive
+
+        // Attacker (not the registered Morpho provider) hits the callback. The phase
+        // and hash gates pass; only the caller check should reject.
+        vm.prank(attacker);
+        vm.expectRevert(LiquidationExecutor.InvalidCallbackCaller.selector);
+        executor.onMorphoFlashLoan(LOAN_AMOUNT, planBytes);
+    }
+
+    /// configureMorpho must atomically set both the morphoBlue (liquidation) slot
+    /// AND the FLASH_PROVIDER_MORPHO entry in allowedFlashProviders. Without this
+    /// helper, two-tx config could leave the two roles pointing at different
+    /// addresses — opening a window where the flashloan callback is gated by an
+    /// outdated provider while liquidation calls go to a new contract.
+    function test_configureMorphoAtomicallyPinsBothSlots() public {
+        uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
+
+        // Sanity: setUp() previously called only setMorphoBlue, leaving the flash
+        // provider entry empty.
+        assertEq(executor.morphoBlue(), address(morphoBlue));
+        assertEq(executor.allowedFlashProviders(morphoFlashId), address(0));
+
+        vm.prank(owner);
+        executor.configureMorpho(address(morphoBlue));
+
+        assertEq(executor.morphoBlue(), address(morphoBlue), "morphoBlue must be set");
+        assertEq(
+            executor.allowedFlashProviders(morphoFlashId),
+            address(morphoBlue),
+            "FLASH_PROVIDER_MORPHO entry must be set to the same address"
+        );
+    }
+
+    /// Validation parity: configureMorpho must apply the same zero-address and
+    /// allowedTargets gates as the legacy setters so the helper cannot smuggle an
+    /// unwhitelisted address into either slot.
+    function test_configureMorphoRejectsZeroAndUnwhitelisted() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.configureMorpho(address(0));
+
+        address notWhitelisted = address(0xDEADBEEF);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        executor.configureMorpho(notWhitelisted);
+    }
+
     /// Insufficient repay balance: a fresh executor with no pre-funding plus a swap that
     /// returns less than the loan principal forces _finalizeMorphoFlashloan to revert
     /// before the approve, since Morpho would otherwise pull more than the executor holds.
