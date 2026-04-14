@@ -551,66 +551,16 @@ contract LiquidationExecutor is
         if (amount != plan.loanAmount) revert CallbackAmountMismatch();
         if (premium > plan.maxFlashFee) revert FlashFeeExceeded(premium, plan.maxFlashFee);
 
-        // Pre-execution: verify flash loan funds received
-        if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
-
-        // Derive collateralAsset and trackingToken for delta check and swap plan
-        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
-
-        // Verify aToken address against canonical source when receiveAToken=true
-        if (trackingToken != address(0) && trackingToken != collateralAsset) {
-            _verifyATokenAddress(plan.actions, collateralAsset, trackingToken);
-        }
-
-        // Snapshot BEFORE protocol actions
-        uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
-        uint256 collateralBefore;
-        if (trackingToken != address(0)) {
-            collateralBefore = IERC20(trackingToken).balanceOf(address(this));
-        }
-
-        // Execute protocol actions (liquidations), skip INTERNAL
-        for (uint256 i = 0; i < plan.actions.length; ++i) {
-            if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
-                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
-            }
-        }
-
-        // Post-action: verify liquidation produced collateral (delta-based, all modes)
-        if (trackingToken != address(0)) {
-            if (IERC20(trackingToken).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
-        }
-
-        // Unwrap aTokens to underlying if receiveAToken was used — delta only
-        if (trackingToken != address(0) && trackingToken != collateralAsset) {
-            uint256 aTokenDelta = IERC20(trackingToken).balanceOf(address(this)) - collateralBefore;
-            if (aTokenDelta > 0) {
-                uint256 underlyingBefore = IERC20(collateralAsset).balanceOf(address(this));
-                _unwrapATokens(collateralAsset, aTokenDelta);
-                if (IERC20(collateralAsset).balanceOf(address(this)) <= underlyingBefore) revert UnwrapFailed();
-            }
-        }
-
         uint256 flashRepayAmount = amount + premium;
-        _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset);
+        (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped) =
+            _runFlashloanPipeline(plan, flashRepayAmount);
 
-        // Execute internal actions (coinbase payment) after swap
-        uint256 totalCoinbasePayment;
-        uint256 totalWethUnwrapped;
-        for (uint256 i = 0; i < plan.actions.length; ++i) {
-            if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
-                (uint256 cbPaid, uint256 wethUsed) =
-                    _executeInternalAction(plan.actions[i].data, plan.swapPlan.profitToken);
-                totalCoinbasePayment += cbPaid;
-                totalWethUnwrapped += wethUsed;
-            }
-        }
-
-        // Aave pulls repayment after we return true — approve exact amount
-        _finalizeAaveFlashloan(
+        // Aave pulls repayment after we return true — approve exact amount (vault=0).
+        _finalizeFlashloan(
             asset,
             amount,
             flashRepayAmount,
+            address(0),
             plan.swapPlan.profitToken,
             profitBefore,
             plan.swapPlan.minProfitAmount,
@@ -644,63 +594,12 @@ contract LiquidationExecutor is
         if (amounts[0] != plan.loanAmount) revert CallbackAmountMismatch();
         if (feeAmounts[0] > plan.maxFlashFee) revert FlashFeeExceeded(feeAmounts[0], plan.maxFlashFee);
 
-        // Pre-execution: verify flash loan funds received
-        if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
-
-        // Derive collateralAsset and trackingToken for delta check and swap plan
-        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
-
-        // Verify aToken address against canonical source when receiveAToken=true
-        if (trackingToken != address(0) && trackingToken != collateralAsset) {
-            _verifyATokenAddress(plan.actions, collateralAsset, trackingToken);
-        }
-
-        // Snapshot BEFORE protocol actions
-        uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
-        uint256 collateralBefore;
-        if (trackingToken != address(0)) {
-            collateralBefore = IERC20(trackingToken).balanceOf(address(this));
-        }
-
-        // Execute protocol actions (liquidations)
-        for (uint256 i = 0; i < plan.actions.length; ++i) {
-            if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
-                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
-            }
-        }
-
-        // Post-action: verify liquidation produced collateral (delta-based, all modes)
-        if (trackingToken != address(0)) {
-            if (IERC20(trackingToken).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
-        }
-
-        // Unwrap aTokens to underlying if receiveAToken was used — delta only
-        if (trackingToken != address(0) && trackingToken != collateralAsset) {
-            uint256 aTokenDelta = IERC20(trackingToken).balanceOf(address(this)) - collateralBefore;
-            if (aTokenDelta > 0) {
-                uint256 underlyingBefore = IERC20(collateralAsset).balanceOf(address(this));
-                _unwrapATokens(collateralAsset, aTokenDelta);
-                if (IERC20(collateralAsset).balanceOf(address(this)) <= underlyingBefore) revert UnwrapFailed();
-            }
-        }
-
         uint256 flashRepayAmount = amounts[0] + feeAmounts[0];
-        _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset);
+        (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped) =
+            _runFlashloanPipeline(plan, flashRepayAmount);
 
-        // Execute internal actions (coinbase payment) after swap
-        uint256 totalCoinbasePayment;
-        uint256 totalWethUnwrapped;
-        for (uint256 i = 0; i < plan.actions.length; ++i) {
-            if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
-                (uint256 cbPaid, uint256 wethUsed) =
-                    _executeInternalAction(plan.actions[i].data, plan.swapPlan.profitToken);
-                totalCoinbasePayment += cbPaid;
-                totalWethUnwrapped += wethUsed;
-            }
-        }
-
-        // Balancer expects funds returned by end of callback via transfer
-        _finalizeBalancerFlashloan(
+        // Balancer expects funds returned by end of callback via transfer (vault=msg.sender).
+        _finalizeFlashloan(
             address(tokens[0]),
             amounts[0],
             flashRepayAmount,
@@ -732,6 +631,36 @@ contract LiquidationExecutor is
         if (amount != plan.loanAmount) revert CallbackAmountMismatch();
         // Morpho flashloan is fee-free, no maxFlashFee comparison needed (0 ≤ any uint256).
 
+        // Morpho fee = 0, so flash repay equals principal
+        uint256 flashRepayAmount = amount;
+        (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped) =
+            _runFlashloanPipeline(plan, flashRepayAmount);
+
+        // Morpho also pulls via safeTransferFrom after callback returns (vault=0).
+        _finalizeFlashloan(
+            plan.loanToken,
+            amount,
+            flashRepayAmount,
+            address(0),
+            plan.swapPlan.profitToken,
+            profitBefore,
+            plan.swapPlan.minProfitAmount,
+            totalCoinbasePayment,
+            totalWethUnwrapped
+        );
+    }
+
+    // ─── Internal: Shared post-loan pipeline ─────────────────────────
+    /// @dev Identical body across Aave V3 / Balancer / Morpho callbacks — extracted to
+    /// shrink runtime size below EIP-170. Pre-execution validation, snapshot of profit
+    /// + collateral, target-action fan-out, post-action delta checks, optional aToken
+    /// unwrap, swap, and finally the internal-action loop (e.g. coinbase payment).
+    /// Each callback wraps this with provider-specific argument validation and a
+    /// finalize call (`_finalizeFlashloan` for repayment).
+    function _runFlashloanPipeline(Plan memory plan, uint256 flashRepayAmount)
+        internal
+        returns (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped)
+    {
         // Pre-execution: verify flash loan funds received
         if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
@@ -744,7 +673,7 @@ contract LiquidationExecutor is
         }
 
         // Snapshot BEFORE protocol actions
-        uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
+        profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
         uint256 collateralBefore;
         if (trackingToken != address(0)) {
             collateralBefore = IERC20(trackingToken).balanceOf(address(this));
@@ -757,7 +686,7 @@ contract LiquidationExecutor is
             }
         }
 
-        // Post-action: verify liquidation produced collateral
+        // Post-action: verify liquidation produced collateral (delta-based, all modes)
         if (trackingToken != address(0)) {
             if (IERC20(trackingToken).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
         }
@@ -772,13 +701,9 @@ contract LiquidationExecutor is
             }
         }
 
-        // Morpho fee = 0, so flash repay equals principal
-        uint256 flashRepayAmount = amount;
         _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset);
 
-        // Internal actions (coinbase payment) after swap
-        uint256 totalCoinbasePayment;
-        uint256 totalWethUnwrapped;
+        // Execute internal actions (coinbase payment) after swap
         for (uint256 i = 0; i < plan.actions.length; ++i) {
             if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
                 (uint256 cbPaid, uint256 wethUsed) =
@@ -787,82 +712,16 @@ contract LiquidationExecutor is
                 totalWethUnwrapped += wethUsed;
             }
         }
-
-        _finalizeMorphoFlashloan(
-            plan.loanToken,
-            amount,
-            flashRepayAmount,
-            plan.swapPlan.profitToken,
-            profitBefore,
-            plan.swapPlan.minProfitAmount,
-            totalCoinbasePayment,
-            totalWethUnwrapped
-        );
     }
 
-    // ─── Internal: Finalize Morpho Flashloan ─────────────────────────
-    /// @dev Morpho pulls repayment via safeTransferFrom after callback returns, so we must
-    /// approve `repayAmount` (== principal, fee=0) to msg.sender. Reverts on dust shortfall.
-    function _finalizeMorphoFlashloan(
-        address asset,
-        uint256 principalAmount,
-        uint256 repayAmount,
-        address profitTkn,
-        uint256 profitBefore,
-        uint256 minProfitAmount,
-        uint256 totalCoinbasePayment,
-        uint256 totalWethUnwrapped
-    ) internal {
-        uint256 balance = IERC20(asset).balanceOf(address(this));
-        if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
-
-        IERC20(asset).forceApprove(msg.sender, repayAmount);
-
-        _checkProfit(
-            asset,
-            principalAmount,
-            repayAmount,
-            profitTkn,
-            profitBefore,
-            minProfitAmount,
-            true,
-            totalCoinbasePayment,
-            totalWethUnwrapped
-        );
-    }
-
-    // ─── Internal: Finalize Aave Flashloan ───────────────────────────
-    function _finalizeAaveFlashloan(
-        address asset,
-        uint256 principalAmount,
-        uint256 repayAmount,
-        address profitTkn,
-        uint256 profitBefore,
-        uint256 minProfitAmount,
-        uint256 totalCoinbasePayment,
-        uint256 totalWethUnwrapped
-    ) internal {
-        uint256 balance = IERC20(asset).balanceOf(address(this));
-        if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
-
-        // Approve exact repay to Aave pool — pool pulls after we return true
-        IERC20(asset).forceApprove(msg.sender, repayAmount);
-
-        _checkProfit(
-            asset,
-            principalAmount,
-            repayAmount,
-            profitTkn,
-            profitBefore,
-            minProfitAmount,
-            true,
-            totalCoinbasePayment,
-            totalWethUnwrapped
-        );
-    }
-
-    // ─── Internal: Finalize Balancer Flashloan ───────────────────────
-    function _finalizeBalancerFlashloan(
+    // ─── Internal: Finalize Flashloan (unified) ──────────────────────
+    /// @dev Single repayment + profit-check path for all three providers. Aave V3 and
+    /// Morpho pull repayment via safeTransferFrom after the callback returns, so we
+    /// approve the principal back to msg.sender (`vault == address(0)`). Balancer
+    /// expects funds returned via safeTransfer to the vault inside the callback
+    /// (`vault != address(0)`). The `repayPending` flag forwarded to `_checkProfit`
+    /// reflects whether the principal still sits on this contract at check-time.
+    function _finalizeFlashloan(
         address asset,
         uint256 principalAmount,
         uint256 repayAmount,
@@ -876,8 +735,15 @@ contract LiquidationExecutor is
         uint256 balance = IERC20(asset).balanceOf(address(this));
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
 
-        // Balancer: transfer back to vault
-        IERC20(asset).safeTransfer(vault, repayAmount);
+        bool repayPending;
+        if (vault == address(0)) {
+            // Aave V3 / Morpho: pool pulls after we return — approve exact amount.
+            IERC20(asset).forceApprove(msg.sender, repayAmount);
+            repayPending = true;
+        } else {
+            // Balancer: push funds back to vault inside the callback.
+            IERC20(asset).safeTransfer(vault, repayAmount);
+        }
 
         _checkProfit(
             asset,
@@ -886,7 +752,7 @@ contract LiquidationExecutor is
             profitTkn,
             profitBefore,
             minProfitAmount,
-            false,
+            repayPending,
             totalCoinbasePayment,
             totalWethUnwrapped
         );
@@ -1041,7 +907,14 @@ contract LiquidationExecutor is
     ///   collateral ── swap1 ──→ intermediate ── swap2 ──→ repayToken
     ///
     /// Each leg is self-contained: srcToken and amountIn extracted from calldata.
-    function _executeParaswapDouble(SwapPlan memory plan, uint256 flashRepayAmount, address collateralAsset) internal {
+    function _executeParaswapDouble(
+        SwapPlan memory plan,
+        uint256,
+        /* flashRepayAmount */
+        address collateralAsset
+    )
+        internal
+    {
         // Execute leg 1
         (address src1, address dst1, uint256 amountIn1, uint256 amountOut1) =
             _executeParaswapCall(plan.paraswapCalldata);
