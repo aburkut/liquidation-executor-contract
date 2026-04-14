@@ -998,7 +998,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             beneficiary := and(mload(add(p, 224)), 0xffffffffffffffffffffffffffffffffffffffff) // GenericData.beneficiary
         }
 
-        if (beneficiary != address(this)) revert SwapRecipientInvalid(beneficiary);
+        // Paraswap V6 omits the beneficiary write when it equals the caller, so the
+        // GenericData slot reads back as address(0). Treat it as equivalent to address(this).
+        if (beneficiary != address(this) && beneficiary != address(0)) {
+            revert SwapRecipientInvalid(beneficiary);
+        }
         if (srcToken == address(0)) revert ZeroAddress();
         if (dstToken == address(0)) revert ZeroAddress();
         amountIn = fromAmount;

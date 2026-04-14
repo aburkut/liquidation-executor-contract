@@ -1637,6 +1637,49 @@ contract ExecutorTest is Test {
     // PARASWAP CALLDATA VALIDATION
     // ═══════════════════════════════════════════════════════════════════
 
+    /// Paraswap V6 sometimes encodes beneficiary == address(0) as a gas optimization
+    /// (caller is implicit recipient). Contract must accept it as equivalent to address(this).
+    function test_paraswapSingle_acceptsZeroBeneficiary() public {
+        // Fund mock so the swap can deliver loanToken on behalf of the implicit recipient.
+        loanToken.mint(address(augustus), DEFAULT_SWAP_AMOUNT);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: _buildParaswapCalldata(
+                address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(0)
+            ),
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    /// Sanity that beneficiary == address(this) still works (covered in happy paths,
+    /// pinned here next to the zero-beneficiary case for symmetry).
+    function test_paraswapSingle_acceptsSelfBeneficiary() public {
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
     function test_revertIfSwapRecipientInvalid() public {
         address badRecipient = address(0xBAAD);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
