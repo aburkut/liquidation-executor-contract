@@ -28,7 +28,7 @@ contract MockParaswapAugustus {
         partialFillPct = pct;
     }
 
-    // Optimized UniV3 selectors — see ParaswapSelectorKind in LiquidationExecutor.
+    // FixedStruct optimized selectors (struct inlined in head).
     bytes4 private constant _SWAP_EXACT_IN_UNI_V3 = bytes4(
         keccak256(
             "swapExactAmountInOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,uint256),uint256,bytes)"
@@ -39,11 +39,25 @@ contract MockParaswapAugustus {
             "swapExactAmountOutOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,uint256),uint256,bytes)"
         )
     );
+    // DynamicStruct selectors (struct in tail with head offset).
+    bytes4 private constant _SWAP_EXACT_IN_UNI_V2 = bytes4(
+        keccak256(
+            "swapExactAmountInOnUniswapV2((address,address,uint256,uint256,uint256,bytes32,address,uint256[]),uint256,bytes)"
+        )
+    );
+    bytes4 private constant _SWAP_EXACT_OUT_UNI_V2 = bytes4(
+        keccak256(
+            "swapExactAmountOutOnUniswapV2((address,address,uint256,uint256,uint256,bytes32,address,uint256[]),uint256,bytes)"
+        )
+    );
 
-    /// @dev Decodes both the generic GenericData layout and the optimized UniswapV3
-    /// struct layout. Generic places src/dst/amount after a 32-byte `executor` head
-    /// word; optimized inlines the struct directly. Discriminating by selector keeps
-    /// the mock representative of the real Augustus dispatch behavior.
+    /// @dev Decodes three calldata families that share the same first 7 fixed
+    /// fields (srcToken, destToken, fromAmount, toAmount, quotedAmount, metadata,
+    /// recipient). Discriminating by selector lets the mock follow the same dispatch
+    /// path the real Augustus V6 uses:
+    ///   • generic: skip 32-byte executor head word
+    ///   • FixedStruct (UniV3): struct inlined right after selector
+    ///   • DynamicStruct (UniV2): struct in the tail; head[0] is the offset
     fallback() external payable {
         require(!swapReverts, "MockParaswapAugustus: swap reverts");
         require(msg.data.length >= 132, "MockParaswapAugustus: bad calldata");
@@ -57,18 +71,25 @@ contract MockParaswapAugustus {
         address dstToken;
         uint256 amountIn;
         if (selector == _SWAP_EXACT_IN_UNI_V3 || selector == _SWAP_EXACT_OUT_UNI_V3) {
-            // Optimized: struct inlined right after selector, no executor head word.
             assembly {
-                srcToken := calldataload(4) // data.srcToken
-                dstToken := calldataload(36) // data.destToken
-                amountIn := calldataload(68) // data.fromAmount
+                srcToken := calldataload(4)
+                dstToken := calldataload(36)
+                amountIn := calldataload(68)
+            }
+        } else if (selector == _SWAP_EXACT_IN_UNI_V2 || selector == _SWAP_EXACT_OUT_UNI_V2) {
+            assembly {
+                let structOffset := calldataload(4)
+                let s := add(4, structOffset)
+                srcToken := calldataload(s)
+                dstToken := calldataload(add(s, 32))
+                amountIn := calldataload(add(s, 64))
             }
         } else {
             // Generic: skip executor head word.
             assembly {
-                srcToken := calldataload(36) // GenericData.srcToken
-                dstToken := calldataload(68) // GenericData.destToken
-                amountIn := calldataload(100) // GenericData.fromAmount
+                srcToken := calldataload(36)
+                dstToken := calldataload(68)
+                amountIn := calldataload(100)
             }
         }
 
