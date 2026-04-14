@@ -10,7 +10,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IAaveV3Pool, IFlashLoanSimpleReceiver} from "./interfaces/IAaveV3Pool.sol";
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
-import {IMorphoBlue, MarketParams} from "./interfaces/IMorphoBlue.sol";
+import {IMorphoBlue, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/IMorphoBlue.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -20,7 +20,14 @@ interface IWETH {
 /// @notice Flashloan + multi-swap + liquidation executor.
 /// @dev Fail-closed. No upgradeability. External calls restricted to allowedTargets allowlist.
 /// Supports Paraswap single/double swaps and Bebop multi-output swaps.
-contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanSimpleReceiver, IFlashLoanRecipient {
+contract LiquidationExecutor is
+    Ownable2Step,
+    Pausable,
+    ReentrancyGuard,
+    IFlashLoanSimpleReceiver,
+    IFlashLoanRecipient,
+    IMorphoFlashLoanCallback
+{
     using SafeERC20 for IERC20;
 
     // ─── Custom Errors ───────────────────────────────────────────────
@@ -110,6 +117,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
     uint8 public constant FLASH_PROVIDER_BALANCER = 2;
+    uint8 public constant FLASH_PROVIDER_MORPHO = 3;
 
     uint8 public constant PROTOCOL_AAVE_V3 = 1;
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
@@ -513,6 +521,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             uint256[] memory amounts = new uint256[](1);
             amounts[0] = plan.loanAmount;
             IBalancerVault(provider).flashLoan(address(this), tokens, amounts, planData);
+        } else if (plan.flashProviderId == FLASH_PROVIDER_MORPHO) {
+            // Morpho Blue flashloan: zero fee, repayment pulled via safeTransferFrom after callback.
+            IMorphoBlue(provider).flashLoan(plan.loanToken, plan.loanAmount, planData);
         } else {
             revert FlashProviderNotAllowed();
         }
@@ -697,6 +708,124 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             plan.swapPlan.profitToken,
             profitBefore,
             plan.swapPlan.minProfitAmount,
+            totalCoinbasePayment,
+            totalWethUnwrapped
+        );
+    }
+
+    // ─── Morpho Blue Flashloan Callback ──────────────────────────────
+    /// @notice Morpho Blue flashloan callback. Same internal pipeline as Aave V3 / Balancer:
+    /// validate caller + plan hash, run liquidation actions, swap collateral, settle profit.
+    /// Morpho is fee-free and pulls repayment via safeTransferFrom after this returns, so we
+    /// must approve `amount` to msg.sender (the Morpho contract). Reverts on insufficient
+    /// repayment balance or any caller other than the registered Morpho flash provider.
+    function onMorphoFlashLoan(uint256 amount, bytes calldata data) external override {
+        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
+        if (_activePlanHash == bytes32(0)) revert NoActivePlan();
+        if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_MORPHO]) revert InvalidCallbackCaller();
+        if (keccak256(data) != _activePlanHash) revert InvalidPlan();
+
+        Plan memory plan = abi.decode(data, (Plan));
+
+        // P0 safety: strict amount match. Morpho passes no asset, so we trust loanToken from
+        // the plan-hash-bound payload (already pinned by the activePlanHash check above).
+        if (amount != plan.loanAmount) revert CallbackAmountMismatch();
+        // Morpho flashloan is fee-free, no maxFlashFee comparison needed (0 ≤ any uint256).
+
+        // Pre-execution: verify flash loan funds received
+        if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
+
+        // Derive collateralAsset and trackingToken for delta check and swap plan
+        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
+
+        // Verify aToken address against canonical source when receiveAToken=true
+        if (trackingToken != address(0) && trackingToken != collateralAsset) {
+            _verifyATokenAddress(plan.actions, collateralAsset, trackingToken);
+        }
+
+        // Snapshot BEFORE protocol actions
+        uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
+        uint256 collateralBefore;
+        if (trackingToken != address(0)) {
+            collateralBefore = IERC20(trackingToken).balanceOf(address(this));
+        }
+
+        // Execute protocol actions (liquidations), skip INTERNAL
+        for (uint256 i = 0; i < plan.actions.length; ++i) {
+            if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
+                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
+            }
+        }
+
+        // Post-action: verify liquidation produced collateral
+        if (trackingToken != address(0)) {
+            if (IERC20(trackingToken).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
+        }
+
+        // Unwrap aTokens to underlying if receiveAToken was used — delta only
+        if (trackingToken != address(0) && trackingToken != collateralAsset) {
+            uint256 aTokenDelta = IERC20(trackingToken).balanceOf(address(this)) - collateralBefore;
+            if (aTokenDelta > 0) {
+                uint256 underlyingBefore = IERC20(collateralAsset).balanceOf(address(this));
+                _unwrapATokens(collateralAsset, aTokenDelta);
+                if (IERC20(collateralAsset).balanceOf(address(this)) <= underlyingBefore) revert UnwrapFailed();
+            }
+        }
+
+        // Morpho fee = 0, so flash repay equals principal
+        uint256 flashRepayAmount = amount;
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset);
+
+        // Internal actions (coinbase payment) after swap
+        uint256 totalCoinbasePayment;
+        uint256 totalWethUnwrapped;
+        for (uint256 i = 0; i < plan.actions.length; ++i) {
+            if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
+                (uint256 cbPaid, uint256 wethUsed) =
+                    _executeInternalAction(plan.actions[i].data, plan.swapPlan.profitToken);
+                totalCoinbasePayment += cbPaid;
+                totalWethUnwrapped += wethUsed;
+            }
+        }
+
+        _finalizeMorphoFlashloan(
+            plan.loanToken,
+            amount,
+            flashRepayAmount,
+            plan.swapPlan.profitToken,
+            profitBefore,
+            plan.swapPlan.minProfitAmount,
+            totalCoinbasePayment,
+            totalWethUnwrapped
+        );
+    }
+
+    // ─── Internal: Finalize Morpho Flashloan ─────────────────────────
+    /// @dev Morpho pulls repayment via safeTransferFrom after callback returns, so we must
+    /// approve `repayAmount` (== principal, fee=0) to msg.sender. Reverts on dust shortfall.
+    function _finalizeMorphoFlashloan(
+        address asset,
+        uint256 principalAmount,
+        uint256 repayAmount,
+        address profitTkn,
+        uint256 profitBefore,
+        uint256 minProfitAmount,
+        uint256 totalCoinbasePayment,
+        uint256 totalWethUnwrapped
+    ) internal {
+        uint256 balance = IERC20(asset).balanceOf(address(this));
+        if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
+
+        IERC20(asset).forceApprove(msg.sender, repayAmount);
+
+        _checkProfit(
+            asset,
+            principalAmount,
+            repayAmount,
+            profitTkn,
+            profitBefore,
+            minProfitAmount,
+            true,
             totalCoinbasePayment,
             totalWethUnwrapped
         );

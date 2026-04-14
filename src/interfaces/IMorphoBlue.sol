@@ -31,4 +31,13 @@ interface IMorphoBlue {
         uint256 repaidShares,
         bytes memory data
     ) external returns (uint256 assetsSeized, uint256 assetsRepaid);
+
+    /// @notice Morpho Blue flashloan: lends `assets` of `token` to msg.sender, then pulls them
+    /// back via safeTransferFrom after the `onMorphoFlashLoan(assets, data)` callback. Fee is zero.
+    function flashLoan(address token, uint256 assets, bytes calldata data) external;
+}
+
+/// @notice Callback interface implemented by flashloan recipients of Morpho Blue.
+interface IMorphoFlashLoanCallback {
+    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external;
 }
