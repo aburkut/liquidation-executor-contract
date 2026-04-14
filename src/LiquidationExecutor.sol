@@ -978,16 +978,17 @@ contract LiquidationExecutor is
         (address src1, address dst1, uint256 amountIn1, uint256 amountOut1) =
             _executeParaswapCall(plan.paraswapCalldata);
 
-        // For CHAINED: validate leg 2 input <= leg 1 output BEFORE executing leg 2
+        // For CHAINED: validate leg 2 input <= leg 1 output BEFORE executing leg 2.
+        // Routes through the same selector-aware decoder the orchestrator uses, so
+        // optimized variants (where fromAmount sits at a different calldata offset
+        // than the generic GenericData layout) are read correctly. The previous
+        // hardcoded `mload(add(add(cd2, 36), 96))` only matched the generic family
+        // and would silently misread an optimized leg2, defeating the chained guard.
         if (plan.doubleSwapPattern == DoubleSwapPattern.CHAINED) {
-            bytes memory cd2 = plan.paraswapCalldata2;
-            // Ensure calldata is long enough for assembly read at offset 132 (36+96)
-            if (cd2.length < 132) revert InvalidParaswapCalldata();
-            uint256 leg2FromAmount;
-            assembly {
-                leg2FromAmount := mload(add(add(cd2, 36), 96)) // same offset as _executeParaswapCall
+            (,, uint256 leg2FromAmount,) = _decodeAndValidateParaswap(plan.paraswapCalldata2);
+            if (leg2FromAmount > amountOut1) {
+                revert ChainedInputExceedsOutput(leg2FromAmount, amountOut1);
             }
-            if (leg2FromAmount > amountOut1) revert ChainedInputExceedsOutput(leg2FromAmount, amountOut1);
         }
 
         // Execute leg 2

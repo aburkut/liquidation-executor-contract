@@ -1136,6 +1136,94 @@ contract ExecutorTest is Test {
         executor.execute(plan); // should succeed
     }
 
+    /// Chained pattern where leg2 uses the optimized UniV3 selector. Pre-fix this
+    /// path silently misread `leg2FromAmount` from the generic offset (96 from args
+    /// start, which on optimized calldata holds the toAmount field instead of
+    /// fromAmount), so the chained guard saw garbage and either passed or reverted
+    /// at random. Selector-aware decode now returns the real fromAmount and the
+    /// validation is meaningful again.
+    function test_paraswapDouble_chained_optimizedLeg2_happyPath() public {
+        uint256 debtToCover = 400e18;
+
+        // Leg 1: collateral -> profitToken at 1.1x via generic exact-in
+        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
+        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18; // 1100e18
+        bytes memory cd1 =
+            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
+
+        // Leg 2: profitToken -> loanToken via OPTIMIZED UniV3 ExactIn (struct inline,
+        // no executor head word). leg2FromAmount must read fromAmount at the
+        // optimized offset, not at the generic offset.
+        uint256 leg2AmountIn = leg1AmountOut;
+        bytes memory cd2 = _buildOptimizedExactInUniV3Calldata(
+            address(profitToken), address(loanToken), leg2AmountIn, 0, address(executor)
+        );
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
+            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
+        );
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan); // must succeed end-to-end with optimized leg2
+    }
+
+    /// Chained pattern, optimized leg2 declares MORE input than leg1 produced.
+    /// The selector-aware guard must catch this (post-fix) and revert with
+    /// `ChainedInputExceedsOutput(declared, leg1_actual_output)`. Pre-fix this
+    /// would have read fromAmount from the wrong offset and either let it
+    /// through or panicked on unrelated grounds.
+    function test_paraswapDouble_chained_optimizedLeg2_excessiveInput_reverts() public {
+        uint256 debtToCover = 400e18;
+
+        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
+        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18; // 1100e18
+        bytes memory cd1 =
+            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
+
+        // Optimized leg 2 declares 2x the leg1 output — must revert.
+        uint256 leg2AmountIn = leg1AmountOut * 2;
+        bytes memory cd2 = _buildOptimizedExactInUniV3Calldata(
+            address(profitToken), address(loanToken), leg2AmountIn, 0, address(executor)
+        );
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
+            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
+        );
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.ChainedInputExceedsOutput.selector, leg2AmountIn, leg1AmountOut)
+        );
+        executor.execute(plan);
+    }
+
+    /// Sanity guard: chained with a generic leg2 still works after the
+    /// selector-aware refactor (no regression on the existing path).
+    function test_paraswapDouble_chained_genericLeg2_stillWorks() public {
+        uint256 debtToCover = 400e18;
+        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
+        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18;
+        bytes memory cd1 =
+            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
+        bytes memory cd2 =
+            _buildParaswapCalldata(address(profitToken), address(loanToken), leg1AmountOut, address(executor));
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
+            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
+        );
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
     function test_paraswapDouble_split_revertsRepayInsufficient() public {
         // Split pattern where the repay leg output is insufficient for flash loan repay.
         // Uses a fresh executor with no pre-existing loanToken to ensure absolute balance is truly insufficient.
