@@ -28,20 +28,48 @@ contract MockParaswapAugustus {
         partialFillPct = pct;
     }
 
-    /// @dev Generic fallback that decodes (srcToken, dstToken, amountIn) from Paraswap
-    /// GenericData layout: selector(4) + executor(32) + srcToken(32) + destToken(32) + fromAmount(32) ...
+    // Optimized UniV3 selectors — see ParaswapSelectorKind in LiquidationExecutor.
+    bytes4 private constant _SWAP_EXACT_IN_UNI_V3 = bytes4(
+        keccak256(
+            "swapExactAmountInOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,uint256),uint256,bytes)"
+        )
+    );
+    bytes4 private constant _SWAP_EXACT_OUT_UNI_V3 = bytes4(
+        keccak256(
+            "swapExactAmountOutOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,uint256),uint256,bytes)"
+        )
+    );
+
+    /// @dev Decodes both the generic GenericData layout and the optimized UniswapV3
+    /// struct layout. Generic places src/dst/amount after a 32-byte `executor` head
+    /// word; optimized inlines the struct directly. Discriminating by selector keeps
+    /// the mock representative of the real Augustus dispatch behavior.
     fallback() external payable {
         require(!swapReverts, "MockParaswapAugustus: swap reverts");
-
-        // Decode srcToken, dstToken, fromAmount from GenericData after selector + executor
         require(msg.data.length >= 132, "MockParaswapAugustus: bad calldata");
+
+        bytes4 selector;
+        assembly {
+            selector := calldataload(0)
+        }
+
         address srcToken;
         address dstToken;
         uint256 amountIn;
-        assembly {
-            srcToken := calldataload(36) // GenericData.srcToken
-            dstToken := calldataload(68) // GenericData.destToken
-            amountIn := calldataload(100) // GenericData.fromAmount
+        if (selector == _SWAP_EXACT_IN_UNI_V3 || selector == _SWAP_EXACT_OUT_UNI_V3) {
+            // Optimized: struct inlined right after selector, no executor head word.
+            assembly {
+                srcToken := calldataload(4) // data.srcToken
+                dstToken := calldataload(36) // data.destToken
+                amountIn := calldataload(68) // data.fromAmount
+            }
+        } else {
+            // Generic: skip executor head word.
+            assembly {
+                srcToken := calldataload(36) // GenericData.srcToken
+                dstToken := calldataload(68) // GenericData.destToken
+                amountIn := calldataload(100) // GenericData.fromAmount
+            }
         }
 
         uint256 actualIn = partialFillPct > 0 ? amountIn * partialFillPct / 100 : amountIn;

@@ -59,6 +59,18 @@ contract ExecutorTest is Test {
         )
     );
 
+    bytes4 constant SWAP_EXACT_IN_UNI_V3_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountInOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,uint256),uint256,bytes)"
+        )
+    );
+
+    bytes4 constant SWAP_EXACT_OUT_UNI_V3_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountOutOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,uint256),uint256,bytes)"
+        )
+    );
+
     function setUp() public {
         loanToken = new MockERC20("Loan Token", "LOAN", 18);
         collateralToken = new MockERC20("Collateral Token", "COLL", 18);
@@ -150,6 +162,57 @@ contract ExecutorTest is Test {
             uint256(0), // partnerAndFee
             bytes(""), // permit
             bytes("") // executorData
+        );
+    }
+
+    /// @dev Build Paraswap optimized swapExactAmountInOnUniswapV3 calldata. The
+    /// first arg is a UniswapV3Data struct (no executor head word); src/dst/amount
+    /// live at offsets 4/36/68, recipient at offset 196 (post-selector).
+    function _buildOptimizedExactInUniV3Calldata(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        return abi.encodeWithSelector(
+            SWAP_EXACT_IN_UNI_V3_SELECTOR,
+            srcToken, // data.srcToken
+            dstToken, // data.destToken
+            amountIn, // data.fromAmount
+            minAmountOut, // data.toAmount (== minAmountOut for ExactIn)
+            uint256(0), // data.quotedAmount
+            bytes32(0), // data.metadata
+            beneficiary, // data.recipient
+            uint256(0), // data.pool
+            uint256(0), // partnerAndFee
+            bytes("") // permit
+        );
+    }
+
+    /// @dev Build Paraswap optimized swapExactAmountOutOnUniswapV3 calldata.
+    /// Same struct layout as ExactIn — fromAmount is interpreted as the maximum
+    /// input by Augustus. minAmountOut field semantically encodes the exact output
+    /// the caller wants, but we still pin amountOut >= toAmount on our side.
+    function _buildOptimizedExactOutUniV3Calldata(
+        address srcToken,
+        address dstToken,
+        uint256 maxAmountIn,
+        uint256 exactAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        return abi.encodeWithSelector(
+            SWAP_EXACT_OUT_UNI_V3_SELECTOR,
+            srcToken,
+            dstToken,
+            maxAmountIn,
+            exactAmountOut,
+            uint256(0),
+            bytes32(0),
+            beneficiary,
+            uint256(0),
+            uint256(0),
+            bytes("")
         );
     }
 
@@ -1869,6 +1932,233 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // OPTIMIZED PARASWAP SELECTORS (UniswapV3 ExactIn / ExactOut)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Optimized exact-in selector: full-size struct in head (no executor word),
+    /// recipient at slot 6. Mock decodes by selector and routes through the same
+    /// execution + balance-delta path as the generic call.
+    function test_paraswapOptimized_exactIn_uniV3_happyPath() public {
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 loanAfter = loanToken.balanceOf(address(executor));
+        assertGt(loanAfter, loanBefore, "optimized exact-in must produce loanToken output");
+    }
+
+    /// Optimized exact-out selector with a 95% partial-fill mock — actual consumed
+    /// must be <= declared max (matches generic ExactOut semantics).
+    function test_paraswapOptimized_exactOut_uniV3_happyPath() public {
+        augustus.setPartialFillPct(95); // consume 95% of declared max
+
+        bytes memory cd = _buildOptimizedExactOutUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // Restore for unrelated tests.
+        augustus.setPartialFillPct(0);
+    }
+
+    /// Wrong srcToken in optimized calldata must surface via the executor's
+    /// post-decode validation — the spec.srcToken / decoded srcToken mismatch is
+    /// caught by `_executeParaswapSingle` (ParaswapSrcTokenMismatch).
+    function test_paraswapOptimized_wrongSrcToken_reverts() public {
+        // Calldata claims wrong srcToken (mockWeth) while plan declares collateralToken.
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(mockWeth), // wrong src
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    /// Wrong dstToken in optimized calldata must surface via repayToken mismatch.
+    function test_paraswapOptimized_wrongDstToken_reverts() public {
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken),
+            address(mockWeth), // wrong dst (plan expects loanToken)
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken), // mismatch with cd dst
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    /// Wrong amount in optimized exact-in calldata: actual consumed (= declared)
+    /// must equal plan.amountIn. Mismatch fires `ParaswapAmountInMismatch`.
+    function test_paraswapOptimized_wrongAmount_reverts() public {
+        // Calldata declares half of plan.amountIn → consumed = half → mismatch.
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT / 2, 0, address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    /// Unknown selector (anything not in the explicit whitelist) must revert with
+    /// `InvalidParaswapSelector(selector)` — no silent fallback to the generic
+    /// decoder, no arbitrary-call passthrough.
+    function test_paraswapOptimized_unknownSelector_reverts() public {
+        bytes4 fakeSelector = 0xdeadbeef;
+        bytes memory cd = abi.encodePacked(fakeSelector, new bytes(420)); // pad past length checks
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidParaswapSelector.selector, fakeSelector));
+        executor.execute(plan);
+    }
+
+    /// Beneficiary rule still enforced for optimized — same SwapRecipientInvalid
+    /// surface as for the generic family. Anything other than {address(this), 0}
+    /// reverts pre-call.
+    function test_paraswapOptimized_invalidBeneficiary_reverts() public {
+        address badRecipient = address(0xBAAD);
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, badRecipient
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.SwapRecipientInvalid.selector, badRecipient));
+        executor.execute(plan);
+    }
+
     function test_revertIfSwapRecipientInvalid() public {
         address badRecipient = address(0xBAAD);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
@@ -1966,7 +2256,9 @@ contract ExecutorTest is Test {
             _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidSwapSelector.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.InvalidParaswapSelector.selector, bytes4(0xdeadbeef))
+        );
         executor.execute(plan);
     }
 
