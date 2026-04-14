@@ -573,6 +573,195 @@ contract ExecutorTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // MORPHO FLASH HAPPY PATH + CALLBACK VALIDATION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Morpho flashloan + Morpho liquidation + Paraswap collateral→loanToken + repay pulled by Morpho.
+    /// Mirrors the Aave/Balancer happy-path shape but uses FLASH_PROVIDER_MORPHO (id=3) and a
+    /// PROTOCOL_MORPHO_BLUE liquidation action — flashloan and liquidation paths stay separate
+    /// even though both ultimately call into the same Morpho Blue contract.
+    function test_morphoFlash_paraswap_morphoRepay() public {
+        uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
+        vm.prank(owner);
+        executor.setFlashProvider(morphoFlashId, address(morphoBlue));
+
+        uint256 seizedAssets = 500e18;
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, MIN_PROFIT);
+        LiquidationExecutor.Action[] memory liqAction = _singleAction(
+            2, // PROTOCOL_MORPHO_BLUE
+            _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), seizedAssets)
+        );
+        // Morpho fee is zero; pass FLASH_FEE as maxFlashFee headroom only.
+        bytes memory plan = _buildPlan(3, address(loanToken), LOAN_AMOUNT, FLASH_FEE, liqAction, swapPlan);
+
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 loanAfter = loanToken.balanceOf(address(executor));
+        assertGe(loanAfter - loanBefore, MIN_PROFIT);
+
+        // Approval hygiene: Morpho approval was forceApprove(repayAmount), pulled to zero
+        // by the post-callback transferFrom. Augustus approval reset by the swap path.
+        assertEq(loanToken.allowance(address(executor), address(morphoBlue)), 0);
+        assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+    }
+
+    /// Direct call to onMorphoFlashLoan from outside an active flashloan must revert.
+    /// Phase guard catches this regardless of whether the caller pretends to be Morpho.
+    function test_morphoCallbackRejectsAttacker() public {
+        vm.prank(attacker);
+        vm.expectRevert(LiquidationExecutor.InvalidExecutionPhase.selector);
+        executor.onMorphoFlashLoan(LOAN_AMOUNT, "");
+    }
+
+    /// Strict caller-auth proof: even when the phase guard and plan-hash guard are
+    /// both forced to "valid" via direct storage manipulation, the callback MUST
+    /// still revert with InvalidCallbackCaller for any sender other than the
+    /// configured FLASH_PROVIDER_MORPHO. This catches a regression where the caller
+    /// check is accidentally weakened or removed in a refactor — relying on
+    /// InvalidExecutionPhase alone would mask such a bug whenever an attacker
+    /// finds any way to land mid-flashloan (e.g. cross-callback re-entry).
+    function test_morphoCallbackRejectsCallerEvenWithValidPhaseAndHash() public {
+        // Register Morpho as the flashloan provider so the auth check has a concrete
+        // address to compare against.
+        uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
+        vm.prank(owner);
+        executor.setFlashProvider(morphoFlashId, address(morphoBlue));
+
+        // Build a real plan and abi-encode it; the plan hash must match what we
+        // plant into _activePlanHash for the hash check to pass.
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
+        LiquidationExecutor.Action[] memory liqAction = _singleAction(
+            2, // PROTOCOL_MORPHO_BLUE
+            _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), 500e18)
+        );
+        bytes memory planBytes = _buildPlan(3, address(loanToken), LOAN_AMOUNT, FLASH_FEE, liqAction, swapPlan);
+        bytes32 planHash = keccak256(planBytes);
+
+        // Storage layout (forge inspect LiquidationExecutor storage):
+        //   slot 9  = _activePlanHash    (bytes32)
+        //   slot 10 = _executionPhase    (uint8 enum, low byte)
+        // Force both into the "during flashloan" state so neither guard short-circuits.
+        vm.store(address(executor), bytes32(uint256(9)), planHash);
+        vm.store(address(executor), bytes32(uint256(10)), bytes32(uint256(1))); // FlashLoanActive
+
+        // Attacker (not the registered Morpho provider) hits the callback. The phase
+        // and hash gates pass; only the caller check should reject.
+        vm.prank(attacker);
+        vm.expectRevert(LiquidationExecutor.InvalidCallbackCaller.selector);
+        executor.onMorphoFlashLoan(LOAN_AMOUNT, planBytes);
+    }
+
+    /// configureMorpho must atomically set both the morphoBlue (liquidation) slot
+    /// AND the FLASH_PROVIDER_MORPHO entry in allowedFlashProviders. Without this
+    /// helper, two-tx config could leave the two roles pointing at different
+    /// addresses — opening a window where the flashloan callback is gated by an
+    /// outdated provider while liquidation calls go to a new contract.
+    function test_configureMorphoAtomicallyPinsBothSlots() public {
+        uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
+
+        // Sanity: setUp() previously called only setMorphoBlue, leaving the flash
+        // provider entry empty.
+        assertEq(executor.morphoBlue(), address(morphoBlue));
+        assertEq(executor.allowedFlashProviders(morphoFlashId), address(0));
+
+        vm.prank(owner);
+        executor.configureMorpho(address(morphoBlue));
+
+        assertEq(executor.morphoBlue(), address(morphoBlue), "morphoBlue must be set");
+        assertEq(
+            executor.allowedFlashProviders(morphoFlashId),
+            address(morphoBlue),
+            "FLASH_PROVIDER_MORPHO entry must be set to the same address"
+        );
+    }
+
+    /// Validation parity: configureMorpho must apply the same zero-address and
+    /// allowedTargets gates as the legacy setters so the helper cannot smuggle an
+    /// unwhitelisted address into either slot.
+    function test_configureMorphoRejectsZeroAndUnwhitelisted() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.configureMorpho(address(0));
+
+        address notWhitelisted = address(0xDEADBEEF);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        executor.configureMorpho(notWhitelisted);
+    }
+
+    /// Insufficient repay balance: a fresh executor with no pre-funding plus a swap that
+    /// returns less than the loan principal forces _finalizeMorphoFlashloan to revert
+    /// before the approve, since Morpho would otherwise pull more than the executor holds.
+    function test_morphoFlash_revertsOnInsufficientRepayBalance() public {
+        address[] memory targets = new address[](2);
+        targets[0] = address(augustus);
+        targets[1] = address(morphoBlue);
+        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            targets
+        );
+
+        uint8 morphoFlashId = freshExecutor.FLASH_PROVIDER_MORPHO();
+        vm.startPrank(owner);
+        freshExecutor.setMorphoBlue(address(morphoBlue));
+        freshExecutor.setFlashProvider(morphoFlashId, address(morphoBlue));
+        vm.stopPrank();
+
+        uint256 seizedAssets = 500e18;
+        uint256 collateralReward = COLLATERAL_REWARD;
+        morphoBlue.setLiquidationCollateralReward(collateralReward);
+
+        // Bleed swap output: 0.6× rate → executor receives only 360 loanToken vs 1000 repay needed.
+        uint256 originalRate = augustus.rate();
+        augustus.setRate(0.6e18);
+
+        loanToken.mint(address(morphoBlue), 100_000e18);
+        collateralToken.mint(address(morphoBlue), 100_000e18);
+        loanToken.mint(address(augustus), 100_000e18);
+
+        bytes memory targetAction =
+            _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), seizedAssets);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: collateralReward,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: _buildParaswapCalldata(
+                address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
+            ),
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(3, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(); // InsufficientRepayBalance
+        freshExecutor.execute(plan);
+
+        // Restore for unrelated tests
+        augustus.setRate(originalRate);
+
+        // No tokens stranded on revert
+        assertEq(loanToken.balanceOf(address(freshExecutor)), 0, "no loanToken stuck");
+        assertEq(collateralToken.balanceOf(address(freshExecutor)), 0, "no collateralToken stuck");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // BALANCER CALLBACK VALIDATION
     // ═══════════════════════════════════════════════════════════════════
 

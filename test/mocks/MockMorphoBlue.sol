@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {MarketParams} from "../../src/interfaces/IMorphoBlue.sol";
+import {MarketParams, IMorphoFlashLoanCallback} from "../../src/interfaces/IMorphoBlue.sol";
 
 contract MockMorphoBlue {
     using SafeERC20 for IERC20;
@@ -13,6 +13,9 @@ contract MockMorphoBlue {
     uint256 public liquidationCollateralReward;
     bool public liquidationCollateralRewardSet;
     uint256 public liquidationDebtAmount;
+    /// @dev When true, the mock skips the safeTransferFrom pull, simulating a
+    /// caller that fails to leave enough balance to satisfy repayment.
+    bool public flashLoanSkipsPull;
 
     function setRepayReverts(bool _reverts) external {
         repayReverts = _reverts;
@@ -66,6 +69,20 @@ contract MockMorphoBlue {
         external
     {
         IERC20(marketParams.collateralToken).safeTransferFrom(msg.sender, address(this), assets);
+    }
+
+    function setFlashLoanSkipsPull(bool _skip) external {
+        flashLoanSkipsPull = _skip;
+    }
+
+    /// @notice Mirrors Morpho Blue: send `assets` of `token` to caller, invoke callback,
+    /// then pull repayment via safeTransferFrom. Fee = 0.
+    function flashLoan(address token, uint256 assets, bytes calldata data) external {
+        IERC20(token).safeTransfer(msg.sender, assets);
+        IMorphoFlashLoanCallback(msg.sender).onMorphoFlashLoan(assets, data);
+        if (!flashLoanSkipsPull) {
+            IERC20(token).safeTransferFrom(msg.sender, address(this), assets);
+        }
     }
 
     function liquidate(
