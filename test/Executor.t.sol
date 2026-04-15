@@ -19,10 +19,12 @@ import {MockAaveV2LendingPool} from "./mocks/MockAaveV2LendingPool.sol";
 import {MockBebopSettlement} from "./mocks/MockBebopSettlement.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 
-/// Test-only struct mirroring Augustus V6.2 UniswapV2Data exactly. Used so
-/// `abi.encodeWithSelector` produces the correct DynamicStruct layout (struct in
-/// tail with a head offset) rather than flattening fields.
-struct TestUniV2Data {
+/// Test-only struct mirroring Augustus V6.2 UniswapV2Data / UniswapV3Data. Both
+/// real V6.2 structs share this exact 8-field shape (`bytes pools` makes the
+/// struct dynamic → tail-encoded, with a head offset). Using a typed struct
+/// here makes `abi.encodeWithSelector` produce the canonical V6.2 calldata
+/// layout instead of flattening the fields.
+struct TestUniV2V3Data {
     address srcToken;
     address destToken;
     uint256 fromAmount;
@@ -30,7 +32,48 @@ struct TestUniV2Data {
     uint256 quotedAmount;
     bytes32 metadata;
     address recipient;
-    uint256[] pools;
+    bytes pools;
+}
+
+/// Test-only struct mirroring Augustus V6.2 CurveV1Data (9 fields, no dynamic
+/// → inline-encoded into the head).
+struct TestCurveV1Data {
+    uint256 curveData;
+    uint256 curveAssets;
+    address srcToken;
+    address destToken;
+    uint256 fromAmount;
+    uint256 toAmount;
+    uint256 quotedAmount;
+    bytes32 metadata;
+    address beneficiary;
+}
+
+/// Test-only struct mirroring Augustus V6.2 CurveV2Data (11 fields, no dynamic
+/// → inline-encoded into the head).
+struct TestCurveV2Data {
+    uint256 curveData;
+    uint256 i;
+    uint256 j;
+    address poolAddress;
+    address srcToken;
+    address destToken;
+    uint256 fromAmount;
+    uint256 toAmount;
+    uint256 quotedAmount;
+    bytes32 metadata;
+    address beneficiary;
+}
+
+/// Test-only struct mirroring Augustus V6.2 BalancerV2Data (5 fields, no dynamic).
+/// Used only for the explicit-reject test — the executor must revert before
+/// touching the struct.
+struct TestBalancerV2Data {
+    uint256 fromAmount;
+    uint256 toAmount;
+    uint256 quotedAmount;
+    bytes32 metadata;
+    uint256 beneficiaryAndApproveFlag;
 }
 
 contract ExecutorTest is Test {
@@ -61,47 +104,71 @@ contract ExecutorTest is Test {
     uint256 constant COLLATERAL_REWARD = 600e18;
     uint256 constant DEFAULT_SWAP_AMOUNT = 1000e18; // Pre-funded collateral balance used in default swaps
 
+    // ─── Augustus V6.2 swap entrypoint selectors (all 11) ────────────────
+    // Verified against Sourcify metadata for 0x6A000F20005980200259B80c5102003040001068.
+    // 8 accepted by the executor, 3 explicitly rejected (BalancerV2 In/Out + RFQ).
     bytes4 constant SWAP_EXACT_IN_SELECTOR = bytes4(
         keccak256(
             "swapExactAmountIn(address,(address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes,bytes)"
         )
-    );
+    ); // 0xe3ead59e
 
     bytes4 constant SWAP_EXACT_OUT_SELECTOR = bytes4(
         keccak256(
             "swapExactAmountOut(address,(address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes,bytes)"
         )
-    );
+    ); // 0x7f457675
 
     bytes4 constant SWAP_EXACT_IN_UNI_V3_SELECTOR = bytes4(
         keccak256(
-            "swapExactAmountInOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,uint256),uint256,bytes)"
+            "swapExactAmountInOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
         )
-    );
+    ); // 0x876a02f6
 
     bytes4 constant SWAP_EXACT_OUT_UNI_V3_SELECTOR = bytes4(
         keccak256(
-            "swapExactAmountOutOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,uint256),uint256,bytes)"
+            "swapExactAmountOutOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
         )
-    );
+    ); // 0x5e94e28d
 
     bytes4 constant SWAP_EXACT_IN_UNI_V2_SELECTOR = bytes4(
         keccak256(
-            "swapExactAmountInOnUniswapV2((address,address,uint256,uint256,uint256,bytes32,address,uint256[]),uint256,bytes)"
+            "swapExactAmountInOnUniswapV2((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
         )
-    );
+    ); // 0xe8bb3b6c
 
-    bytes4 constant SWAP_EXACT_IN_BALANCER_V2_SELECTOR = bytes4(
+    bytes4 constant SWAP_EXACT_OUT_UNI_V2_SELECTOR = bytes4(
         keccak256(
-            "swapExactAmountInOnBalancerV2((bytes32[],uint8[],address[],bytes,uint256,address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes)"
+            "swapExactAmountOutOnUniswapV2((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
         )
-    );
+    ); // 0xa76f4eb6
+
+    bytes4 constant SWAP_EXACT_IN_CURVE_V1_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountInOnCurveV1((uint256,uint256,address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes)"
+        )
+    ); // 0x1a01c532
 
     bytes4 constant SWAP_EXACT_IN_CURVE_V2_SELECTOR = bytes4(
         keccak256(
-            "swapExactAmountInOnCurveV2((address,address,address,uint256,uint256,uint256,bytes32,address,uint256),uint256,bytes)"
+            "swapExactAmountInOnCurveV2((uint256,uint256,uint256,address,address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes)"
         )
-    );
+    ); // 0xe37ed256
+
+    // ─── Documented-reject selectors ─────────────────────────────────────
+    bytes4 constant SWAP_EXACT_IN_BALANCER_V2_SELECTOR = bytes4(
+        keccak256("swapExactAmountInOnBalancerV2((uint256,uint256,uint256,bytes32,uint256),uint256,bytes,bytes)")
+    ); // 0xd85ca173
+
+    bytes4 constant SWAP_EXACT_OUT_BALANCER_V2_SELECTOR = bytes4(
+        keccak256("swapExactAmountOutOnBalancerV2((uint256,uint256,uint256,bytes32,uint256),uint256,bytes,bytes)")
+    ); // 0xd6ed22e6
+
+    bytes4 constant SWAP_RFQ_BATCH_FILL_SELECTOR = bytes4(
+        keccak256(
+            "swapOnAugustusRFQTryBatchFill((uint256,uint256,uint8,bytes32,address),((uint256,uint128,address,address,address,address,uint256,uint256),bytes,uint256,bytes,bytes)[],bytes)"
+        )
+    ); // 0xda35bb0d
 
     function setUp() public {
         loanToken = new MockERC20("Loan Token", "LOAN", 18);
@@ -197,9 +264,31 @@ contract ExecutorTest is Test {
         );
     }
 
-    /// @dev Build Paraswap optimized swapExactAmountInOnUniswapV3 calldata. The
-    /// first arg is a UniswapV3Data struct (no executor head word); src/dst/amount
-    /// live at offsets 4/36/68, recipient at offset 196 (post-selector).
+    /// @dev Build a UniswapV2 / UniswapV3 swap calldata for any of the four
+    /// In/Out direct selectors. Both real V6.2 structs share the same 8-field
+    /// shape with a trailing `bytes pools` — so the struct is dynamic and
+    /// encoded in the TAIL with a head offset.
+    function _buildUniV2V3Calldata(
+        bytes4 selector,
+        address srcToken,
+        address dstToken,
+        uint256 fromAmount,
+        uint256 toAmount,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        TestUniV2V3Data memory data = TestUniV2V3Data({
+            srcToken: srcToken,
+            destToken: dstToken,
+            fromAmount: fromAmount,
+            toAmount: toAmount,
+            quotedAmount: 0,
+            metadata: bytes32(0),
+            recipient: beneficiary,
+            pools: hex"deadbeef" // dummy; mock ignores
+        });
+        return abi.encodeWithSelector(selector, data, uint256(0), bytes(""));
+    }
+
     function _buildOptimizedExactInUniV3Calldata(
         address srcToken,
         address dstToken,
@@ -207,25 +296,11 @@ contract ExecutorTest is Test {
         uint256 minAmountOut,
         address beneficiary
     ) internal pure returns (bytes memory) {
-        return abi.encodeWithSelector(
-            SWAP_EXACT_IN_UNI_V3_SELECTOR,
-            srcToken, // data.srcToken
-            dstToken, // data.destToken
-            amountIn, // data.fromAmount
-            minAmountOut, // data.toAmount (== minAmountOut for ExactIn)
-            uint256(0), // data.quotedAmount
-            bytes32(0), // data.metadata
-            beneficiary, // data.recipient
-            uint256(0), // data.pool
-            uint256(0), // partnerAndFee
-            bytes("") // permit
+        return _buildUniV2V3Calldata(
+            SWAP_EXACT_IN_UNI_V3_SELECTOR, srcToken, dstToken, amountIn, minAmountOut, beneficiary
         );
     }
 
-    /// @dev Build Paraswap optimized swapExactAmountOutOnUniswapV3 calldata.
-    /// Same struct layout as ExactIn — fromAmount is interpreted as the maximum
-    /// input by Augustus. minAmountOut field semantically encodes the exact output
-    /// the caller wants, but we still pin amountOut >= toAmount on our side.
     function _buildOptimizedExactOutUniV3Calldata(
         address srcToken,
         address dstToken,
@@ -233,26 +308,11 @@ contract ExecutorTest is Test {
         uint256 exactAmountOut,
         address beneficiary
     ) internal pure returns (bytes memory) {
-        return abi.encodeWithSelector(
-            SWAP_EXACT_OUT_UNI_V3_SELECTOR,
-            srcToken,
-            dstToken,
-            maxAmountIn,
-            exactAmountOut,
-            uint256(0),
-            bytes32(0),
-            beneficiary,
-            uint256(0),
-            uint256(0),
-            bytes("")
+        return _buildUniV2V3Calldata(
+            SWAP_EXACT_OUT_UNI_V3_SELECTOR, srcToken, dstToken, maxAmountIn, exactAmountOut, beneficiary
         );
     }
 
-    /// @dev Build Paraswap swapExactAmountInOnUniswapV2 calldata. The first arg is
-    /// a UniswapV2Data struct containing a dynamic `uint256[] pools` field, so the
-    /// struct is encoded in the TAIL with an offset stored in the head — this is
-    /// the canonical "DynamicStruct" shape the executor's
-    /// `_decodeParaswapDynamicStruct` is designed for.
     function _buildUniV2ExactInCalldata(
         address srcToken,
         address dstToken,
@@ -260,19 +320,81 @@ contract ExecutorTest is Test {
         uint256 minAmountOut,
         address beneficiary
     ) internal pure returns (bytes memory) {
-        uint256[] memory pools = new uint256[](1);
-        pools[0] = 0xdeadbeef; // dummy pool id; mock ignores it
-        TestUniV2Data memory data = TestUniV2Data({
+        return _buildUniV2V3Calldata(
+            SWAP_EXACT_IN_UNI_V2_SELECTOR, srcToken, dstToken, amountIn, minAmountOut, beneficiary
+        );
+    }
+
+    function _buildUniV2ExactOutCalldata(
+        address srcToken,
+        address dstToken,
+        uint256 maxAmountIn,
+        uint256 exactAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        return _buildUniV2V3Calldata(
+            SWAP_EXACT_OUT_UNI_V2_SELECTOR, srcToken, dstToken, maxAmountIn, exactAmountOut, beneficiary
+        );
+    }
+
+    /// @dev Build a CurveV1 swapExactAmountInOnCurveV1 calldata. Inline 9-field
+    /// struct (no dynamic) → packs into the head exactly as the real V6.2
+    /// CurveV1Data ABI.
+    function _buildCurveV1ExactInCalldata(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        TestCurveV1Data memory data = TestCurveV1Data({
+            curveData: 0,
+            curveAssets: 0,
             srcToken: srcToken,
             destToken: dstToken,
             fromAmount: amountIn,
             toAmount: minAmountOut,
             quotedAmount: 0,
             metadata: bytes32(0),
-            recipient: beneficiary,
-            pools: pools
+            beneficiary: beneficiary
         });
-        return abi.encodeWithSelector(SWAP_EXACT_IN_UNI_V2_SELECTOR, data, uint256(0), bytes(""));
+        return abi.encodeWithSelector(SWAP_EXACT_IN_CURVE_V1_SELECTOR, data, uint256(0), bytes(""));
+    }
+
+    /// @dev Build a CurveV2 swapExactAmountInOnCurveV2 calldata. Inline 11-field
+    /// struct (no dynamic).
+    function _buildCurveV2ExactInCalldata(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        TestCurveV2Data memory data = TestCurveV2Data({
+            curveData: 0,
+            i: 0,
+            j: 0,
+            poolAddress: address(0),
+            srcToken: srcToken,
+            destToken: dstToken,
+            fromAmount: amountIn,
+            toAmount: minAmountOut,
+            quotedAmount: 0,
+            metadata: bytes32(0),
+            beneficiary: beneficiary
+        });
+        return abi.encodeWithSelector(SWAP_EXACT_IN_CURVE_V2_SELECTOR, data, uint256(0), bytes(""));
+    }
+
+    /// @dev Build a BalancerV2 direct calldata for the explicit-reject test.
+    /// The executor must revert before any decoding, so the field values are
+    /// arbitrary (only the selector + the ABI shape need to be valid enough to
+    /// parse the head).
+    function _buildBalancerV2RejectCalldata(bytes4 selector) internal pure returns (bytes memory) {
+        TestBalancerV2Data memory data = TestBalancerV2Data({
+            fromAmount: 1, toAmount: 1, quotedAmount: 0, metadata: bytes32(0), beneficiaryAndApproveFlag: 0
+        });
+        return abi.encodeWithSelector(selector, data, uint256(0), bytes(""), bytes(""));
     }
 
     /// @dev Build Paraswap swapExactAmountOut calldata (fromAmount = max input)
@@ -2518,14 +2640,14 @@ contract ExecutorTest is Test {
     // RFQ EXPLICIT REJECTION
     // ═══════════════════════════════════════════════════════════════════
 
-    /// Any selector outside the explicit non-RFQ whitelist (incl. RFQ-bound
-    /// entrypoints like the AugustusRFQ batch-fill family) must revert with
-    /// `InvalidParaswapSelector(selector)`. We use the canonical RFQ selector
-    /// stub here; the contract treats it identically to any other unknown
-    /// selector — never silently routed, never executed.
+    /// The real Augustus V6.2 RFQ entrypoint (`swapOnAugustusRFQTryBatchFill`,
+    /// selector 0xda35bb0d) must revert with `InvalidParaswapSelector` because
+    /// RFQ flows route through the off-chain matcher and we never want to
+    /// execute one. The classifier maps this selector to its dedicated `RFQ`
+    /// kind so the rejection is intentional rather than an "unknown selector"
+    /// coincidence.
     function test_paraswapRFQ_selector_explicitlyRejected() public {
-        bytes4 rfqSelector =
-            bytes4(keccak256("swapOnAugustusRFQTryBatchFill((address,address,uint256,address,bytes)[],bytes,address)"));
+        bytes4 rfqSelector = SWAP_RFQ_BATCH_FILL_SELECTOR;
         bytes memory cd = abi.encodePacked(rfqSelector, new bytes(420));
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
@@ -4711,6 +4833,149 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.MorphoShareModeUnsupported.selector);
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // AUGUSTUS V6.2 — COMPLETE SELECTOR COVERAGE
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // The 11 swap-entrypoint selectors below are the COMPLETE set exposed by
+    // the deployed Augustus V6.2 contract at
+    // 0x6A000F20005980200259B80c5102003040001068 (verified against Sourcify
+    // metadata + on-chain bytecode dispatch table). Each test asserts the
+    // executor's behaviour for one selector — accept (decode + swap) or
+    // reject (revert with `InvalidParaswapSelector(selector)`).
+    //
+    // Coverage is provable via `forge test --match-test paraswapV62Coverage`:
+    // 8 accept tests + 3 reject tests + 1 unknown-selector test = 12 tests.
+
+    function test_paraswapV62Coverage_genericExactIn_accepted() public {
+        bytes memory cd = _buildParaswapCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_genericExactOut_accepted() public {
+        bytes memory cd = _buildParaswapExactOutCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_uniV2ExactIn_accepted() public {
+        bytes memory cd = _buildUniV2ExactInCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_uniV2ExactOut_accepted() public {
+        bytes memory cd = _buildUniV2ExactOutCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_uniV3ExactIn_accepted() public {
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_uniV3ExactOut_accepted() public {
+        bytes memory cd = _buildOptimizedExactOutUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_curveV1ExactIn_accepted() public {
+        bytes memory cd = _buildCurveV1ExactInCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_curveV2ExactIn_accepted() public {
+        bytes memory cd = _buildCurveV2ExactInCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_balancerV2ExactIn_rejected() public {
+        bytes memory cd = _buildBalancerV2RejectCalldata(SWAP_EXACT_IN_BALANCER_V2_SELECTOR);
+        _expectRejectedSwap(cd, SWAP_EXACT_IN_BALANCER_V2_SELECTOR);
+    }
+
+    function test_paraswapV62Coverage_balancerV2ExactOut_rejected() public {
+        bytes memory cd = _buildBalancerV2RejectCalldata(SWAP_EXACT_OUT_BALANCER_V2_SELECTOR);
+        _expectRejectedSwap(cd, SWAP_EXACT_OUT_BALANCER_V2_SELECTOR);
+    }
+
+    function test_paraswapV62Coverage_rfq_rejected() public {
+        bytes memory cd = abi.encodePacked(SWAP_RFQ_BATCH_FILL_SELECTOR, new bytes(420));
+        _expectRejectedSwap(cd, SWAP_RFQ_BATCH_FILL_SELECTOR);
+    }
+
+    function test_paraswapV62Coverage_unknownSelector_rejected() public {
+        bytes4 unknown = bytes4(0xdeadbeef);
+        bytes memory cd = abi.encodePacked(unknown, new bytes(420));
+        _expectRejectedSwap(cd, unknown);
+    }
+
+    /// Drives an accepted-selector swap through the real flash-loan path and
+    /// asserts no revert. Reuses the standard plan layout so any decode/route
+    /// regression in `_decodeAndValidateParaswap` surfaces as a test failure.
+    function _runAcceptedSwap(bytes memory cd) internal {
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 loanAfter = loanToken.balanceOf(address(executor));
+        assertGt(loanAfter, loanBefore, "accepted selector must produce loanToken output");
+    }
+
+    /// Drives a rejected-selector swap and asserts the canonical revert.
+    function _expectRejectedSwap(bytes memory cd, bytes4 expectedSelector) internal {
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidParaswapSelector.selector, expectedSelector));
         executor.execute(plan);
     }
 }
