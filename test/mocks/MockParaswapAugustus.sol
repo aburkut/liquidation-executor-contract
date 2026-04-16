@@ -77,6 +77,12 @@ contract MockParaswapAugustus {
             "swapExactAmountInOnCurveV2((uint256,uint256,uint256,address,address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes)"
         )
     ); // 0xe37ed256
+    bytes4 private constant _SWAP_EXACT_IN_BALANCER_V2 = bytes4(
+        keccak256("swapExactAmountInOnBalancerV2((uint256,uint256,uint256,bytes32,uint256),uint256,bytes,bytes)")
+    ); // 0xd85ca173
+    bytes4 private constant _SWAP_EXACT_OUT_BALANCER_V2 = bytes4(
+        keccak256("swapExactAmountOutOnBalancerV2((uint256,uint256,uint256,bytes32,uint256),uint256,bytes,bytes)")
+    ); // 0xd6ed22e6
 
     /// @dev Dispatches every accepted Augustus V6.2 selector, decoding
     /// (srcToken, dstToken, fromAmount) at the real calldata positions for
@@ -127,6 +133,23 @@ contract MockParaswapAugustus {
                 srcToken := calldataload(add(4, 128))
                 dstToken := calldataload(add(4, 160))
                 amountIn := calldataload(add(4, 192))
+            }
+        } else if (selector == _SWAP_EXACT_IN_BALANCER_V2 || selector == _SWAP_EXACT_OUT_BALANCER_V2) {
+            // BalancerV2 inline struct (5 fields): fromAmount at [0], toAmount at [32].
+            // srcToken/dstToken live in `bytes data` blob. Parse via batchSwap assets array.
+            assembly {
+                amountIn := calldataload(4) // fromAmount = struct field 0
+                // offset_to_data at args[224]
+                let dataOff := calldataload(add(4, 224))
+                // data content starts at 4 + dataOff + 32 (skip length word)
+                let d := add(4, add(dataOff, 32))
+                // For batchSwap: assetsOffset at content[68]
+                let assetsOff := calldataload(add(d, 68))
+                // first asset at content[4 + assetsOff + 32]
+                srcToken := calldataload(add(d, add(4, add(assetsOff, 32))))
+                // count at content[4 + assetsOff]
+                let cnt := calldataload(add(d, add(4, assetsOff)))
+                dstToken := calldataload(add(d, add(4, add(assetsOff, mul(cnt, 32)))))
             }
         } else if (selector == _SWAP_EXACT_AMOUNT_IN || selector == _SWAP_EXACT_AMOUNT_OUT) {
             // Generic: skip executor head word, then GenericData inlined.

@@ -229,7 +229,7 @@ contract LiquidationExecutor is
     /// `_decodeAndValidateParaswap` or maps to a `revert InvalidParaswapSelector`
     /// branch — there is no silent path.
     enum ParaswapSelectorKind {
-        // Accepted families (10 entrypoints across 6 decoder shapes).
+        // Accepted families (12 entrypoints across 7 decoder shapes).
         ExactInGeneric, // 0xe3ead59e
         ExactOutGeneric, // 0x7f457675
         UniswapV2ExactIn, // 0xe8bb3b6c
@@ -238,8 +238,9 @@ contract LiquidationExecutor is
         UniswapV3ExactOut, // 0x5e94e28d
         CurveV1ExactIn, // 0x1a01c532
         CurveV2ExactIn, // 0xe37ed256
+        BalancerV2ExactIn, // 0xd85ca173
+        BalancerV2ExactOut, // 0xd6ed22e6
         // Explicit-reject (documented V6.2 selectors we choose not to support).
-        BalancerV2Rejected, // 0xd85ca173 / 0xd6ed22e6 — struct lacks src/dst
         RFQ, // 0xda35bb0d — off-chain order matching
         // Unknown selector (always reverts).
         Unsupported
@@ -1125,9 +1126,10 @@ contract LiquidationExecutor is
         // Curve V1 / V2 direct (inline CurveV1Data / CurveV2Data — no ExactOut in V6.2).
         if (selector == _SWAP_EXACT_IN_CURVE_V1) return ParaswapSelectorKind.CurveV1ExactIn;
         if (selector == _SWAP_EXACT_IN_CURVE_V2) return ParaswapSelectorKind.CurveV2ExactIn;
-        // Documented-reject: BalancerV2 direct (struct has no src/dst) + RFQ.
-        if (selector == _SWAP_EXACT_IN_BALANCER_V2) return ParaswapSelectorKind.BalancerV2Rejected;
-        if (selector == _SWAP_EXACT_OUT_BALANCER_V2) return ParaswapSelectorKind.BalancerV2Rejected;
+        // BalancerV2 direct: srcToken/dstToken extracted from bytes data blob.
+        if (selector == _SWAP_EXACT_IN_BALANCER_V2) return ParaswapSelectorKind.BalancerV2ExactIn;
+        if (selector == _SWAP_EXACT_OUT_BALANCER_V2) return ParaswapSelectorKind.BalancerV2ExactOut;
+        // Documented-reject: RFQ.
         if (selector == _SWAP_RFQ_BATCH_FILL) return ParaswapSelectorKind.RFQ;
         return ParaswapSelectorKind.Unsupported;
     }
@@ -1140,7 +1142,7 @@ contract LiquidationExecutor is
     function _isExactIn(ParaswapSelectorKind kind) internal pure returns (bool) {
         return kind == ParaswapSelectorKind.ExactInGeneric || kind == ParaswapSelectorKind.UniswapV2ExactIn
             || kind == ParaswapSelectorKind.UniswapV3ExactIn || kind == ParaswapSelectorKind.CurveV1ExactIn
-            || kind == ParaswapSelectorKind.CurveV2ExactIn;
+            || kind == ParaswapSelectorKind.CurveV2ExactIn || kind == ParaswapSelectorKind.BalancerV2ExactIn;
     }
 
     /// @dev Decode the GenericData layout used by the generic Paraswap V6 selectors
@@ -1295,6 +1297,65 @@ contract LiquidationExecutor is
         }
     }
 
+    /// @dev Decode BalancerV2 direct calldata. srcToken/dstToken parsed from the
+    /// `bytes data` param (raw Balancer Vault calldata). Matches Augustus V6.2
+    /// BalancerV2Utils._decodeBalancerV2Params exactly.
+    function _decodeParaswapBalancerV2(bytes memory cd)
+        internal
+        pure
+        returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut, address beneficiary)
+    {
+        if (cd.length < 296) {
+            revert InvalidParaswapCalldata();
+        }
+        assembly {
+            let mask := 0xffffffffffffffffffffffffffffffffffffffff
+            let p := add(cd, 36)
+            fromAmount := mload(p)
+            minAmountOut := mload(add(p, 32))
+            beneficiary := and(mload(add(p, 128)), mask)
+            let dataOff := mload(add(p, 224))
+            let dataLen := mload(add(p, dataOff))
+            // d = pointer to data content (past length word)
+            let d := add(p, add(dataOff, 32))
+            let vSel := shr(224, mload(d))
+            // 0x52bbbe29 = swap()
+            switch vSel
+            case 0x52bbbe29 {
+                if lt(dataLen, 324) {
+                    mstore(0, 0x25d306c600000000000000000000000000000000000000000000000000000000)
+                    revert(0, 4)
+                }
+                srcToken := and(mload(add(d, 292)), mask)
+                dstToken := and(mload(add(d, 324)), mask)
+            }
+            // 0x945bcec9 = batchSwap()
+            case 0x945bcec9 {
+                let assetsOff := mload(add(d, 68))
+                let cnt := mload(add(d, add(4, assetsOff)))
+                if iszero(cnt) {
+                    mstore(0, 0x25d306c600000000000000000000000000000000000000000000000000000000)
+                    revert(0, 4)
+                }
+                let first := and(mload(add(d, add(4, add(assetsOff, 32)))), mask)
+                let last := and(mload(add(d, add(4, add(assetsOff, mul(cnt, 32))))), mask)
+                switch eq(mload(add(d, 4)), 1)
+                case 1 {
+                    srcToken := last
+                    dstToken := first
+                }
+                default {
+                    srcToken := first
+                    dstToken := last
+                }
+            }
+            default {
+                mstore(0, 0x25d306c600000000000000000000000000000000000000000000000000000000)
+                revert(0, 4)
+            }
+        }
+    }
+
     // ─── Internal: Decode + validate Paraswap calldata ───────────────
     /// @dev Single entry that classifies the selector, routes to the correct decoder,
     /// and applies the universal validation rules. Returning the decoded tuple lets
@@ -1317,10 +1378,7 @@ contract LiquidationExecutor is
         // Documented-reject + unknown selectors all revert with the same error.
         // Each is kept as a distinct enum variant so the classifier coverage test
         // can assert the *reason* a selector is rejected.
-        if (
-            kind == ParaswapSelectorKind.Unsupported || kind == ParaswapSelectorKind.RFQ
-                || kind == ParaswapSelectorKind.BalancerV2Rejected
-        ) {
+        if (kind == ParaswapSelectorKind.Unsupported || kind == ParaswapSelectorKind.RFQ) {
             revert InvalidParaswapSelector(selector);
         }
 
@@ -1336,6 +1394,8 @@ contract LiquidationExecutor is
             (srcToken, dstToken, fromAmount, minAmountOut, beneficiary) = _decodeParaswapInlineCurveV1(cd);
         } else if (kind == ParaswapSelectorKind.CurveV2ExactIn) {
             (srcToken, dstToken, fromAmount, minAmountOut, beneficiary) = _decodeParaswapInlineCurveV2(cd);
+        } else if (kind == ParaswapSelectorKind.BalancerV2ExactIn || kind == ParaswapSelectorKind.BalancerV2ExactOut) {
+            (srcToken, dstToken, fromAmount, minAmountOut, beneficiary) = _decodeParaswapBalancerV2(cd);
         } else {
             // Unreachable: every accepted kind is covered above and every reject
             // kind is handled before this branch. Defensive revert in case a future

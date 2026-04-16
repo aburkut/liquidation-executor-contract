@@ -386,15 +386,46 @@ contract ExecutorTest is Test {
         return abi.encodeWithSelector(SWAP_EXACT_IN_CURVE_V2_SELECTOR, data, uint256(0), bytes(""));
     }
 
-    /// @dev Build a BalancerV2 direct calldata for the explicit-reject test.
-    /// The executor must revert before any decoding, so the field values are
-    /// arbitrary (only the selector + the ABI shape need to be valid enough to
-    /// parse the head).
-    function _buildBalancerV2RejectCalldata(bytes4 selector) internal pure returns (bytes memory) {
+    /// @dev Build a BalancerV2 direct calldata with a batchSwap data blob.
+    /// The `bytes data` param carries raw Balancer Vault batchSwap calldata with
+    /// an assets array `[srcToken, dstToken]` so the executor can extract tokens.
+    function _buildBalancerV2Calldata(
+        bytes4 selector,
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        TestBalancerV2Data memory data = TestBalancerV2Data({
+            fromAmount: amountIn,
+            toAmount: minAmountOut,
+            quotedAmount: 0,
+            metadata: bytes32(0),
+            beneficiaryAndApproveFlag: uint256(uint160(beneficiary))
+        });
+        // Build minimal batchSwap calldata: selector(4) + swapType(32) +
+        // swapsOffset(32) + assetsOffset(32) + ... assets array [src, dst]
+        bytes memory batchData = abi.encodePacked(
+            bytes4(0x945bcec9), // batchSwap selector
+            uint256(0), // swapType = 0 (ExactIn)
+            uint256(0), // swapsOffset (unused by our decoder)
+            uint256(128), // assetsOffset (points to assets array = 4 words from content start)
+            uint256(0), // fundsOffset (unused)
+            // assets array at offset 128 from content start (after 4 head words):
+            uint256(2), // assetsCount = 2
+            uint256(uint160(srcToken)), // assets[0] = srcToken
+            uint256(uint160(dstToken)) // assets[1] = dstToken
+        );
+        return abi.encodeWithSelector(selector, data, uint256(0), bytes(""), batchData);
+    }
+
+    function _buildBalancerV2InvalidBlobCalldata(bytes4 selector) internal pure returns (bytes memory) {
         TestBalancerV2Data memory data = TestBalancerV2Data({
             fromAmount: 1, toAmount: 1, quotedAmount: 0, metadata: bytes32(0), beneficiaryAndApproveFlag: 0
         });
-        return abi.encodeWithSelector(selector, data, uint256(0), bytes(""), bytes(""));
+        bytes memory badData = abi.encodePacked(bytes4(0xdeadbeef), uint256(0));
+        return abi.encodeWithSelector(selector, data, uint256(0), bytes(""), badData);
     }
 
     /// @dev Build Paraswap swapExactAmountOut calldata (fromAmount = max input)
@@ -4906,14 +4937,116 @@ contract ExecutorTest is Test {
         _runAcceptedSwap(cd);
     }
 
-    function test_paraswapV62Coverage_balancerV2ExactIn_rejected() public {
-        bytes memory cd = _buildBalancerV2RejectCalldata(SWAP_EXACT_IN_BALANCER_V2_SELECTOR);
-        _expectRejectedSwap(cd, SWAP_EXACT_IN_BALANCER_V2_SELECTOR);
+    function test_paraswapV62Coverage_balancerV2ExactIn_accepted() public {
+        bytes memory cd = _buildBalancerV2Calldata(
+            SWAP_EXACT_IN_BALANCER_V2_SELECTOR,
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        _runAcceptedSwap(cd);
     }
 
-    function test_paraswapV62Coverage_balancerV2ExactOut_rejected() public {
-        bytes memory cd = _buildBalancerV2RejectCalldata(SWAP_EXACT_OUT_BALANCER_V2_SELECTOR);
-        _expectRejectedSwap(cd, SWAP_EXACT_OUT_BALANCER_V2_SELECTOR);
+    function test_paraswapV62Coverage_balancerV2ExactOut_accepted() public {
+        bytes memory cd = _buildBalancerV2Calldata(
+            SWAP_EXACT_OUT_BALANCER_V2_SELECTOR,
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_balancerV2_wrongSrcToken_reverts() public {
+        bytes memory cd = _buildBalancerV2Calldata(
+            SWAP_EXACT_IN_BALANCER_V2_SELECTOR,
+            address(mockWeth), // blob says mockWeth
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken), // plan says collateralToken
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.ParaswapSrcTokenMismatch.selector, address(collateralToken), address(mockWeth)
+            )
+        );
+        executor.execute(plan);
+    }
+
+    function test_balancerV2_invalidBlobSelector_reverts() public {
+        bytes memory cd = _buildBalancerV2InvalidBlobCalldata(SWAP_EXACT_IN_BALANCER_V2_SELECTOR);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: 1,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidParaswapCalldata.selector);
+        executor.execute(plan);
+    }
+
+    function test_balancerV2_beneficiaryRule_reverts() public {
+        address badRecipient = address(0xBAAD);
+        bytes memory cd = _buildBalancerV2Calldata(
+            SWAP_EXACT_IN_BALANCER_V2_SELECTOR,
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            badRecipient
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.SwapRecipientInvalid.selector, badRecipient));
+        executor.execute(plan);
     }
 
     function test_paraswapV62Coverage_rfq_rejected() public {
