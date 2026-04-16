@@ -1,23 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/// @dev Aave V3 Pool interface — liquidation and utility methods only.
+/// flashLoanSimple / FLASHLOAN_PREMIUM_TOTAL / IFlashLoanSimpleReceiver removed:
+/// Aave V3 is no longer used as a flashloan source (Balancer + Morpho only).
 interface IAaveV3Pool {
-    function flashLoanSimple(
-        address receiverAddress,
-        address asset,
-        uint256 amount,
-        bytes calldata params,
-        uint16 referralCode
-    ) external;
-
-    function repay(address asset, uint256 amount, uint256 interestRateMode, address onBehalfOf)
-        external
-        returns (uint256);
-
-    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
-
-    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
-
     function liquidationCall(
         address collateralAsset,
         address debtAsset,
@@ -25,6 +12,8 @@ interface IAaveV3Pool {
         uint256 debtToCover,
         bool receiveAToken
     ) external;
+
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
 
     /// @dev Returns reserve data. We only use the aTokenAddress (9th field).
     function getReserveData(address asset)
@@ -47,12 +36,4 @@ interface IAaveV3Pool {
             uint128 unbacked,
             uint128 isolationModeTotalDebt
         );
-
-    function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
-}
-
-interface IFlashLoanSimpleReceiver {
-    function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes calldata params)
-        external
-        returns (bool);
 }

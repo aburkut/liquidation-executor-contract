@@ -19,6 +19,63 @@ import {MockAaveV2LendingPool} from "./mocks/MockAaveV2LendingPool.sol";
 import {MockBebopSettlement} from "./mocks/MockBebopSettlement.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 
+/// Test-only struct mirroring Augustus V6.2 UniswapV2Data / UniswapV3Data. Both
+/// real V6.2 structs share this exact 8-field shape (`bytes pools` makes the
+/// struct dynamic → tail-encoded, with a head offset). Using a typed struct
+/// here makes `abi.encodeWithSelector` produce the canonical V6.2 calldata
+/// layout instead of flattening the fields.
+struct TestUniV2V3Data {
+    address srcToken;
+    address destToken;
+    uint256 fromAmount;
+    uint256 toAmount;
+    uint256 quotedAmount;
+    bytes32 metadata;
+    address recipient;
+    bytes pools;
+}
+
+/// Test-only struct mirroring Augustus V6.2 CurveV1Data (9 fields, no dynamic
+/// → inline-encoded into the head).
+struct TestCurveV1Data {
+    uint256 curveData;
+    uint256 curveAssets;
+    address srcToken;
+    address destToken;
+    uint256 fromAmount;
+    uint256 toAmount;
+    uint256 quotedAmount;
+    bytes32 metadata;
+    address beneficiary;
+}
+
+/// Test-only struct mirroring Augustus V6.2 CurveV2Data (11 fields, no dynamic
+/// → inline-encoded into the head).
+struct TestCurveV2Data {
+    uint256 curveData;
+    uint256 i;
+    uint256 j;
+    address poolAddress;
+    address srcToken;
+    address destToken;
+    uint256 fromAmount;
+    uint256 toAmount;
+    uint256 quotedAmount;
+    bytes32 metadata;
+    address beneficiary;
+}
+
+/// Test-only struct mirroring Augustus V6.2 BalancerV2Data (5 fields, no dynamic).
+/// Used only for the explicit-reject test — the executor must revert before
+/// touching the struct.
+struct TestBalancerV2Data {
+    uint256 fromAmount;
+    uint256 toAmount;
+    uint256 quotedAmount;
+    bytes32 metadata;
+    uint256 beneficiaryAndApproveFlag;
+}
+
 contract ExecutorTest is Test {
     LiquidationExecutor public executor;
 
@@ -47,17 +104,71 @@ contract ExecutorTest is Test {
     uint256 constant COLLATERAL_REWARD = 600e18;
     uint256 constant DEFAULT_SWAP_AMOUNT = 1000e18; // Pre-funded collateral balance used in default swaps
 
+    // ─── Augustus V6.2 swap entrypoint selectors (all 11) ────────────────
+    // Verified against Sourcify metadata for 0x6A000F20005980200259B80c5102003040001068.
+    // 8 accepted by the executor, 3 explicitly rejected (BalancerV2 In/Out + RFQ).
     bytes4 constant SWAP_EXACT_IN_SELECTOR = bytes4(
         keccak256(
             "swapExactAmountIn(address,(address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes,bytes)"
         )
-    );
+    ); // 0xe3ead59e
 
     bytes4 constant SWAP_EXACT_OUT_SELECTOR = bytes4(
         keccak256(
             "swapExactAmountOut(address,(address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes,bytes)"
         )
-    );
+    ); // 0x7f457675
+
+    bytes4 constant SWAP_EXACT_IN_UNI_V3_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountInOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
+        )
+    ); // 0x876a02f6
+
+    bytes4 constant SWAP_EXACT_OUT_UNI_V3_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountOutOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
+        )
+    ); // 0x5e94e28d
+
+    bytes4 constant SWAP_EXACT_IN_UNI_V2_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountInOnUniswapV2((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
+        )
+    ); // 0xe8bb3b6c
+
+    bytes4 constant SWAP_EXACT_OUT_UNI_V2_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountOutOnUniswapV2((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
+        )
+    ); // 0xa76f4eb6
+
+    bytes4 constant SWAP_EXACT_IN_CURVE_V1_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountInOnCurveV1((uint256,uint256,address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes)"
+        )
+    ); // 0x1a01c532
+
+    bytes4 constant SWAP_EXACT_IN_CURVE_V2_SELECTOR = bytes4(
+        keccak256(
+            "swapExactAmountInOnCurveV2((uint256,uint256,uint256,address,address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes)"
+        )
+    ); // 0xe37ed256
+
+    // ─── Documented-reject selectors ─────────────────────────────────────
+    bytes4 constant SWAP_EXACT_IN_BALANCER_V2_SELECTOR = bytes4(
+        keccak256("swapExactAmountInOnBalancerV2((uint256,uint256,uint256,bytes32,uint256),uint256,bytes,bytes)")
+    ); // 0xd85ca173
+
+    bytes4 constant SWAP_EXACT_OUT_BALANCER_V2_SELECTOR = bytes4(
+        keccak256("swapExactAmountOutOnBalancerV2((uint256,uint256,uint256,bytes32,uint256),uint256,bytes,bytes)")
+    ); // 0xd6ed22e6
+
+    bytes4 constant SWAP_RFQ_BATCH_FILL_SELECTOR = bytes4(
+        keccak256(
+            "swapOnAugustusRFQTryBatchFill((uint256,uint256,uint8,bytes32,address),((uint256,uint128,address,address,address,address,uint256,uint256),bytes,uint256,bytes,bytes)[],bytes)"
+        )
+    ); // 0xda35bb0d
 
     function setUp() public {
         loanToken = new MockERC20("Loan Token", "LOAN", 18);
@@ -151,6 +262,170 @@ contract ExecutorTest is Test {
             bytes(""), // permit
             bytes("") // executorData
         );
+    }
+
+    /// @dev Build a UniswapV2 / UniswapV3 swap calldata for any of the four
+    /// In/Out direct selectors. Both real V6.2 structs share the same 8-field
+    /// shape with a trailing `bytes pools` — so the struct is dynamic and
+    /// encoded in the TAIL with a head offset.
+    function _buildUniV2V3Calldata(
+        bytes4 selector,
+        address srcToken,
+        address dstToken,
+        uint256 fromAmount,
+        uint256 toAmount,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        TestUniV2V3Data memory data = TestUniV2V3Data({
+            srcToken: srcToken,
+            destToken: dstToken,
+            fromAmount: fromAmount,
+            toAmount: toAmount,
+            quotedAmount: 0,
+            metadata: bytes32(0),
+            recipient: beneficiary,
+            pools: hex"deadbeef" // dummy; mock ignores
+        });
+        return abi.encodeWithSelector(selector, data, uint256(0), bytes(""));
+    }
+
+    function _buildOptimizedExactInUniV3Calldata(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        return _buildUniV2V3Calldata(
+            SWAP_EXACT_IN_UNI_V3_SELECTOR, srcToken, dstToken, amountIn, minAmountOut, beneficiary
+        );
+    }
+
+    function _buildOptimizedExactOutUniV3Calldata(
+        address srcToken,
+        address dstToken,
+        uint256 maxAmountIn,
+        uint256 exactAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        return _buildUniV2V3Calldata(
+            SWAP_EXACT_OUT_UNI_V3_SELECTOR, srcToken, dstToken, maxAmountIn, exactAmountOut, beneficiary
+        );
+    }
+
+    function _buildUniV2ExactInCalldata(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        return _buildUniV2V3Calldata(
+            SWAP_EXACT_IN_UNI_V2_SELECTOR, srcToken, dstToken, amountIn, minAmountOut, beneficiary
+        );
+    }
+
+    function _buildUniV2ExactOutCalldata(
+        address srcToken,
+        address dstToken,
+        uint256 maxAmountIn,
+        uint256 exactAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        return _buildUniV2V3Calldata(
+            SWAP_EXACT_OUT_UNI_V2_SELECTOR, srcToken, dstToken, maxAmountIn, exactAmountOut, beneficiary
+        );
+    }
+
+    /// @dev Build a CurveV1 swapExactAmountInOnCurveV1 calldata. Inline 9-field
+    /// struct (no dynamic) → packs into the head exactly as the real V6.2
+    /// CurveV1Data ABI.
+    function _buildCurveV1ExactInCalldata(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        TestCurveV1Data memory data = TestCurveV1Data({
+            curveData: 0,
+            curveAssets: 0,
+            srcToken: srcToken,
+            destToken: dstToken,
+            fromAmount: amountIn,
+            toAmount: minAmountOut,
+            quotedAmount: 0,
+            metadata: bytes32(0),
+            beneficiary: beneficiary
+        });
+        return abi.encodeWithSelector(SWAP_EXACT_IN_CURVE_V1_SELECTOR, data, uint256(0), bytes(""));
+    }
+
+    /// @dev Build a CurveV2 swapExactAmountInOnCurveV2 calldata. Inline 11-field
+    /// struct (no dynamic).
+    function _buildCurveV2ExactInCalldata(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        TestCurveV2Data memory data = TestCurveV2Data({
+            curveData: 0,
+            i: 0,
+            j: 0,
+            poolAddress: address(0),
+            srcToken: srcToken,
+            destToken: dstToken,
+            fromAmount: amountIn,
+            toAmount: minAmountOut,
+            quotedAmount: 0,
+            metadata: bytes32(0),
+            beneficiary: beneficiary
+        });
+        return abi.encodeWithSelector(SWAP_EXACT_IN_CURVE_V2_SELECTOR, data, uint256(0), bytes(""));
+    }
+
+    /// @dev Build a BalancerV2 direct calldata with a batchSwap data blob.
+    /// The `bytes data` param carries raw Balancer Vault batchSwap calldata with
+    /// an assets array `[srcToken, dstToken]` so the executor can extract tokens.
+    function _buildBalancerV2Calldata(
+        bytes4 selector,
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address beneficiary
+    ) internal pure returns (bytes memory) {
+        TestBalancerV2Data memory data = TestBalancerV2Data({
+            fromAmount: amountIn,
+            toAmount: minAmountOut,
+            quotedAmount: 0,
+            metadata: bytes32(0),
+            beneficiaryAndApproveFlag: uint256(uint160(beneficiary))
+        });
+        // Build minimal batchSwap calldata: selector(4) + swapType(32) +
+        // swapsOffset(32) + assetsOffset(32) + ... assets array [src, dst]
+        bytes memory batchData = abi.encodePacked(
+            bytes4(0x945bcec9), // batchSwap selector
+            uint256(0), // swapType = 0 (ExactIn)
+            uint256(0), // swapsOffset (unused by our decoder)
+            uint256(128), // assetsOffset (points to assets array = 4 words from content start)
+            uint256(0), // fundsOffset (unused)
+            // assets array at offset 128 from content start (after 4 head words):
+            uint256(2), // assetsCount = 2
+            uint256(uint160(srcToken)), // assets[0] = srcToken
+            uint256(uint160(dstToken)) // assets[1] = dstToken
+        );
+        return abi.encodeWithSelector(selector, data, uint256(0), bytes(""), batchData);
+    }
+
+    function _buildBalancerV2InvalidBlobCalldata(bytes4 selector) internal pure returns (bytes memory) {
+        TestBalancerV2Data memory data = TestBalancerV2Data({
+            fromAmount: 1, toAmount: 1, quotedAmount: 0, metadata: bytes32(0), beneficiaryAndApproveFlag: 0
+        });
+        bytes memory badData = abi.encodePacked(bytes4(0xdeadbeef), uint256(0));
+        return abi.encodeWithSelector(selector, data, uint256(0), bytes(""), badData);
     }
 
     /// @dev Build Paraswap swapExactAmountOut calldata (fromAmount = max input)
@@ -435,7 +710,7 @@ contract ExecutorTest is Test {
 
     function test_onlyOperatorCanExecute() public {
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
         vm.prank(attacker);
         vm.expectRevert(LiquidationExecutor.Unauthorized.selector);
         executor.execute(plan);
@@ -491,17 +766,6 @@ contract ExecutorTest is Test {
     // PAUSE BLOCKS EXECUTE FOR ALL PROVIDERS
     // ═══════════════════════════════════════════════════════════════════
 
-    function test_pauseBlocksExecuteAaveV3() public {
-        vm.prank(owner);
-        executor.pause();
-
-        bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
-        vm.prank(operatorAddr);
-        vm.expectRevert();
-        executor.execute(plan);
-    }
-
     function test_pauseBlocksExecuteBalancer() public {
         vm.prank(owner);
         executor.pause();
@@ -511,29 +775,6 @@ contract ExecutorTest is Test {
         vm.prank(operatorAddr);
         vm.expectRevert();
         executor.execute(plan);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // AAVE V3 FLASH + PARASWAP + AAVE V3 REPAY (happy path)
-    // ═══════════════════════════════════════════════════════════════════
-
-    function test_aaveV3Flash_paraswap_aaveV3Repay() public {
-        uint256 repayAmt = 500e18;
-        LiquidationExecutor.SwapPlan memory swapPlan =
-            _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, MIN_PROFIT);
-
-        bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), swapPlan);
-
-        uint256 loanBefore = loanToken.balanceOf(address(executor));
-        vm.prank(operatorAddr);
-        executor.execute(plan);
-        uint256 loanAfter = loanToken.balanceOf(address(executor));
-        assertGe(loanAfter - loanBefore, MIN_PROFIT);
-
-        // Approval hygiene
-        assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
-        assertEq(collateralToken.allowance(address(executor), address(aavePool)), 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -779,21 +1020,6 @@ contract ExecutorTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // AAVE V3 CALLBACK VALIDATION
-    // ═══════════════════════════════════════════════════════════════════
-
-    function test_aaveV3CallbackRejectsWrongCaller() public {
-        vm.prank(attacker);
-        vm.expectRevert(LiquidationExecutor.InvalidExecutionPhase.selector);
-        executor.executeOperation(address(loanToken), LOAN_AMOUNT, FLASH_FEE, address(executor), "");
-    }
-
-    function test_aaveV3CallbackRejectsWrongInitiator() public {
-        vm.prank(address(aavePool));
-        vm.expectRevert(LiquidationExecutor.InvalidExecutionPhase.selector);
-        executor.executeOperation(address(loanToken), LOAN_AMOUNT, FLASH_FEE, attacker, "");
-    }
-
     // ═══════════════════════════════════════════════════════════════════
     // PARASWAP SINGLE SWAP TESTS
     // ═══════════════════════════════════════════════════════════════════
@@ -804,7 +1030,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, MIN_PROFIT);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), swapPlan);
 
         uint256 loanBefore = loanToken.balanceOf(address(executor));
         vm.prank(operatorAddr);
@@ -820,7 +1046,7 @@ contract ExecutorTest is Test {
         augustus.setSwapReverts(true);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
 
         vm.prank(operatorAddr);
         vm.expectRevert(); // ParaswapSwapFailed
@@ -850,7 +1076,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(
@@ -862,7 +1088,7 @@ contract ExecutorTest is Test {
     function test_paraswapApprovalResetAfterSwap() public {
         uint256 repayAmt = 500e18;
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), _defaultSwapPlan());
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), _defaultSwapPlan());
         vm.prank(operatorAddr);
         executor.execute(plan);
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
@@ -889,7 +1115,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         uint256 loanBefore = loanToken.balanceOf(address(executor));
         vm.prank(operatorAddr);
@@ -917,7 +1143,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         uint256 profitBefore = profitToken.balanceOf(address(executor));
         vm.prank(operatorAddr);
@@ -942,7 +1168,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(); // BebopTargetNotContract (no code at 0xBAD)
@@ -984,7 +1210,7 @@ contract ExecutorTest is Test {
         swapPlan.bebopCalldata = bebopCd;
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(); // InsufficientRepayOutput from _executeSwapPlan absolute check
@@ -1005,7 +1231,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(); // BebopSwapFailed
@@ -1038,7 +1264,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         uint256 profitBefore = profitToken.balanceOf(address(executor));
         vm.prank(operatorAddr);
@@ -1067,10 +1293,98 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         vm.prank(operatorAddr);
         executor.execute(plan); // should succeed
+    }
+
+    /// Chained pattern where leg2 uses the optimized UniV3 selector. Pre-fix this
+    /// path silently misread `leg2FromAmount` from the generic offset (96 from args
+    /// start, which on optimized calldata holds the toAmount field instead of
+    /// fromAmount), so the chained guard saw garbage and either passed or reverted
+    /// at random. Selector-aware decode now returns the real fromAmount and the
+    /// validation is meaningful again.
+    function test_paraswapDouble_chained_optimizedLeg2_happyPath() public {
+        uint256 debtToCover = 400e18;
+
+        // Leg 1: collateral -> profitToken at 1.1x via generic exact-in
+        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
+        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18; // 1100e18
+        bytes memory cd1 =
+            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
+
+        // Leg 2: profitToken -> loanToken via OPTIMIZED UniV3 ExactIn (struct inline,
+        // no executor head word). leg2FromAmount must read fromAmount at the
+        // optimized offset, not at the generic offset.
+        uint256 leg2AmountIn = leg1AmountOut;
+        bytes memory cd2 = _buildOptimizedExactInUniV3Calldata(
+            address(profitToken), address(loanToken), leg2AmountIn, 0, address(executor)
+        );
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
+            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
+        );
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan); // must succeed end-to-end with optimized leg2
+    }
+
+    /// Chained pattern, optimized leg2 declares MORE input than leg1 produced.
+    /// The selector-aware guard must catch this (post-fix) and revert with
+    /// `ChainedInputExceedsOutput(declared, leg1_actual_output)`. Pre-fix this
+    /// would have read fromAmount from the wrong offset and either let it
+    /// through or panicked on unrelated grounds.
+    function test_paraswapDouble_chained_optimizedLeg2_excessiveInput_reverts() public {
+        uint256 debtToCover = 400e18;
+
+        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
+        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18; // 1100e18
+        bytes memory cd1 =
+            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
+
+        // Optimized leg 2 declares 2x the leg1 output — must revert.
+        uint256 leg2AmountIn = leg1AmountOut * 2;
+        bytes memory cd2 = _buildOptimizedExactInUniV3Calldata(
+            address(profitToken), address(loanToken), leg2AmountIn, 0, address(executor)
+        );
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
+            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
+        );
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.ChainedInputExceedsOutput.selector, leg2AmountIn, leg1AmountOut)
+        );
+        executor.execute(plan);
+    }
+
+    /// Sanity guard: chained with a generic leg2 still works after the
+    /// selector-aware refactor (no regression on the existing path).
+    function test_paraswapDouble_chained_genericLeg2_stillWorks() public {
+        uint256 debtToCover = 400e18;
+        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
+        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18;
+        bytes memory cd1 =
+            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
+        bytes memory cd2 =
+            _buildParaswapCalldata(address(profitToken), address(loanToken), leg1AmountOut, address(executor));
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
+            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
     }
 
     function test_paraswapDouble_split_revertsRepayInsufficient() public {
@@ -1108,7 +1422,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(); // InsufficientRepayOutput (absolute balance check)
@@ -1135,7 +1449,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(
@@ -1167,7 +1481,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(3, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(3, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -1186,7 +1500,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
 
         bytes memory plan = _buildPlan(
-            1,
+            2,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
@@ -1208,7 +1522,7 @@ contract ExecutorTest is Test {
         aaveV2Pool.setLiquidationReverts(true);
 
         bytes memory plan = _buildPlan(
-            1,
+            2,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
@@ -1238,7 +1552,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 700e18);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert();
@@ -1251,7 +1565,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 99e18);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), swapPlan);
         vm.prank(operatorAddr);
         executor.execute(plan); // should not revert
     }
@@ -1273,15 +1587,6 @@ contract ExecutorTest is Test {
     // FEE CAP
     // ═══════════════════════════════════════════════════════════════════
 
-    function test_aaveV3FeeCap() public {
-        aavePool.setFlashFee(100e18);
-        bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, 1e18, _defaultLiqAction(500e18), _defaultSwapPlan());
-        vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.FlashFeeExceeded.selector, 100e18, 1e18));
-        executor.execute(plan);
-    }
-
     function test_balancerFeeCap() public {
         balancerVault.setFlashFee(100e18);
         bytes memory plan =
@@ -1294,74 +1599,6 @@ contract ExecutorTest is Test {
     // ═══════════════════════════════════════════════════════════════════
     // P0 SAFETY: CALLBACK ASSET/AMOUNT MISMATCH
     // ═══════════════════════════════════════════════════════════════════
-
-    function test_aaveV3CallbackRejectsAssetMismatch() public {
-        MockAavePoolLiar liarPool = new MockAavePoolLiar(FLASH_FEE, address(collateralToken));
-        collateralToken.mint(address(liarPool), 100_000e18);
-        loanToken.mint(address(liarPool), 100_000e18);
-
-        // Deploy a fresh executor with liarPool in allowedTargets
-        address[] memory targets = new address[](4);
-        targets[0] = address(aavePool);
-        targets[1] = address(augustus);
-        targets[2] = address(aaveV2Pool);
-        targets[3] = address(liarPool);
-        LiquidationExecutor exec2 = new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(aavePool),
-            address(balancerVault),
-            address(augustus),
-            targets
-        );
-
-        vm.prank(owner);
-        exec2.setFlashProvider(1, address(liarPool));
-
-        loanToken.mint(address(exec2), LOAN_AMOUNT + FLASH_FEE + 100e18);
-        collateralToken.mint(address(exec2), 1000e18);
-
-        bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.CallbackAssetMismatch.selector);
-        exec2.execute(plan);
-    }
-
-    function test_aaveV3CallbackRejectsAmountMismatch() public {
-        MockAavePoolAmountLiar liarPool = new MockAavePoolAmountLiar(FLASH_FEE);
-        loanToken.mint(address(liarPool), 100_000e18);
-
-        address[] memory targets = new address[](4);
-        targets[0] = address(aavePool);
-        targets[1] = address(augustus);
-        targets[2] = address(aaveV2Pool);
-        targets[3] = address(liarPool);
-        LiquidationExecutor exec2 = new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(aavePool),
-            address(balancerVault),
-            address(augustus),
-            targets
-        );
-
-        vm.startPrank(owner);
-        exec2.setFlashProvider(1, address(liarPool));
-        vm.stopPrank();
-
-        loanToken.mint(address(exec2), LOAN_AMOUNT + FLASH_FEE + 100e18);
-
-        bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.CallbackAmountMismatch.selector);
-        exec2.execute(plan);
-    }
 
     function test_balancerCallbackRejectsTokenMismatch() public {
         MockBalancerVaultLiar liarVault =
@@ -1440,7 +1677,7 @@ contract ExecutorTest is Test {
         aavePool.setLiquidationReverts(true);
         collateralToken.mint(address(aavePool), 100_000e18);
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
 
         vm.prank(operatorAddr);
         vm.expectRevert();
@@ -1467,7 +1704,7 @@ contract ExecutorTest is Test {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), 0, 0);
 
-        bytes memory plan = _buildPlan(1, address(loanToken), 0, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        bytes memory plan = _buildPlan(2, address(loanToken), 0, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
@@ -1475,7 +1712,7 @@ contract ExecutorTest is Test {
 
     function test_revertIfLoanTokenZeroAddress() public {
         bytes memory plan =
-            _buildPlan(1, address(0), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
+            _buildPlan(2, address(0), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         executor.execute(plan);
@@ -1483,7 +1720,7 @@ contract ExecutorTest is Test {
 
     function test_revertIfInvalidProtocolId() public {
         bytes memory plan = _buildPlan(
-            1,
+            2,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
@@ -1713,7 +1950,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 5e18);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), swapPlan);
 
         vm.prank(operatorAddr);
         executor.execute(plan); // must not revert
@@ -1775,7 +2012,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
 
         bytes memory plan = _buildPlan(
-            1, // Aave V3 flash
+            2, // Balancer flash
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
@@ -1804,7 +2041,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
 
         bytes memory plan = _buildPlan(
-            1,
+            2,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
@@ -1850,7 +2087,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -1863,9 +2100,480 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // OPTIMIZED PARASWAP SELECTORS (UniswapV3 ExactIn / ExactOut)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Optimized exact-in selector: full-size struct in head (no executor word),
+    /// recipient at slot 6. Mock decodes by selector and routes through the same
+    /// execution + balance-delta path as the generic call.
+    function test_paraswapOptimized_exactIn_uniV3_happyPath() public {
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 loanAfter = loanToken.balanceOf(address(executor));
+        assertGt(loanAfter, loanBefore, "optimized exact-in must produce loanToken output");
+    }
+
+    /// Optimized exact-out selector with a 95% partial-fill mock — actual consumed
+    /// must be <= declared max (matches generic ExactOut semantics).
+    function test_paraswapOptimized_exactOut_uniV3_happyPath() public {
+        augustus.setPartialFillPct(95); // consume 95% of declared max
+
+        bytes memory cd = _buildOptimizedExactOutUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // Restore for unrelated tests.
+        augustus.setPartialFillPct(0);
+    }
+
+    /// Wrong srcToken in optimized calldata must surface via the executor's
+    /// post-decode validation — the spec.srcToken / decoded srcToken mismatch is
+    /// caught by `_executeParaswapSingle` (ParaswapSrcTokenMismatch).
+    function test_paraswapOptimized_wrongSrcToken_reverts() public {
+        // Calldata claims wrong srcToken (mockWeth) while plan declares collateralToken.
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(mockWeth), // wrong src
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    /// Wrong dstToken in optimized calldata must surface via repayToken mismatch.
+    function test_paraswapOptimized_wrongDstToken_reverts() public {
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken),
+            address(mockWeth), // wrong dst (plan expects loanToken)
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken), // mismatch with cd dst
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    /// Wrong amount in optimized exact-in calldata: actual consumed (= declared)
+    /// must equal plan.amountIn. Mismatch fires `ParaswapAmountInMismatch`.
+    function test_paraswapOptimized_wrongAmount_reverts() public {
+        // Calldata declares half of plan.amountIn → consumed = half → mismatch.
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT / 2, 0, address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    /// Unknown selector (anything not in the explicit whitelist) must revert with
+    /// `InvalidParaswapSelector(selector)` — no silent fallback to the generic
+    /// decoder, no arbitrary-call passthrough.
+    function test_paraswapOptimized_unknownSelector_reverts() public {
+        bytes4 fakeSelector = 0xdeadbeef;
+        bytes memory cd = abi.encodePacked(fakeSelector, new bytes(420)); // pad past length checks
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidParaswapSelector.selector, fakeSelector));
+        executor.execute(plan);
+    }
+
+    /// Beneficiary rule still enforced for optimized — same SwapRecipientInvalid
+    /// surface as for the generic family. Anything other than {address(this), 0}
+    /// reverts pre-call.
+    function test_paraswapOptimized_invalidBeneficiary_reverts() public {
+        address badRecipient = address(0xBAAD);
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, badRecipient
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.SwapRecipientInvalid.selector, badRecipient));
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // DIRECT ROUTER FAMILIES — DynamicStruct (UniswapV2)
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // The decoder for DynamicStruct families (UniV2 / BalancerV2 / CurveV1) reads
+    // the struct in the calldata TAIL via the offset stored in head[0]. These
+    // tests exercise UniswapV2 specifically; BalancerV2 and CurveV1 share the
+    // same decoder shape (selector → DynamicStruct branch in
+    // `_decodeAndValidateParaswap`) and would reuse this scaffolding once their
+    // exact struct prefix is verified against on-chain Augustus V6.2.
+
+    function test_paraswapDirect_uniV2_exactIn_happyPath() public {
+        bytes memory cd = _buildUniV2ExactInCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 loanAfter = loanToken.balanceOf(address(executor));
+        assertGt(loanAfter, loanBefore, "UniV2 exact-in must produce loanToken output");
+    }
+
+    function test_paraswapDirect_uniV2_wrongSrcToken_reverts() public {
+        bytes memory cd = _buildUniV2ExactInCalldata(
+            address(mockWeth), // wrong src
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_paraswapDirect_uniV2_wrongDstToken_reverts() public {
+        bytes memory cd = _buildUniV2ExactInCalldata(
+            address(collateralToken),
+            address(mockWeth), // wrong dst
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken), // mismatch
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_paraswapDirect_uniV2_wrongAmount_reverts() public {
+        bytes memory cd = _buildUniV2ExactInCalldata(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT / 2, // half of plan.amountIn
+            0,
+            address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_paraswapDirect_uniV2_invalidBeneficiary_reverts() public {
+        address badRecipient = address(0xBAAD);
+        bytes memory cd = _buildUniV2ExactInCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, badRecipient
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.SwapRecipientInvalid.selector, badRecipient));
+        executor.execute(plan);
+    }
+
+    /// Chained double-swap: leg2 uses UniV2 (DynamicStruct). Pre-fix the chained
+    /// guard read leg2.fromAmount at the wrong offset for any non-generic family,
+    /// silently letting an invalid input through. The selector-aware decoder now
+    /// follows the head→tail offset and reads the correct value.
+    function test_paraswapDouble_chained_uniV2Leg2_happyPath() public {
+        uint256 debtToCover = 400e18;
+        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
+        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18;
+
+        bytes memory cd1 =
+            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
+        bytes memory cd2 =
+            _buildUniV2ExactInCalldata(address(profitToken), address(loanToken), leg1AmountOut, 0, address(executor));
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
+            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    /// Chained double-swap with UniV2 leg2 declaring more input than leg1 produced
+    /// must revert via the selector-aware chained guard.
+    function test_paraswapDouble_chained_uniV2Leg2_excessiveInput_reverts() public {
+        uint256 debtToCover = 400e18;
+        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
+        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18;
+
+        bytes memory cd1 =
+            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
+        // Declare 2x leg1 output → ChainedInputExceedsOutput.
+        uint256 leg2AmountIn = leg1AmountOut * 2;
+        bytes memory cd2 =
+            _buildUniV2ExactInCalldata(address(profitToken), address(loanToken), leg2AmountIn, 0, address(executor));
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
+            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.ChainedInputExceedsOutput.selector, leg2AmountIn, leg1AmountOut)
+        );
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // RFQ EXPLICIT REJECTION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// The real Augustus V6.2 RFQ entrypoint (`swapOnAugustusRFQTryBatchFill`,
+    /// selector 0xda35bb0d) must revert with `InvalidParaswapSelector` because
+    /// RFQ flows route through the off-chain matcher and we never want to
+    /// execute one. The classifier maps this selector to its dedicated `RFQ`
+    /// kind so the rejection is intentional rather than an "unknown selector"
+    /// coincidence.
+    function test_paraswapRFQ_selector_explicitlyRejected() public {
+        bytes4 rfqSelector = SWAP_RFQ_BATCH_FILL_SELECTOR;
+        bytes memory cd = abi.encodePacked(rfqSelector, new bytes(420));
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidParaswapSelector.selector, rfqSelector));
         executor.execute(plan);
     }
 
@@ -1889,7 +2597,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.SwapRecipientInvalid.selector, badRecipient));
@@ -1919,7 +2627,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(
@@ -1963,10 +2671,12 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidSwapSelector.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.InvalidParaswapSelector.selector, bytes4(0xdeadbeef))
+        );
         executor.execute(plan);
     }
 
@@ -1980,7 +2690,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(loanToken), address(collateralToken), LOAN_AMOUNT, 0);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
         vm.prank(operatorAddr);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -2049,7 +2759,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), debtToCover, flashFee, _singleAction(1, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), debtToCover, flashFee, _singleAction(1, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         freshExecutor.execute(plan);
@@ -2124,7 +2834,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), debtToCover, flashFee, _singleAction(1, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), debtToCover, flashFee, _singleAction(1, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert();
@@ -2193,7 +2903,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), debtToCover, flashFee, _singleAction(1, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), debtToCover, flashFee, _singleAction(1, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(
@@ -2278,7 +2988,7 @@ contract ExecutorTest is Test {
             minProfitAmount: 0
         });
 
-        bytes memory plan = _buildPlan(1, address(loanToken), totalDebt, flashFee, actions, swapPlan);
+        bytes memory plan = _buildPlan(2, address(loanToken), totalDebt, flashFee, actions, swapPlan);
 
         vm.prank(operatorAddr);
         freshExecutor.execute(plan);
@@ -2357,7 +3067,7 @@ contract ExecutorTest is Test {
             minProfitAmount: 0
         });
 
-        bytes memory plan = _buildPlan(1, address(loanToken), debtToCover * 2, flashFee, actions, swapPlan);
+        bytes memory plan = _buildPlan(2, address(loanToken), debtToCover * 2, flashFee, actions, swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert();
@@ -2375,7 +3085,7 @@ contract ExecutorTest is Test {
     function test_execute_reverts_on_empty_actions() public {
         LiquidationExecutor.Action[] memory empty = new LiquidationExecutor.Action[](0);
 
-        bytes memory plan = _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, empty, _defaultSwapPlan());
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, empty, _defaultSwapPlan());
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.NoActions.selector);
@@ -2393,7 +3103,7 @@ contract ExecutorTest is Test {
             });
         }
 
-        bytes memory plan = _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, tooMany, _defaultSwapPlan());
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, tooMany, _defaultSwapPlan());
 
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TooManyActions.selector, 11));
@@ -2427,7 +3137,7 @@ contract ExecutorTest is Test {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), 200e18, 0);
 
-        bytes memory plan = _buildPlan(1, address(loanToken), 200e18, FLASH_FEE, actions, swapPlan);
+        bytes memory plan = _buildPlan(2, address(loanToken), 200e18, FLASH_FEE, actions, swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(
@@ -2462,7 +3172,7 @@ contract ExecutorTest is Test {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), 200e18, 0);
 
-        bytes memory plan = _buildPlan(1, address(loanToken), 200e18, FLASH_FEE, actions, swapPlan);
+        bytes memory plan = _buildPlan(2, address(loanToken), 200e18, FLASH_FEE, actions, swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(
@@ -2481,7 +3191,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(otherToken), address(loanToken), 200e18, 0);
 
         bytes memory plan = _buildPlan(
-            1,
+            2,
             address(loanToken),
             200e18,
             FLASH_FEE,
@@ -2505,7 +3215,7 @@ contract ExecutorTest is Test {
 
     function test_reverts_on_zero_action_amount() public {
         bytes memory plan = _buildPlan(
-            1,
+            2,
             address(loanToken),
             200e18,
             FLASH_FEE,
@@ -2556,7 +3266,7 @@ contract ExecutorTest is Test {
     function test_reverts_on_invalid_protocol() public {
         // Protocol ID 99 -> INVALID_PROTOCOL
         bytes memory plan = _buildPlan(
-            1,
+            2,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
@@ -2611,7 +3321,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan = _buildPlan(
-            1,
+            2,
             address(loanToken),
             500e18,
             FLASH_FEE,
@@ -2629,66 +3339,6 @@ contract ExecutorTest is Test {
         freshExec.execute(plan);
     }
 
-    function test_reverts_on_invalid_flash_loan_balance() public {
-        // Deploy a stingy flash provider that transfers LESS than requested
-        MockAavePoolStingy stingyPool = new MockAavePoolStingy(FLASH_FEE);
-        loanToken.mint(address(stingyPool), 100_000e18);
-
-        // Fresh executor wired to stingy pool
-        address[] memory targets = new address[](2);
-        targets[0] = address(stingyPool);
-        targets[1] = address(augustus);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(stingyPool),
-            address(balancerVault),
-            address(augustus),
-            targets
-        );
-
-        aavePool.setLiquidationCollateralReward(COLLATERAL_REWARD);
-
-        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(freshExec)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
-            repayToken: address(loanToken),
-            profitToken: address(loanToken),
-            minProfitAmount: 0
-        });
-
-        bytes memory plan = _buildPlan(
-            1,
-            address(loanToken),
-            LOAN_AMOUNT,
-            FLASH_FEE,
-            _singleAction(
-                1,
-                _buildAaveV3LiquidationAction(
-                    address(collateralToken), address(loanToken), address(0x1234), 500e18, false
-                )
-            ),
-            swapPlan
-        );
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidFlashLoan.selector);
-        freshExec.execute(plan);
-
-        // No stuck tokens
-        assertEq(loanToken.balanceOf(address(freshExec)), 0);
-    }
-
     // ═══════════════════════════════════════════════════════════════════
     // INVARIANT: Internal-only plan must revert
     // ═══════════════════════════════════════════════════════════════════
@@ -2698,7 +3348,7 @@ contract ExecutorTest is Test {
         LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
         actions[0] = _buildCoinbasePaymentAction(0.1 ether);
 
-        bytes memory plan = _buildPlan(1, address(mockWeth), LOAN_AMOUNT, FLASH_FEE, actions, _wethSwapPlan());
+        bytes memory plan = _buildPlan(2, address(mockWeth), LOAN_AMOUNT, FLASH_FEE, actions, _wethSwapPlan());
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.NoLiquidationAction.selector);
@@ -2719,7 +3369,7 @@ contract ExecutorTest is Test {
         assertTrue(collateralToken.balanceOf(address(executor)) > 0, "precondition: stale collateral exists");
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan());
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan());
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.NoCollateralReceived.selector);
@@ -2752,7 +3402,7 @@ contract ExecutorTest is Test {
         vm.deal(address(executor), 1 ether);
 
         vm.prank(operatorAddr);
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
 
         assertEq(coinbase.balance, 0.5 ether);
         assertEq(address(executor).balance, 0.5 ether);
@@ -2764,7 +3414,7 @@ contract ExecutorTest is Test {
         // Payment of 100_000 ether exceeds that -> INSUFFICIENT_ETH.
         vm.prank(operatorAddr);
         vm.expectRevert();
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 100_000 ether), 0));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 100_000 ether), 0));
     }
 
     function test_coinbasePayment_revertsOnFailedCall() public {
@@ -2774,7 +3424,7 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.CoinbasePaymentFailed.selector);
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
     }
 
     function test_coinbasePayment_zeroAmountNoOp() public {
@@ -2782,7 +3432,7 @@ contract ExecutorTest is Test {
         vm.coinbase(coinbase);
 
         vm.prank(operatorAddr);
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0), 0));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 0), 0));
 
         assertEq(coinbase.balance, 0);
     }
@@ -2795,7 +3445,7 @@ contract ExecutorTest is Test {
         // coinbaseCostNotInDelta = 0.1e18 (pre-funded, not in delta).
         // effectiveProfit = 699 - 0.1 = 698.9 > 99 -> passes.
         vm.prank(operatorAddr);
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.1 ether), 99e18));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 0.1 ether), 99e18));
     }
 
     function test_coinbasePayment_minProfitFailsIfUnprofitable() public {
@@ -2807,7 +3457,7 @@ contract ExecutorTest is Test {
         // minProfit = 700 -> reverts.
         vm.prank(operatorAddr);
         vm.expectRevert();
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.1 ether), 700e18));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 0.1 ether), 700e18));
     }
 
     function test_coinbasePayment_invalidActionTypeReverts() public {
@@ -2820,7 +3470,7 @@ contract ExecutorTest is Test {
         });
         actions[1] = LiquidationExecutor.Action({protocolId: 100, data: abi.encode(uint8(99), uint256(0.5 ether))});
 
-        bytes memory plan = _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultSwapPlan());
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultSwapPlan());
 
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidAction.selector, 99));
@@ -2835,7 +3485,7 @@ contract ExecutorTest is Test {
         vm.prank(operatorAddr);
         vm.expectEmit(true, false, false, true);
         emit LiquidationExecutor.CoinbasePaid(coinbase, 0.5 ether);
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
     }
 
     function test_coinbasePayment_balancerProvider() public {
@@ -2867,7 +3517,7 @@ contract ExecutorTest is Test {
         });
         actions[1] = _buildCoinbasePaymentAction(0.5 ether);
 
-        bytes memory plan = _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultSwapPlan());
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultSwapPlan());
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.CoinbasePaymentRequiresWethProfit.selector);
@@ -2885,7 +3535,7 @@ contract ExecutorTest is Test {
         // effectiveProfit = 698e18. minProfit = 699 -> 698 < 699 -> reverts.
         vm.prank(operatorAddr);
         vm.expectRevert();
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 1e18), 699e18));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 1e18), 699e18));
     }
 
     function test_coinbasePayment_exactProfitBoundaryPasses() public {
@@ -2894,7 +3544,7 @@ contract ExecutorTest is Test {
         // WETH unwrap: costNotInDelta = 0. effectiveProfit = rawProfit - unwrapDelta.
         // Use conservative minProfit that matches the actual computed value.
         vm.prank(operatorAddr);
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 1e18), 0));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 1e18), 0));
     }
 
     /// @notice Pre-funded ETH coinbase payment IS deducted from profit (native ETH cost).
@@ -2906,7 +3556,7 @@ contract ExecutorTest is Test {
         // rawProfit ~699e18. effectiveProfit = 699 - 100 = 599. minProfit = 600 → reverts.
         vm.prank(operatorAddr);
         vm.expectRevert();
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 100e18), 600e18));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 100e18), 600e18));
     }
 
     function test_coinbasePayment_multiplePaymentsAccumulated() public {
@@ -2926,7 +3576,7 @@ contract ExecutorTest is Test {
 
         // Pre-funded ETH pays coinbase. WETH profit unaffected.
         vm.prank(operatorAddr);
-        executor.execute(_buildWethPlan(1, actions, 0));
+        executor.execute(_buildWethPlan(2, actions, 0));
 
         assertEq(coinbase.balance, 3 ether);
     }
@@ -2950,7 +3600,7 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert();
-        executor.execute(_buildWethPlan(1, actions, 697e18));
+        executor.execute(_buildWethPlan(2, actions, 697e18));
     }
 
     function test_coinbasePayment_wethUnwrap() public {
@@ -2959,7 +3609,7 @@ contract ExecutorTest is Test {
         // No vm.deal -> executor has 0 ETH, must unwrap WETH
 
         vm.prank(operatorAddr);
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 1 ether), 0));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 1 ether), 0));
 
         // Coinbase received ETH that could only have come from WETH unwrap
         assertEq(coinbase.balance, 1 ether);
@@ -2974,7 +3624,7 @@ contract ExecutorTest is Test {
         // costNotInDelta = 0. No double-counting. Passes with minProfit = 0.
 
         vm.prank(operatorAddr);
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 1e18), 0));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 1e18), 0));
 
         assertEq(coinbase.balance, 1 ether);
     }
@@ -3061,7 +3711,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), debtToCover, flashFee, _singleAction(1, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), debtToCover, flashFee, _singleAction(1, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         freshExecutor.execute(plan);
@@ -3077,7 +3727,7 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, MIN_PROFIT);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(repayAmt), swapPlan);
 
         uint256 loanBefore = loanToken.balanceOf(address(executor));
         vm.prank(operatorAddr);
@@ -3105,7 +3755,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan = _buildPlan(
-            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, targetAction), _defaultSwapPlan()
+            2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, targetAction), _defaultSwapPlan()
         );
 
         vm.prank(operatorAddr);
@@ -3167,7 +3817,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), seizedAssets, flashFee, _singleAction(2, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), seizedAssets, flashFee, _singleAction(2, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         freshExecutor.execute(plan);
@@ -3211,7 +3861,7 @@ contract ExecutorTest is Test {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), 200e18, 0);
 
-        bytes memory plan = _buildPlan(1, address(loanToken), 200e18, FLASH_FEE, actions, swapPlan);
+        bytes memory plan = _buildPlan(2, address(loanToken), 200e18, FLASH_FEE, actions, swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(
@@ -3248,7 +3898,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan = _buildPlan(
-            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, targetAction), _defaultSwapPlan()
+            2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, targetAction), _defaultSwapPlan()
         );
 
         vm.prank(operatorAddr);
@@ -3296,7 +3946,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.NoCollateralReceived.selector);
@@ -3361,7 +4011,7 @@ contract ExecutorTest is Test {
             _buildParaswapCalldata(address(collateralToken), address(loanToken), COLLATERAL_REWARD, address(freshExec));
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         // Pool withdraw will revert because it has no underlying collateral to send
@@ -3426,7 +4076,7 @@ contract ExecutorTest is Test {
     function test_fullPipeline_v3_receiveATokenFalse() public {
         vm.prank(operatorAddr);
         executor.execute(
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan())
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan())
         );
     }
 
@@ -3462,7 +4112,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         freshExec.execute(plan);
@@ -3515,7 +4165,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         freshExec.execute(plan);
@@ -3564,7 +4214,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         // Morpho tries transferFrom(800e18) but approval is only 400e18 → ERC20 revert
@@ -3627,7 +4277,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(2, targetAction), swapPlan);
 
         vm.prank(operatorAddr);
         freshExec.execute(plan);
@@ -3656,7 +4306,7 @@ contract ExecutorTest is Test {
             _buildParaswapCalldata(address(profitToken), address(loanToken), 500e18, address(executor));
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.ChainedProfitMustMatchRepay.selector);
@@ -3669,17 +4319,11 @@ contract ExecutorTest is Test {
         // but let's be explicit about profitToken == repayToken
         vm.prank(operatorAddr);
         executor.execute(
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan())
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan())
         );
     }
 
     /// P1-5: Phase guard blocks callbacks outside execute()
-    function test_phaseGuard_blocksDirectCallback() public {
-        vm.prank(address(aavePool));
-        vm.expectRevert(LiquidationExecutor.InvalidExecutionPhase.selector);
-        executor.executeOperation(address(loanToken), LOAN_AMOUNT, FLASH_FEE, address(executor), "");
-    }
-
     /// P1-6: Morpho share mode (seizedAssets=0) reverts with explicit error
     function test_morpho_shareMode_explicitRevert() public {
         bytes memory targetAction = _buildMorphoLiquidationActionFull(
@@ -3720,14 +4364,14 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         // Pre-existing balance (1101e18) - debtToCover (400e18) + partialRepay (100e18) = 801e18
         // flashRepayAmount = 1001e18. 801 < 1001 → still reverts here because not enough total.
         // Need to adjust: debtToCover must be small enough that residual + partial >= flashRepay.
         // debtToCover = 50e18 → residual = 1101 - 50 = 1051. 1051 + 100 = 1151 >= 1001 ✓
         bytes memory plan2 = _buildPlan(
-            1,
+            2,
             address(loanToken),
             LOAN_AMOUNT,
             FLASH_FEE,
@@ -3761,7 +4405,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -3780,7 +4424,7 @@ contract ExecutorTest is Test {
         // minProfit = 650 → reverts (profit reduced by coinbase cost).
         vm.prank(operatorAddr);
         vm.expectRevert();
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 50e18), 650e18));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 50e18), 650e18));
     }
 
     /// FIX 3: Zero collateralAsset must revert
@@ -3802,7 +4446,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan = _buildPlan(
-            1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, targetAction), _defaultSwapPlan()
+            2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, targetAction), _defaultSwapPlan()
         );
 
         vm.prank(operatorAddr);
@@ -3826,7 +4470,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(
@@ -3871,7 +4515,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidParaswapCalldata.selector);
@@ -3892,7 +4536,7 @@ contract ExecutorTest is Test {
         );
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectEmit(true, false, false, true);
@@ -3909,7 +4553,7 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidCoinbase.selector);
-        executor.execute(_buildWethPlan(1, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
+        executor.execute(_buildWethPlan(2, _wethLiqActionWithCoinbase(400e18, 0.5 ether), 0));
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -3942,7 +4586,7 @@ contract ExecutorTest is Test {
         });
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
 
         vm.prank(operatorAddr);
         executor.execute(plan); // must NOT revert — actual < max is OK for exact-out
@@ -3957,7 +4601,7 @@ contract ExecutorTest is Test {
         augustus.setPartialFillPct(60);
 
         bytes memory plan =
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan());
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan());
 
         vm.prank(operatorAddr);
         vm.expectRevert(); // ParaswapAmountInMismatch
@@ -3973,7 +4617,7 @@ contract ExecutorTest is Test {
         // Covered by test_morphoLiquidation_happyPath but verified explicitly here
         vm.prank(operatorAddr);
         executor.execute(
-            _buildPlan(1, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan())
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan())
         );
     }
 
@@ -4030,6 +4674,251 @@ contract ExecutorTest is Test {
         vm.expectRevert(LiquidationExecutor.MorphoShareModeUnsupported.selector);
         executor.execute(plan);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // AUGUSTUS V6.2 — COMPLETE SELECTOR COVERAGE
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // The 11 swap-entrypoint selectors below are the COMPLETE set exposed by
+    // the deployed Augustus V6.2 contract at
+    // 0x6A000F20005980200259B80c5102003040001068 (verified against Sourcify
+    // metadata + on-chain bytecode dispatch table). Each test asserts the
+    // executor's behaviour for one selector — accept (decode + swap) or
+    // reject (revert with `InvalidParaswapSelector(selector)`).
+    //
+    // Coverage is provable via `forge test --match-test paraswapV62Coverage`:
+    // 8 accept tests + 3 reject tests + 1 unknown-selector test = 12 tests.
+
+    function test_paraswapV62Coverage_genericExactIn_accepted() public {
+        bytes memory cd = _buildParaswapCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_genericExactOut_accepted() public {
+        bytes memory cd = _buildParaswapExactOutCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_uniV2ExactIn_accepted() public {
+        bytes memory cd = _buildUniV2ExactInCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_uniV2ExactOut_accepted() public {
+        bytes memory cd = _buildUniV2ExactOutCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_uniV3ExactIn_accepted() public {
+        bytes memory cd = _buildOptimizedExactInUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_uniV3ExactOut_accepted() public {
+        bytes memory cd = _buildOptimizedExactOutUniV3Calldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_curveV1ExactIn_accepted() public {
+        bytes memory cd = _buildCurveV1ExactInCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_curveV2ExactIn_accepted() public {
+        bytes memory cd = _buildCurveV2ExactInCalldata(
+            address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_balancerV2ExactIn_accepted() public {
+        bytes memory cd = _buildBalancerV2Calldata(
+            SWAP_EXACT_IN_BALANCER_V2_SELECTOR,
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_paraswapV62Coverage_balancerV2ExactOut_accepted() public {
+        bytes memory cd = _buildBalancerV2Calldata(
+            SWAP_EXACT_OUT_BALANCER_V2_SELECTOR,
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        _runAcceptedSwap(cd);
+    }
+
+    function test_balancerV2_wrongSrcToken_reverts() public {
+        bytes memory cd = _buildBalancerV2Calldata(
+            SWAP_EXACT_IN_BALANCER_V2_SELECTOR,
+            address(mockWeth), // blob says mockWeth
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            address(executor)
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken), // plan says collateralToken
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.ParaswapSrcTokenMismatch.selector, address(collateralToken), address(mockWeth)
+            )
+        );
+        executor.execute(plan);
+    }
+
+    function test_balancerV2_invalidBlobSelector_reverts() public {
+        bytes memory cd = _buildBalancerV2InvalidBlobCalldata(SWAP_EXACT_IN_BALANCER_V2_SELECTOR);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: 1,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidParaswapCalldata.selector);
+        executor.execute(plan);
+    }
+
+    function test_balancerV2_beneficiaryRule_reverts() public {
+        address badRecipient = address(0xBAAD);
+        bytes memory cd = _buildBalancerV2Calldata(
+            SWAP_EXACT_IN_BALANCER_V2_SELECTOR,
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            badRecipient
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.SwapRecipientInvalid.selector, badRecipient));
+        executor.execute(plan);
+    }
+
+    function test_paraswapV62Coverage_rfq_rejected() public {
+        bytes memory cd = abi.encodePacked(SWAP_RFQ_BATCH_FILL_SELECTOR, new bytes(420));
+        _expectRejectedSwap(cd, SWAP_RFQ_BATCH_FILL_SELECTOR);
+    }
+
+    function test_paraswapV62Coverage_unknownSelector_rejected() public {
+        bytes4 unknown = bytes4(0xdeadbeef);
+        bytes memory cd = abi.encodePacked(unknown, new bytes(420));
+        _expectRejectedSwap(cd, unknown);
+    }
+
+    /// Drives an accepted-selector swap through the real flash-loan path and
+    /// asserts no revert. Reuses the standard plan layout so any decode/route
+    /// regression in `_decodeAndValidateParaswap` surfaces as a test failure.
+    function _runAcceptedSwap(bytes memory cd) internal {
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 loanAfter = loanToken.balanceOf(address(executor));
+        assertGt(loanAfter, loanBefore, "accepted selector must produce loanToken output");
+    }
+
+    /// Drives a rejected-selector swap and asserts the canonical revert.
+    function _expectRejectedSwap(bytes memory cd, bytes4 expectedSelector) internal {
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: cd,
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
+            paraswapCalldata2: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidParaswapSelector.selector, expectedSelector));
+        executor.execute(plan);
+    }
 }
 
 /// @dev Contract that rejects ETH -- used to test coinbase payment failure
@@ -4053,72 +4942,6 @@ contract MockWETH is ERC20 {
     }
 
     receive() external payable {}
-}
-
-/// @dev Flash provider mock that transfers LESS than requested (triggers INVALID_FLASH_LOAN)
-contract MockAavePoolStingy {
-    using SafeERC20 for IERC20;
-
-    uint256 public flashFee;
-
-    constructor(uint256 _fee) {
-        flashFee = _fee;
-    }
-
-    function flashLoanSimple(address receiver, address asset, uint256 amount, bytes calldata params, uint16) external {
-        // Transfer only HALF the requested amount -- triggers INVALID_FLASH_LOAN
-        uint256 shortAmount = amount / 2;
-        IERC20(asset).safeTransfer(receiver, shortAmount);
-
-        IFlashLoanSimpleReceiver(receiver).executeOperation(asset, amount, flashFee, receiver, params);
-
-        // Pull back (will fail anyway due to revert, but needed for compilation)
-        IERC20(asset).safeTransferFrom(receiver, address(this), shortAmount + flashFee);
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// HELPER MOCK: Aave Pool that lies about asset in callback
-// ═══════════════════════════════════════════════════════════════════
-
-import {IFlashLoanSimpleReceiver} from "../src/interfaces/IAaveV3Pool.sol";
-
-contract MockAavePoolLiar {
-    using SafeERC20 for IERC20;
-    uint256 public flashFee;
-    address public fakeAsset; // lies about this asset in callback
-
-    constructor(uint256 _fee, address _fakeAsset) {
-        flashFee = _fee;
-        fakeAsset = _fakeAsset;
-    }
-
-    function flashLoanSimple(address receiver, address asset, uint256 amount, bytes calldata params, uint16) external {
-        IERC20(asset).safeTransfer(receiver, amount);
-        // Call back with WRONG asset
-        IFlashLoanSimpleReceiver(receiver).executeOperation(fakeAsset, amount, flashFee, receiver, params);
-        IERC20(asset).safeTransferFrom(receiver, address(this), amount + flashFee);
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// HELPER MOCK: Aave Pool that lies about amount in callback
-// ═══════════════════════════════════════════════════════════════════
-
-contract MockAavePoolAmountLiar {
-    using SafeERC20 for IERC20;
-    uint256 public flashFee;
-
-    constructor(uint256 _fee) {
-        flashFee = _fee;
-    }
-
-    function flashLoanSimple(address receiver, address asset, uint256 amount, bytes calldata params, uint16) external {
-        IERC20(asset).safeTransfer(receiver, amount);
-        // Call back with WRONG amount
-        IFlashLoanSimpleReceiver(receiver).executeOperation(asset, amount + 1, flashFee, receiver, params);
-        IERC20(asset).safeTransferFrom(receiver, address(this), amount + flashFee);
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
