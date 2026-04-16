@@ -7,7 +7,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import {IAaveV3Pool, IFlashLoanSimpleReceiver} from "./interfaces/IAaveV3Pool.sol";
+import {IAaveV3Pool} from "./interfaces/IAaveV3Pool.sol";
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 import {IMorphoBlue, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/IMorphoBlue.sol";
@@ -20,14 +20,7 @@ interface IWETH {
 /// @notice Flashloan + multi-swap + liquidation executor.
 /// @dev Fail-closed. No upgradeability. External calls restricted to allowedTargets allowlist.
 /// Supports Paraswap single/double swaps and Bebop multi-output swaps.
-contract LiquidationExecutor is
-    Ownable2Step,
-    Pausable,
-    ReentrancyGuard,
-    IFlashLoanSimpleReceiver,
-    IFlashLoanRecipient,
-    IMorphoFlashLoanCallback
-{
+contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecipient, IMorphoFlashLoanCallback {
     using SafeERC20 for IERC20;
 
     // ─── Custom Errors ───────────────────────────────────────────────
@@ -119,7 +112,8 @@ contract LiquidationExecutor is
     error TargetNotAllowed(address target);
 
     // ─── Constants ───────────────────────────────────────────────────
-    uint8 public constant FLASH_PROVIDER_AAVE_V3 = 1;
+    // FLASH_PROVIDER_AAVE_V3 (1) removed — Aave V3 flashloan path deleted.
+    // IDs 2 and 3 kept stable for bot integration compatibility.
     uint8 public constant FLASH_PROVIDER_BALANCER = 2;
     uint8 public constant FLASH_PROVIDER_MORPHO = 3;
 
@@ -407,7 +401,6 @@ contract LiquidationExecutor is
         balancerVault = balancerVault_;
         paraswapAugustusV6 = paraswapAugustus_;
 
-        allowedFlashProviders[FLASH_PROVIDER_AAVE_V3] = aavePool_;
         allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
 
         allowedTargets[aavePool_] = true;
@@ -644,9 +637,7 @@ contract LiquidationExecutor is
         _activePlanHash = keccak256(planData);
         _executionPhase = ExecutionPhase.FlashLoanActive;
 
-        if (plan.flashProviderId == FLASH_PROVIDER_AAVE_V3) {
-            IAaveV3Pool(provider).flashLoanSimple(address(this), plan.loanToken, plan.loanAmount, planData, 0);
-        } else if (plan.flashProviderId == FLASH_PROVIDER_BALANCER) {
+        if (plan.flashProviderId == FLASH_PROVIDER_BALANCER) {
             IERC20[] memory tokens = new IERC20[](1);
             tokens[0] = IERC20(plan.loanToken);
             uint256[] memory amounts = new uint256[](1);
@@ -662,43 +653,6 @@ contract LiquidationExecutor is
         _activePlanHash = bytes32(0);
         _executionPhase = ExecutionPhase.Idle;
         emit FlashExecuted(plan.flashProviderId, plan.loanToken, plan.loanAmount);
-    }
-
-    // ─── Aave V3 Flashloan Callback ─────────────────────────────────
-    function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes calldata params)
-        external
-        override
-        returns (bool)
-    {
-        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
-        if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_AAVE_V3]) revert InvalidCallbackCaller();
-        if (initiator != address(this)) revert InvalidInitiator();
-        if (keccak256(params) != _activePlanHash) revert InvalidPlan();
-
-        Plan memory plan = abi.decode(params, (Plan));
-
-        // P0 safety: strict asset/amount match
-        if (asset != plan.loanToken) revert CallbackAssetMismatch();
-        if (amount != plan.loanAmount) revert CallbackAmountMismatch();
-        if (premium > plan.maxFlashFee) revert FlashFeeExceeded(premium, plan.maxFlashFee);
-
-        uint256 flashRepayAmount = amount + premium;
-        (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped) =
-            _runFlashloanPipeline(plan, flashRepayAmount);
-
-        // Aave pulls repayment after we return true — approve exact amount (vault=0).
-        _finalizeFlashloan(
-            asset,
-            amount,
-            flashRepayAmount,
-            address(0),
-            plan.swapPlan.profitToken,
-            profitBefore,
-            plan.swapPlan.minProfitAmount,
-            totalCoinbasePayment,
-            totalWethUnwrapped
-        );
-        return true;
     }
 
     // ─── Balancer Flashloan Callback ─────────────────────────────────
