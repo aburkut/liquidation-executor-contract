@@ -18,6 +18,7 @@ import {MockParaswapAugustus} from "./mocks/MockParaswapAugustus.sol";
 import {MockAaveV2LendingPool} from "./mocks/MockAaveV2LendingPool.sol";
 import {MockBebopSettlement} from "./mocks/MockBebopSettlement.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
+import {MockUniversalRouter} from "./mocks/MockUniversalRouter.sol";
 
 /// Test-only struct mirroring Augustus V6.2 UniswapV2Data / UniswapV3Data. Both
 /// real V6.2 structs share this exact 8-field shape (`bytes pools` makes the
@@ -92,6 +93,7 @@ contract ExecutorTest is Test {
     MockWETH public mockWeth;
     MockBebopSettlement public bebop;
     MockMorphoBlue public morphoBlue;
+    MockUniversalRouter public universalRouterMock;
 
     address public owner = address(0xA11CE);
     address public operatorAddr = address(0xB0B);
@@ -183,13 +185,15 @@ contract ExecutorTest is Test {
         bebop = new MockBebopSettlement();
         morphoBlue = new MockMorphoBlue();
         aToken = new MockERC20("aToken", "aWETH", 18);
+        universalRouterMock = new MockUniversalRouter(SWAP_RATE);
 
-        address[] memory targets = new address[](5);
+        address[] memory targets = new address[](6);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(aaveV2Pool);
         targets[3] = address(bebop);
         targets[4] = address(morphoBlue);
+        targets[5] = address(universalRouterMock);
 
         executor = new LiquidationExecutor(
             owner,
@@ -204,6 +208,7 @@ contract ExecutorTest is Test {
         vm.startPrank(owner);
         executor.setAaveV2LendingPool(address(aaveV2Pool));
         executor.setMorphoBlue(address(morphoBlue));
+        executor.setUniversalRouter(address(universalRouterMock));
         vm.stopPrank();
 
         // Configure liquidation reward so the delta-based collateral check passes
@@ -238,6 +243,12 @@ contract ExecutorTest is Test {
         collateralToken.mint(address(bebop), 100_000e18);
         profitToken.mint(address(bebop), 100_000e18);
         profitToken.mint(address(augustus), 100_000e18);
+
+        // Fund Universal Router mock with output tokens
+        loanToken.mint(address(universalRouterMock), 100_000e18);
+        collateralToken.mint(address(universalRouterMock), 100_000e18);
+        profitToken.mint(address(universalRouterMock), 100_000e18);
+        mockWeth.mint(address(universalRouterMock), 100_000e18);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────
@@ -464,11 +475,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: _buildParaswapCalldata(srcToken, dstToken, amountIn, address(executor)),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: dstToken,
             profitToken: dstToken,
-            minProfitAmount: minProfitAmt
+            minProfitAmount: minProfitAmt,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
     }
 
@@ -489,36 +506,55 @@ contract ExecutorTest is Test {
             paraswapCalldata: "",
             bebopTarget: bebopTarget,
             bebopCalldata: bebopCd,
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: repayTkn,
             profitToken: profitTkn,
-            minProfitAmount: minProfitAmt
+            minProfitAmount: minProfitAmt,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
     }
 
-    function _buildParaswapDoubleSwapPlan(
-        LiquidationExecutor.DoubleSwapPattern pattern,
-        bytes memory cd1,
-        bytes memory cd2,
-        address repayTkn,
-        address profitTkn,
+    function _buildURSwapPlan(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint256 minOut,
         uint256 minProfitAmt
     ) internal view returns (LiquidationExecutor.SwapPlan memory) {
+        bytes[] memory urInputs = new bytes[](1);
+        urInputs[0] = abi.encode(srcToken, dstToken, amountIn);
         return LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_DOUBLE,
-            srcToken: address(0), // ignored by PARASWAP_DOUBLE
-            amountIn: 0, // ignored by PARASWAP_DOUBLE
+            mode: LiquidationExecutor.SwapMode.UNIVERSAL_ROUTER,
+            srcToken: srcToken,
+            amountIn: amountIn,
             deadline: block.timestamp + 3600,
-            paraswapCalldata: cd1,
+            paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: pattern,
-            paraswapCalldata2: cd2,
-            repayToken: repayTkn,
-            profitToken: profitTkn,
-            minProfitAmount: minProfitAmt
+            repayToken: dstToken,
+            profitToken: dstToken,
+            minProfitAmount: minProfitAmt,
+            universalCommands: hex"00",
+            universalInputs: urInputs,
+            minSwapOutput: minOut,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
+    }
+
+    function _buildURInputs(address tokenIn, address tokenOut, uint256 amount) internal pure returns (bytes[] memory) {
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(tokenIn, tokenOut, amount);
+        return inputs;
     }
 
     function _buildPlan(
@@ -882,11 +918,11 @@ contract ExecutorTest is Test {
         bytes32 planHash = keccak256(planBytes);
 
         // Storage layout (forge inspect LiquidationExecutor storage):
-        //   slot 9  = _activePlanHash    (bytes32)
-        //   slot 10 = _executionPhase    (uint8 enum, low byte)
+        //   slot 10 = _activePlanHash    (bytes32)
+        //   slot 11 = _executionPhase    (uint8 enum, low byte)
         // Force both into the "during flashloan" state so neither guard short-circuits.
-        vm.store(address(executor), bytes32(uint256(9)), planHash);
-        vm.store(address(executor), bytes32(uint256(10)), bytes32(uint256(1))); // FlashLoanActive
+        vm.store(address(executor), bytes32(uint256(10)), planHash);
+        vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1))); // FlashLoanActive
 
         // Attacker (not the registered Morpho provider) hits the callback. The phase
         // and hash gates pass; only the caller check should reject.
@@ -980,11 +1016,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -1068,11 +1110,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -1235,228 +1283,6 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(); // BebopSwapFailed
-        executor.execute(plan);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // PARASWAP DOUBLE SWAP TESTS
-    // ═══════════════════════════════════════════════════════════════════
-
-    function test_paraswapDouble_split_happyPath() public {
-        // Split pattern: collateral -> repayToken (leg 1), collateral -> profitToken (leg 2)
-        uint256 debtToCover = 400e18;
-
-        // Fund augustus with profitToken for the second leg
-        profitToken.mint(address(augustus), 100_000e18);
-
-        // Leg 1: 920 collateral -> loanToken (at 1.1x = 1012 loanToken, >= 1001 flash repay)
-        uint256 leg1AmountIn = 920e18;
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(loanToken), leg1AmountIn, address(executor));
-
-        // Leg 2: 80 collateral -> profitToken (at 1.1x = 88 profitToken)
-        uint256 leg2AmountIn = 80e18;
-        bytes memory cd2 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg2AmountIn, address(executor));
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.SPLIT, cd1, cd2, address(loanToken), address(profitToken), 0
-        );
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
-
-        uint256 profitBefore = profitToken.balanceOf(address(executor));
-        vm.prank(operatorAddr);
-        executor.execute(plan);
-        uint256 profitAfter = profitToken.balanceOf(address(executor));
-        assertGt(profitAfter, profitBefore);
-    }
-
-    function test_paraswapDouble_chained_happyPath() public {
-        // Chained pattern: collateral -> intermediate -> repayToken
-        uint256 debtToCover = 400e18;
-
-        // Leg 1: collateral -> profitToken (intermediate) at 1.1x
-        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT; // 1000e18
-        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18; // 1100e18
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
-
-        // Leg 2: profitToken -> loanToken at 1.1x
-        uint256 leg2AmountIn = leg1AmountOut; // 1100e18
-        bytes memory cd2 =
-            _buildParaswapCalldata(address(profitToken), address(loanToken), leg2AmountIn, address(executor));
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
-
-        vm.prank(operatorAddr);
-        executor.execute(plan); // should succeed
-    }
-
-    /// Chained pattern where leg2 uses the optimized UniV3 selector. Pre-fix this
-    /// path silently misread `leg2FromAmount` from the generic offset (96 from args
-    /// start, which on optimized calldata holds the toAmount field instead of
-    /// fromAmount), so the chained guard saw garbage and either passed or reverted
-    /// at random. Selector-aware decode now returns the real fromAmount and the
-    /// validation is meaningful again.
-    function test_paraswapDouble_chained_optimizedLeg2_happyPath() public {
-        uint256 debtToCover = 400e18;
-
-        // Leg 1: collateral -> profitToken at 1.1x via generic exact-in
-        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
-        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18; // 1100e18
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
-
-        // Leg 2: profitToken -> loanToken via OPTIMIZED UniV3 ExactIn (struct inline,
-        // no executor head word). leg2FromAmount must read fromAmount at the
-        // optimized offset, not at the generic offset.
-        uint256 leg2AmountIn = leg1AmountOut;
-        bytes memory cd2 = _buildOptimizedExactInUniV3Calldata(
-            address(profitToken), address(loanToken), leg2AmountIn, 0, address(executor)
-        );
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
-
-        vm.prank(operatorAddr);
-        executor.execute(plan); // must succeed end-to-end with optimized leg2
-    }
-
-    /// Chained pattern, optimized leg2 declares MORE input than leg1 produced.
-    /// The selector-aware guard must catch this (post-fix) and revert with
-    /// `ChainedInputExceedsOutput(declared, leg1_actual_output)`. Pre-fix this
-    /// would have read fromAmount from the wrong offset and either let it
-    /// through or panicked on unrelated grounds.
-    function test_paraswapDouble_chained_optimizedLeg2_excessiveInput_reverts() public {
-        uint256 debtToCover = 400e18;
-
-        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
-        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18; // 1100e18
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
-
-        // Optimized leg 2 declares 2x the leg1 output — must revert.
-        uint256 leg2AmountIn = leg1AmountOut * 2;
-        bytes memory cd2 = _buildOptimizedExactInUniV3Calldata(
-            address(profitToken), address(loanToken), leg2AmountIn, 0, address(executor)
-        );
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.ChainedInputExceedsOutput.selector, leg2AmountIn, leg1AmountOut)
-        );
-        executor.execute(plan);
-    }
-
-    /// Sanity guard: chained with a generic leg2 still works after the
-    /// selector-aware refactor (no regression on the existing path).
-    function test_paraswapDouble_chained_genericLeg2_stillWorks() public {
-        uint256 debtToCover = 400e18;
-        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
-        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18;
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
-        bytes memory cd2 =
-            _buildParaswapCalldata(address(profitToken), address(loanToken), leg1AmountOut, address(executor));
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
-
-        vm.prank(operatorAddr);
-        executor.execute(plan);
-    }
-
-    function test_paraswapDouble_split_revertsRepayInsufficient() public {
-        // Split pattern where the repay leg output is insufficient for flash loan repay.
-        // Uses a fresh executor with no pre-existing loanToken to ensure absolute balance is truly insufficient.
-        address[] memory targets = new address[](2);
-        targets[0] = address(aavePool);
-        targets[1] = address(augustus);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(aavePool),
-            address(balancerVault),
-            address(augustus),
-            targets
-        );
-        collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
-
-        uint256 debtToCover = 400e18;
-
-        // Set a low rate so repay leg does not produce enough
-        augustus.setRate(0.5e18);
-
-        uint256 leg1AmountIn = 300e18;
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(loanToken), leg1AmountIn, address(freshExec));
-
-        uint256 leg2AmountIn = 300e18;
-        bytes memory cd2 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg2AmountIn, address(freshExec));
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.SPLIT, cd1, cd2, address(loanToken), address(profitToken), 0
-        );
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(); // InsufficientRepayOutput (absolute balance check)
-        freshExec.execute(plan);
-
-        // Reset rate
-        augustus.setRate(SWAP_RATE);
-    }
-
-    function test_paraswapDouble_chained_revertsOnLinkMismatch() public {
-        // Chained pattern where dst1 != src2 -> ChainLinkMismatch
-        uint256 debtToCover = 400e18;
-
-        // Leg 1: collateral -> profitToken
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), 300e18, address(executor));
-
-        // Leg 2: collateral -> loanToken (src2 = collateral, but dst1 = profitToken != collateral)
-        bytes memory cd2 =
-            _buildParaswapCalldata(address(collateralToken), address(loanToken), 300e18, address(executor));
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.ChainLinkMismatch.selector, address(profitToken), address(collateralToken)
-            )
-        );
         executor.execute(plan);
     }
 
@@ -2079,11 +1905,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2125,11 +1957,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2158,11 +1996,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2195,11 +2039,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2227,11 +2077,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken), // mismatch with cd dst
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2257,11 +2113,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2287,11 +2149,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2318,11 +2186,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2356,11 +2230,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2389,11 +2269,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2419,11 +2305,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken), // mismatch
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2449,11 +2341,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2476,68 +2374,23 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.SwapRecipientInvalid.selector, badRecipient));
-        executor.execute(plan);
-    }
-
-    /// Chained double-swap: leg2 uses UniV2 (DynamicStruct). Pre-fix the chained
-    /// guard read leg2.fromAmount at the wrong offset for any non-generic family,
-    /// silently letting an invalid input through. The selector-aware decoder now
-    /// follows the head→tail offset and reads the correct value.
-    function test_paraswapDouble_chained_uniV2Leg2_happyPath() public {
-        uint256 debtToCover = 400e18;
-        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
-        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18;
-
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
-        bytes memory cd2 =
-            _buildUniV2ExactInCalldata(address(profitToken), address(loanToken), leg1AmountOut, 0, address(executor));
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
-
-        vm.prank(operatorAddr);
-        executor.execute(plan);
-    }
-
-    /// Chained double-swap with UniV2 leg2 declaring more input than leg1 produced
-    /// must revert via the selector-aware chained guard.
-    function test_paraswapDouble_chained_uniV2Leg2_excessiveInput_reverts() public {
-        uint256 debtToCover = 400e18;
-        uint256 leg1AmountIn = DEFAULT_SWAP_AMOUNT;
-        uint256 leg1AmountOut = leg1AmountIn * SWAP_RATE / 1e18;
-
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
-        // Declare 2x leg1 output → ChainedInputExceedsOutput.
-        uint256 leg2AmountIn = leg1AmountOut * 2;
-        bytes memory cd2 =
-            _buildUniV2ExactInCalldata(address(profitToken), address(loanToken), leg2AmountIn, 0, address(executor));
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.ChainedInputExceedsOutput.selector, leg2AmountIn, leg1AmountOut)
-        );
         executor.execute(plan);
     }
 
@@ -2563,11 +2416,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2589,11 +2448,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2619,11 +2484,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2663,11 +2534,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: badCalldata,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2751,11 +2628,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2826,11 +2709,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2895,11 +2784,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 10e18
+            minProfitAmount: 10e18,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -2981,11 +2876,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan = _buildPlan(2, address(loanToken), totalDebt, flashFee, actions, swapPlan);
@@ -3060,11 +2961,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan = _buildPlan(2, address(loanToken), debtToCover * 2, flashFee, actions, swapPlan);
@@ -3313,11 +3220,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan = _buildPlan(
@@ -3703,11 +3616,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -3809,11 +3728,17 @@ contract ExecutorTest is Test {
             ),
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -4290,39 +4215,6 @@ contract ExecutorTest is Test {
     // P1 HARDENING REGRESSION TESTS
     // ═══════════════════════════════════════════════════════════════════
 
-    /// P1-1: CHAINED profitToken != repayToken must revert
-    function test_chained_profitTokenMismatch_reverts() public {
-        // Build chained swap with profitToken != repayToken
-        LiquidationExecutor.SwapPlan memory swapPlan;
-        swapPlan.mode = LiquidationExecutor.SwapMode.PARASWAP_DOUBLE;
-        swapPlan.doubleSwapPattern = LiquidationExecutor.DoubleSwapPattern.CHAINED;
-        swapPlan.deadline = block.timestamp + 3600;
-        swapPlan.repayToken = address(loanToken);
-        swapPlan.profitToken = address(profitToken); // different from repayToken
-        swapPlan.minProfitAmount = 0;
-        swapPlan.paraswapCalldata =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), 500e18, address(executor));
-        swapPlan.paraswapCalldata2 =
-            _buildParaswapCalldata(address(profitToken), address(loanToken), 500e18, address(executor));
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.ChainedProfitMustMatchRepay.selector);
-        executor.execute(plan);
-    }
-
-    /// P1-1: CHAINED profitToken == repayToken works
-    function test_chained_profitTokenMatchesRepay_works() public {
-        // This is already covered by test_paraswapDouble_chained_happyPath
-        // but let's be explicit about profitToken == repayToken
-        vm.prank(operatorAddr);
-        executor.execute(
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan())
-        );
-    }
-
     /// P1-5: Phase guard blocks callbacks outside execute()
     /// P1-6: Morpho share mode (seizedAssets=0) reverts with explicit error
     function test_morpho_shareMode_explicitRevert() public {
@@ -4454,31 +4346,6 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
-    /// FIX 4: CHAINED second leg cannot consume more than first leg produced
-    function test_fix4_chainedInputExceedsOutput_reverts() public {
-        // Leg 1 produces X, leg 2 tries to consume X+extra → revert
-        uint256 leg1AmountIn = 500e18;
-        uint256 leg2AmountIn = 600e18; // intentionally > leg1 output at 1.1x rate (550e18)
-
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), leg1AmountIn, address(executor));
-        bytes memory cd2 =
-            _buildParaswapCalldata(address(profitToken), address(loanToken), leg2AmountIn, address(executor));
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.ChainedInputExceedsOutput.selector, leg2AmountIn, 550e18)
-        );
-        executor.execute(plan);
-    }
-
     /// FIX 6: Balancer callback outside execution must revert
     function test_fix6_balancerCallback_outsideExecution_reverts() public {
         IERC20[] memory tokens = new IERC20[](1);
@@ -4496,56 +4363,6 @@ contract ExecutorTest is Test {
     // ═══════════════════════════════════════════════════════════════════
     // P2 FINAL HARDENING TESTS
     // ═══════════════════════════════════════════════════════════════════
-
-    /// FIX 1: CHAINED with short cd2 must revert InvalidParaswapCalldata
-    function test_chained_shortCalldata_reverts() public {
-        // Build leg 1 normally
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), 500e18, address(executor));
-        // Build cd2 as only 50 bytes — too short for assembly read at offset 132
-        bytes memory cd2 = new bytes(50);
-        // Copy selector only
-        cd2[0] = cd1[0];
-        cd2[1] = cd1[1];
-        cd2[2] = cd1[2];
-        cd2[3] = cd1[3];
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidParaswapCalldata.selector);
-        executor.execute(plan);
-    }
-
-    /// FIX 3: CHAINED remainder emits event when intermediate tokens are left
-    function test_chained_remainder_emitted() public {
-        // Build chained swap: collateral → profitToken → loanToken
-        // Leg 1 swaps 500e18 collateral → profitToken at 1.1x = 550e18 profitToken
-        // Leg 2 swaps 400e18 profitToken → loanToken (remainder = 150e18 profitToken)
-        bytes memory cd1 =
-            _buildParaswapCalldata(address(collateralToken), address(profitToken), 500e18, address(executor));
-        bytes memory cd2 = _buildParaswapCalldata(address(profitToken), address(loanToken), 400e18, address(executor));
-
-        LiquidationExecutor.SwapPlan memory swapPlan = _buildParaswapDoubleSwapPlan(
-            LiquidationExecutor.DoubleSwapPattern.CHAINED, cd1, cd2, address(loanToken), address(loanToken), 0
-        );
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
-
-        vm.prank(operatorAddr);
-        vm.expectEmit(true, false, false, true);
-        emit LiquidationExecutor.ChainedRemainder(address(profitToken), 150e18);
-        executor.execute(plan);
-
-        // Verify remainder is in the contract
-        assertEq(profitToken.balanceOf(address(executor)), 150e18);
-    }
 
     /// FIX 4: Coinbase payment to address(0) reverts
     function test_coinbase_zero_reverts() public {
@@ -4578,11 +4395,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
 
         bytes memory plan =
@@ -4786,11 +4609,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4813,11 +4642,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4844,11 +4679,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4880,11 +4721,17 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4906,17 +4753,292 @@ contract ExecutorTest is Test {
             paraswapCalldata: cd,
             bebopTarget: address(0),
             bebopCalldata: "",
-            doubleSwapPattern: LiquidationExecutor.DoubleSwapPattern.SPLIT,
-            paraswapCalldata2: "",
             repayToken: address(loanToken),
             profitToken: address(loanToken),
-            minProfitAmount: 0
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidParaswapSelector.selector, expectedSelector));
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // UNIVERSAL ROUTER TESTS
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_universalRouter_single_happyPath() public {
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildURSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 loanAfter = loanToken.balanceOf(address(executor));
+
+        assertGt(loanAfter, 0, "executor should have profit remaining");
+    }
+
+    function test_universalRouter_notSet_reverts() public {
+        vm.store(address(executor), bytes32(uint256(7)), bytes32(0));
+
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildURSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.UniversalRouterNotSet.selector);
+        executor.execute(plan);
+    }
+
+    function test_paraswap_then_universalRouter() public {
+        // Leg1: Paraswap collateral → profitToken (intermediate)
+        // Leg2: UR profitToken → loanToken (FULL_BALANCE)
+        uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: _buildParaswapCalldata(
+                address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, address(executor)
+            ),
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2MinAmountOut: 0,
+            leg2Commands: hex"00",
+            leg2Inputs: _buildURInputs(address(profitToken), address(loanToken), leg1Output)
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "executor should have profit");
+    }
+
+    function test_bebop_then_universalRouter() public {
+        // Leg1: Bebop collateral → profitToken (intermediate only, no direct repay)
+        // Leg2: UR profitToken → loanToken (FULL_BALANCE)
+        uint256 bebopOutput = 1100e18;
+        uint256 leg2Output = bebopOutput * SWAP_RATE / 1e18; // 1210e18
+
+        bebop.configure(address(collateralToken), DEFAULT_SWAP_AMOUNT, address(profitToken), bebopOutput, address(0), 0);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.BEBOP_MULTI,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(bebop),
+            bebopCalldata: hex"aabbccdd",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2MinAmountOut: 0,
+            leg2Commands: hex"00",
+            leg2Inputs: _buildURInputs(address(profitToken), address(loanToken), bebopOutput)
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "executor should have profit");
+    }
+
+    function test_universalRouter_then_universalRouter() public {
+        // Leg1: UR collateral → profitToken (intermediate)
+        // Leg2: UR profitToken → loanToken (FULL_BALANCE)
+        uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
+
+        bytes[] memory leg1Inputs = _buildURInputs(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.UNIVERSAL_ROUTER,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: hex"00",
+            universalInputs: leg1Inputs,
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2MinAmountOut: 0,
+            leg2Commands: hex"00",
+            leg2Inputs: _buildURInputs(address(profitToken), address(loanToken), leg1Output)
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "executor should have profit");
+    }
+
+    function test_universalRouter_fullBalance_usesRealLeftover() public {
+        // Verify FULL_BALANCE mode reads actual on-chain balance (not encoded amount)
+        // Pre-fund executor with some extra profitToken so FULL_BALANCE picks up more than leg1 output
+        uint256 extraProfitToken = 50e18;
+        profitToken.mint(address(executor), extraProfitToken);
+
+        uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
+        uint256 totalLeg2Input = leg1Output + extraProfitToken; // 1150e18
+
+        bytes[] memory leg1Inputs = _buildURInputs(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.UNIVERSAL_ROUTER,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: hex"00",
+            universalInputs: leg1Inputs,
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2MinAmountOut: 0,
+            leg2Commands: hex"00",
+            leg2Inputs: _buildURInputs(address(profitToken), address(loanToken), totalLeg2Input)
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(profitToken.balanceOf(address(executor)), 0, "FULL_BALANCE should consume all profitToken");
+    }
+
+    function test_universalRouter_leg2_zeroBalance_reverts() public {
+        // Leg1: PS collateral → loanToken (standard), but leg2TokenIn is profitToken (0 balance)
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
+        swapPlan.hasLeg2 = true;
+        swapPlan.leg2TokenIn = address(profitToken);
+        swapPlan.leg2MinAmountOut = 1;
+        swapPlan.leg2Commands = hex"00";
+        swapPlan.leg2Inputs = _buildURInputs(address(profitToken), address(loanToken), 1);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.ZeroSwapInput.selector);
+        executor.execute(plan);
+    }
+
+    function test_universalRouter_minAmountOut_reverts() public {
+        uint256 expectedOutput = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
+
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildURSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, expectedOutput + 1, 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.InsufficientRepayOutput.selector, expectedOutput, expectedOutput + 1
+            )
+        );
+        executor.execute(plan);
+    }
+
+    function test_universalRouter_swapFails_reverts() public {
+        universalRouterMock.setSwapReverts(true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildURSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.UniversalRouterSwapFailed.selector);
+        executor.execute(plan);
+    }
+
+    function test_universalRouter_emptyCommands_reverts() public {
+        bytes[] memory urInputs = new bytes[](1);
+        urInputs[0] = abi.encode(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.UNIVERSAL_ROUTER,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: urInputs,
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 }
