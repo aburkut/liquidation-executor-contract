@@ -483,6 +483,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -514,6 +515,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -528,7 +530,7 @@ contract ExecutorTest is Test {
         uint256 minProfitAmt
     ) internal view returns (LiquidationExecutor.SwapPlan memory) {
         bytes[] memory urInputs = new bytes[](1);
-        urInputs[0] = abi.encode(srcToken, dstToken, amountIn);
+        urInputs[0] = abi.encode(srcToken, amountIn, dstToken);
         return LiquidationExecutor.SwapPlan({
             mode: LiquidationExecutor.SwapMode.UNIVERSAL_ROUTER,
             srcToken: srcToken,
@@ -545,15 +547,17 @@ contract ExecutorTest is Test {
             minSwapOutput: minOut,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
         });
     }
 
-    function _buildURInputs(address tokenIn, address tokenOut, uint256 amount) internal pure returns (bytes[] memory) {
+    /// @dev Build UR inputs with amountIn at word 1 (byte offset 32) — matches executor's leg2 patching position.
+    function _buildURInputs(address tokenIn, uint256 amount, address tokenOut) internal pure returns (bytes[] memory) {
         bytes[] memory inputs = new bytes[](1);
-        inputs[0] = abi.encode(tokenIn, tokenOut, amount);
+        inputs[0] = abi.encode(tokenIn, amount, tokenOut);
         return inputs;
     }
 
@@ -1024,6 +1028,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -1118,6 +1123,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -1913,6 +1919,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -1965,6 +1972,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2004,6 +2012,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2047,6 +2056,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2085,6 +2095,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2121,6 +2132,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2157,6 +2169,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2194,6 +2207,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2238,6 +2252,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2277,6 +2292,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2313,6 +2329,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2349,6 +2366,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2382,6 +2400,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2424,6 +2443,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2456,6 +2476,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2492,6 +2513,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2542,6 +2564,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2636,6 +2659,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2717,6 +2741,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2792,6 +2817,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2884,6 +2910,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -2969,6 +2996,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -3228,6 +3256,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -3624,6 +3653,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -3736,6 +3766,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -4403,6 +4434,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -4617,6 +4649,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -4650,6 +4683,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -4687,6 +4721,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -4729,6 +4764,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -4761,6 +4797,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)
@@ -4829,9 +4866,10 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: true,
             leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(loanToken),
             leg2MinAmountOut: 0,
             leg2Commands: hex"00",
-            leg2Inputs: _buildURInputs(address(profitToken), address(loanToken), leg1Output)
+            leg2Inputs: _buildURInputs(address(profitToken), leg1Output, address(loanToken))
         });
 
         bytes memory plan =
@@ -4867,9 +4905,10 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: true,
             leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(loanToken),
             leg2MinAmountOut: 0,
             leg2Commands: hex"00",
-            leg2Inputs: _buildURInputs(address(profitToken), address(loanToken), bebopOutput)
+            leg2Inputs: _buildURInputs(address(profitToken), bebopOutput, address(loanToken))
         });
 
         bytes memory plan =
@@ -4886,7 +4925,7 @@ contract ExecutorTest is Test {
         // Leg2: UR profitToken → loanToken (FULL_BALANCE)
         uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
 
-        bytes[] memory leg1Inputs = _buildURInputs(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+        bytes[] memory leg1Inputs = _buildURInputs(address(collateralToken), DEFAULT_SWAP_AMOUNT, address(profitToken));
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             mode: LiquidationExecutor.SwapMode.UNIVERSAL_ROUTER,
@@ -4904,9 +4943,10 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: true,
             leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(loanToken),
             leg2MinAmountOut: 0,
             leg2Commands: hex"00",
-            leg2Inputs: _buildURInputs(address(profitToken), address(loanToken), leg1Output)
+            leg2Inputs: _buildURInputs(address(profitToken), leg1Output, address(loanToken))
         });
 
         bytes memory plan =
@@ -4918,16 +4958,59 @@ contract ExecutorTest is Test {
         assertGt(loanToken.balanceOf(address(executor)), 0, "executor should have profit");
     }
 
-    function test_universalRouter_fullBalance_usesRealLeftover() public {
-        // Verify FULL_BALANCE mode reads actual on-chain balance (not encoded amount)
-        // Pre-fund executor with some extra profitToken so FULL_BALANCE picks up more than leg1 output
-        uint256 extraProfitToken = 50e18;
-        profitToken.mint(address(executor), extraProfitToken);
+    function test_universalRouter_trackedLeftover_dustPreserved() public {
+        // Pre-existing profitToken dust must NOT be consumed by leg2.
+        // Only the delta from leg1 should be used.
+        uint256 dust = 50e18;
+        profitToken.mint(address(executor), dust);
 
         uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
-        uint256 totalLeg2Input = leg1Output + extraProfitToken; // 1150e18
 
-        bytes[] memory leg1Inputs = _buildURInputs(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+        bytes[] memory leg1Inputs = _buildURInputs(address(collateralToken), DEFAULT_SWAP_AMOUNT, address(profitToken));
+
+        // leg2Inputs encodes a STALE amount (999e18) — the executor must overwrite it
+        // with the real tracked leftover (1100e18) via input patching at word 1
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.UNIVERSAL_ROUTER,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: hex"00",
+            universalInputs: leg1Inputs,
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(loanToken),
+            leg2MinAmountOut: 0,
+            leg2Commands: hex"00",
+            leg2Inputs: _buildURInputs(address(profitToken), 999e18, address(loanToken))
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // Dust must be preserved — only leg1 output (1100e18) was consumed
+        assertEq(profitToken.balanceOf(address(executor)), dust, "pre-existing dust must NOT be consumed");
+    }
+
+    function test_universalRouter_staleAmountOverwritten() public {
+        // Encode a deliberately WRONG amountIn in leg2Inputs (999e18).
+        // The executor must patch it with the real tracked leftover (1100e18).
+        // If the stale amount were used, the mock would try to pull 999e18
+        // instead of 1100e18, producing less output.
+        uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
+        uint256 expectedLeg2Output = leg1Output * SWAP_RATE / 1e18; // 1210e18
+
+        bytes[] memory leg1Inputs = _buildURInputs(address(collateralToken), DEFAULT_SWAP_AMOUNT, address(profitToken));
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             mode: LiquidationExecutor.SwapMode.UNIVERSAL_ROUTER,
@@ -4945,9 +5028,93 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: true,
             leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(loanToken),
+            leg2MinAmountOut: expectedLeg2Output,
+            leg2Commands: hex"00",
+            leg2Inputs: _buildURInputs(address(profitToken), 999e18, address(loanToken))
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        // This must succeed: executor patches 999e18 → 1100e18, producing 1210e18 >= minAmountOut
+        // If the stale 999e18 were used, output would be 1098.9e18 < 1210e18 → revert
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(profitToken.balanceOf(address(executor)), 0, "all tracked leftover should be consumed");
+    }
+
+    function test_universalRouter_leg2_outputToWeth() public {
+        // Leg2 outputs to WETH (not repayToken) — verifies generic leg2TokenOut
+        uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: _buildParaswapCalldata(
+                address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, address(executor)
+            ),
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(mockWeth),
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(mockWeth),
             leg2MinAmountOut: 0,
             leg2Commands: hex"00",
-            leg2Inputs: _buildURInputs(address(profitToken), address(loanToken), totalLeg2Input)
+            leg2Inputs: _buildURInputs(address(profitToken), leg1Output, address(mockWeth))
+        });
+
+        // Pre-fund executor with loanToken to cover flash repay (leg2 outputs WETH, not loanToken)
+        loanToken.mint(address(executor), LOAN_AMOUNT + FLASH_FEE);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 wethBefore = mockWeth.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(mockWeth.balanceOf(address(executor)), wethBefore, "executor should receive WETH from leg2");
+    }
+
+    function test_paraswap_then_universalRouter_trackedLeftover() public {
+        // PS→UR with tracked leftover. Pre-fund dust to verify it's not consumed.
+        uint256 dust = 25e18;
+        profitToken.mint(address(executor), dust);
+
+        uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: _buildParaswapCalldata(
+                address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, address(executor)
+            ),
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(loanToken),
+            leg2MinAmountOut: 0,
+            leg2Commands: hex"00",
+            leg2Inputs: _buildURInputs(address(profitToken), leg1Output, address(loanToken))
         });
 
         bytes memory plan =
@@ -4956,7 +5123,47 @@ contract ExecutorTest is Test {
         vm.prank(operatorAddr);
         executor.execute(plan);
 
-        assertEq(profitToken.balanceOf(address(executor)), 0, "FULL_BALANCE should consume all profitToken");
+        assertEq(profitToken.balanceOf(address(executor)), dust, "PS->UR dust must be preserved");
+    }
+
+    function test_bebop_then_universalRouter_trackedLeftover() public {
+        // Bebop→UR with tracked leftover. Pre-fund dust to verify it's not consumed.
+        uint256 dust = 30e18;
+        profitToken.mint(address(executor), dust);
+
+        uint256 bebopOutput = 1100e18;
+
+        bebop.configure(address(collateralToken), DEFAULT_SWAP_AMOUNT, address(profitToken), bebopOutput, address(0), 0);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.BEBOP_MULTI,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(bebop),
+            bebopCalldata: hex"aabbccdd",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(loanToken),
+            leg2MinAmountOut: 0,
+            leg2Commands: hex"00",
+            leg2Inputs: _buildURInputs(address(profitToken), bebopOutput, address(loanToken))
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(profitToken.balanceOf(address(executor)), dust, "Bebop->UR dust must be preserved");
     }
 
     function test_universalRouter_leg2_zeroBalance_reverts() public {
@@ -4965,9 +5172,10 @@ contract ExecutorTest is Test {
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
         swapPlan.hasLeg2 = true;
         swapPlan.leg2TokenIn = address(profitToken);
+        swapPlan.leg2TokenOut = address(loanToken);
         swapPlan.leg2MinAmountOut = 1;
         swapPlan.leg2Commands = hex"00";
-        swapPlan.leg2Inputs = _buildURInputs(address(profitToken), address(loanToken), 1);
+        swapPlan.leg2Inputs = _buildURInputs(address(profitToken), 1, address(loanToken));
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5029,6 +5237,7 @@ contract ExecutorTest is Test {
             minSwapOutput: 0,
             hasLeg2: false,
             leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
             leg2MinAmountOut: 0,
             leg2Commands: "",
             leg2Inputs: new bytes[](0)

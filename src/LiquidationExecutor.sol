@@ -300,9 +300,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         bytes universalCommands;
         bytes[] universalInputs;
         uint256 minSwapOutput;
-        // Optional second leg (always UR with FULL_BALANCE, output → repayToken)
+        // Optional second leg (always UR, tracked leftover from leg1)
         bool hasLeg2;
         address leg2TokenIn;
+        address leg2TokenOut;
         uint256 leg2MinAmountOut;
         bytes leg2Commands;
         bytes[] leg2Inputs;
@@ -625,6 +626,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             if (plan.swapPlan.leg2Commands.length == 0) revert InvalidPlan();
             if (plan.swapPlan.leg2Inputs.length == 0) revert InvalidPlan();
             if (plan.swapPlan.leg2TokenIn == address(0)) revert ZeroAddress();
+            if (plan.swapPlan.leg2TokenOut == address(0)) revert ZeroAddress();
+            if (plan.swapPlan.leg2Inputs[0].length < 64) revert InvalidPlan();
         }
 
         address provider = allowedFlashProviders[plan.flashProviderId];
@@ -897,6 +900,12 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         uint256 repayBefore = IERC20(plan.repayToken).balanceOf(address(this));
 
+        // Snapshot leg2 intermediate token BEFORE leg1 (for tracked leftover)
+        uint256 leg2InBefore;
+        if (plan.hasLeg2) {
+            leg2InBefore = IERC20(plan.leg2TokenIn).balanceOf(address(this));
+        }
+
         if (plan.mode == SwapMode.PARASWAP_SINGLE) {
             _executeParaswapSingle(plan);
         } else if (plan.mode == SwapMode.BEBOP_MULTI) {
@@ -908,7 +917,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
                 tokenOut,
                 plan.amountIn,
                 plan.minSwapOutput,
-                false,
                 plan.universalCommands,
                 plan.universalInputs,
                 plan.deadline
@@ -918,12 +926,22 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         if (plan.hasLeg2) {
+            // Tracked leftover: only the delta from leg1, not pre-existing dust
+            uint256 trackedLeftover = IERC20(plan.leg2TokenIn).balanceOf(address(this)) - leg2InBefore;
+            if (trackedLeftover == 0) revert ZeroSwapInput();
+
+            // Patch amountIn in leg2Inputs[0] at word 1 (byte offset 32 in ABI data)
+            // so the router receives the REAL on-chain leftover, not the stale off-chain estimate
+            bytes memory input0 = plan.leg2Inputs[0];
+            assembly {
+                mstore(add(input0, 0x40), trackedLeftover)
+            }
+
             _executeUniversalRouterSwap(
                 plan.leg2TokenIn,
-                plan.repayToken,
-                0,
+                plan.leg2TokenOut,
+                trackedLeftover,
                 plan.leg2MinAmountOut,
-                true,
                 plan.leg2Commands,
                 plan.leg2Inputs,
                 plan.deadline
@@ -1009,16 +1027,14 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     }
 
     // ─── Internal: Universal Router Swap ─────────────────────────────
-    /// @dev Executes a swap via the trusted Universal Router. Supports
-    /// `useFullBalance` mode for second-leg execution where input depends
-    /// on leg1 output (reads actual on-chain balance instead of trusting
-    /// off-chain encoded amount).
+    /// @dev Executes a swap via the trusted Universal Router.
+    /// Caller must provide the exact amountIn (for leg2, this is the tracked leftover
+    /// with inputs[0] already patched at word 1).
     function _executeUniversalRouterSwap(
         address tokenIn,
         address tokenOut,
         uint256 amountIn,
         uint256 minAmountOut,
-        bool useFullBalance,
         bytes memory commands,
         bytes[] memory inputs,
         uint256 deadline
@@ -1026,19 +1042,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address router = universalRouter;
         if (router == address(0)) revert UniversalRouterNotSet();
         if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
-
-        uint256 actualAmountIn;
-        if (useFullBalance) {
-            actualAmountIn = IERC20(tokenIn).balanceOf(address(this));
-            if (actualAmountIn == 0) revert ZeroSwapInput();
-        } else {
-            actualAmountIn = amountIn;
-            if (actualAmountIn == 0) revert InvalidPlan();
-        }
+        if (amountIn == 0) revert InvalidPlan();
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
 
-        IERC20(tokenIn).forceApprove(router, actualAmountIn);
+        IERC20(tokenIn).forceApprove(router, amountIn);
         {
             (bool ok,) =
                 router.call(abi.encodeWithSelector(IUniversalRouter.execute.selector, commands, inputs, deadline));
@@ -1050,7 +1058,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (received == 0) revert ZeroSwapOutput();
         if (received < minAmountOut) revert InsufficientRepayOutput(received, minAmountOut);
 
-        emit UniversalRouterSwapExecuted(tokenIn, tokenOut, actualAmountIn, received);
+        emit UniversalRouterSwapExecuted(tokenIn, tokenOut, amountIn, received);
     }
 
     // ─── Internal: Paraswap selector classification + decoders ───────
