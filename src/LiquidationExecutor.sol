@@ -241,7 +241,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     address public balancerVault;
     address public paraswapAugustusV6;
     address public aaveV2LendingPool;
-    address public universalRouter;
+    /// @dev Immutable — the executor assumes a fixed calldata layout for inputs[0].
+    /// Changing router requires redeploying the contract.
+    address public immutable universalRouter;
 
     mapping(uint8 => address) public allowedFlashProviders;
     mapping(address => bool) public allowedTargets;
@@ -370,6 +372,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address aavePool_,
         address balancerVault_,
         address paraswapAugustus_,
+        address universalRouter_,
         address[] memory allowedTargets_
     ) Ownable(owner_) {
         if (operator_ == address(0)) revert ZeroAddress();
@@ -377,9 +380,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (aavePool_ == address(0)) revert ZeroAddress();
         if (balancerVault_ == address(0)) revert ZeroAddress();
         if (paraswapAugustus_ == address(0)) revert ZeroAddress();
+        if (universalRouter_ == address(0)) revert ZeroAddress();
 
         operator = operator_;
         weth = weth_;
+        universalRouter = universalRouter_;
         aavePool = aavePool_;
         balancerVault = balancerVault_;
         paraswapAugustusV6 = paraswapAugustus_;
@@ -389,6 +394,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         allowedTargets[aavePool_] = true;
         allowedTargets[balancerVault_] = true;
         allowedTargets[paraswapAugustus_] = true;
+        allowedTargets[universalRouter_] = true;
 
         for (uint256 i = 0; i < allowedTargets_.length; i++) {
             if (allowedTargets_[i] == address(0)) revert ZeroAddress();
@@ -417,14 +423,6 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address old = aaveV2LendingPool;
         aaveV2LendingPool = pool;
         emit ConfigUpdated("aaveV2Pool", old, pool);
-    }
-
-    function setUniversalRouter(address router) external onlyOwner {
-        if (router == address(0)) revert ZeroAddress();
-        if (!allowedTargets[router]) revert TargetNotAllowed(router);
-        address old = universalRouter;
-        universalRouter = router;
-        emit ConfigUpdated("universalRouter", old, router);
     }
 
     function setFlashProvider(uint8 providerId, address provider) external onlyOwner {

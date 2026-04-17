@@ -202,13 +202,13 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
         vm.startPrank(owner);
         executor.setAaveV2LendingPool(address(aaveV2Pool));
         executor.setMorphoBlue(address(morphoBlue));
-        executor.setUniversalRouter(address(universalRouterMock));
         vm.stopPrank();
 
         // Configure liquidation reward so the delta-based collateral check passes
@@ -769,7 +769,9 @@ contract ExecutorTest is Test {
     function test_constructorRevertsOnZeroOwner() public {
         address[] memory targets = new address[](0);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new LiquidationExecutor(address(0), address(1), address(2), address(3), address(4), address(5), targets);
+        new LiquidationExecutor(
+            address(0), address(1), address(2), address(3), address(4), address(5), address(6), targets
+        );
     }
 
     function test_rescueERC20() public {
@@ -922,11 +924,11 @@ contract ExecutorTest is Test {
         bytes32 planHash = keccak256(planBytes);
 
         // Storage layout (forge inspect LiquidationExecutor storage):
-        //   slot 10 = _activePlanHash    (bytes32)
-        //   slot 11 = _executionPhase    (uint8 enum, low byte)
+        //   slot 9  = _activePlanHash    (bytes32)
+        //   slot 10 = _executionPhase    (uint8 enum, low byte)
         // Force both into the "during flashloan" state so neither guard short-circuits.
-        vm.store(address(executor), bytes32(uint256(10)), planHash);
-        vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1))); // FlashLoanActive
+        vm.store(address(executor), bytes32(uint256(9)), planHash);
+        vm.store(address(executor), bytes32(uint256(10)), bytes32(uint256(1))); // FlashLoanActive
 
         // Attacker (not the registered Morpho provider) hits the callback. The phase
         // and hash gates pass; only the caller check should reject.
@@ -987,6 +989,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -1242,6 +1245,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -1450,6 +1454,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -1484,6 +1489,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -2616,6 +2622,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -2703,6 +2710,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -2777,6 +2785,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -2859,6 +2868,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -2949,6 +2959,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -3231,6 +3242,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -3615,6 +3627,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -3729,6 +3742,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -3884,6 +3898,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
         vm.prank(owner);
@@ -3940,6 +3955,7 @@ contract ExecutorTest is Test {
             address(emptyPool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
 
@@ -4050,6 +4066,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
         vm.prank(owner);
@@ -4097,6 +4114,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
         vm.prank(owner);
@@ -4147,6 +4165,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
         vm.prank(owner);
@@ -4215,6 +4234,7 @@ contract ExecutorTest is Test {
             address(aavePool),
             address(balancerVault),
             address(augustus),
+            address(universalRouterMock),
             targets
         );
         vm.prank(owner);
@@ -4829,18 +4849,20 @@ contract ExecutorTest is Test {
         assertGt(loanAfter, 0, "executor should have profit remaining");
     }
 
-    function test_universalRouter_notSet_reverts() public {
-        vm.store(address(executor), bytes32(uint256(7)), bytes32(0));
-
-        LiquidationExecutor.SwapPlan memory swapPlan =
-            _buildURSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, 0);
-
-        bytes memory plan =
-            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
-
-        vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.UniversalRouterNotSet.selector);
-        executor.execute(plan);
+    function test_universalRouter_zeroInConstructor_reverts() public {
+        address[] memory targets = new address[](1);
+        targets[0] = address(aavePool);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(0),
+            targets
+        );
     }
 
     function test_paraswap_then_universalRouter() public {
