@@ -11,6 +11,7 @@ import {IAaveV3Pool} from "./interfaces/IAaveV3Pool.sol";
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 import {IMorphoBlue, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/IMorphoBlue.sol";
+import {IUniversalRouter} from "./interfaces/IUniversalRouter.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -62,13 +63,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error InvalidExecutionPhase();
     error InvalidCollateralAsset();
     error NoActivePlan();
-    error ChainedInputExceedsOutput(uint256 amountIn2, uint256 amountOut1);
     error InvalidCoinbase();
     error MorphoMixedModeUnsupported();
 
     // Swap errors
     error InvalidSwapMode();
-    error InvalidDoubleSwapPattern();
     error SwapDeadlineExpired(uint256 deadline, uint256 current);
     error InsufficientRepayOutput(uint256 actual, uint256 required);
     error RepayTokenMismatch(address expected, address actual);
@@ -93,16 +92,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error BebopTargetNotContract();
     error BebopSwapFailed();
 
-    // Double swap errors
-    error SplitSrcTokenMismatch(address src1, address src2);
-    error SplitDstTokensMustDiffer(address dst);
-    error SplitNoRepayLeg();
-    error SplitRepayLegInsufficient(uint256 actual, uint256 required);
-    error SplitDstTokenUnexpected(address dst1, address dst2);
-    error ChainLinkMismatch(address dst1, address src2);
-    error ChainDstNotRepay(address dst2, address repayToken);
-    error ChainedProfitMustMatchRepay();
-    error Leg1SrcNotCollateral(address src1, address collateral);
+    // Universal Router errors
+    error UniversalRouterNotSet();
+    error ZeroSwapInput();
+    error UniversalRouterSwapFailed();
 
     // Profit / payment errors
     error InsufficientProfit(uint256 actual, uint256 required);
@@ -248,6 +241,9 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     address public balancerVault;
     address public paraswapAugustusV6;
     address public aaveV2LendingPool;
+    /// @dev Immutable — the executor assumes a fixed calldata layout for inputs[0].
+    /// Changing router requires redeploying the contract.
+    address public immutable universalRouter;
 
     mapping(uint8 => address) public allowedFlashProviders;
     mapping(address => bool) public allowedTargets;
@@ -279,51 +275,40 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     event BebopSwapExecuted(
         address indexed target, address indexed srcToken, uint256 amountIn, uint256 repayDelta, uint256 profitDelta
     );
-    event DoubleSwapExecuted(
-        DoubleSwapPattern indexed pattern,
-        address srcToken1,
-        address dstToken1,
-        uint256 amountIn1,
-        uint256 amountOut1,
-        address srcToken2,
-        address dstToken2,
-        uint256 amountIn2,
-        uint256 amountOut2
+    event UniversalRouterSwapExecuted(
+        address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut
     );
-    event ChainedRemainder(address indexed token, uint256 amount);
 
     // ─── Enums ────────────────────────────────────────────────────────
     enum SwapMode {
         PARASWAP_SINGLE,
         BEBOP_MULTI,
-        PARASWAP_DOUBLE
-    }
-
-    enum DoubleSwapPattern {
-        SPLIT,
-        CHAINED
+        UNIVERSAL_ROUTER
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
     struct SwapPlan {
         SwapMode mode;
-        // PARASWAP_SINGLE and BEBOP_MULTI only (ignored by PARASWAP_DOUBLE):
         address srcToken;
         uint256 amountIn;
-        // All modes:
         uint256 deadline;
-        // PARASWAP_SINGLE: single swap calldata. PARASWAP_DOUBLE: swap 1 calldata.
         bytes paraswapCalldata;
-        // BEBOP_MULTI only:
         address bebopTarget;
         bytes bebopCalldata;
-        // PARASWAP_DOUBLE only:
-        DoubleSwapPattern doubleSwapPattern;
-        bytes paraswapCalldata2;
-        // Output validation:
         address repayToken;
         address profitToken;
         uint256 minProfitAmount;
+        // Universal Router fields (leg1 when mode == UNIVERSAL_ROUTER)
+        bytes universalCommands;
+        bytes[] universalInputs;
+        uint256 minSwapOutput;
+        // Optional second leg (always UR, tracked leftover from leg1)
+        bool hasLeg2;
+        address leg2TokenIn;
+        address leg2TokenOut;
+        uint256 leg2MinAmountOut;
+        bytes leg2Commands;
+        bytes[] leg2Inputs;
     }
 
     struct Action {
@@ -387,6 +372,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address aavePool_,
         address balancerVault_,
         address paraswapAugustus_,
+        address universalRouter_,
         address[] memory allowedTargets_
     ) Ownable(owner_) {
         if (operator_ == address(0)) revert ZeroAddress();
@@ -394,9 +380,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (aavePool_ == address(0)) revert ZeroAddress();
         if (balancerVault_ == address(0)) revert ZeroAddress();
         if (paraswapAugustus_ == address(0)) revert ZeroAddress();
+        if (universalRouter_ == address(0)) revert ZeroAddress();
 
         operator = operator_;
         weth = weth_;
+        universalRouter = universalRouter_;
         aavePool = aavePool_;
         balancerVault = balancerVault_;
         paraswapAugustusV6 = paraswapAugustus_;
@@ -406,6 +394,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         allowedTargets[aavePool_] = true;
         allowedTargets[balancerVault_] = true;
         allowedTargets[paraswapAugustus_] = true;
+        allowedTargets[universalRouter_] = true;
 
         for (uint256 i = 0; i < allowedTargets_.length; i++) {
             if (allowedTargets_[i] == address(0)) revert ZeroAddress();
@@ -609,8 +598,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Validate all actions use same debt/collateral assets
         (address collateralAsset,) = _validateActions(plan.actions, plan.loanToken);
 
-        // Collateral linkage for SINGLE/BEBOP (DOUBLE validated after calldata extraction)
-        if (plan.swapPlan.mode != SwapMode.PARASWAP_DOUBLE) {
+        // Collateral linkage: srcToken must match liquidation collateral
+        {
             if (collateralAsset != address(0)) {
                 if (plan.swapPlan.srcToken != collateralAsset) {
                     revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.srcToken);
@@ -624,11 +613,19 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         } else if (plan.swapPlan.mode == SwapMode.BEBOP_MULTI) {
             if (plan.swapPlan.bebopTarget == address(0)) revert InvalidBebopTarget();
             if (plan.swapPlan.bebopCalldata.length < 4) revert InvalidBebopCalldata();
-        } else if (plan.swapPlan.mode == SwapMode.PARASWAP_DOUBLE) {
-            if (plan.swapPlan.paraswapCalldata.length < 4) revert InvalidParaswapCalldata();
-            if (plan.swapPlan.paraswapCalldata2.length < 4) revert InvalidParaswapCalldata();
+        } else if (plan.swapPlan.mode == SwapMode.UNIVERSAL_ROUTER) {
+            if (plan.swapPlan.universalCommands.length == 0) revert InvalidPlan();
+            if (plan.swapPlan.universalInputs.length == 0) revert InvalidPlan();
         } else {
             revert InvalidSwapMode();
+        }
+
+        if (plan.swapPlan.hasLeg2) {
+            if (plan.swapPlan.leg2Commands.length == 0) revert InvalidPlan();
+            if (plan.swapPlan.leg2Inputs.length == 0) revert InvalidPlan();
+            if (plan.swapPlan.leg2TokenIn == address(0)) revert ZeroAddress();
+            if (plan.swapPlan.leg2TokenOut == address(0)) revert ZeroAddress();
+            if (plan.swapPlan.leg2Inputs[0].length < 64) revert InvalidPlan();
         }
 
         address provider = allowedFlashProviders[plan.flashProviderId];
@@ -890,19 +887,67 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     /// @dev Dispatches swap by mode, validates absolute repay balance covers flash loan obligation.
     /// Uses absolute balance (not delta) because partial liquidations may leave residual loanToken
     /// that legitimately contributes to repayment.
-    function _executeSwapPlan(SwapPlan memory plan, uint256 flashRepayAmount, address collateralAsset) internal {
+    function _executeSwapPlan(
+        SwapPlan memory plan,
+        uint256 flashRepayAmount,
+        address /* collateralAsset */
+    )
+        internal
+    {
         if (block.timestamp > plan.deadline) revert SwapDeadlineExpired(plan.deadline, block.timestamp);
 
         uint256 repayBefore = IERC20(plan.repayToken).balanceOf(address(this));
+
+        // Snapshot leg2 intermediate token BEFORE leg1 (for tracked leftover)
+        uint256 leg2InBefore;
+        if (plan.hasLeg2) {
+            leg2InBefore = IERC20(plan.leg2TokenIn).balanceOf(address(this));
+        }
 
         if (plan.mode == SwapMode.PARASWAP_SINGLE) {
             _executeParaswapSingle(plan);
         } else if (plan.mode == SwapMode.BEBOP_MULTI) {
             _executeBebopMulti(plan, repayBefore);
-        } else if (plan.mode == SwapMode.PARASWAP_DOUBLE) {
-            _executeParaswapDouble(plan, flashRepayAmount, collateralAsset);
+        } else if (plan.mode == SwapMode.UNIVERSAL_ROUTER) {
+            address tokenOut = plan.hasLeg2 ? plan.leg2TokenIn : plan.repayToken;
+            _executeUniversalRouterSwap(
+                plan.srcToken,
+                tokenOut,
+                plan.amountIn,
+                plan.minSwapOutput,
+                plan.universalCommands,
+                plan.universalInputs,
+                plan.deadline
+            );
         } else {
             revert InvalidSwapMode();
+        }
+
+        if (plan.hasLeg2) {
+            // Tracked leftover: only the delta from leg1, not pre-existing dust
+            uint256 trackedLeftover = IERC20(plan.leg2TokenIn).balanceOf(address(this)) - leg2InBefore;
+            if (trackedLeftover == 0) revert ZeroSwapInput();
+
+            // REQUIRED INPUT SHAPE: leg2Inputs[0] must have amountIn at ABI word 1
+            // (byte offset 32). This matches Uniswap UR V2/V3 SWAP_EXACT_IN:
+            //   abi.encode(address recipient, uint256 amountIn, uint256 minOut, bytes path, bool payer)
+            // The executor overwrites word 1 with the tracked leftover so the router
+            // receives the REAL on-chain amount, not the stale off-chain estimate.
+            // Validation: execute() requires leg2Inputs[0].length >= 64.
+            bytes memory input0 = plan.leg2Inputs[0];
+            assembly {
+                mstore(add(input0, 0x40), trackedLeftover)
+            }
+
+            _executeUniversalRouterSwap(
+                plan.leg2TokenIn,
+                plan.leg2TokenOut,
+                trackedLeftover,
+                plan.leg2MinAmountOut,
+                plan.leg2Commands,
+                plan.leg2Inputs,
+                plan.deadline
+            );
         }
 
         // Absolute balance check: total repayToken must cover flash loan obligation
@@ -936,7 +981,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             if (amountIn > plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
         }
 
-        if (dstToken != plan.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
+        if (plan.hasLeg2) {
+            if (dstToken != plan.leg2TokenIn) revert ParaswapDstTokenUnexpected(dstToken);
+        } else {
+            if (dstToken != plan.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
+        }
 
         emit ParaswapSwapExecuted(srcToken, dstToken, amountIn, amountOut);
     }
@@ -983,81 +1032,39 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         emit BebopSwapExecuted(target, plan.srcToken, plan.amountIn, repayDelta, profitDelta);
     }
 
-    // ─── Internal: Paraswap Double ───────────────────────────────────
-    /// @dev PARASWAP_DOUBLE supports two routing patterns:
-    ///
-    /// Split pattern (same srcToken, different dstTokens):
-    ///   collateral ──┬── swap1 ──→ repayToken
-    ///                └── swap2 ──→ profitToken
-    ///
-    /// Chained pattern (swap1 output feeds swap2 input):
-    ///   collateral ── swap1 ──→ intermediate ── swap2 ──→ repayToken
-    ///
-    /// Each leg is self-contained: srcToken and amountIn extracted from calldata.
-    function _executeParaswapDouble(
-        SwapPlan memory plan,
-        uint256,
-        /* flashRepayAmount */
-        address collateralAsset
-    )
-        internal
-    {
-        // Execute leg 1
-        (address src1, address dst1, uint256 amountIn1, uint256 amountOut1) =
-            _executeParaswapCall(plan.paraswapCalldata);
+    // ─── Internal: Universal Router Swap ─────────────────────────────
+    /// @dev Executes a swap via the trusted Universal Router.
+    /// Caller must provide the exact amountIn (for leg2, this is the tracked leftover
+    /// with inputs[0] already patched at word 1).
+    function _executeUniversalRouterSwap(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        bytes memory commands,
+        bytes[] memory inputs,
+        uint256 deadline
+    ) internal {
+        address router = universalRouter;
+        if (router == address(0)) revert UniversalRouterNotSet();
+        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
+        if (amountIn == 0) revert InvalidPlan();
 
-        // For CHAINED: validate leg 2 input <= leg 1 output BEFORE executing leg 2.
-        // Routes through the same selector-aware decoder the orchestrator uses, so
-        // optimized variants (where fromAmount sits at a different calldata offset
-        // than the generic GenericData layout) are read correctly. The previous
-        // hardcoded `mload(add(add(cd2, 36), 96))` only matched the generic family
-        // and would silently misread an optimized leg2, defeating the chained guard.
-        if (plan.doubleSwapPattern == DoubleSwapPattern.CHAINED) {
-            (,, uint256 leg2FromAmount,) = _decodeAndValidateParaswap(plan.paraswapCalldata2);
-            if (leg2FromAmount > amountOut1) {
-                revert ChainedInputExceedsOutput(leg2FromAmount, amountOut1);
-            }
+        uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
+
+        IERC20(tokenIn).forceApprove(router, amountIn);
+        {
+            (bool ok,) =
+                router.call(abi.encodeWithSelector(IUniversalRouter.execute.selector, commands, inputs, deadline));
+            if (!ok) revert UniversalRouterSwapFailed();
         }
+        IERC20(tokenIn).forceApprove(router, 0);
 
-        // Execute leg 2
-        (address src2, address dst2, uint256 amountIn2, uint256 amountOut2) =
-            _executeParaswapCall(plan.paraswapCalldata2);
+        uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
+        if (received == 0) revert ZeroSwapOutput();
+        if (received < minAmountOut) revert InsufficientRepayOutput(received, minAmountOut);
 
-        // Collateral linkage: leg 1 must consume liquidation collateral
-        if (collateralAsset != address(0)) {
-            if (src1 != collateralAsset) revert Leg1SrcNotCollateral(src1, collateralAsset);
-        }
-
-        if (plan.doubleSwapPattern == DoubleSwapPattern.SPLIT) {
-            if (src1 != src2) revert SplitSrcTokenMismatch(src1, src2);
-            if (dst1 == dst2) revert SplitDstTokensMustDiffer(dst1);
-
-            // Validate repay/profit leg routing — repay sufficiency checked by _executeSwapPlan
-            // via absolute balance (not per-leg delta) to support pre-existing repayToken balance.
-            if (dst1 == plan.repayToken) {
-                if (dst2 != plan.profitToken) revert SplitDstTokenUnexpected(dst1, dst2);
-            } else if (dst2 == plan.repayToken) {
-                if (dst1 != plan.profitToken) revert SplitDstTokenUnexpected(dst1, dst2);
-            } else {
-                revert SplitNoRepayLeg();
-            }
-        } else if (plan.doubleSwapPattern == DoubleSwapPattern.CHAINED) {
-            if (dst1 != src2) revert ChainLinkMismatch(dst1, src2);
-            if (dst2 != plan.repayToken) revert ChainDstNotRepay(dst2, plan.repayToken);
-            if (plan.profitToken != plan.repayToken) revert ChainedProfitMustMatchRepay();
-
-            // Signal any leftover intermediate tokens for off-chain observability
-            uint256 intermediateBalance = IERC20(dst1).balanceOf(address(this));
-            if (intermediateBalance > 0) {
-                emit ChainedRemainder(dst1, intermediateBalance);
-            }
-        } else {
-            revert InvalidDoubleSwapPattern();
-        }
-
-        emit DoubleSwapExecuted(
-            plan.doubleSwapPattern, src1, dst1, amountIn1, amountOut1, src2, dst2, amountIn2, amountOut2
-        );
+        emit UniversalRouterSwapExecuted(tokenIn, tokenOut, amountIn, received);
     }
 
     // ─── Internal: Paraswap selector classification + decoders ───────
