@@ -5166,8 +5166,8 @@ contract ExecutorTest is Test {
         assertEq(profitToken.balanceOf(address(executor)), dust, "Bebop->UR dust must be preserved");
     }
 
-    function test_universalRouter_leg2_zeroBalance_reverts() public {
-        // Leg1: PS collateral → loanToken (standard), but leg2TokenIn is profitToken (0 balance)
+    function test_paraswap_leg2_wrongDstToken_reverts() public {
+        // PS outputs loanToken but leg2TokenIn is profitToken → dstToken mismatch enforced
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
         swapPlan.hasLeg2 = true;
@@ -5181,8 +5181,127 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.ZeroSwapInput.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.ParaswapDstTokenUnexpected.selector, address(loanToken))
+        );
         executor.execute(plan);
+    }
+
+    function test_paraswap_leg2_correctDstToken_passes() public {
+        // PS outputs profitToken (matches leg2TokenIn) → valid two-leg PS→UR
+        uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18;
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: _buildParaswapCalldata(
+                address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, address(executor)
+            ),
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(loanToken),
+            leg2MinAmountOut: 0,
+            leg2Commands: hex"00",
+            leg2Inputs: _buildURInputs(address(profitToken), leg1Output, address(loanToken))
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        assertGt(loanToken.balanceOf(address(executor)), 0, "PS->UR with correct dstToken must succeed");
+    }
+
+    function test_paraswap_single_dstToken_stillEnforced() public {
+        // Single-leg PS: dstToken must equal repayToken (no relaxation)
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: _buildParaswapCalldata(
+                address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, address(executor)
+            ),
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: "",
+            universalInputs: new bytes[](0),
+            minSwapOutput: 0,
+            hasLeg2: false,
+            leg2TokenIn: address(0),
+            leg2TokenOut: address(0),
+            leg2MinAmountOut: 0,
+            leg2Commands: "",
+            leg2Inputs: new bytes[](0)
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.ParaswapDstTokenUnexpected.selector, address(profitToken))
+        );
+        executor.execute(plan);
+    }
+
+    function test_universalRouter_inputPatchAtWord1() public {
+        // Verify the input patching at word 1 (byte offset 32) actually controls execution.
+        // Encode a WRONG amountIn at word 1 in leg2Inputs (1e18).
+        // Executor patches it with tracked leftover (1100e18).
+        // The mock reads amountIn from word 1 — if patching works, it pulls 1100e18.
+        // If patching fails, it pulls 1e18 and output is too low for repay.
+        uint256 leg1Output = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18; // 1100e18
+
+        bytes[] memory leg1Inputs = _buildURInputs(address(collateralToken), DEFAULT_SWAP_AMOUNT, address(profitToken));
+
+        // Deliberately encode 1e18 as amountIn — must be overwritten
+        bytes[] memory leg2Inputs = new bytes[](1);
+        leg2Inputs[0] = abi.encode(address(profitToken), uint256(1e18), address(loanToken));
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.UNIVERSAL_ROUTER,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: address(loanToken),
+            profitToken: address(loanToken),
+            minProfitAmount: 0,
+            universalCommands: hex"00",
+            universalInputs: leg1Inputs,
+            minSwapOutput: 0,
+            hasLeg2: true,
+            leg2TokenIn: address(profitToken),
+            leg2TokenOut: address(loanToken),
+            leg2MinAmountOut: leg1Output * SWAP_RATE / 1e18,
+            leg2Commands: hex"00",
+            leg2Inputs: leg2Inputs
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        // Succeeds only if patching overwrote 1e18 → 1100e18 at word 1
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        assertEq(profitToken.balanceOf(address(executor)), 0, "all leftover consumed via patched input");
     }
 
     function test_universalRouter_minAmountOut_reverts() public {

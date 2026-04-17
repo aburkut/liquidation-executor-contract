@@ -930,8 +930,12 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             uint256 trackedLeftover = IERC20(plan.leg2TokenIn).balanceOf(address(this)) - leg2InBefore;
             if (trackedLeftover == 0) revert ZeroSwapInput();
 
-            // Patch amountIn in leg2Inputs[0] at word 1 (byte offset 32 in ABI data)
-            // so the router receives the REAL on-chain leftover, not the stale off-chain estimate
+            // REQUIRED INPUT SHAPE: leg2Inputs[0] must have amountIn at ABI word 1
+            // (byte offset 32). This matches Uniswap UR V2/V3 SWAP_EXACT_IN:
+            //   abi.encode(address recipient, uint256 amountIn, uint256 minOut, bytes path, bool payer)
+            // The executor overwrites word 1 with the tracked leftover so the router
+            // receives the REAL on-chain amount, not the stale off-chain estimate.
+            // Validation: execute() requires leg2Inputs[0].length >= 64.
             bytes memory input0 = plan.leg2Inputs[0];
             assembly {
                 mstore(add(input0, 0x40), trackedLeftover)
@@ -979,7 +983,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             if (amountIn > plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
         }
 
-        if (!plan.hasLeg2 && dstToken != plan.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
+        if (plan.hasLeg2) {
+            if (dstToken != plan.leg2TokenIn) revert ParaswapDstTokenUnexpected(dstToken);
+        } else {
+            if (dstToken != plan.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
+        }
 
         emit ParaswapSwapExecuted(srcToken, dstToken, amountIn, amountOut);
     }
