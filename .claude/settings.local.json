@@ -20,7 +20,11 @@
       "WebFetch(domain:help.velora.xyz)",
       "Bash(git add:*)",
       "Bash(mktemp:*)",
-      "Bash(grep -n 'test_morpho_approvalReset\\\\|^}$' test/Executor.t.sol)"
+      "Bash(grep -n 'test_morpho_approvalReset\\\\|^}$' test/Executor.t.sol)",
+      "Bash(claude plugin *)",
+      "Read(//Users/alexanderburkut/.claude/**)",
+      "Read(//Users/alexanderburkut/**)",
+      "Bash(wait)"
     ]
   }
 }

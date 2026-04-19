@@ -96,6 +96,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error UniversalRouterNotSet();
     error ZeroSwapInput();
     error UniversalRouterSwapFailed();
+    error UnsupportedLeg2Command(bytes1 cmd);
+    error Leg2TokenMismatch(address expected, address actual);
 
     // Profit / payment errors
     error InsufficientProfit(uint256 actual, uint256 required);
@@ -116,6 +118,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     uint8 public constant PROTOCOL_INTERNAL = 100;
 
     uint8 public constant ACTION_PAY_COINBASE = 1;
+
+    // Universal Router command IDs (Uniswap UR `Commands` library).
+    // The high bit (0x80) is `FLAG_ALLOW_REVERT`; the remaining 5 bits identify
+    // the command. We strip the flag via `UR_COMMAND_MASK` before comparison.
+    uint8 private constant UR_V3_SWAP_EXACT_IN = 0x00;
+    uint8 private constant UR_V2_SWAP_EXACT_IN = 0x08;
+    uint8 private constant UR_COMMAND_MASK = 0x3f;
 
     /// @dev Paraswap Augustus V6 supported selectors.
     ///
@@ -625,7 +634,12 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             if (plan.swapPlan.leg2Inputs.length == 0) revert InvalidPlan();
             if (plan.swapPlan.leg2TokenIn == address(0)) revert ZeroAddress();
             if (plan.swapPlan.leg2TokenOut == address(0)) revert ZeroAddress();
-            if (plan.swapPlan.leg2Inputs[0].length < 64) revert InvalidPlan();
+            // inputs[0] must carry the exact layout `(address tokenIn, uint256
+            // amountIn, address tokenOut)` — 3 static words, 96 bytes.
+            if (plan.swapPlan.leg2Inputs[0].length < 96) revert InvalidPlan();
+            // leg2 must be a single exact-input UR swap command.
+            bytes1 cmd = plan.swapPlan.leg2Commands[0];
+            if (!_isSupportedURExactIn(cmd)) revert UnsupportedLeg2Command(cmd);
         }
 
         address provider = allowedFlashProviders[plan.flashProviderId];
@@ -924,17 +938,26 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         if (plan.hasLeg2) {
-            // Tracked leftover: only the delta from leg1, not pre-existing dust
-            uint256 trackedLeftover = IERC20(plan.leg2TokenIn).balanceOf(address(this)) - leg2InBefore;
+            // Safe tracked leftover: never underflow if leg1 net-reduced leg2TokenIn.
+            // Use ZeroSwapInput to surface the condition explicitly.
+            uint256 leg2InAfter = IERC20(plan.leg2TokenIn).balanceOf(address(this));
+            uint256 trackedLeftover = leg2InAfter > leg2InBefore ? leg2InAfter - leg2InBefore : 0;
             if (trackedLeftover == 0) revert ZeroSwapInput();
 
-            // REQUIRED INPUT SHAPE: leg2Inputs[0] must have amountIn at ABI word 1
-            // (byte offset 32). This matches Uniswap UR V2/V3 SWAP_EXACT_IN:
-            //   abi.encode(address recipient, uint256 amountIn, uint256 minOut, bytes path, bool payer)
-            // The executor overwrites word 1 with the tracked leftover so the router
-            // receives the REAL on-chain amount, not the stale off-chain estimate.
-            // Validation: execute() requires leg2Inputs[0].length >= 64.
+            // REQUIRED INPUT SHAPE: leg2Inputs[0] must abi-encode
+            //   (address tokenIn, uint256 amountIn, address tokenOut)
+            // i.e. word0=tokenIn, word1=amountIn, word2=tokenOut. The executor
+            // decodes inputs[0], asserts the tokens match the plan, and only
+            // then patches word1 (byte offset 32 in data → 0x40 from pointer)
+            // with the tracked leftover. execute() enforces length >= 96.
             bytes memory input0 = plan.leg2Inputs[0];
+            (address decodedTokenIn,, address decodedTokenOut) = abi.decode(input0, (address, uint256, address));
+            if (decodedTokenIn != plan.leg2TokenIn) {
+                revert Leg2TokenMismatch(plan.leg2TokenIn, decodedTokenIn);
+            }
+            if (decodedTokenOut != plan.leg2TokenOut) {
+                revert Leg2TokenMismatch(plan.leg2TokenOut, decodedTokenOut);
+            }
             assembly {
                 mstore(add(input0, 0x40), trackedLeftover)
             }
@@ -950,9 +973,23 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             );
         }
 
-        // Absolute balance check: total repayToken must cover flash loan obligation
-        uint256 repayBalance = IERC20(plan.repayToken).balanceOf(address(this));
-        if (repayBalance < flashRepayAmount) revert InsufficientRepayOutput(repayBalance, flashRepayAmount);
+        // Delta-based repay check: swap output alone must cover the flashloan
+        // obligation. Using the delta (not absolute balance) prevents a
+        // pre-funded or dust repayToken balance from masking an insufficient
+        // swap.
+        uint256 repayAfter = IERC20(plan.repayToken).balanceOf(address(this));
+        uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
+        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+    }
+
+    /// @dev True when `cmd` (low 6 bits, flag bit stripped) identifies one of
+    /// the two supported Universal Router exact-input swap commands. Used by
+    /// leg2 validation — leg2 must be a single UR swap, never WRAP_ETH,
+    /// UNWRAP_WETH, PERMIT2_TRANSFER_FROM, SWEEP, PAY_PORTION, an ExactOut
+    /// variant, or any other UR command.
+    function _isSupportedURExactIn(bytes1 cmd) internal pure returns (bool) {
+        uint8 c = uint8(cmd) & UR_COMMAND_MASK;
+        return c == UR_V3_SWAP_EXACT_IN || c == UR_V2_SWAP_EXACT_IN;
     }
 
     // ─── Internal: Paraswap Single ───────────────────────────────────
@@ -1260,47 +1297,112 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     /// @dev Decode BalancerV2 direct calldata. srcToken/dstToken parsed from the
     /// `bytes data` param (raw Balancer Vault calldata). Matches Augustus V6.2
-    /// BalancerV2Utils._decodeBalancerV2Params exactly.
+    /// BalancerV2Utils._decodeBalancerV2Params, with strict bounds checks at
+    /// every user-controlled offset so malformed calldata can never drive an
+    /// `mload` outside the args region.
+    ///
+    /// All offsets in this function are "post-selector" — relative to `p := cd
+    /// + 36`. A 32-byte read at offset X is safe iff `4 + X + 32 <= cd.length`,
+    /// i.e. `X + 36 <= cd.length`.
     function _decodeParaswapBalancerV2(bytes memory cd)
         internal
         pure
         returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut, address beneficiary)
     {
-        if (cd.length < 296) {
-            revert InvalidParaswapCalldata();
-        }
+        uint256 L = cd.length;
+        // Minimum to safely read the head fields up to `dataOff` at X = 224.
+        // 4 + 224 + 32 = 260 bytes; we keep the pre-existing 296 floor to match
+        // the selector+head+offsets layout of canonical Augustus V6.2 calldata.
+        if (L < 296) revert InvalidParaswapCalldata();
+
+        uint256 dataOff;
         assembly {
             let mask := 0xffffffffffffffffffffffffffffffffffffffff
             let p := add(cd, 36)
             fromAmount := mload(p)
             minAmountOut := mload(add(p, 32))
             beneficiary := and(mload(add(p, 128)), mask)
-            let dataOff := mload(add(p, 224))
-            let dataLen := mload(add(p, dataOff))
-            // d = pointer to data content (past length word)
+            dataOff := mload(add(p, 224))
+        }
+
+        // Bound `dataOff`: we will read `dataLen` at post-selector offset
+        // `dataOff`, so `dataOff + 36 <= L`.
+        if (dataOff + 36 > L) revert InvalidParaswapCalldata();
+
+        uint256 dataLen;
+        assembly {
+            let p := add(cd, 36)
+            dataLen := mload(add(p, dataOff))
+        }
+
+        // Bound `dataLen`: the `bytes data` body lives at post-selector offsets
+        // `dataOff + 32 .. dataOff + 32 + dataLen`. Require the full body fits:
+        // `4 + dataOff + 32 + dataLen <= L`.
+        if (dataLen + dataOff + 36 > L) revert InvalidParaswapCalldata();
+
+        // Need at least a 4-byte Balancer selector inside the data blob.
+        if (dataLen < 4) revert InvalidParaswapCalldata();
+
+        uint256 vSel;
+        assembly {
+            let p := add(cd, 36)
             let d := add(p, add(dataOff, 32))
-            let vSel := shr(224, mload(d))
-            // 0x52bbbe29 = swap()
-            switch vSel
-            case 0x52bbbe29 {
-                if lt(dataLen, 324) {
-                    mstore(0, 0x25d306c600000000000000000000000000000000000000000000000000000000)
-                    revert(0, 4)
-                }
+            vSel := shr(224, mload(d))
+        }
+
+        if (vSel == 0x52bbbe29) {
+            // swap(): reads 32 bytes at offsets d+292 (srcToken) and d+324
+            // (dstToken). The last byte read is d+355, so require
+            // dataLen >= 356.
+            if (dataLen < 356) revert InvalidParaswapCalldata();
+            assembly {
+                let mask := 0xffffffffffffffffffffffffffffffffffffffff
+                let p := add(cd, 36)
+                let d := add(p, add(dataOff, 32))
                 srcToken := and(mload(add(d, 292)), mask)
                 dstToken := and(mload(add(d, 324)), mask)
             }
-            // 0x945bcec9 = batchSwap()
-            case 0x945bcec9 {
-                let assetsOff := mload(add(d, 68))
-                let cnt := mload(add(d, add(4, assetsOff)))
-                if iszero(cnt) {
-                    mstore(0, 0x25d306c600000000000000000000000000000000000000000000000000000000)
-                    revert(0, 4)
-                }
+        } else if (vSel == 0x945bcec9) {
+            // batchSwap(): reads kind at d+4, assetsOff at d+68, cnt at
+            // d+4+assetsOff, then first/last asset entries. Require each
+            // read's 32-byte window fits inside the data blob.
+            if (dataLen < 100) revert InvalidParaswapCalldata(); // kind + assetsOff covered
+
+            uint256 assetsOff;
+            uint256 kind;
+            assembly {
+                let p := add(cd, 36)
+                let d := add(p, add(dataOff, 32))
+                kind := mload(add(d, 4))
+                assetsOff := mload(add(d, 68))
+            }
+
+            // Need `cnt` word readable: end at d+4+assetsOff+32 ≤ d+dataLen.
+            if (assetsOff + 36 > dataLen) revert InvalidParaswapCalldata();
+
+            uint256 cnt;
+            assembly {
+                let p := add(cd, 36)
+                let d := add(p, add(dataOff, 32))
+                cnt := mload(add(d, add(4, assetsOff)))
+            }
+            if (cnt == 0) revert InvalidParaswapCalldata();
+            // Prevent `cnt * 32` overflow before bounds-checking.
+            if (cnt > type(uint256).max / 32) revert InvalidParaswapCalldata();
+
+            // first entry read ends at d + 4 + assetsOff + 64.
+            // last entry read ends at d + 4 + assetsOff + cnt*32 + 32.
+            // The stricter bound is the last read: must stay inside dataLen.
+            uint256 lastEnd = 4 + assetsOff + cnt * 32 + 32;
+            if (lastEnd > dataLen) revert InvalidParaswapCalldata();
+
+            assembly {
+                let mask := 0xffffffffffffffffffffffffffffffffffffffff
+                let p := add(cd, 36)
+                let d := add(p, add(dataOff, 32))
                 let first := and(mload(add(d, add(4, add(assetsOff, 32)))), mask)
                 let last := and(mload(add(d, add(4, add(assetsOff, mul(cnt, 32))))), mask)
-                switch eq(mload(add(d, 4)), 1)
+                switch eq(kind, 1)
                 case 1 {
                     srcToken := last
                     dstToken := first
@@ -1310,10 +1412,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
                     dstToken := last
                 }
             }
-            default {
-                mstore(0, 0x25d306c600000000000000000000000000000000000000000000000000000000)
-                revert(0, 4)
-            }
+        } else {
+            revert InvalidParaswapCalldata();
         }
     }
 
