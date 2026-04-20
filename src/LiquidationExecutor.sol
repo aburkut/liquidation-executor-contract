@@ -106,9 +106,12 @@ contract LiquidationExecutor is
 
     // Uniswap V2 / V3 / V4 swap errors
     error ZeroSwapInput();
+    error ZeroAmountIn();
+    error ZeroRepayOutput();
     error InvalidV2Path();
     error InvalidV3Fee(uint24 fee);
     error InvalidV4Data();
+    error InvalidV4Fee();
     error InvalidV4TokenOut(address expected, address actual);
     error InvalidV4NativeToken();
     error InvalidV4FeeOrSpacing();
@@ -119,6 +122,7 @@ contract LiquidationExecutor is
     error InsufficientProfit(uint256 actual, uint256 required);
     error CoinbasePaymentRequiresWethProfit();
     error CoinbaseExceedsProfit(uint256 coinbase, uint256 profit);
+    error InvalidCoinbaseBps();
     error InsufficientRepayBalance(uint256 required, uint256 available);
     error InsufficientSrcBalance(uint256 required, uint256 available);
     error TargetNotAllowed(address target);
@@ -650,20 +654,16 @@ contract LiquidationExecutor is
         if (feeAmounts[0] > plan.maxFlashFee) revert FlashFeeExceeded(feeAmounts[0], plan.maxFlashFee);
 
         uint256 flashRepayAmount = amounts[0] + feeAmounts[0];
-        (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped) =
-            _runFlashloanPipeline(plan, flashRepayAmount);
+        (uint256 realizedProfit, uint256 totalCoinbasePayment) = _runFlashloanPipeline(plan, flashRepayAmount);
 
         // Balancer expects funds returned by end of callback via transfer (vault=msg.sender).
         _finalizeFlashloan(
             address(tokens[0]),
-            amounts[0],
             flashRepayAmount,
             msg.sender,
-            plan.swapPlan.profitToken,
-            profitBefore,
-            plan.swapPlan.minProfitAmount,
+            realizedProfit,
             totalCoinbasePayment,
-            totalWethUnwrapped
+            plan.swapPlan.minProfitAmount
         );
     }
 
@@ -688,20 +688,16 @@ contract LiquidationExecutor is
 
         // Morpho fee = 0, so flash repay equals principal
         uint256 flashRepayAmount = amount;
-        (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped) =
-            _runFlashloanPipeline(plan, flashRepayAmount);
+        (uint256 realizedProfit, uint256 totalCoinbasePayment) = _runFlashloanPipeline(plan, flashRepayAmount);
 
         // Morpho also pulls via safeTransferFrom after callback returns (vault=0).
         _finalizeFlashloan(
             plan.loanToken,
-            amount,
             flashRepayAmount,
             address(0),
-            plan.swapPlan.profitToken,
-            profitBefore,
-            plan.swapPlan.minProfitAmount,
+            realizedProfit,
             totalCoinbasePayment,
-            totalWethUnwrapped
+            plan.swapPlan.minProfitAmount
         );
     }
 
@@ -714,7 +710,7 @@ contract LiquidationExecutor is
     /// finalize call (`_finalizeFlashloan` for repayment).
     function _runFlashloanPipeline(Plan memory plan, uint256 flashRepayAmount)
         internal
-        returns (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped)
+        returns (uint256 realizedProfit, uint256 totalCoinbasePayment)
     {
         // Pre-execution: verify flash loan funds received
         if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
@@ -728,7 +724,7 @@ contract LiquidationExecutor is
         }
 
         // Snapshot BEFORE protocol actions
-        profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
+        uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
         uint256 collateralBefore;
         if (trackingToken != address(0)) {
             collateralBefore = IERC20(trackingToken).balanceOf(address(this));
@@ -777,108 +773,89 @@ contract LiquidationExecutor is
 
         _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset, collateralDelta);
 
-        // Execute internal actions (coinbase payment) after swap
+        // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
+        // BEFORE flash repay. This is the authoritative base that ACTION_PAY_COINBASE
+        // basis-points arithmetic multiplies against.
+        realizedProfit = _computeRealizedProfit(
+            plan.loanToken, plan.swapPlan.profitToken, profitBefore, plan.loanAmount, flashRepayAmount
+        );
+
+        // Execute internal actions (coinbase bps payments) now that realized profit
+        // is known. Per-action bps is validated and multiplied against realizedProfit.
         for (uint256 i = 0; i < plan.actions.length; ++i) {
             if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
-                (uint256 cbPaid, uint256 wethUsed) =
-                    _executeInternalAction(plan.actions[i].data, plan.swapPlan.profitToken);
-                totalCoinbasePayment += cbPaid;
-                totalWethUnwrapped += wethUsed;
+                totalCoinbasePayment += _executeInternalAction(
+                    plan.actions[i].data, plan.swapPlan.profitToken, realizedProfit
+                );
             }
         }
     }
 
-    // ─── Internal: Finalize Flashloan (unified) ──────────────────────
-    /// @dev Single repayment + profit-check path for all three providers. Aave V3 and
-    /// Morpho pull repayment via safeTransferFrom after the callback returns, so we
-    /// approve the principal back to msg.sender (`vault == address(0)`). Balancer
-    /// expects funds returned via safeTransfer to the vault inside the callback
-    /// (`vault != address(0)`). The `repayPending` flag forwarded to `_checkProfit`
-    /// reflects whether the principal still sits on this contract at check-time.
-    function _finalizeFlashloan(
+    /// @dev Compute realized on-chain profit net of the flashloan obligation, but
+    /// BEFORE any coinbase bid is paid. Used as the base for bps-sized coinbase
+    /// payments and for the final `minProfitAmount` check.
+    function _computeRealizedProfit(
         address asset,
-        uint256 principalAmount,
-        uint256 repayAmount,
-        address vault,
         address profitTkn,
         uint256 profitBefore,
-        uint256 minProfitAmount,
+        uint256 principalAmount,
+        uint256 repayAmount
+    ) internal view returns (uint256) {
+        uint256 profitNow = IERC20(profitTkn).balanceOf(address(this));
+        if (profitTkn == asset) {
+            // profitBefore was snapshotted AFTER flashloan arrival (includes principal).
+            // profitNow is post-swap, pre-repay, pre-coinbase (still includes principal).
+            // Realized profit once repay is settled:
+            //   (profitNow - repayAmount) - (profitBefore - principalAmount)
+            // Saturating subtraction — underflow means the swap under-delivered.
+            uint256 lhs = profitNow + principalAmount;
+            uint256 rhs = profitBefore + repayAmount;
+            return lhs > rhs ? lhs - rhs : 0;
+        }
+        return profitNow > profitBefore ? profitNow - profitBefore : 0;
+    }
+
+    // ─── Internal: Finalize Flashloan (unified) ──────────────────────
+    /// @dev Single repayment + profit-check path. Aave-style callbacks pull via
+    /// `transferFrom` after we return, so `vault == address(0)` signals approve-
+    /// only; Balancer expects a push to the vault inside the callback. Profit
+    /// accounting is fully decided before this call — `realizedProfit` already
+    /// accounts for the flashloan obligation, and `totalCoinbasePayment` is
+    /// the sum of on-chain-computed bps payments already made.
+    function _finalizeFlashloan(
+        address asset,
+        uint256 repayAmount,
+        address vault,
+        uint256 realizedProfit,
         uint256 totalCoinbasePayment,
-        uint256 totalWethUnwrapped
+        uint256 minProfitAmount
     ) internal {
         uint256 balance = IERC20(asset).balanceOf(address(this));
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
 
-        bool repayPending;
         if (vault == address(0)) {
-            // Aave V3 / Morpho: pool pulls after we return — approve exact amount.
             IERC20(asset).forceApprove(msg.sender, repayAmount);
-            repayPending = true;
         } else {
-            // Balancer: push funds back to vault inside the callback.
             IERC20(asset).safeTransfer(vault, repayAmount);
         }
 
-        _checkProfit(
-            asset,
-            principalAmount,
-            repayAmount,
-            profitTkn,
-            profitBefore,
-            minProfitAmount,
-            repayPending,
-            totalCoinbasePayment,
-            totalWethUnwrapped
-        );
+        _checkProfit(realizedProfit, totalCoinbasePayment, minProfitAmount);
     }
 
     // ─── Internal: Check Profit ──────────────────────────────────────
-    function _checkProfit(
-        address asset,
-        uint256 principalAmount,
-        uint256 repayAmount,
-        address profitTkn,
-        uint256 profitBefore,
-        uint256 minProfitAmount,
-        bool repayPending, // true for Aave (pool pulls later), false for Balancer (already transferred)
-        uint256 totalCoinbasePayment,
-        uint256 totalWethUnwrapped
-    ) internal view {
-        uint256 profitAfter = IERC20(profitTkn).balanceOf(address(this));
+    /// @dev Pure: `realizedProfit` already accounts for the flashloan obligation,
+    /// and `totalCoinbasePayment` is the on-chain bps-derived sum already paid.
+    /// The `> realizedProfit` branch is defensive against multiple coinbase
+    /// actions whose bps sum exceeds 100% (each per-action bps is <= 10000,
+    /// but nothing blocks operators from stacking them).
+    function _checkProfit(uint256 realizedProfit, uint256 totalCoinbasePayment, uint256 minProfitAmount) internal pure {
+        if (totalCoinbasePayment > realizedProfit) {
+            revert CoinbaseExceedsProfit(totalCoinbasePayment, realizedProfit);
+        }
         uint256 effectiveProfit;
-
-        if (profitTkn == asset) {
-            if (repayPending) {
-                // Aave: profitBefore includes principal; profitAfter still includes repayAmount (pool pulls later)
-                effectiveProfit = profitAfter + principalAmount > profitBefore + repayAmount
-                    ? profitAfter + principalAmount - profitBefore - repayAmount
-                    : 0;
-            } else {
-                // Balancer: repayAmount already transferred out; profitBefore included principal
-                effectiveProfit =
-                    profitAfter + principalAmount > profitBefore ? profitAfter + principalAmount - profitBefore : 0;
-            }
-        } else {
-            effectiveProfit = profitAfter > profitBefore ? profitAfter - profitBefore : 0;
+        unchecked {
+            effectiveProfit = realizedProfit - totalCoinbasePayment;
         }
-
-        // Coinbase payment accounting: always deduct the cost NOT already in the ERC20 delta.
-        // - WETH unwrapped: already reduced profitAfter (in delta), no additional deduction needed.
-        // - Pre-existing ETH: NOT in the ERC20 delta, MUST be deducted explicitly.
-        // Formula: deduct = totalCoinbasePayment - totalWethUnwrapped (the native ETH portion).
-        // Reverts with a dedicated error when the native-ETH portion exceeds
-        // effectiveProfit — the operator-supplied bid cannot quietly eat all
-        // of our profit and still pass as a silent 0 that fails the minProfit
-        // check without signalling the cause.
-        if (totalCoinbasePayment > 0) {
-            uint256 costNotInDelta =
-                totalCoinbasePayment > totalWethUnwrapped ? totalCoinbasePayment - totalWethUnwrapped : 0;
-            if (effectiveProfit < costNotInDelta) {
-                revert CoinbaseExceedsProfit(costNotInDelta, effectiveProfit);
-            }
-            effectiveProfit -= costNotInDelta;
-        }
-
         if (effectiveProfit < minProfitAmount) revert InsufficientProfit(effectiveProfit, minProfitAmount);
     }
 
@@ -925,7 +902,7 @@ contract LiquidationExecutor is
     // ─── Internal: Paraswap Single ───────────────────────────────────
     function _executeParaswapSingle(SwapPlan memory plan) internal {
         if (plan.srcToken == address(0)) revert ZeroAddress();
-        if (plan.amountIn == 0) revert InvalidPlan();
+        if (plan.amountIn == 0) revert ZeroAmountIn();
 
         (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut, bool isExactIn) =
             _executeParaswapCall(plan.paraswapCalldata);
@@ -953,7 +930,7 @@ contract LiquidationExecutor is
         if (target.code.length == 0) revert BebopTargetNotContract();
         if (!allowedTargets[target]) revert TargetNotAllowed(target);
         if (plan.srcToken == address(0)) revert ZeroAddress();
-        if (plan.amountIn == 0) revert InvalidPlan();
+        if (plan.amountIn == 0) revert ZeroAmountIn();
         if (plan.bebopCalldata.length < 4) revert InvalidBebopCalldata();
 
         uint256 srcBal = IERC20(plan.srcToken).balanceOf(address(this));
@@ -976,6 +953,10 @@ contract LiquidationExecutor is
         // Repay sufficiency is checked by _executeSwapPlan via absolute balance.
         uint256 repayAfter = IERC20(plan.repayToken).balanceOf(address(this));
         uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
+        // Bebop has no mode-local minAmountOut; fail closed on zero output so a
+        // silent 0-delivery Bebop call cannot slip through when minProfitAmount
+        // is also 0 (the aggregate repay check catches it only transitively).
+        if (repayDelta == 0) revert ZeroRepayOutput();
         uint256 profitDelta;
         if (plan.repayToken == plan.profitToken) {
             profitDelta = repayDelta;
@@ -1109,9 +1090,11 @@ contract LiquidationExecutor is
         if (tokenIn == tokenOut) revert InvalidV4Data();
 
         // Reject clearly-broken PoolKey params. Canonical V4 pools require
-        // positive tickSpacing and a non-zero fee (dynamic-fee pools, which
-        // set the high bit of `fee`, are out of scope — intentionally).
+        // positive tickSpacing and a non-zero fee.
         if (fee == 0 || tickSpacing <= 0) revert InvalidV4FeeOrSpacing();
+        // Explicitly reject dynamic-fee pools (V4 sets the high bit of `fee`
+        // for dynamic-fee pools — out of scope for this executor).
+        if (fee & 0x800000 != 0) revert InvalidV4Fee();
 
         if (hook != address(0) && !allowedV4Hooks[hook]) revert V4HookNotAllowed(hook);
     }
@@ -1386,11 +1369,20 @@ contract LiquidationExecutor is
     }
 
     // ─── Internal: Execute Internal Action ──────────────────────────
-    /// @dev Centralized dispatch for PROTOCOL_INTERNAL actions.
-    /// Only supports ACTION_PAY_COINBASE. Returns coinbase payment accounting.
-    function _executeInternalAction(bytes memory actionData, address profitToken)
+    /// @dev Centralized dispatch for PROTOCOL_INTERNAL actions. Only
+    /// ACTION_PAY_COINBASE is defined.
+    ///
+    /// ACTION_PAY_COINBASE amount is interpreted as basis points (0..10000)
+    /// over realized on-chain profit, not as an absolute payment amount.
+    /// The operator specifies a percentage; the contract sizes the actual
+    /// bid from the on-chain-computed `realizedProfit` snapshot taken
+    /// between swap completion and any coinbase payment.
+    ///
+    /// No-ops (returns 0, no transfer) when `realizedProfit == 0` or
+    /// `coinbaseBps == 0` — consistent behaviour in both degenerate cases.
+    function _executeInternalAction(bytes memory actionData, address profitToken, uint256 realizedProfit)
         internal
-        returns (uint256 coinbasePaid, uint256 wethUnwrapped)
+        returns (uint256 coinbasePaid)
     {
         uint8 actionType = abi.decode(actionData, (uint8));
 
@@ -1398,18 +1390,24 @@ contract LiquidationExecutor is
             // Coinbase payment is ETH-denominated — only valid when profit is in WETH
             if (profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
 
-            (, uint256 amount) = abi.decode(actionData, (uint8, uint256));
-            wethUnwrapped = _payCoinbase(amount);
-            coinbasePaid = amount;
+            (, uint256 coinbaseBps) = abi.decode(actionData, (uint8, uint256));
+            if (coinbaseBps > 10_000) revert InvalidCoinbaseBps();
+
+            if (realizedProfit == 0 || coinbaseBps == 0) return 0;
+
+            coinbasePaid = realizedProfit * coinbaseBps / 10_000;
+            if (coinbasePaid > 0) {
+                _payCoinbase(coinbasePaid);
+            }
         } else {
             revert InvalidAction(actionType);
         }
     }
 
-    /// @dev Send ETH to block.coinbase. Only reachable when profitToken == weth (enforced by caller).
-    /// Auto-unwraps WETH if insufficient ETH. Returns the amount unwrapped (for profit accounting).
-    function _payCoinbase(uint256 amount) internal returns (uint256 wethUnwrapped) {
-        if (amount == 0) return 0;
+    /// @dev Send ETH to block.coinbase. Only reachable when profitToken == weth
+    /// (enforced by caller). Auto-unwraps WETH if insufficient ETH.
+    function _payCoinbase(uint256 amount) internal {
+        if (amount == 0) return;
         if (block.coinbase == address(0)) revert InvalidCoinbase();
 
         // Auto-unwrap WETH if insufficient ETH
@@ -1421,7 +1419,6 @@ contract LiquidationExecutor is
                 uint256 toUnwrap = deficit < wethBal ? deficit : wethBal;
                 if (toUnwrap > 0) {
                     IWETH(wethAddr).withdraw(toUnwrap);
-                    wethUnwrapped = toUnwrap;
                 }
             }
         }
