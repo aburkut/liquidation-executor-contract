@@ -108,9 +108,14 @@ contract LiquidationExecutor is
     error InvalidV2Path();
     error InvalidV3Fee(uint24 fee);
     error InvalidV4Data();
+    error InvalidV4TokenOut(address expected, address actual);
+    error InvalidV4NativeToken();
+    error InvalidV4FeeOrSpacing(uint24 fee, int24 tickSpacing);
     error V4HookNotAllowed(address hook);
     error V4UnexpectedDelta();
     error V4CallbackInactive();
+    error V4ZeroOwed();
+    error V4ZeroGained();
 
     // Profit / payment errors
     error InsufficientProfit(uint256 actual, uint256 required);
@@ -702,10 +707,9 @@ contract LiquidationExecutor is
             if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
             if (plan.swapPlan.minAmountOut == 0) revert InvalidPlan();
         } else if (plan.swapPlan.mode == SwapMode.UNI_V4) {
-            if (plan.swapPlan.v4PoolManager == address(0)) revert ZeroAddress();
-            if (!allowedTargets[plan.swapPlan.v4PoolManager]) revert TargetNotAllowed(plan.swapPlan.v4PoolManager);
-            if (plan.swapPlan.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
-            if (plan.swapPlan.minAmountOut == 0) revert InvalidPlan();
+            // Eager full-content validation — fails closed BEFORE the flashloan
+            // is requested, so misconfigured V4 plans never burn a flash fee.
+            _validateV4Plan(plan.swapPlan);
         } else {
             revert InvalidSwapMode();
         }
@@ -1185,15 +1189,24 @@ contract LiquidationExecutor is
         emit UniV3SwapExecuted(plan.srcToken, plan.repayToken, fee, amountIn, received);
     }
 
-    // ─── Internal: Uniswap V4 single-hop exact-input swap ────────────
-    /// @dev Executes a single-hop exact-input swap via PoolManager's
-    /// unlock-callback pattern. Strict subset of V4:
-    ///   * exact-input only (amountSpecified negative)
-    ///   * single hop, srcToken → repayToken
-    ///   * sqrtPriceLimitX96 disabled (bounded by minAmountOut instead)
-    ///   * hook must be address(0) or in `allowedV4Hooks`
-    /// Anything else reverts before touching the PoolManager.
-    function _executeUniV4(SwapPlan memory plan, uint256 collateralDelta) internal {
+    // ─── Internal: V4 plan validation (centralized fail-closed checks) ─
+    /// @dev Single source of truth for V4 preconditions. Called from both
+    /// `execute()` (fail-fast before flashloan) and `_executeUniV4` (defensive
+    /// re-check inside the pipeline). Returns the decoded PoolKey fields so
+    /// the caller can reuse them without re-decoding.
+    ///
+    /// PRODUCTION SCOPE — the V4 path is intentionally narrow:
+    ///   * single-hop only (one `swap()` call per execute())
+    ///   * exact-input only (amountSpecified negative, see unlockCallback)
+    ///   * ERC20 → ERC20 only (native ETH / Currency(0) is rejected)
+    ///   * tokenOut MUST equal plan.repayToken (no intermediate swaps)
+    ///   * hook MUST be address(0) or in `allowedV4Hooks`
+    /// Any widening of this scope requires new tests and a fresh review.
+    function _validateV4Plan(SwapPlan memory plan)
+        internal
+        view
+        returns (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook)
+    {
         if (plan.srcToken == address(0)) revert ZeroAddress();
         if (plan.repayToken == address(0)) revert ZeroAddress();
         if (plan.minAmountOut == 0) revert InvalidPlan();
@@ -1203,13 +1216,39 @@ contract LiquidationExecutor is
         if (!allowedTargets[pm]) revert TargetNotAllowed(pm);
         if (plan.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
 
-        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
+        (tokenIn, tokenOut, fee, tickSpacing, hook) =
             abi.decode(plan.v4SwapData, (address, address, uint24, int24, address));
 
+        // ERC20 → ERC20 only. V4 Currency(0) is native ETH; explicitly blocked
+        // because the executor's accounting assumes `IERC20.balanceOf` deltas.
+        if (tokenIn == address(0) || tokenOut == address(0)) revert InvalidV4NativeToken();
+
         if (tokenIn != plan.srcToken) revert InvalidV4Data();
-        if (tokenOut != plan.repayToken) revert InvalidV4Data();
+        // Distinct error for the single most common operator misconfiguration
+        // (routing to profit token instead of repay token).
+        if (tokenOut != plan.repayToken) revert InvalidV4TokenOut(plan.repayToken, tokenOut);
         if (tokenIn == tokenOut) revert InvalidV4Data();
+
+        // Reject clearly-broken PoolKey params. Canonical V4 pools require
+        // positive tickSpacing and a non-zero fee (dynamic-fee pools, which
+        // set the high bit of `fee`, are out of scope — intentionally).
+        if (fee == 0) revert InvalidV4FeeOrSpacing(fee, tickSpacing);
+        if (tickSpacing <= 0) revert InvalidV4FeeOrSpacing(fee, tickSpacing);
+
         if (hook != address(0) && !allowedV4Hooks[hook]) revert V4HookNotAllowed(hook);
+    }
+
+    // ─── Internal: Uniswap V4 single-hop exact-input swap ────────────
+    /// @notice PRODUCTION SCOPE — the V4 path is intentionally narrow.
+    /// Supported: single-hop, exact-input, ERC20→ERC20, tokenOut == repayToken,
+    /// hook ∈ {address(0)} ∪ allowedV4Hooks. Everything else fails closed.
+    /// Widening this scope (multi-hop, ETH, exact-output, generic routing)
+    /// requires new tests and security review.
+    /// @dev Executes a single-hop exact-input swap via PoolManager's
+    /// unlock-callback pattern. Validation is centralized in `_validateV4Plan`;
+    /// this function only orchestrates the swap + balance-delta check.
+    function _executeUniV4(SwapPlan memory plan, uint256 collateralDelta) internal {
+        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook) = _validateV4Plan(plan);
 
         uint256 amountIn = plan.useFullBalance ? collateralDelta : plan.amountIn;
         if (amountIn == 0) revert ZeroSwapInput();
@@ -1219,6 +1258,7 @@ contract LiquidationExecutor is
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
 
+        address pm = plan.v4PoolManager;
         _activeV4PoolManager = pm;
         IPoolManager(pm).unlock(abi.encode(tokenIn, tokenOut, fee, tickSpacing, hook, amountIn));
         _activeV4PoolManager = address(0);
@@ -1230,10 +1270,17 @@ contract LiquidationExecutor is
     }
 
     /// @inheritdoc IUnlockCallback
-    /// @dev Accepts only the PoolManager currently mid-unlock (pinned by
-    /// `_executeUniV4` in `_activeV4PoolManager`). Performs exactly one
-    /// `swap()`, settles the input currency via `sync+transfer+settle`, and
-    /// pulls the output via `take()`. Any other entry shape reverts.
+    /// @notice PRODUCTION SCOPE — this callback implements exactly ONE shape:
+    ///   exact-input single-hop ERC20→ERC20 swap inside the flashloan pipeline.
+    /// @dev Three layers of protection against stray or adversarial calls:
+    ///   1. `ExecutionPhase.FlashLoanActive` — only valid inside execute()
+    ///   2. `_activeV4PoolManager != 0`     — only while `_executeUniV4` is mid-unlock
+    ///   3. `msg.sender == _activeV4PoolManager` — only the pinned PoolManager
+    /// BalanceDelta invariant: tokenInDelta < 0 (we owe) AND tokenOutDelta > 0
+    /// (we receive). Any other shape — including zero-output swaps, partial
+    /// settlement, or positive input — fails closed. Widening the callback
+    /// (multi-hop, native ETH, exact-output, hook-specific deltas) requires
+    /// new tests and security review.
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
         address pm = _activeV4PoolManager;
@@ -1265,13 +1312,25 @@ contract LiquidationExecutor is
         int128 tokenInDelta = zeroForOne ? amount0 : amount1;
         int128 tokenOutDelta = zeroForOne ? amount1 : amount0;
 
-        // Exact-input swap: PoolManager owes us tokenOut (positive), we owe
-        // tokenIn (negative). Any other shape — including zero-output trades —
-        // is a signal of unexpected pool/hook behaviour and fails closed.
-        if (tokenInDelta >= 0 || tokenOutDelta <= 0) revert V4UnexpectedDelta();
+        // Exact-input single-hop invariant: owe strictly positive tokenIn,
+        // gain strictly positive tokenOut. Split checks for precise revert
+        // attribution: positive-input deltas and non-positive-output deltas
+        // each route through V4UnexpectedDelta with the same fail-closed
+        // semantics but traced distinctly in event logs.
+        if (tokenInDelta >= 0) revert V4UnexpectedDelta();
+        if (tokenOutDelta <= 0) revert V4UnexpectedDelta();
 
+        // owedIn = |tokenInDelta| (safe: tokenInDelta < 0)
+        // gainedOut = tokenOutDelta (safe: tokenOutDelta > 0)
         uint256 owedIn = uint256(int256(-tokenInDelta));
         uint256 gainedOut = uint256(int256(tokenOutDelta));
+
+        // Defensive: belt-and-suspenders against any future change that could
+        // weaken the delta checks above. Under the current invariants these
+        // are unreachable, but they keep the contract explicitly fail-closed
+        // against zero-amount settlement that would otherwise be a no-op.
+        if (owedIn == 0) revert V4ZeroOwed();
+        if (gainedOut == 0) revert V4ZeroGained();
 
         IPoolManager(pm).sync(tokenIn);
         IERC20(tokenIn).safeTransfer(pm, owedIn);

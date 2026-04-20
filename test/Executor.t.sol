@@ -5429,6 +5429,181 @@ contract ExecutorTest is Test {
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         executor.setV4HookAllowed(address(0), true);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // V4 HARDENING TESTS (narrow-scope fail-closed checks)
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_UniV4_nativeETH_tokenIn_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+        swapPlan.v4SwapData = abi.encode(address(0), address(loanToken), uint24(3000), int24(60), address(0));
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidV4NativeToken.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_nativeETH_tokenOut_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+        swapPlan.v4SwapData = abi.encode(address(collateralToken), address(0), uint24(3000), int24(60), address(0));
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidV4NativeToken.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_wrongTokenOut_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+        swapPlan.v4SwapData =
+            abi.encode(address(collateralToken), address(profitToken), uint24(3000), int24(60), address(0));
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.InvalidV4TokenOut.selector, address(loanToken), address(profitToken)
+            )
+        );
+        executor.execute(plan);
+    }
+
+    function test_UniV4_zeroFee_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(0), int24(60))
+        );
+        executor.execute(plan);
+    }
+
+    function test_UniV4_zeroTickSpacing_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(0),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(3000), int24(0))
+        );
+        executor.execute(plan);
+    }
+
+    function test_UniV4_negativeTickSpacing_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(-60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(3000), int24(-60))
+        );
+        executor.execute(plan);
+    }
+
+    function test_UniV4_validationFailsFast_beforeFlashloan() public {
+        // Prove eager V4 validation fires before flashloan is requested. Use
+        // an unconfigured flashProviderId (99): if the V4 check ran AFTER
+        // flashloan setup, we'd get FlashProviderNotAllowed instead of the
+        // V4-content error.
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+        swapPlan.v4SwapData =
+            abi.encode(address(collateralToken), address(profitToken), uint24(3000), int24(60), address(0));
+
+        bytes memory plan =
+            _buildPlan(99, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.InvalidV4TokenOut.selector, address(loanToken), address(profitToken)
+            )
+        );
+        executor.execute(plan);
+    }
 }
 
 /// @dev Contract that rejects ETH -- used to test coinbase payment failure
