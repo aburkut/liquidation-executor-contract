@@ -84,6 +84,12 @@ contract LiquidationExecutor is
     error InsufficientRepayOutput(uint256 actual, uint256 required);
     error RepayTokenMismatch(address expected, address actual);
 
+    // Two-leg errors
+    error InvalidLegLink(address leg1Out, address leg2In);
+    error Leg2ModeNotAllowed(uint8 mode);
+    error Leg2ZeroLeftover();
+    error LegUseFullBalanceNotAllowed(uint8 mode);
+
     // Paraswap errors
     error InvalidParaswapCalldata();
     error InvalidSwapSelector();
@@ -227,6 +233,13 @@ contract LiquidationExecutor is
     );
     event UniV4SwapExecuted(
         address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
+    );
+    event TwoLegSwapExecuted(
+        address indexed intermediateToken,
+        uint256 leg1AmountIn,
+        uint256 intermediateDelta,
+        uint256 leg2AmountIn,
+        uint256 finalRepayDelta
     );
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
 
