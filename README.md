@@ -4,27 +4,30 @@
 
 | Parameter | Value |
 |---|---|
-| **Contract** | `0xbdBcDAa6C667582298ca70dE2CD6647d6ab105e5` |
-| **Deploy tx** | `0x132b93b032ced2f1f2874c8836b90ba45fa81ba0f947f75e222f67d192a69468` |
+| **Contract (V4)** | `0xB5C7881500F0A7A56E985266Da6AD9d19a5CCBB4` |
+| **Deploy tx** | `0x95383aabc6cf9b092ac9809facd9c1eb966be3c824e0f5f6ca583fd4374c7976` |
+| **ParaswapDecoderLib** | `0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16` (linked via `--libraries`) |
+| **Library deploy tx** | `0x1446d0fc56087032a8872d3bf09083cf341bfb91cc3924e3baa0cb6cfca17dac` |
+| **Runtime bytecode size** | 23 813 bytes (763 bytes margin under EIP-170) |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
 | **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
 | **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
 | **Deployer** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` |
-| **Aave V3 Pool** | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` (liquidation target; V3 flashloan path removed in current source) |
-| **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` |
-| **ParaSwap Augustus** | `0x6A000F20005980200259B80c5102003040001068` |
-| **Bebop Settlement** | `0xbbbbbBB520d69a9775E85b458C58c648259FAD5F` (whitelisted) |
-| **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (whitelisted) |
+| **Aave V3 Pool** | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` (liquidation target; V3 flashloan path removed) |
+| **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` (auto-registered as flash provider id=2) |
+| **ParaSwap AugustusV6** | `0x6A000F20005980200259B80c5102003040001068` |
+| **Uniswap V2 Router02** | `0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D` (immutable) |
+| **Uniswap V3 SwapRouter02** | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` (immutable) |
+| **Uniswap V4 PoolManager** | `0x000000000004444c5dc75cB358380D2e3dE08A90` (in `allowedTargets`, used per-swap) |
+| **Morpho Blue** | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` (liquidation target + flashloan id=3 — needs `configureMorpho`) |
+| **Bebop Settlement** | `0xbbbbbBB520d69a9775E85b458C58c648259FAD5F` (allowlisted) |
+| **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (allowlisted — needs `setAaveV2LendingPool`) |
 | **Solidity** | 0.8.24, Shanghai, optimizer 1 run, `via_ir=true`, `bytecode_hash=none` |
-
-> **Note**: the address above is the currently-active deployment, which still uses the legacy
-> SwapMode layout (`PARASWAP_SINGLE`/`BEBOP_MULTI`/`PARASWAP_DOUBLE`). The source in this repo has
-> moved on to a new layout (see below) and must be redeployed to pick up `UNI_V2/V3/V4`, the
-> bps-based coinbase payment, and the removal of Aave V3 flashloan + `PARASWAP_DOUBLE`. The
-> deployed contract is the one the bot currently targets.
 
 | Previous deployments | |
 |---|---|
+| **V3 Contract** | `0xbdBcDAa6C667582298ca70dE2CD6647d6ab105e5` (deprecated — legacy SwapMode layout with `PARASWAP_DOUBLE`; 0x11 overflow on whale BUY-side; bot migrated off on 2026-04-21) |
+| **V3 deploy tx** | `0x132b93b032ced2f1f2874c8836b90ba45fa81ba0f947f75e222f67d192a69468` |
 | **V2 Contract** | `0x38F4473C077c014786037cC3d82fce52510b9089` (deprecated — no Bebop, had ERC20 payment) |
 | **V1 Contract** | `0x1aaED107C21B389a38a632129dC0Cb362819bC8D` (deprecated) |
 
@@ -415,13 +418,45 @@ ETHEREUM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
 ETHERSCAN_API_KEY=...
 ```
 
-### 2. Deploy
+### 2. Deploy (two steps — external library)
+
+The Paraswap Augustus V6.2 selector classifier and per-family decoders live in
+`src/libraries/ParaswapDecoderLib.sol` as an **external library** called via
+`DELEGATECALL` from the main contract.  Pulling the decoder out of the main
+contract's own bytecode is what keeps the deployed executor comfortably under
+the EIP-170 24,576-byte limit — but the price is that the main contract's
+compiled bytecode contains an unresolved link placeholder (`__$...$__`) where
+the library address needs to be spliced in at deploy time.  `forge create`
+refuses to deploy such bytecode without a concrete library address, hence the
+two-step flow below.
+
+#### 2.1 — Deploy `ParaswapDecoderLib` first
+
+```bash
+forge create src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib \
+  --rpc-url $ETHEREUM_RPC_URL \
+  --private-key $PRIVATE_KEY \
+  --broadcast
+```
+
+Copy the `Deployed to:` address from the output:
+
+```bash
+export LIB_ADDR=<deployed-library-address>
+```
+
+The library is stateless and has no owner — once deployed, it can be reused for
+every future `LiquidationExecutor` deployment, so this step normally only runs
+once per chain.
+
+#### 2.2 — Deploy `LiquidationExecutor` linked to the library
 
 ```bash
 forge create src/LiquidationExecutor.sol:LiquidationExecutor \
   --rpc-url $ETHEREUM_RPC_URL \
   --private-key $PRIVATE_KEY \
   --broadcast \
+  --libraries "src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib:$LIB_ADDR" \
   --constructor-args \
     <OWNER_ADDRESS> \
     <OPERATOR_ADDRESS> \
@@ -431,8 +466,16 @@ forge create src/LiquidationExecutor.sol:LiquidationExecutor \
     0x6A000F20005980200259B80c5102003040001068 \
     0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D \
     0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45 \
-    "[0xbbbbbBB520d69a9775E85b458C58c648259FAD5F,0xBBBB9D7463eFa42bBE4d9A92D09F8568E6C14Cbe,0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9,0x000000000004444c5dc75cB358380D2e3dE08A90]"
+    "[0xbbbbbBB520d69a9775E85b458C58c648259FAD5F,0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb,0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9,0x000000000004444c5dc75cB358380D2e3dE08A90]"
 ```
+
+The `--libraries` flag format is `<file>:<name>:<address>` — forge replaces the
+placeholder in the linker with `$LIB_ADDR` before broadcast.  To verify both
+the library and the main contract on Etherscan in the same run, append
+`--verify --etherscan-api-key $ETHERSCAN_API_KEY` to each of the two `forge
+create` commands above (Etherscan needs the library address to reproduce the
+linked bytecode for the main contract, which is why the library must be
+verified first).
 
 Constructor arg order:
 1. Owner (Safe multisig)
@@ -451,7 +494,7 @@ Constructor arg order:
 EXECUTOR=<DEPLOYED_ADDRESS>
 
 # Configure Morpho Blue (atomic — sets both liquidation target and flash provider)
-cast send $EXECUTOR "configureMorpho(address)" 0xBBBB9D7463eFa42bBE4d9A92D09F8568E6C14Cbe \
+cast send $EXECUTOR "configureMorpho(address)" 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb \
   --rpc-url $ETHEREUM_RPC_URL --private-key $PRIVATE_KEY
 
 # Configure Aave V2 LendingPool (liquidation target)
@@ -485,7 +528,7 @@ cast call $EXECUTOR "paused()(bool)" --rpc-url $ETHEREUM_RPC_URL
 | Aave V3 Pool | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` |
 | Aave V2 LendingPool | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` |
 | Balancer Vault | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` |
-| Morpho Blue | `0xBBBB9D7463eFa42bBE4d9A92D09F8568E6C14Cbe` |
+| Morpho Blue | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` |
 | ParaSwap AugustusV6 | `0x6A000F20005980200259B80c5102003040001068` |
 | Uniswap V2 Router02 | `0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D` |
 | Uniswap V3 SwapRouter02 | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` |
