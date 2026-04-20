@@ -11,7 +11,10 @@ import {IAaveV3Pool} from "./interfaces/IAaveV3Pool.sol";
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 import {IMorphoBlue, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/IMorphoBlue.sol";
-import {IUniversalRouter} from "./interfaces/IUniversalRouter.sol";
+import {IUniV2Router} from "./interfaces/IUniV2Router.sol";
+import {IUniV3SwapRouter} from "./interfaces/IUniV3SwapRouter.sol";
+import {IPoolManager, IUnlockCallback, PoolKey, SwapParams} from "./interfaces/IPoolManager.sol";
+import {ParaswapDecoderLib} from "./libraries/ParaswapDecoderLib.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -20,8 +23,17 @@ interface IWETH {
 /// @title LiquidationExecutor
 /// @notice Flashloan + multi-swap + liquidation executor.
 /// @dev Fail-closed. No upgradeability. External calls restricted to allowedTargets allowlist.
-/// Supports Paraswap single/double swaps and Bebop multi-output swaps.
-contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecipient, IMorphoFlashLoanCallback {
+/// Supports Paraswap single swaps, Bebop multi-output swaps, and deterministic
+/// on-chain fallback swaps via Uniswap V2, V3 (SwapRouter02), and V4 (PoolManager
+/// unlock-callback pattern, strict single-hop exact-input mode only).
+contract LiquidationExecutor is
+    Ownable2Step,
+    Pausable,
+    ReentrancyGuard,
+    IFlashLoanRecipient,
+    IMorphoFlashLoanCallback,
+    IUnlockCallback
+{
     using SafeERC20 for IERC20;
 
     // ─── Custom Errors ───────────────────────────────────────────────
@@ -92,16 +104,26 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error BebopTargetNotContract();
     error BebopSwapFailed();
 
-    // Universal Router errors
-    error UniversalRouterNotSet();
+    // Uniswap V2 / V3 / V4 swap errors
     error ZeroSwapInput();
-    error UniversalRouterSwapFailed();
-    error UnsupportedLeg2Command(bytes1 cmd);
-    error Leg2TokenMismatch(address expected, address actual);
+    error ZeroAmountIn();
+    error ZeroRepayOutput();
+    error InvalidV2Path();
+    error InvalidV3Fee(uint24 fee);
+    error InvalidV4Data();
+    error InvalidV4Fee();
+    error InvalidV4TokenOut(address expected, address actual);
+    error InvalidV4NativeToken();
+    error InvalidV4FeeOrSpacing();
+    error V4HookNotAllowed(address hook);
+    error V4UnexpectedDelta();
+    error InvalidV4CallbackHook();
 
     // Profit / payment errors
     error InsufficientProfit(uint256 actual, uint256 required);
     error CoinbasePaymentRequiresWethProfit();
+    error CoinbaseExceedsProfit(uint256 coinbase, uint256 profit);
+    error InvalidCoinbaseBps();
     error InsufficientRepayBalance(uint256 required, uint256 available);
     error InsufficientSrcBalance(uint256 required, uint256 available);
     error TargetNotAllowed(address target);
@@ -119,128 +141,26 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     uint8 public constant ACTION_PAY_COINBASE = 1;
 
-    // Universal Router command IDs (Uniswap UR `Commands` library).
-    // The high bit (0x80) is `FLAG_ALLOW_REVERT`; the remaining 5 bits identify
-    // the command. We strip the flag via `UR_COMMAND_MASK` before comparison.
-    uint8 private constant UR_V3_SWAP_EXACT_IN = 0x00;
-    uint8 private constant UR_V2_SWAP_EXACT_IN = 0x08;
-    uint8 private constant UR_COMMAND_MASK = 0x3f;
+    /// @dev Gas limit on coinbase ETH transfers. Small bound keeps a
+    /// malicious block.coinbase from grinding gas in the callback.
+    uint256 private constant COINBASE_CALL_GAS = 10_000;
 
-    /// @dev Paraswap Augustus V6 supported selectors.
-    ///
-    /// Generic family (GenericData layout — first arg is `address executor`, second arg
-    /// is the GenericData struct holding src/dst/amounts/beneficiary).
-    bytes4 private constant _SWAP_EXACT_AMOUNT_IN = bytes4(
-        keccak256(
-            "swapExactAmountIn(address,(address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes,bytes)"
-        )
-    );
-    bytes4 private constant _SWAP_EXACT_AMOUNT_OUT = bytes4(
-        keccak256(
-            "swapExactAmountOut(address,(address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes,bytes)"
-        )
-    );
+    /// @dev Uniswap V4 sqrt price limits, set one tick inside the allowed
+    /// range so the swap is unconstrained by price (slippage is enforced
+    /// by the output delta check against `plan.minAmountOut`).
+    /// Reference: v4-core TickMath.MIN_SQRT_PRICE / MAX_SQRT_PRICE.
+    uint160 private constant V4_MIN_SQRT_PRICE_LIMIT = 4_295_128_740;
+    uint160 private constant V4_MAX_SQRT_PRICE_LIMIT =
+        1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261;
 
-    /// Direct router families — selectors and struct layouts derived from the
-    /// deployed Augustus V6.2 source (Sourcify metadata for
-    /// 0x6A000F20005980200259B80c5102003040001068, see AugustusV6Types.sol).
-    /// Each `swapExactAmountInOn{Family}` / `swapExactAmountOutOn{Family}`
-    /// entrypoint takes the family-specific data struct as its first arg
-    /// (no executor head word). Two distinct calldata shapes:
-    ///
-    ///   Inline (struct has only static fields → inlines into the head):
-    ///     selector(4) + struct fields packed at fixed positions
-    ///     + partnerAndFee(32) + offset_to_permit(32) + permit_len(32)
-    ///     + permit_data + (optional) data tail.
-    ///     CurveV1 (9 fields), CurveV2 (11 fields), Generic (7 fields), and
-    ///     BalancerV2 (5 fields) all use this shape.
-    ///
-    ///   Tail (struct has at least one dynamic field — `bytes pools` — so the
-    ///   head holds an offset and the struct lives in the tail):
-    ///     selector(4) + offset_to_struct(32) + partnerAndFee(32)
-    ///     + offset_to_permit(32) + (struct at offset, 8 head words: 7 fixed
-    ///     + offset_to_pools) + pools data + permit data.
-    ///     UniswapV2 and UniswapV3 use this shape (both share `(srcToken,
-    ///     destToken, fromAmount, toAmount, quotedAmount, metadata, beneficiary,
-    ///     bytes pools)`).
-    ///
-    /// V6.2 has no MakerPSM entrypoint and no CurveV1/V2 ExactOut — those are
-    /// not in the contract ABI.
-    bytes4 private constant _SWAP_EXACT_IN_UNI_V3 = bytes4(
-        keccak256(
-            "swapExactAmountInOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
-        )
-    ); // 0x876a02f6
-    bytes4 private constant _SWAP_EXACT_OUT_UNI_V3 = bytes4(
-        keccak256(
-            "swapExactAmountOutOnUniswapV3((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
-        )
-    ); // 0x5e94e28d
-    bytes4 private constant _SWAP_EXACT_IN_UNI_V2 = bytes4(
-        keccak256(
-            "swapExactAmountInOnUniswapV2((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
-        )
-    ); // 0xe8bb3b6c
-    bytes4 private constant _SWAP_EXACT_OUT_UNI_V2 = bytes4(
-        keccak256(
-            "swapExactAmountOutOnUniswapV2((address,address,uint256,uint256,uint256,bytes32,address,bytes),uint256,bytes)"
-        )
-    ); // 0xa76f4eb6
-    /// BalancerV2 direct: explicitly rejected. The on-chain BalancerV2Data
-    /// struct carries no srcToken/destToken — they're encoded into the opaque
-    /// `bytes data` Balancer-batch blob — so we cannot cross-check calldata
-    /// tokens against `plan.srcToken` / `plan.repayToken` without a full
-    /// Balancer-batch parser. Paraswap API falls back to the Generic family
-    /// for Balancer routes when direct isn't available, so rejection only
-    /// narrows our route set slightly while keeping the validator provable.
-    bytes4 private constant _SWAP_EXACT_IN_BALANCER_V2 = bytes4(
-        keccak256("swapExactAmountInOnBalancerV2((uint256,uint256,uint256,bytes32,uint256),uint256,bytes,bytes)")
-    ); // 0xd85ca173
-    bytes4 private constant _SWAP_EXACT_OUT_BALANCER_V2 = bytes4(
-        keccak256("swapExactAmountOutOnBalancerV2((uint256,uint256,uint256,bytes32,uint256),uint256,bytes,bytes)")
-    ); // 0xd6ed22e6
-    bytes4 private constant _SWAP_EXACT_IN_CURVE_V1 = bytes4(
-        keccak256(
-            "swapExactAmountInOnCurveV1((uint256,uint256,address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes)"
-        )
-    ); // 0x1a01c532
-    bytes4 private constant _SWAP_EXACT_IN_CURVE_V2 = bytes4(
-        keccak256(
-            "swapExactAmountInOnCurveV2((uint256,uint256,uint256,address,address,address,uint256,uint256,uint256,bytes32,address),uint256,bytes)"
-        )
-    ); // 0xe37ed256
-    /// AugustusRFQ batch fill — explicitly rejected. RFQ flows route through the
-    /// off-chain order matcher; we never want to execute one accidentally.
-    bytes4 private constant _SWAP_RFQ_BATCH_FILL = bytes4(
-        keccak256(
-            "swapOnAugustusRFQTryBatchFill((uint256,uint256,uint8,bytes32,address),((uint256,uint128,address,address,address,address,uint256,uint256),bytes,uint256,bytes,bytes)[],bytes)"
-        )
-    ); // 0xda35bb0d
+    /// @dev Strict size of encoded v4SwapData: 5 × 32-byte words
+    /// (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook).
+    uint256 private constant V4_SWAP_DATA_LENGTH = 160;
 
-    /// @dev Categorises a 4-byte Paraswap selector. Maps every Augustus V6.2 swap
-    /// entrypoint (10 non-RFQ + 1 RFQ) to a deterministic outcome — either a
-    /// supported family (decoder + amount-direction semantics) or an explicit
-    /// rejection reason. Unknown selectors fall through to `Unsupported`.
-    /// Every variant in this enum either drives a decoder branch in
-    /// `_decodeAndValidateParaswap` or maps to a `revert InvalidParaswapSelector`
-    /// branch — there is no silent path.
-    enum ParaswapSelectorKind {
-        // Accepted families (12 entrypoints across 7 decoder shapes).
-        ExactInGeneric, // 0xe3ead59e
-        ExactOutGeneric, // 0x7f457675
-        UniswapV2ExactIn, // 0xe8bb3b6c
-        UniswapV2ExactOut, // 0xa76f4eb6
-        UniswapV3ExactIn, // 0x876a02f6
-        UniswapV3ExactOut, // 0x5e94e28d
-        CurveV1ExactIn, // 0x1a01c532
-        CurveV2ExactIn, // 0xe37ed256
-        BalancerV2ExactIn, // 0xd85ca173
-        BalancerV2ExactOut, // 0xd6ed22e6
-        // Explicit-reject (documented V6.2 selectors we choose not to support).
-        RFQ, // 0xda35bb0d — off-chain order matching
-        // Unknown selector (always reverts).
-        Unsupported
-    }
+    // Paraswap Augustus V6.2 selector classifier + per-family decoders live
+    // in `ParaswapDecoderLib` (external library, DELEGATECALL). Keeps the
+    // executor's deployed bytecode under EIP-170. See that file for selector
+    // constants, decoder shapes, and bounds-check commentary.
 
     // ─── State ───────────────────────────────────────────────────────
     address public immutable operator;
@@ -250,14 +170,31 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     address public balancerVault;
     address public paraswapAugustusV6;
     address public aaveV2LendingPool;
-    /// @dev Immutable — the executor assumes a fixed calldata layout for inputs[0].
-    /// Changing router requires redeploying the contract.
-    address public immutable universalRouter;
+    /// @dev Immutable — canonical Uniswap V2 Router02 (mainnet
+    /// 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D). Auto-whitelisted in
+    /// allowedTargets at construction. Rotating requires redeployment.
+    address public immutable uniV2Router;
+    /// @dev Immutable — canonical Uniswap V3 SwapRouter02 (mainnet
+    /// 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45). SwapRouter02 struct omits
+    /// deadline; the executor enforces its own via plan.deadline.
+    address public immutable uniV3Router;
 
     mapping(uint8 => address) public allowedFlashProviders;
     mapping(address => bool) public allowedTargets;
+    /// @dev Owner-curated whitelist of V4 hook contracts. A V4 swap whose
+    /// PoolKey references a hook that is neither address(0) nor allow-listed
+    /// reverts with `V4HookNotAllowed`. Hooks run arbitrary code inside
+    /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
+    /// hook has been audited is the intended default.
+    mapping(address => bool) public allowedV4Hooks;
 
     bytes32 private _activePlanHash;
+
+    /// @dev PoolManager address currently mid-unlock. Set by `_executeUniV4`
+    /// before `unlock()` and cleared on return. `unlockCallback` refuses any
+    /// caller that is not this address, so stray `unlockCallback` invocations
+    /// from an allow-listed PoolManager acting outside our pipeline revert.
+    address private _activeV4PoolManager;
 
     /// @dev Execution phase guard — prevents unexpected callbacks
     enum ExecutionPhase {
@@ -284,15 +221,22 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     event BebopSwapExecuted(
         address indexed target, address indexed srcToken, uint256 amountIn, uint256 repayDelta, uint256 profitDelta
     );
-    event UniversalRouterSwapExecuted(
-        address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut
+    event UniV2SwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
+    event UniV3SwapExecuted(
+        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
     );
+    event UniV4SwapExecuted(
+        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
+    );
+    event V4HookAllowedUpdated(address indexed hook, bool allowed);
 
     // ─── Enums ────────────────────────────────────────────────────────
     enum SwapMode {
         PARASWAP_SINGLE,
         BEBOP_MULTI,
-        UNIVERSAL_ROUTER
+        UNI_V2,
+        UNI_V3,
+        UNI_V4
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
@@ -307,17 +251,23 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address repayToken;
         address profitToken;
         uint256 minProfitAmount;
-        // Universal Router fields (leg1 when mode == UNIVERSAL_ROUTER)
-        bytes universalCommands;
-        bytes[] universalInputs;
-        uint256 minSwapOutput;
-        // Optional second leg (always UR, tracked leftover from leg1)
-        bool hasLeg2;
-        address leg2TokenIn;
-        address leg2TokenOut;
-        uint256 leg2MinAmountOut;
-        bytes leg2Commands;
-        bytes[] leg2Inputs;
+        // Uniswap V2 / V3 / V4 fields (ignored for other modes)
+        /// @dev UNI_V3 only — pool fee tier, must be in {100, 500, 3000, 10000}.
+        uint24 v3Fee;
+        /// @dev UNI_V2 only — swap path, path[0]==srcToken, path[last]==repayToken, length >= 2.
+        address[] v2Path;
+        /// @dev UNI_V2/V3/V4 only — output floor (strict > 0).
+        uint256 minAmountOut;
+        /// @dev UNI_V2/V3/V4 only — if true, swap input = collateral balance delta
+        /// produced during this execute() invocation. Prevents swapping
+        /// pre-existing collateral balances acquired outside the flash pipeline.
+        bool useFullBalance;
+        /// @dev UNI_V4 only — PoolManager address (must be in allowedTargets).
+        address v4PoolManager;
+        /// @dev UNI_V4 only — strict-encoded PoolKey fields:
+        ///   abi.encode(address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook)
+        /// Length must be exactly 160 bytes; shorter/longer payloads revert with InvalidV4Data.
+        bytes v4SwapData;
     }
 
     struct Action {
@@ -381,7 +331,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address aavePool_,
         address balancerVault_,
         address paraswapAugustus_,
-        address universalRouter_,
+        address uniV2Router_,
+        address uniV3Router_,
         address[] memory allowedTargets_
     ) Ownable(owner_) {
         if (operator_ == address(0)) revert ZeroAddress();
@@ -389,11 +340,13 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (aavePool_ == address(0)) revert ZeroAddress();
         if (balancerVault_ == address(0)) revert ZeroAddress();
         if (paraswapAugustus_ == address(0)) revert ZeroAddress();
-        if (universalRouter_ == address(0)) revert ZeroAddress();
+        if (uniV2Router_ == address(0)) revert ZeroAddress();
+        if (uniV3Router_ == address(0)) revert ZeroAddress();
 
         operator = operator_;
         weth = weth_;
-        universalRouter = universalRouter_;
+        uniV2Router = uniV2Router_;
+        uniV3Router = uniV3Router_;
         aavePool = aavePool_;
         balancerVault = balancerVault_;
         paraswapAugustusV6 = paraswapAugustus_;
@@ -403,7 +356,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         allowedTargets[aavePool_] = true;
         allowedTargets[balancerVault_] = true;
         allowedTargets[paraswapAugustus_] = true;
-        allowedTargets[universalRouter_] = true;
+        allowedTargets[uniV2Router_] = true;
+        allowedTargets[uniV3Router_] = true;
 
         for (uint256 i = 0; i < allowedTargets_.length; i++) {
             if (allowedTargets_[i] == address(0)) revert ZeroAddress();
@@ -463,6 +417,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address oldProvider = allowedFlashProviders[FLASH_PROVIDER_MORPHO];
         allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho;
         emit FlashProviderUpdated(FLASH_PROVIDER_MORPHO, oldProvider, morpho);
+    }
+
+    /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.
+    /// @dev Hooks execute arbitrary logic during `beforeSwap`/`afterSwap` on the
+    /// PoolManager; any non-zero hook that is NOT in this whitelist causes the
+    /// V4 path to revert with `V4HookNotAllowed`. Default is empty — operator
+    /// routes MUST stay on hook-less pools unless the owner explicitly enables
+    /// a hook after review.
+    function setV4HookAllowed(address hook, bool allowed) external onlyOwner {
+        if (hook == address(0)) revert ZeroAddress();
+        allowedV4Hooks[hook] = allowed;
+        emit V4HookAllowedUpdated(hook, allowed);
     }
 
     function pause() external onlyOwner {
@@ -622,24 +588,22 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         } else if (plan.swapPlan.mode == SwapMode.BEBOP_MULTI) {
             if (plan.swapPlan.bebopTarget == address(0)) revert InvalidBebopTarget();
             if (plan.swapPlan.bebopCalldata.length < 4) revert InvalidBebopCalldata();
-        } else if (plan.swapPlan.mode == SwapMode.UNIVERSAL_ROUTER) {
-            if (plan.swapPlan.universalCommands.length == 0) revert InvalidPlan();
-            if (plan.swapPlan.universalInputs.length == 0) revert InvalidPlan();
+        } else if (plan.swapPlan.mode == SwapMode.UNI_V2) {
+            uint256 pLen = plan.swapPlan.v2Path.length;
+            if (pLen < 2) revert InvalidV2Path();
+            if (plan.swapPlan.v2Path[0] != plan.swapPlan.srcToken) revert InvalidV2Path();
+            if (plan.swapPlan.v2Path[pLen - 1] != plan.swapPlan.repayToken) revert InvalidV2Path();
+            if (plan.swapPlan.minAmountOut == 0) revert InvalidPlan();
+        } else if (plan.swapPlan.mode == SwapMode.UNI_V3) {
+            uint24 f = plan.swapPlan.v3Fee;
+            if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
+            if (plan.swapPlan.minAmountOut == 0) revert InvalidPlan();
+        } else if (plan.swapPlan.mode == SwapMode.UNI_V4) {
+            // Eager full-content validation — fails closed BEFORE the flashloan
+            // is requested, so misconfigured V4 plans never burn a flash fee.
+            _validateV4Plan(plan.swapPlan);
         } else {
             revert InvalidSwapMode();
-        }
-
-        if (plan.swapPlan.hasLeg2) {
-            if (plan.swapPlan.leg2Commands.length == 0) revert InvalidPlan();
-            if (plan.swapPlan.leg2Inputs.length == 0) revert InvalidPlan();
-            if (plan.swapPlan.leg2TokenIn == address(0)) revert ZeroAddress();
-            if (plan.swapPlan.leg2TokenOut == address(0)) revert ZeroAddress();
-            // inputs[0] must carry the exact layout `(address tokenIn, uint256
-            // amountIn, address tokenOut)` — 3 static words, 96 bytes.
-            if (plan.swapPlan.leg2Inputs[0].length < 96) revert InvalidPlan();
-            // leg2 must be a single exact-input UR swap command.
-            bytes1 cmd = plan.swapPlan.leg2Commands[0];
-            if (!_isSupportedURExactIn(cmd)) revert UnsupportedLeg2Command(cmd);
         }
 
         address provider = allowedFlashProviders[plan.flashProviderId];
@@ -691,20 +655,16 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (feeAmounts[0] > plan.maxFlashFee) revert FlashFeeExceeded(feeAmounts[0], plan.maxFlashFee);
 
         uint256 flashRepayAmount = amounts[0] + feeAmounts[0];
-        (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped) =
-            _runFlashloanPipeline(plan, flashRepayAmount);
+        (uint256 realizedProfit, uint256 totalCoinbasePayment) = _runFlashloanPipeline(plan, flashRepayAmount);
 
         // Balancer expects funds returned by end of callback via transfer (vault=msg.sender).
         _finalizeFlashloan(
             address(tokens[0]),
-            amounts[0],
             flashRepayAmount,
             msg.sender,
-            plan.swapPlan.profitToken,
-            profitBefore,
-            plan.swapPlan.minProfitAmount,
+            realizedProfit,
             totalCoinbasePayment,
-            totalWethUnwrapped
+            plan.swapPlan.minProfitAmount
         );
     }
 
@@ -729,20 +689,16 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         // Morpho fee = 0, so flash repay equals principal
         uint256 flashRepayAmount = amount;
-        (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped) =
-            _runFlashloanPipeline(plan, flashRepayAmount);
+        (uint256 realizedProfit, uint256 totalCoinbasePayment) = _runFlashloanPipeline(plan, flashRepayAmount);
 
         // Morpho also pulls via safeTransferFrom after callback returns (vault=0).
         _finalizeFlashloan(
             plan.loanToken,
-            amount,
             flashRepayAmount,
             address(0),
-            plan.swapPlan.profitToken,
-            profitBefore,
-            plan.swapPlan.minProfitAmount,
+            realizedProfit,
             totalCoinbasePayment,
-            totalWethUnwrapped
+            plan.swapPlan.minProfitAmount
         );
     }
 
@@ -755,7 +711,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     /// finalize call (`_finalizeFlashloan` for repayment).
     function _runFlashloanPipeline(Plan memory plan, uint256 flashRepayAmount)
         internal
-        returns (uint256 profitBefore, uint256 totalCoinbasePayment, uint256 totalWethUnwrapped)
+        returns (uint256 realizedProfit, uint256 totalCoinbasePayment)
     {
         // Pre-execution: verify flash loan funds received
         if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
@@ -769,10 +725,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         }
 
         // Snapshot BEFORE protocol actions
-        profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
+        uint256 profitBefore = IERC20(plan.swapPlan.profitToken).balanceOf(address(this));
         uint256 collateralBefore;
         if (trackingToken != address(0)) {
             collateralBefore = IERC20(trackingToken).balanceOf(address(this));
+        }
+        // Separate snapshot on the collateral asset itself (may differ from
+        // trackingToken when receiveAToken=true). Drives UNI_V2/V3 full-balance
+        // mode: amountIn is the delta produced by this execute() call, never a
+        // pre-existing balance.
+        uint256 collateralAssetBefore;
+        if (collateralAsset != address(0)) {
+            collateralAssetBefore = IERC20(collateralAsset).balanceOf(address(this));
         }
 
         // Execute protocol actions (liquidations), skip INTERNAL
@@ -797,114 +761,115 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             }
         }
 
-        _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset);
+        // Post-pipeline collateral delta (underlying asset only) — consumed by
+        // UNI_V2/V3 useFullBalance mode. Computed AFTER aToken unwrap so the
+        // full produced amount is available for swapping regardless of
+        // receiveAToken setting.
+        uint256 collateralDelta;
+        if (collateralAsset != address(0)) {
+            uint256 collateralAssetAfter = IERC20(collateralAsset).balanceOf(address(this));
+            collateralDelta =
+                collateralAssetAfter > collateralAssetBefore ? collateralAssetAfter - collateralAssetBefore : 0;
+        }
 
-        // Execute internal actions (coinbase payment) after swap
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset, collateralDelta);
+
+        // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
+        // BEFORE flash repay. This is the authoritative base that ACTION_PAY_COINBASE
+        // basis-points arithmetic multiplies against.
+        realizedProfit = _computeRealizedProfit(
+            plan.loanToken, plan.swapPlan.profitToken, profitBefore, plan.loanAmount, flashRepayAmount
+        );
+
+        // Execute internal actions (coinbase bps payments) now that realized profit
+        // is known. Per-action bps is validated and multiplied against realizedProfit.
         for (uint256 i = 0; i < plan.actions.length; ++i) {
             if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
-                (uint256 cbPaid, uint256 wethUsed) =
-                    _executeInternalAction(plan.actions[i].data, plan.swapPlan.profitToken);
-                totalCoinbasePayment += cbPaid;
-                totalWethUnwrapped += wethUsed;
+                totalCoinbasePayment += _executeInternalAction(
+                    plan.actions[i].data, plan.swapPlan.profitToken, realizedProfit
+                );
             }
         }
     }
 
-    // ─── Internal: Finalize Flashloan (unified) ──────────────────────
-    /// @dev Single repayment + profit-check path for all three providers. Aave V3 and
-    /// Morpho pull repayment via safeTransferFrom after the callback returns, so we
-    /// approve the principal back to msg.sender (`vault == address(0)`). Balancer
-    /// expects funds returned via safeTransfer to the vault inside the callback
-    /// (`vault != address(0)`). The `repayPending` flag forwarded to `_checkProfit`
-    /// reflects whether the principal still sits on this contract at check-time.
-    function _finalizeFlashloan(
+    /// @dev Compute realized on-chain profit net of the flashloan obligation, but
+    /// BEFORE any coinbase bid is paid. Used as the base for bps-sized coinbase
+    /// payments and for the final `minProfitAmount` check.
+    function _computeRealizedProfit(
         address asset,
-        uint256 principalAmount,
-        uint256 repayAmount,
-        address vault,
         address profitTkn,
         uint256 profitBefore,
-        uint256 minProfitAmount,
+        uint256 principalAmount,
+        uint256 repayAmount
+    ) internal view returns (uint256) {
+        uint256 profitNow = IERC20(profitTkn).balanceOf(address(this));
+        if (profitTkn == asset) {
+            // profitBefore was snapshotted AFTER flashloan arrival (includes principal).
+            // profitNow is post-swap, pre-repay, pre-coinbase (still includes principal).
+            // Realized profit once repay is settled:
+            //   (profitNow - repayAmount) - (profitBefore - principalAmount)
+            // Saturating subtraction — underflow means the swap under-delivered.
+            uint256 lhs = profitNow + principalAmount;
+            uint256 rhs = profitBefore + repayAmount;
+            return lhs > rhs ? lhs - rhs : 0;
+        }
+        return profitNow > profitBefore ? profitNow - profitBefore : 0;
+    }
+
+    // ─── Internal: Finalize Flashloan (unified) ──────────────────────
+    /// @dev Single repayment + profit-check path. Aave-style callbacks pull via
+    /// `transferFrom` after we return, so `vault == address(0)` signals approve-
+    /// only; Balancer expects a push to the vault inside the callback. Profit
+    /// accounting is fully decided before this call — `realizedProfit` already
+    /// accounts for the flashloan obligation, and `totalCoinbasePayment` is
+    /// the sum of on-chain-computed bps payments already made.
+    function _finalizeFlashloan(
+        address asset,
+        uint256 repayAmount,
+        address vault,
+        uint256 realizedProfit,
         uint256 totalCoinbasePayment,
-        uint256 totalWethUnwrapped
+        uint256 minProfitAmount
     ) internal {
         uint256 balance = IERC20(asset).balanceOf(address(this));
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
 
-        bool repayPending;
         if (vault == address(0)) {
-            // Aave V3 / Morpho: pool pulls after we return — approve exact amount.
             IERC20(asset).forceApprove(msg.sender, repayAmount);
-            repayPending = true;
         } else {
-            // Balancer: push funds back to vault inside the callback.
             IERC20(asset).safeTransfer(vault, repayAmount);
         }
 
-        _checkProfit(
-            asset,
-            principalAmount,
-            repayAmount,
-            profitTkn,
-            profitBefore,
-            minProfitAmount,
-            repayPending,
-            totalCoinbasePayment,
-            totalWethUnwrapped
-        );
+        _checkProfit(realizedProfit, totalCoinbasePayment, minProfitAmount);
     }
 
     // ─── Internal: Check Profit ──────────────────────────────────────
-    function _checkProfit(
-        address asset,
-        uint256 principalAmount,
-        uint256 repayAmount,
-        address profitTkn,
-        uint256 profitBefore,
-        uint256 minProfitAmount,
-        bool repayPending, // true for Aave (pool pulls later), false for Balancer (already transferred)
-        uint256 totalCoinbasePayment,
-        uint256 totalWethUnwrapped
-    ) internal view {
-        uint256 profitAfter = IERC20(profitTkn).balanceOf(address(this));
+    /// @dev Pure: `realizedProfit` already accounts for the flashloan obligation,
+    /// and `totalCoinbasePayment` is the on-chain bps-derived sum already paid.
+    /// The `> realizedProfit` branch is defensive against multiple coinbase
+    /// actions whose bps sum exceeds 100% (each per-action bps is <= 10000,
+    /// but nothing blocks operators from stacking them).
+    function _checkProfit(uint256 realizedProfit, uint256 totalCoinbasePayment, uint256 minProfitAmount) internal pure {
+        if (totalCoinbasePayment > realizedProfit) {
+            revert CoinbaseExceedsProfit(totalCoinbasePayment, realizedProfit);
+        }
         uint256 effectiveProfit;
-
-        if (profitTkn == asset) {
-            if (repayPending) {
-                // Aave: profitBefore includes principal; profitAfter still includes repayAmount (pool pulls later)
-                effectiveProfit = profitAfter + principalAmount > profitBefore + repayAmount
-                    ? profitAfter + principalAmount - profitBefore - repayAmount
-                    : 0;
-            } else {
-                // Balancer: repayAmount already transferred out; profitBefore included principal
-                effectiveProfit =
-                    profitAfter + principalAmount > profitBefore ? profitAfter + principalAmount - profitBefore : 0;
-            }
-        } else {
-            effectiveProfit = profitAfter > profitBefore ? profitAfter - profitBefore : 0;
+        unchecked {
+            effectiveProfit = realizedProfit - totalCoinbasePayment;
         }
-
-        // Coinbase payment accounting: always deduct the cost NOT already in the ERC20 delta.
-        // - WETH unwrapped: already reduced profitAfter (in delta), no additional deduction needed.
-        // - Pre-existing ETH: NOT in the ERC20 delta, MUST be deducted explicitly.
-        // Formula: deduct = totalCoinbasePayment - totalWethUnwrapped (the native ETH portion).
-        if (totalCoinbasePayment > 0) {
-            uint256 costNotInDelta =
-                totalCoinbasePayment > totalWethUnwrapped ? totalCoinbasePayment - totalWethUnwrapped : 0;
-            effectiveProfit = effectiveProfit > costNotInDelta ? effectiveProfit - costNotInDelta : 0;
-        }
-
         if (effectiveProfit < minProfitAmount) revert InsufficientProfit(effectiveProfit, minProfitAmount);
     }
 
     // ─── Internal: Execute Swap Plan ─────────────────────────────────
-    /// @dev Dispatches swap by mode, validates absolute repay balance covers flash loan obligation.
-    /// Uses absolute balance (not delta) because partial liquidations may leave residual loanToken
-    /// that legitimately contributes to repayment.
+    /// @dev Dispatches swap by mode, validates delta-based repay balance covers flash loan obligation.
+    /// `collateralDelta` is the net underlying-asset increase produced by the
+    /// current execute() invocation (post-liquidation, post-aToken-unwrap),
+    /// consumed only by UNI_V2/V3 when useFullBalance=true.
     function _executeSwapPlan(
         SwapPlan memory plan,
         uint256 flashRepayAmount,
-        address /* collateralAsset */
+        address, /* collateralAsset */
+        uint256 collateralDelta
     )
         internal
     {
@@ -912,65 +877,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
         uint256 repayBefore = IERC20(plan.repayToken).balanceOf(address(this));
 
-        // Snapshot leg2 intermediate token BEFORE leg1 (for tracked leftover)
-        uint256 leg2InBefore;
-        if (plan.hasLeg2) {
-            leg2InBefore = IERC20(plan.leg2TokenIn).balanceOf(address(this));
-        }
-
         if (plan.mode == SwapMode.PARASWAP_SINGLE) {
             _executeParaswapSingle(plan);
         } else if (plan.mode == SwapMode.BEBOP_MULTI) {
             _executeBebopMulti(plan, repayBefore);
-        } else if (plan.mode == SwapMode.UNIVERSAL_ROUTER) {
-            address tokenOut = plan.hasLeg2 ? plan.leg2TokenIn : plan.repayToken;
-            _executeUniversalRouterSwap(
-                plan.srcToken,
-                tokenOut,
-                plan.amountIn,
-                plan.minSwapOutput,
-                plan.universalCommands,
-                plan.universalInputs,
-                plan.deadline
-            );
+        } else if (plan.mode == SwapMode.UNI_V2) {
+            _executeUniV2(plan, collateralDelta);
+        } else if (plan.mode == SwapMode.UNI_V3) {
+            _executeUniV3(plan, collateralDelta);
+        } else if (plan.mode == SwapMode.UNI_V4) {
+            _executeUniV4(plan, collateralDelta);
         } else {
             revert InvalidSwapMode();
-        }
-
-        if (plan.hasLeg2) {
-            // Safe tracked leftover: never underflow if leg1 net-reduced leg2TokenIn.
-            // Use ZeroSwapInput to surface the condition explicitly.
-            uint256 leg2InAfter = IERC20(plan.leg2TokenIn).balanceOf(address(this));
-            uint256 trackedLeftover = leg2InAfter > leg2InBefore ? leg2InAfter - leg2InBefore : 0;
-            if (trackedLeftover == 0) revert ZeroSwapInput();
-
-            // REQUIRED INPUT SHAPE: leg2Inputs[0] must abi-encode
-            //   (address tokenIn, uint256 amountIn, address tokenOut)
-            // i.e. word0=tokenIn, word1=amountIn, word2=tokenOut. The executor
-            // decodes inputs[0], asserts the tokens match the plan, and only
-            // then patches word1 (byte offset 32 in data → 0x40 from pointer)
-            // with the tracked leftover. execute() enforces length >= 96.
-            bytes memory input0 = plan.leg2Inputs[0];
-            (address decodedTokenIn,, address decodedTokenOut) = abi.decode(input0, (address, uint256, address));
-            if (decodedTokenIn != plan.leg2TokenIn) {
-                revert Leg2TokenMismatch(plan.leg2TokenIn, decodedTokenIn);
-            }
-            if (decodedTokenOut != plan.leg2TokenOut) {
-                revert Leg2TokenMismatch(plan.leg2TokenOut, decodedTokenOut);
-            }
-            assembly {
-                mstore(add(input0, 0x40), trackedLeftover)
-            }
-
-            _executeUniversalRouterSwap(
-                plan.leg2TokenIn,
-                plan.leg2TokenOut,
-                trackedLeftover,
-                plan.leg2MinAmountOut,
-                plan.leg2Commands,
-                plan.leg2Inputs,
-                plan.deadline
-            );
         }
 
         // Delta-based repay check: swap output alone must cover the flashloan
@@ -982,35 +900,17 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
     }
 
-    /// @dev True when `cmd` (low 6 bits, flag bit stripped) identifies one of
-    /// the two supported Universal Router exact-input swap commands. Used by
-    /// leg2 validation — leg2 must be a single UR swap, never WRAP_ETH,
-    /// UNWRAP_WETH, PERMIT2_TRANSFER_FROM, SWEEP, PAY_PORTION, an ExactOut
-    /// variant, or any other UR command.
-    function _isSupportedURExactIn(bytes1 cmd) internal pure returns (bool) {
-        uint8 c = uint8(cmd) & UR_COMMAND_MASK;
-        return c == UR_V3_SWAP_EXACT_IN || c == UR_V2_SWAP_EXACT_IN;
-    }
-
     // ─── Internal: Paraswap Single ───────────────────────────────────
     function _executeParaswapSingle(SwapPlan memory plan) internal {
         if (plan.srcToken == address(0)) revert ZeroAddress();
-        if (plan.amountIn == 0) revert InvalidPlan();
+        if (plan.amountIn == 0) revert ZeroAmountIn();
 
-        (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut) =
+        (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut, bool isExactIn) =
             _executeParaswapCall(plan.paraswapCalldata);
 
         if (srcToken != plan.srcToken) revert ParaswapSrcTokenMismatch(plan.srcToken, srcToken);
 
-        // For ExactIn (generic OR optimized): actual consumed must equal declared.
-        // For ExactOut (generic OR optimized): actual consumed must be <= declared max.
-        bytes4 selector;
-        bytes memory cd = plan.paraswapCalldata;
-        assembly {
-            selector := mload(add(cd, 32))
-        }
-        ParaswapSelectorKind kind = _classifyParaswapSelector(selector);
-        if (_isExactIn(kind)) {
+        if (isExactIn) {
             // ExactIn (any family): consumed must equal declared.
             if (amountIn != plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
         } else {
@@ -1018,11 +918,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             if (amountIn > plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
         }
 
-        if (plan.hasLeg2) {
-            if (dstToken != plan.leg2TokenIn) revert ParaswapDstTokenUnexpected(dstToken);
-        } else {
-            if (dstToken != plan.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
-        }
+        if (dstToken != plan.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
 
         emit ParaswapSwapExecuted(srcToken, dstToken, amountIn, amountOut);
     }
@@ -1035,7 +931,7 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (target.code.length == 0) revert BebopTargetNotContract();
         if (!allowedTargets[target]) revert TargetNotAllowed(target);
         if (plan.srcToken == address(0)) revert ZeroAddress();
-        if (plan.amountIn == 0) revert InvalidPlan();
+        if (plan.amountIn == 0) revert ZeroAmountIn();
         if (plan.bebopCalldata.length < 4) revert InvalidBebopCalldata();
 
         uint256 srcBal = IERC20(plan.srcToken).balanceOf(address(this));
@@ -1058,6 +954,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         // Repay sufficiency is checked by _executeSwapPlan via absolute balance.
         uint256 repayAfter = IERC20(plan.repayToken).balanceOf(address(this));
         uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
+        // Bebop has no mode-local minAmountOut; fail closed on zero output so a
+        // silent 0-delivery Bebop call cannot slip through when minProfitAmount
+        // is also 0 (the aggregate repay check catches it only transitively).
+        if (repayDelta == 0) revert ZeroRepayOutput();
         uint256 profitDelta;
         if (plan.repayToken == plan.profitToken) {
             profitDelta = repayDelta;
@@ -1069,39 +969,239 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         emit BebopSwapExecuted(target, plan.srcToken, plan.amountIn, repayDelta, profitDelta);
     }
 
-    // ─── Internal: Universal Router Swap ─────────────────────────────
-    /// @dev Executes a swap via the trusted Universal Router.
-    /// Caller must provide the exact amountIn (for leg2, this is the tracked leftover
-    /// with inputs[0] already patched at word 1).
-    function _executeUniversalRouterSwap(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        uint256 minAmountOut,
-        bytes memory commands,
-        bytes[] memory inputs,
-        uint256 deadline
-    ) internal {
-        address router = universalRouter;
-        if (router == address(0)) revert UniversalRouterNotSet();
-        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
-        if (amountIn == 0) revert InvalidPlan();
+    // ─── Internal: Uniswap V2 single-call swap ───────────────────────
+    /// @dev Executes `swapExactTokensForTokens` on the immutable V2 router.
+    /// Path endpoints are pinned to `plan.srcToken` and `plan.repayToken`
+    /// (also asserted up-front in `execute()`). When `useFullBalance=true`,
+    /// `amountIn` is the collateral delta produced by the current
+    /// execute() call — never a pre-existing balance.
+    function _executeUniV2(SwapPlan memory plan, uint256 collateralDelta) internal {
+        if (plan.srcToken == address(0)) revert ZeroAddress();
+        if (plan.repayToken == address(0)) revert ZeroAddress();
+
+        // Re-assert path shape (execute() already validated; this is the
+        // in-pipeline fail-closed check so no caller can reach here with a
+        // malformed path even if validation is skipped in the future).
+        uint256 pLen = plan.v2Path.length;
+        if (pLen < 2) revert InvalidV2Path();
+        if (plan.v2Path[0] != plan.srcToken) revert InvalidV2Path();
+        if (plan.v2Path[pLen - 1] != plan.repayToken) revert InvalidV2Path();
+        if (plan.minAmountOut == 0) revert InvalidPlan();
+
+        uint256 amountIn = plan.useFullBalance ? collateralDelta : plan.amountIn;
+        if (amountIn == 0) revert ZeroSwapInput();
+
+        uint256 srcBal = IERC20(plan.srcToken).balanceOf(address(this));
+        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
+
+        address router = uniV2Router;
+        uint256 outBefore = IERC20(plan.repayToken).balanceOf(address(this));
+
+        IERC20(plan.srcToken).forceApprove(router, amountIn);
+        IUniV2Router(router)
+            .swapExactTokensForTokens(amountIn, plan.minAmountOut, plan.v2Path, address(this), plan.deadline);
+        IERC20(plan.srcToken).forceApprove(router, 0);
+
+        uint256 received = IERC20(plan.repayToken).balanceOf(address(this)) - outBefore;
+        if (received < plan.minAmountOut) revert InsufficientRepayOutput(received, plan.minAmountOut);
+
+        emit UniV2SwapExecuted(plan.srcToken, plan.repayToken, amountIn, received);
+    }
+
+    // ─── Internal: Uniswap V3 single-hop swap ────────────────────────
+    /// @dev Executes `exactInputSingle` on the immutable V3 SwapRouter02.
+    /// Fee tier is restricted to the four canonical pools. A non-existent
+    /// pool reverts inside the router — no pre-call factory lookup needed.
+    function _executeUniV3(SwapPlan memory plan, uint256 collateralDelta) internal {
+        if (plan.srcToken == address(0)) revert ZeroAddress();
+        if (plan.repayToken == address(0)) revert ZeroAddress();
+
+        uint24 fee = plan.v3Fee;
+        if (fee != 100 && fee != 500 && fee != 3000 && fee != 10000) revert InvalidV3Fee(fee);
+        if (plan.minAmountOut == 0) revert InvalidPlan();
+
+        uint256 amountIn = plan.useFullBalance ? collateralDelta : plan.amountIn;
+        if (amountIn == 0) revert ZeroSwapInput();
+
+        uint256 srcBal = IERC20(plan.srcToken).balanceOf(address(this));
+        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
+
+        address router = uniV3Router;
+        uint256 outBefore = IERC20(plan.repayToken).balanceOf(address(this));
+
+        IERC20(plan.srcToken).forceApprove(router, amountIn);
+        IUniV3SwapRouter(router)
+            .exactInputSingle(
+                IUniV3SwapRouter.ExactInputSingleParams({
+                    tokenIn: plan.srcToken,
+                    tokenOut: plan.repayToken,
+                    fee: fee,
+                    recipient: address(this),
+                    amountIn: amountIn,
+                    amountOutMinimum: plan.minAmountOut,
+                    sqrtPriceLimitX96: 0
+                })
+            );
+        IERC20(plan.srcToken).forceApprove(router, 0);
+
+        uint256 received = IERC20(plan.repayToken).balanceOf(address(this)) - outBefore;
+        if (received < plan.minAmountOut) revert InsufficientRepayOutput(received, plan.minAmountOut);
+
+        emit UniV3SwapExecuted(plan.srcToken, plan.repayToken, fee, amountIn, received);
+    }
+
+    // ─── Internal: V4 plan validation (centralized fail-closed checks) ─
+    /// @dev Single source of truth for V4 preconditions. Called from both
+    /// `execute()` (fail-fast before flashloan) and `_executeUniV4` (defensive
+    /// re-check inside the pipeline). Returns the decoded PoolKey fields so
+    /// the caller can reuse them without re-decoding.
+    ///
+    /// PRODUCTION SCOPE — the V4 path is intentionally narrow:
+    ///   * single-hop only (one `swap()` call per execute())
+    ///   * exact-input only (amountSpecified negative, see unlockCallback)
+    ///   * ERC20 → ERC20 only (native ETH / Currency(0) is rejected)
+    ///   * tokenOut MUST equal plan.repayToken (no intermediate swaps)
+    ///   * hook MUST be address(0) or in `allowedV4Hooks`
+    /// Any widening of this scope requires new tests and a fresh review.
+    function _validateV4Plan(SwapPlan memory plan)
+        internal
+        view
+        returns (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook)
+    {
+        if (plan.srcToken == address(0)) revert ZeroAddress();
+        if (plan.repayToken == address(0)) revert ZeroAddress();
+        if (plan.minAmountOut == 0) revert InvalidPlan();
+
+        address pm = plan.v4PoolManager;
+        if (pm == address(0)) revert ZeroAddress();
+        if (!allowedTargets[pm]) revert TargetNotAllowed(pm);
+        if (plan.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
+
+        (tokenIn, tokenOut, fee, tickSpacing, hook) =
+            abi.decode(plan.v4SwapData, (address, address, uint24, int24, address));
+
+        // ERC20 → ERC20 only. V4 Currency(0) is native ETH; explicitly blocked
+        // because the executor's accounting assumes `IERC20.balanceOf` deltas.
+        if (tokenIn == address(0) || tokenOut == address(0)) revert InvalidV4NativeToken();
+
+        if (tokenIn != plan.srcToken) revert InvalidV4Data();
+        // Distinct error for the single most common operator misconfiguration
+        // (routing to profit token instead of repay token).
+        if (tokenOut != plan.repayToken) revert InvalidV4TokenOut(plan.repayToken, tokenOut);
+        if (tokenIn == tokenOut) revert InvalidV4Data();
+
+        // Reject clearly-broken PoolKey params. Canonical V4 pools require
+        // positive tickSpacing and a non-zero fee.
+        if (fee == 0 || tickSpacing <= 0) revert InvalidV4FeeOrSpacing();
+        // Explicitly reject dynamic-fee pools (V4 sets the high bit of `fee`
+        // for dynamic-fee pools — out of scope for this executor).
+        if (fee & 0x800000 != 0) revert InvalidV4Fee();
+
+        if (hook != address(0) && !allowedV4Hooks[hook]) revert V4HookNotAllowed(hook);
+    }
+
+    // ─── Internal: Uniswap V4 single-hop exact-input swap ────────────
+    /// @notice PRODUCTION SCOPE — the V4 path is intentionally narrow.
+    /// Supported: single-hop, exact-input, ERC20→ERC20, tokenOut == repayToken,
+    /// hook ∈ {address(0)} ∪ allowedV4Hooks. Everything else fails closed.
+    /// Widening this scope (multi-hop, ETH, exact-output, generic routing)
+    /// requires new tests and security review.
+    /// @dev Executes a single-hop exact-input swap via PoolManager's
+    /// unlock-callback pattern. Full validation already ran in `execute()`
+    /// via `_validateV4Plan`; this function re-decodes inline to keep the
+    /// runtime size down.
+    function _executeUniV4(SwapPlan memory plan, uint256 collateralDelta) internal {
+        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
+            abi.decode(plan.v4SwapData, (address, address, uint24, int24, address));
+
+        uint256 amountIn = plan.useFullBalance ? collateralDelta : plan.amountIn;
+        if (amountIn == 0) revert ZeroSwapInput();
+
+        uint256 srcBal = IERC20(tokenIn).balanceOf(address(this));
+        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
 
-        IERC20(tokenIn).forceApprove(router, amountIn);
-        {
-            (bool ok,) =
-                router.call(abi.encodeWithSelector(IUniversalRouter.execute.selector, commands, inputs, deadline));
-            if (!ok) revert UniversalRouterSwapFailed();
-        }
-        IERC20(tokenIn).forceApprove(router, 0);
+        address pm = plan.v4PoolManager;
+        _activeV4PoolManager = pm;
+        IPoolManager(pm).unlock(abi.encode(tokenIn, tokenOut, fee, tickSpacing, hook, amountIn));
+        _activeV4PoolManager = address(0);
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
-        if (received == 0) revert ZeroSwapOutput();
-        if (received < minAmountOut) revert InsufficientRepayOutput(received, minAmountOut);
+        if (received < plan.minAmountOut) revert InsufficientRepayOutput(received, plan.minAmountOut);
 
-        emit UniversalRouterSwapExecuted(tokenIn, tokenOut, amountIn, received);
+        emit UniV4SwapExecuted(tokenIn, tokenOut, fee, amountIn, received);
+    }
+
+    /// @inheritdoc IUnlockCallback
+    /// @notice PRODUCTION SCOPE — this callback implements exactly ONE shape:
+    ///   exact-input single-hop ERC20→ERC20 swap inside the flashloan pipeline.
+    /// @dev Three layers of protection against stray or adversarial calls:
+    ///   1. `ExecutionPhase.FlashLoanActive` — only valid inside execute()
+    ///   2. `_activeV4PoolManager != 0`     — only while `_executeUniV4` is mid-unlock
+    ///   3. `msg.sender == _activeV4PoolManager` — only the pinned PoolManager
+    /// BalanceDelta invariant: tokenInDelta < 0 (we owe) AND tokenOutDelta > 0
+    /// (we receive). Any other shape — including zero-output swaps, partial
+    /// settlement, or positive input — fails closed. Widening the callback
+    /// (multi-hop, native ETH, exact-output, hook-specific deltas) requires
+    /// new tests and security review.
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
+        address pm = _activeV4PoolManager;
+        // pm == 0 covered by the strict caller check below (msg.sender can never be 0).
+        if (msg.sender != pm) revert InvalidCallbackCaller();
+
+        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint256 amountIn) =
+            abi.decode(data, (address, address, uint24, int24, address, uint256));
+
+        // Defense-in-depth against a malicious/misconfigured PoolManager
+        // echoing modified data back to us: re-assert the hook whitelist
+        // against owner-curated state. tokenIn/tokenOut are NOT re-asserted
+        // here because `plan` is out of scope and adding storage is out of
+        // scope for this patch — tokenOut substitution is caught by the
+        // post-unlock `received` delta (computed against plan.repayToken) and
+        // the pipeline-level `repayDelta >= flashRepayAmount` gate.
+        if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
+
+        bool zeroForOne = tokenIn < tokenOut;
+        PoolKey memory key = PoolKey({
+            currency0: zeroForOne ? tokenIn : tokenOut,
+            currency1: zeroForOne ? tokenOut : tokenIn,
+            fee: fee,
+            tickSpacing: tickSpacing,
+            hooks: hook
+        });
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: -int256(amountIn),
+            sqrtPriceLimitX96: zeroForOne ? V4_MIN_SQRT_PRICE_LIMIT : V4_MAX_SQRT_PRICE_LIMIT
+        });
+
+        int256 swapDelta = IPoolManager(pm).swap(key, params, "");
+        int128 amount0 = int128(swapDelta >> 128);
+        int128 amount1 = int128(swapDelta);
+
+        int128 tokenInDelta = zeroForOne ? amount0 : amount1;
+        int128 tokenOutDelta = zeroForOne ? amount1 : amount0;
+
+        // Exact-input single-hop invariant: owe strictly positive tokenIn
+        // (tokenInDelta < 0), gain strictly positive tokenOut (tokenOutDelta > 0).
+        // Any other shape — including zero-output, positive-input, or partial
+        // settlement — fails closed. Strict `< 0` / `> 0` makes owedIn > 0
+        // and gainedOut > 0 by construction (no extra zero-guards needed).
+        if (tokenInDelta >= 0 || tokenOutDelta <= 0) revert V4UnexpectedDelta();
+
+        uint256 owedIn = uint256(int256(-tokenInDelta));
+        uint256 gainedOut = uint256(int256(tokenOutDelta));
+
+        IPoolManager(pm).sync(tokenIn);
+        IERC20(tokenIn).safeTransfer(pm, owedIn);
+        IPoolManager(pm).settle();
+
+        IPoolManager(pm).take(tokenOut, address(this), gainedOut);
+
+        return "";
     }
 
     // ─── Internal: Paraswap selector classification + decoders ───────
@@ -1112,366 +1212,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     /// (BalancerV2 direct, RFQ) return their dedicated reject kind so the caller
     /// can revert with `InvalidParaswapSelector(selector)`. Unknown selectors
     /// return `Unsupported`, which also reverts.
-    function _classifyParaswapSelector(bytes4 selector) internal pure returns (ParaswapSelectorKind) {
-        // Generic family (Paraswap router does the routing internally).
-        if (selector == _SWAP_EXACT_AMOUNT_IN) return ParaswapSelectorKind.ExactInGeneric;
-        if (selector == _SWAP_EXACT_AMOUNT_OUT) return ParaswapSelectorKind.ExactOutGeneric;
-        // UniswapV2 / V3 direct (tail-encoded UniV2Data / UniV3Data).
-        if (selector == _SWAP_EXACT_IN_UNI_V3) return ParaswapSelectorKind.UniswapV3ExactIn;
-        if (selector == _SWAP_EXACT_OUT_UNI_V3) return ParaswapSelectorKind.UniswapV3ExactOut;
-        if (selector == _SWAP_EXACT_IN_UNI_V2) return ParaswapSelectorKind.UniswapV2ExactIn;
-        if (selector == _SWAP_EXACT_OUT_UNI_V2) return ParaswapSelectorKind.UniswapV2ExactOut;
-        // Curve V1 / V2 direct (inline CurveV1Data / CurveV2Data — no ExactOut in V6.2).
-        if (selector == _SWAP_EXACT_IN_CURVE_V1) return ParaswapSelectorKind.CurveV1ExactIn;
-        if (selector == _SWAP_EXACT_IN_CURVE_V2) return ParaswapSelectorKind.CurveV2ExactIn;
-        // BalancerV2 direct: srcToken/dstToken extracted from bytes data blob.
-        if (selector == _SWAP_EXACT_IN_BALANCER_V2) return ParaswapSelectorKind.BalancerV2ExactIn;
-        if (selector == _SWAP_EXACT_OUT_BALANCER_V2) return ParaswapSelectorKind.BalancerV2ExactOut;
-        // Documented-reject: RFQ.
-        if (selector == _SWAP_RFQ_BATCH_FILL) return ParaswapSelectorKind.RFQ;
-        return ParaswapSelectorKind.Unsupported;
-    }
-
-    /// @dev True for any ExactIn-direction kind. Used by the orchestrator
-    /// to decide between strict "consumed == declared" (ExactIn) vs lenient
-    /// "consumed <= declared" (ExactOut) amount validation. Reject kinds
-    /// (BalancerV2Rejected, RFQ, Unsupported) never reach this function — the
-    /// orchestrator reverts before the ExactIn check — so they are not listed.
-    function _isExactIn(ParaswapSelectorKind kind) internal pure returns (bool) {
-        return kind == ParaswapSelectorKind.ExactInGeneric || kind == ParaswapSelectorKind.UniswapV2ExactIn
-            || kind == ParaswapSelectorKind.UniswapV3ExactIn || kind == ParaswapSelectorKind.CurveV1ExactIn
-            || kind == ParaswapSelectorKind.CurveV2ExactIn || kind == ParaswapSelectorKind.BalancerV2ExactIn;
-    }
-
-    /// @dev Decode the GenericData layout used by the generic Paraswap V6 selectors
-    /// (`swapExactAmountIn` / `swapExactAmountOut`). Argument layout after selector:
-    ///   args[0..32]   = address executor
-    ///   args[32..64]  = GenericData.srcToken
-    ///   args[64..96]  = GenericData.destToken
-    ///   args[96..128] = GenericData.fromAmount
-    ///   args[128..160]= GenericData.toAmount     ← minAmountOut for ExactIn
-    ///   args[160..192]= GenericData.quotedAmount
-    ///   args[192..224]= GenericData.metadata
-    ///   args[224..256]= GenericData.beneficiary
-    /// `cd` includes the 32-byte length prefix in memory, so absolute offsets add 36
-    /// (32 length + 4 selector) before the args block.
-    function _decodeParaswapGeneric(bytes memory cd)
-        internal
-        pure
-        returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut, address beneficiary)
-    {
-        if (cd.length < 260) {
-            revert InvalidParaswapCalldata();
-        }
-        assembly {
-            let p := add(cd, 36) // skip length prefix (32) + selector (4)
-            srcToken := and(mload(add(p, 32)), 0xffffffffffffffffffffffffffffffffffffffff)
-            dstToken := and(mload(add(p, 64)), 0xffffffffffffffffffffffffffffffffffffffff)
-            fromAmount := mload(add(p, 96))
-            minAmountOut := mload(add(p, 128))
-            beneficiary := and(mload(add(p, 224)), 0xffffffffffffffffffffffffffffffffffffffff)
-        }
-    }
-
-    /// @dev Decode the tail-encoded UniV2 / UniV3 layout. Both share `(srcToken,
-    /// destToken, fromAmount, toAmount, quotedAmount, metadata, beneficiary,
-    /// bytes pools)` — the trailing `bytes pools` makes the struct dynamic, so
-    /// the head holds an offset and the struct lives in the tail.
-    ///
-    /// Calldata after selector:
-    ///   args[0..32]    = offset_to_struct  (head[0])
-    ///   args[32..64]   = partnerAndFee     (head[1])
-    ///   args[64..96]   = offset_to_permit  (head[2])
-    /// Struct at args[offset_to_struct]:
-    ///   struct[0..32]    = srcToken
-    ///   struct[32..64]   = destToken
-    ///   struct[64..96]   = fromAmount
-    ///   struct[96..128]  = toAmount        ← minAmountOut for ExactIn / max for ExactOut
-    ///   struct[128..160] = quotedAmount
-    ///   struct[160..192] = metadata
-    ///   struct[192..224] = beneficiary
-    ///   struct[224..256] = offset_to_pools (rel. to struct start)
-    /// Pools data + permit data follow further in the tail.
-    ///
-    /// `cd` includes the 32-byte length prefix, so absolute offsets add 36
-    /// (32 length + 4 selector). Strict bounds: `structOffset` is word-aligned,
-    /// at least 96 (after the 3 head words), and the struct's 8 head words
-    /// (256 bytes) must fit inside `cd.length`.
-    function _decodeParaswapTailUniV2V3(bytes memory cd)
-        internal
-        pure
-        returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut, address beneficiary)
-    {
-        // Bare structural minimum: selector(4) + 3 head words (96) + 8 struct
-        // head words (256) = 356. The dynamic bound below catches larger
-        // structOffset values.
-        if (cd.length < 356) revert InvalidParaswapCalldata();
-
-        uint256 structOffset;
-        assembly {
-            structOffset := mload(add(cd, 36)) // first head word after selector
-        }
-        if (structOffset % 32 != 0) revert InvalidParaswapCalldata();
-        if (structOffset < 96) revert InvalidParaswapCalldata();
-        // The struct's 8 head words (256 bytes) must lie inside the args
-        // portion of cd. cd.length excludes the in-memory length prefix, and
-        // structOffset is relative to the args base (post-selector), so we
-        // need: 4 (selector) + structOffset + 256 <= cd.length.
-        if (4 + structOffset + 256 > cd.length) revert InvalidParaswapCalldata();
-
-        assembly {
-            let s := add(add(cd, 36), structOffset)
-            srcToken := and(mload(s), 0xffffffffffffffffffffffffffffffffffffffff)
-            dstToken := and(mload(add(s, 32)), 0xffffffffffffffffffffffffffffffffffffffff)
-            fromAmount := mload(add(s, 64))
-            minAmountOut := mload(add(s, 96))
-            beneficiary := and(mload(add(s, 192)), 0xffffffffffffffffffffffffffffffffffffffff)
-        }
-    }
-
-    /// @dev Decode the inline CurveV1Data layout (9 static fields, no dynamic
-    /// → struct inlines into the head). Calldata after selector:
-    ///   args[0..32]    = curveData     (uint256, packed pool address + flags)
-    ///   args[32..64]   = curveAssets   (uint256, packed i/j indices)
-    ///   args[64..96]   = srcToken
-    ///   args[96..128]  = destToken
-    ///   args[128..160] = fromAmount
-    ///   args[160..192] = toAmount      ← minAmountOut for ExactIn (no ExactOut on V6.2)
-    ///   args[192..224] = quotedAmount
-    ///   args[224..256] = metadata
-    ///   args[256..288] = beneficiary
-    ///   args[288..320] = partnerAndFee
-    ///   args[320..352] = offset_to_permit
-    ///   ... permit length + data in tail.
-    function _decodeParaswapInlineCurveV1(bytes memory cd)
-        internal
-        pure
-        returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut, address beneficiary)
-    {
-        // Last read is `beneficiary` at args[256..288], so min cd.length covers
-        // selector(4) + 9 struct words (288). 4 + 288 = 292.
-        if (cd.length < 292) revert InvalidParaswapCalldata();
-        assembly {
-            let p := add(cd, 36)
-            srcToken := and(mload(add(p, 64)), 0xffffffffffffffffffffffffffffffffffffffff)
-            dstToken := and(mload(add(p, 96)), 0xffffffffffffffffffffffffffffffffffffffff)
-            fromAmount := mload(add(p, 128))
-            minAmountOut := mload(add(p, 160))
-            beneficiary := and(mload(add(p, 256)), 0xffffffffffffffffffffffffffffffffffffffff)
-        }
-    }
-
-    /// @dev Decode the inline CurveV2Data layout (11 static fields, no dynamic).
-    /// Calldata after selector:
-    ///   args[0..32]    = curveData
-    ///   args[32..64]   = i
-    ///   args[64..96]   = j
-    ///   args[96..128]  = poolAddress
-    ///   args[128..160] = srcToken
-    ///   args[160..192] = destToken
-    ///   args[192..224] = fromAmount
-    ///   args[224..256] = toAmount      ← minAmountOut for ExactIn (no ExactOut on V6.2)
-    ///   args[256..288] = quotedAmount
-    ///   args[288..320] = metadata
-    ///   args[320..352] = beneficiary
-    ///   args[352..384] = partnerAndFee
-    ///   args[384..416] = offset_to_permit
-    ///   ... permit length + data in tail.
-    function _decodeParaswapInlineCurveV2(bytes memory cd)
-        internal
-        pure
-        returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut, address beneficiary)
-    {
-        // Last read is `beneficiary` at args[320..352], so min cd.length covers
-        // selector(4) + 11 struct words (352). 4 + 352 = 356.
-        if (cd.length < 356) revert InvalidParaswapCalldata();
-        assembly {
-            let p := add(cd, 36)
-            srcToken := and(mload(add(p, 128)), 0xffffffffffffffffffffffffffffffffffffffff)
-            dstToken := and(mload(add(p, 160)), 0xffffffffffffffffffffffffffffffffffffffff)
-            fromAmount := mload(add(p, 192))
-            minAmountOut := mload(add(p, 224))
-            beneficiary := and(mload(add(p, 320)), 0xffffffffffffffffffffffffffffffffffffffff)
-        }
-    }
-
-    /// @dev Decode BalancerV2 direct calldata. srcToken/dstToken parsed from the
-    /// `bytes data` param (raw Balancer Vault calldata). Matches Augustus V6.2
-    /// BalancerV2Utils._decodeBalancerV2Params, with strict bounds checks at
-    /// every user-controlled offset so malformed calldata can never drive an
-    /// `mload` outside the args region.
-    ///
-    /// All offsets in this function are "post-selector" — relative to `p := cd
-    /// + 36`. A 32-byte read at offset X is safe iff `4 + X + 32 <= cd.length`,
-    /// i.e. `X + 36 <= cd.length`.
-    function _decodeParaswapBalancerV2(bytes memory cd)
-        internal
-        pure
-        returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut, address beneficiary)
-    {
-        uint256 L = cd.length;
-        // Minimum to safely read the head fields up to `dataOff` at X = 224.
-        // 4 + 224 + 32 = 260 bytes; we keep the pre-existing 296 floor to match
-        // the selector+head+offsets layout of canonical Augustus V6.2 calldata.
-        if (L < 296) revert InvalidParaswapCalldata();
-
-        uint256 dataOff;
-        assembly {
-            let mask := 0xffffffffffffffffffffffffffffffffffffffff
-            let p := add(cd, 36)
-            fromAmount := mload(p)
-            minAmountOut := mload(add(p, 32))
-            beneficiary := and(mload(add(p, 128)), mask)
-            dataOff := mload(add(p, 224))
-        }
-
-        // Bound `dataOff`: we will read `dataLen` at post-selector offset
-        // `dataOff`, so `dataOff + 36 <= L`.
-        if (dataOff + 36 > L) revert InvalidParaswapCalldata();
-
-        uint256 dataLen;
-        assembly {
-            let p := add(cd, 36)
-            dataLen := mload(add(p, dataOff))
-        }
-
-        // Bound `dataLen`: the `bytes data` body lives at post-selector offsets
-        // `dataOff + 32 .. dataOff + 32 + dataLen`. Require the full body fits:
-        // `4 + dataOff + 32 + dataLen <= L`.
-        if (dataLen + dataOff + 36 > L) revert InvalidParaswapCalldata();
-
-        // Need at least a 4-byte Balancer selector inside the data blob.
-        if (dataLen < 4) revert InvalidParaswapCalldata();
-
-        uint256 vSel;
-        assembly {
-            let p := add(cd, 36)
-            let d := add(p, add(dataOff, 32))
-            vSel := shr(224, mload(d))
-        }
-
-        if (vSel == 0x52bbbe29) {
-            // swap(): reads 32 bytes at offsets d+292 (srcToken) and d+324
-            // (dstToken). The last byte read is d+355, so require
-            // dataLen >= 356.
-            if (dataLen < 356) revert InvalidParaswapCalldata();
-            assembly {
-                let mask := 0xffffffffffffffffffffffffffffffffffffffff
-                let p := add(cd, 36)
-                let d := add(p, add(dataOff, 32))
-                srcToken := and(mload(add(d, 292)), mask)
-                dstToken := and(mload(add(d, 324)), mask)
-            }
-        } else if (vSel == 0x945bcec9) {
-            // batchSwap(): reads kind at d+4, assetsOff at d+68, cnt at
-            // d+4+assetsOff, then first/last asset entries. Require each
-            // read's 32-byte window fits inside the data blob.
-            if (dataLen < 100) revert InvalidParaswapCalldata(); // kind + assetsOff covered
-
-            uint256 assetsOff;
-            uint256 kind;
-            assembly {
-                let p := add(cd, 36)
-                let d := add(p, add(dataOff, 32))
-                kind := mload(add(d, 4))
-                assetsOff := mload(add(d, 68))
-            }
-
-            // Need `cnt` word readable: end at d+4+assetsOff+32 ≤ d+dataLen.
-            if (assetsOff + 36 > dataLen) revert InvalidParaswapCalldata();
-
-            uint256 cnt;
-            assembly {
-                let p := add(cd, 36)
-                let d := add(p, add(dataOff, 32))
-                cnt := mload(add(d, add(4, assetsOff)))
-            }
-            if (cnt == 0) revert InvalidParaswapCalldata();
-            // Prevent `cnt * 32` overflow before bounds-checking.
-            if (cnt > type(uint256).max / 32) revert InvalidParaswapCalldata();
-
-            // first entry read ends at d + 4 + assetsOff + 64.
-            // last entry read ends at d + 4 + assetsOff + cnt*32 + 32.
-            // The stricter bound is the last read: must stay inside dataLen.
-            uint256 lastEnd = 4 + assetsOff + cnt * 32 + 32;
-            if (lastEnd > dataLen) revert InvalidParaswapCalldata();
-
-            assembly {
-                let mask := 0xffffffffffffffffffffffffffffffffffffffff
-                let p := add(cd, 36)
-                let d := add(p, add(dataOff, 32))
-                let first := and(mload(add(d, add(4, add(assetsOff, 32)))), mask)
-                let last := and(mload(add(d, add(4, add(assetsOff, mul(cnt, 32))))), mask)
-                switch eq(kind, 1)
-                case 1 {
-                    srcToken := last
-                    dstToken := first
-                }
-                default {
-                    srcToken := first
-                    dstToken := last
-                }
-            }
-        } else {
-            revert InvalidParaswapCalldata();
-        }
-    }
-
     // ─── Internal: Decode + validate Paraswap calldata ───────────────
-    /// @dev Single entry that classifies the selector, routes to the correct decoder,
-    /// and applies the universal validation rules. Returning the decoded tuple lets
-    /// the orchestrator stay below Solidity's 16-slot stack limit. Reverts on:
-    ///   - calldata too short to even read the selector
-    ///   - selector not in the explicit whitelist (`InvalidParaswapSelector`)
-    ///   - beneficiary not in {address(this), address(0)}
-    ///   - srcToken / dstToken == address(0)
+    /// @dev Thin wrapper around `ParaswapDecoderLib.decodeAndValidate`. All
+    /// bulk decoding + classification lives in the library (DELEGATECALL)
+    /// to keep this contract under EIP-170. Returns `isExactIn` so the
+    /// orchestrator can pick strict vs lenient amount-in validation.
     function _decodeAndValidateParaswap(bytes memory cd)
         internal
         view
-        returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut)
+        returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut, bool isExactIn)
     {
-        if (cd.length < 4) revert InvalidParaswapCalldata();
-        bytes4 selector;
-        assembly {
-            selector := mload(add(cd, 32))
-        }
-        ParaswapSelectorKind kind = _classifyParaswapSelector(selector);
-        // Documented-reject + unknown selectors all revert with the same error.
-        // Each is kept as a distinct enum variant so the classifier coverage test
-        // can assert the *reason* a selector is rejected.
-        if (kind == ParaswapSelectorKind.Unsupported || kind == ParaswapSelectorKind.RFQ) {
-            revert InvalidParaswapSelector(selector);
-        }
-
-        address beneficiary;
-        if (kind == ParaswapSelectorKind.ExactInGeneric || kind == ParaswapSelectorKind.ExactOutGeneric) {
-            (srcToken, dstToken, fromAmount, minAmountOut, beneficiary) = _decodeParaswapGeneric(cd);
-        } else if (
-            kind == ParaswapSelectorKind.UniswapV2ExactIn || kind == ParaswapSelectorKind.UniswapV2ExactOut
-                || kind == ParaswapSelectorKind.UniswapV3ExactIn || kind == ParaswapSelectorKind.UniswapV3ExactOut
-        ) {
-            (srcToken, dstToken, fromAmount, minAmountOut, beneficiary) = _decodeParaswapTailUniV2V3(cd);
-        } else if (kind == ParaswapSelectorKind.CurveV1ExactIn) {
-            (srcToken, dstToken, fromAmount, minAmountOut, beneficiary) = _decodeParaswapInlineCurveV1(cd);
-        } else if (kind == ParaswapSelectorKind.CurveV2ExactIn) {
-            (srcToken, dstToken, fromAmount, minAmountOut, beneficiary) = _decodeParaswapInlineCurveV2(cd);
-        } else if (kind == ParaswapSelectorKind.BalancerV2ExactIn || kind == ParaswapSelectorKind.BalancerV2ExactOut) {
-            (srcToken, dstToken, fromAmount, minAmountOut, beneficiary) = _decodeParaswapBalancerV2(cd);
-        } else {
-            // Unreachable: every accepted kind is covered above and every reject
-            // kind is handled before this branch. Defensive revert in case a future
-            // enum variant is added without a decoder.
-            revert InvalidParaswapSelector(selector);
-        }
-
-        // Paraswap V6 sometimes omits the beneficiary write when it equals the
-        // caller, so the slot reads back as address(0). Treat as equivalent to
-        // address(this); reject anything else.
-        if (beneficiary != address(this) && beneficiary != address(0)) {
-            revert SwapRecipientInvalid(beneficiary);
-        }
-        if (srcToken == address(0)) revert ZeroAddress();
-        if (dstToken == address(0)) revert ZeroAddress();
+        (srcToken, dstToken, fromAmount, minAmountOut, isExactIn) =
+            ParaswapDecoderLib.decodeAndValidate(cd, address(this));
     }
 
     // ─── Internal: Execute Single Paraswap Call ──────────────────────
@@ -1483,10 +1235,10 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     /// cannot silently let a bad swap through.
     function _executeParaswapCall(bytes memory cd)
         internal
-        returns (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut)
+        returns (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut, bool isExactIn)
     {
         uint256 minAmountOut;
-        (srcToken, dstToken, amountIn, minAmountOut) = _decodeAndValidateParaswap(cd);
+        (srcToken, dstToken, amountIn, minAmountOut, isExactIn) = _decodeAndValidateParaswap(cd);
 
         address augustus = paraswapAugustusV6;
         if (augustus == address(0)) revert ZeroAddress();
@@ -1627,11 +1379,20 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     }
 
     // ─── Internal: Execute Internal Action ──────────────────────────
-    /// @dev Centralized dispatch for PROTOCOL_INTERNAL actions.
-    /// Only supports ACTION_PAY_COINBASE. Returns coinbase payment accounting.
-    function _executeInternalAction(bytes memory actionData, address profitToken)
+    /// @dev Centralized dispatch for PROTOCOL_INTERNAL actions. Only
+    /// ACTION_PAY_COINBASE is defined.
+    ///
+    /// ACTION_PAY_COINBASE amount is interpreted as basis points (0..10000)
+    /// over realized on-chain profit, not as an absolute payment amount.
+    /// The operator specifies a percentage; the contract sizes the actual
+    /// bid from the on-chain-computed `realizedProfit` snapshot taken
+    /// between swap completion and any coinbase payment.
+    ///
+    /// No-ops (returns 0, no transfer) when `realizedProfit == 0` or
+    /// `coinbaseBps == 0` — consistent behaviour in both degenerate cases.
+    function _executeInternalAction(bytes memory actionData, address profitToken, uint256 realizedProfit)
         internal
-        returns (uint256 coinbasePaid, uint256 wethUnwrapped)
+        returns (uint256 coinbasePaid)
     {
         uint8 actionType = abi.decode(actionData, (uint8));
 
@@ -1639,18 +1400,24 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             // Coinbase payment is ETH-denominated — only valid when profit is in WETH
             if (profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
 
-            (, uint256 amount) = abi.decode(actionData, (uint8, uint256));
-            wethUnwrapped = _payCoinbase(amount);
-            coinbasePaid = amount;
+            (, uint256 coinbaseBps) = abi.decode(actionData, (uint8, uint256));
+            if (coinbaseBps > 10_000) revert InvalidCoinbaseBps();
+
+            if (realizedProfit == 0 || coinbaseBps == 0) return 0;
+
+            coinbasePaid = realizedProfit * coinbaseBps / 10_000;
+            if (coinbasePaid > 0) {
+                _payCoinbase(coinbasePaid);
+            }
         } else {
             revert InvalidAction(actionType);
         }
     }
 
-    /// @dev Send ETH to block.coinbase. Only reachable when profitToken == weth (enforced by caller).
-    /// Auto-unwraps WETH if insufficient ETH. Returns the amount unwrapped (for profit accounting).
-    function _payCoinbase(uint256 amount) internal returns (uint256 wethUnwrapped) {
-        if (amount == 0) return 0;
+    /// @dev Send ETH to block.coinbase. Only reachable when profitToken == weth
+    /// (enforced by caller). Auto-unwraps WETH if insufficient ETH.
+    function _payCoinbase(uint256 amount) internal {
+        if (amount == 0) return;
         if (block.coinbase == address(0)) revert InvalidCoinbase();
 
         // Auto-unwrap WETH if insufficient ETH
@@ -1662,14 +1429,16 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
                 uint256 toUnwrap = deficit < wethBal ? deficit : wethBal;
                 if (toUnwrap > 0) {
                     IWETH(wethAddr).withdraw(toUnwrap);
-                    wethUnwrapped = toUnwrap;
                 }
             }
         }
 
         if (address(this).balance < amount) revert InsufficientEth(amount, address(this).balance);
 
-        (bool success,) = block.coinbase.call{value: amount}("");
+        // Gas-capped transfer: bounds work a hostile block.coinbase can perform
+        // in the receive fallback. ETH transfer to any well-behaved EOA or
+        // builder contract completes in <2300 gas; 10_000 is ample slack.
+        (bool success,) = block.coinbase.call{value: amount, gas: COINBASE_CALL_GAS}("");
         if (!success) revert CoinbasePaymentFailed();
 
         emit CoinbasePaid(block.coinbase, amount);
