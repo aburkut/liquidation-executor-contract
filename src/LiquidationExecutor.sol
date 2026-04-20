@@ -117,6 +117,7 @@ contract LiquidationExecutor is
     error InvalidV4FeeOrSpacing();
     error V4HookNotAllowed(address hook);
     error V4UnexpectedDelta();
+    error InvalidV4CallbackHook();
 
     // Profit / payment errors
     error InsufficientProfit(uint256 actual, uint256 required);
@@ -1152,6 +1153,15 @@ contract LiquidationExecutor is
 
         (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint256 amountIn) =
             abi.decode(data, (address, address, uint24, int24, address, uint256));
+
+        // Defense-in-depth against a malicious/misconfigured PoolManager
+        // echoing modified data back to us: re-assert the hook whitelist
+        // against owner-curated state. tokenIn/tokenOut are NOT re-asserted
+        // here because `plan` is out of scope and adding storage is out of
+        // scope for this patch — tokenOut substitution is caught by the
+        // post-unlock `received` delta (computed against plan.repayToken) and
+        // the pipeline-level `repayDelta >= flashRepayAmount` gate.
+        if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
 
         bool zeroForOne = tokenIn < tokenOut;
         PoolKey memory key = PoolKey({
