@@ -24,7 +24,14 @@
       "Bash(claude plugin *)",
       "Read(//Users/alexanderburkut/.claude/**)",
       "Read(//Users/alexanderburkut/**)",
-      "Bash(wait)"
+      "Bash(wait)",
+      "Bash(awk 'NR>=5232 && NR<=5540 && /function test_|\\\\/\\\\/ ═|\\\\/\\\\/ ─/' /Users/alexanderburkut/workspace/liquidation-executor-contract/test/Executor.t.sol)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(forge inspect *)",
+      "Bash(forge clean *)",
+      "Bash(gh run *)",
+      "Bash(forge fmt *)"
     ]
   }
 }
