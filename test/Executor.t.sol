@@ -20,6 +20,7 @@ import {MockBebopSettlement} from "./mocks/MockBebopSettlement.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockUniV2Router} from "./mocks/MockUniV2Router.sol";
 import {MockUniV3Router} from "./mocks/MockUniV3Router.sol";
+import {MockV4PoolManager} from "./mocks/MockV4PoolManager.sol";
 
 /// Test-only struct mirroring Augustus V6.2 UniswapV2Data / UniswapV3Data. Both
 /// real V6.2 structs share this exact 8-field shape (`bytes pools` makes the
@@ -96,6 +97,7 @@ contract ExecutorTest is Test {
     MockMorphoBlue public morphoBlue;
     MockUniV2Router public uniV2Mock;
     MockUniV3Router public uniV3Mock;
+    MockV4PoolManager public uniV4Mock;
 
     address public owner = address(0xA11CE);
     address public operatorAddr = address(0xB0B);
@@ -189,13 +191,15 @@ contract ExecutorTest is Test {
         aToken = new MockERC20("aToken", "aWETH", 18);
         uniV2Mock = new MockUniV2Router(SWAP_RATE);
         uniV3Mock = new MockUniV3Router(SWAP_RATE);
+        uniV4Mock = new MockV4PoolManager(SWAP_RATE);
 
-        address[] memory targets = new address[](5);
+        address[] memory targets = new address[](6);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(aaveV2Pool);
         targets[3] = address(bebop);
         targets[4] = address(morphoBlue);
+        targets[5] = address(uniV4Mock);
 
         executor = new LiquidationExecutor(
             owner,
@@ -258,6 +262,12 @@ contract ExecutorTest is Test {
         collateralToken.mint(address(uniV3Mock), 100_000e18);
         profitToken.mint(address(uniV3Mock), 100_000e18);
         mockWeth.mint(address(uniV3Mock), 100_000e18);
+
+        // Fund UniV4 PoolManager mock with output tokens
+        loanToken.mint(address(uniV4Mock), 100_000e18);
+        collateralToken.mint(address(uniV4Mock), 100_000e18);
+        profitToken.mint(address(uniV4Mock), 100_000e18);
+        mockWeth.mint(address(uniV4Mock), 100_000e18);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────
@@ -490,7 +500,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
     }
 
@@ -517,7 +529,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
     }
 
@@ -545,7 +559,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: path,
             minAmountOut: minOut,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
     }
 
@@ -571,7 +587,40 @@ contract ExecutorTest is Test {
             v3Fee: fee,
             v2Path: new address[](0),
             minAmountOut: minOut,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
+        });
+    }
+
+    function _buildUniV4SwapPlan(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint24 fee,
+        int24 tickSpacing,
+        address hook,
+        address poolManager,
+        uint256 minOut,
+        uint256 minProfitAmt
+    ) internal view returns (LiquidationExecutor.SwapPlan memory) {
+        return LiquidationExecutor.SwapPlan({
+            mode: LiquidationExecutor.SwapMode.UNI_V4,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            repayToken: dstToken,
+            profitToken: dstToken,
+            minProfitAmount: minProfitAmt,
+            v3Fee: 0,
+            v2Path: new address[](0),
+            minAmountOut: minOut,
+            useFullBalance: false,
+            v4PoolManager: poolManager,
+            v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook)
         });
     }
 
@@ -938,11 +987,13 @@ contract ExecutorTest is Test {
         bytes32 planHash = keccak256(planBytes);
 
         // Storage layout (forge inspect LiquidationExecutor storage):
-        //   slot 9  = _activePlanHash    (bytes32)
-        //   slot 10 = _executionPhase    (uint8 enum, low byte)
+        //   slot 10 = _activePlanHash       (bytes32)
+        //   slot 11 = _activeV4PoolManager  (address, offset 0)
+        //            _executionPhase        (uint8 enum, offset 20)
         // Force both into the "during flashloan" state so neither guard short-circuits.
-        vm.store(address(executor), bytes32(uint256(9)), planHash);
-        vm.store(address(executor), bytes32(uint256(10)), bytes32(uint256(1))); // FlashLoanActive
+        // Byte at offset 20 (Solidity) corresponds to bit 160 of the uint256 slot.
+        vm.store(address(executor), bytes32(uint256(10)), planHash);
+        vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive
 
         // Attacker (not the registered Morpho provider) hits the callback. The phase
         // and hash gates pass; only the caller check should reject.
@@ -1044,7 +1095,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -1134,7 +1187,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -1931,7 +1986,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -1979,7 +2036,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2014,7 +2073,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2053,7 +2114,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2087,7 +2150,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2119,7 +2184,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2151,7 +2218,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2184,7 +2253,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2224,7 +2295,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2259,7 +2332,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2291,7 +2366,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2323,7 +2400,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2352,7 +2431,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2390,7 +2471,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2418,7 +2501,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2450,7 +2535,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2496,7 +2583,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2588,7 +2677,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2667,7 +2758,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2740,7 +2833,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -2830,7 +2925,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan = _buildPlan(2, address(loanToken), totalDebt, flashFee, actions, swapPlan);
@@ -2913,7 +3010,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan = _buildPlan(2, address(loanToken), debtToCover * 2, flashFee, actions, swapPlan);
@@ -3170,7 +3269,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan = _buildPlan(
@@ -3564,7 +3665,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -3674,7 +3777,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -4339,7 +4444,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -4549,7 +4656,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4578,7 +4687,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4611,7 +4722,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4649,7 +4762,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4677,7 +4792,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4721,7 +4838,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -4753,7 +4872,9 @@ contract ExecutorTest is Test {
             v3Fee: 0,
             v2Path: new address[](0),
             minAmountOut: 0,
-            useFullBalance: false
+            useFullBalance: false,
+            v4PoolManager: address(0),
+            v4SwapData: ""
         });
 
         bytes memory plan =
@@ -5061,6 +5182,252 @@ contract ExecutorTest is Test {
             0,
             "V3 router allowance must be zero after swap"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // UNISWAP V4 SWAP TESTS
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_UniV4_singleHop_happyPath() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "profit remained after V4 swap");
+    }
+
+    function test_UniV4_invalidDecode_shortData_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+        swapPlan.v4SwapData = hex"aabbcc"; // 3 bytes — far under the required 160
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidV4Data.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_invalidDecode_tokenMismatch_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+        // Re-encode with the wrong tokenIn so the strict check fires.
+        swapPlan.v4SwapData = abi.encode(address(profitToken), address(loanToken), uint24(3000), int24(60), address(0));
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidV4Data.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_invalidHook_reverts() public {
+        address rogueHook = address(0x1234);
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            rogueHook,
+            address(uniV4Mock),
+            1,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.V4HookNotAllowed.selector, rogueHook));
+        executor.execute(plan);
+    }
+
+    function test_UniV4_whitelistedHook_succeeds() public {
+        address allowedHook = address(0x5678);
+        vm.prank(owner);
+        executor.setV4HookAllowed(allowedHook, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            allowedHook,
+            address(uniV4Mock),
+            1,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_insufficientOutput_reverts() public {
+        uniV4Mock.setRate(0.5e18); // output below minAmountOut below
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            DEFAULT_SWAP_AMOUNT, // require 1000e18 out; rate 0.5 produces 500e18
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+
+        uniV4Mock.setRate(SWAP_RATE);
+    }
+
+    function test_UniV4_poolManagerNotAllowed_reverts() public {
+        MockV4PoolManager stranger = new MockV4PoolManager(SWAP_RATE);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(stranger),
+            1,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, address(stranger)));
+        executor.execute(plan);
+    }
+
+    function test_UniV4_zeroPoolManager_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+        swapPlan.v4PoolManager = address(0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_minAmountOutZero_reverts() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            0,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_zeroOutput_reverts() public {
+        // Mock swap() returns a zero-output delta → tokenOutDelta <= 0 trips
+        // V4UnexpectedDelta inside unlockCallback.
+        uniV4Mock.setZeroOut(true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.V4UnexpectedDelta.selector);
+        executor.execute(plan);
+
+        uniV4Mock.setZeroOut(false);
+    }
+
+    function test_UniV4_unlockCallback_directlyRejected() public {
+        // No active unlock → _activeV4PoolManager == 0 → revert V4CallbackInactive.
+        vm.expectRevert(LiquidationExecutor.InvalidExecutionPhase.selector);
+        executor.unlockCallback("");
+    }
+
+    function test_setV4HookAllowed_onlyOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        executor.setV4HookAllowed(address(0x5678), true);
+    }
+
+    function test_setV4HookAllowed_rejectsZero() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.setV4HookAllowed(address(0), true);
     }
 }
 

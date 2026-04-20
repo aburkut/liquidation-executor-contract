@@ -13,6 +13,7 @@ import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 import {IMorphoBlue, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/IMorphoBlue.sol";
 import {IUniV2Router} from "./interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "./interfaces/IUniV3SwapRouter.sol";
+import {IPoolManager, IUnlockCallback, PoolKey, SwapParams} from "./interfaces/IPoolManager.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -22,8 +23,16 @@ interface IWETH {
 /// @notice Flashloan + multi-swap + liquidation executor.
 /// @dev Fail-closed. No upgradeability. External calls restricted to allowedTargets allowlist.
 /// Supports Paraswap single swaps, Bebop multi-output swaps, and deterministic
-/// on-chain fallback swaps via Uniswap V2 and Uniswap V3 (SwapRouter02).
-contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecipient, IMorphoFlashLoanCallback {
+/// on-chain fallback swaps via Uniswap V2, V3 (SwapRouter02), and V4 (PoolManager
+/// unlock-callback pattern, strict single-hop exact-input mode only).
+contract LiquidationExecutor is
+    Ownable2Step,
+    Pausable,
+    ReentrancyGuard,
+    IFlashLoanRecipient,
+    IMorphoFlashLoanCallback,
+    IUnlockCallback
+{
     using SafeERC20 for IERC20;
 
     // ─── Custom Errors ───────────────────────────────────────────────
@@ -94,10 +103,14 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     error BebopTargetNotContract();
     error BebopSwapFailed();
 
-    // Uniswap V2 / V3 swap errors
+    // Uniswap V2 / V3 / V4 swap errors
     error ZeroSwapInput();
     error InvalidV2Path();
     error InvalidV3Fee(uint24 fee);
+    error InvalidV4Data();
+    error V4HookNotAllowed(address hook);
+    error V4UnexpectedDelta();
+    error V4CallbackInactive();
 
     // Profit / payment errors
     error InsufficientProfit(uint256 actual, uint256 required);
@@ -123,6 +136,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     /// @dev Gas limit on coinbase ETH transfers. Small bound keeps a
     /// malicious block.coinbase from grinding gas in the callback.
     uint256 private constant COINBASE_CALL_GAS = 10_000;
+
+    /// @dev Uniswap V4 sqrt price limits, set one tick inside the allowed
+    /// range so the swap is unconstrained by price (slippage is enforced
+    /// by the output delta check against `plan.minAmountOut`).
+    /// Reference: v4-core TickMath.MIN_SQRT_PRICE / MAX_SQRT_PRICE.
+    uint160 private constant V4_MIN_SQRT_PRICE_LIMIT = 4_295_128_740;
+    uint160 private constant V4_MAX_SQRT_PRICE_LIMIT =
+        1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261;
+
+    /// @dev Strict size of encoded v4SwapData: 5 × 32-byte words
+    /// (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook).
+    uint256 private constant V4_SWAP_DATA_LENGTH = 160;
 
     /// @dev Paraswap Augustus V6 supported selectors.
     ///
@@ -259,8 +284,20 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
 
     mapping(uint8 => address) public allowedFlashProviders;
     mapping(address => bool) public allowedTargets;
+    /// @dev Owner-curated whitelist of V4 hook contracts. A V4 swap whose
+    /// PoolKey references a hook that is neither address(0) nor allow-listed
+    /// reverts with `V4HookNotAllowed`. Hooks run arbitrary code inside
+    /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
+    /// hook has been audited is the intended default.
+    mapping(address => bool) public allowedV4Hooks;
 
     bytes32 private _activePlanHash;
+
+    /// @dev PoolManager address currently mid-unlock. Set by `_executeUniV4`
+    /// before `unlock()` and cleared on return. `unlockCallback` refuses any
+    /// caller that is not this address, so stray `unlockCallback` invocations
+    /// from an allow-listed PoolManager acting outside our pipeline revert.
+    address private _activeV4PoolManager;
 
     /// @dev Execution phase guard — prevents unexpected callbacks
     enum ExecutionPhase {
@@ -291,13 +328,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
     event UniV3SwapExecuted(
         address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
     );
+    event UniV4SwapExecuted(
+        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
+    );
+    event V4HookAllowedUpdated(address indexed hook, bool allowed);
 
     // ─── Enums ────────────────────────────────────────────────────────
     enum SwapMode {
         PARASWAP_SINGLE,
         BEBOP_MULTI,
         UNI_V2,
-        UNI_V3
+        UNI_V3,
+        UNI_V4
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
@@ -312,17 +354,23 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address repayToken;
         address profitToken;
         uint256 minProfitAmount;
-        // Uniswap V2 / V3 fields (ignored for other modes)
+        // Uniswap V2 / V3 / V4 fields (ignored for other modes)
         /// @dev UNI_V3 only — pool fee tier, must be in {100, 500, 3000, 10000}.
         uint24 v3Fee;
         /// @dev UNI_V2 only — swap path, path[0]==srcToken, path[last]==repayToken, length >= 2.
         address[] v2Path;
-        /// @dev UNI_V2/V3 only — output floor (strict > 0).
+        /// @dev UNI_V2/V3/V4 only — output floor (strict > 0).
         uint256 minAmountOut;
-        /// @dev UNI_V2/V3 only — if true, swap input = collateral balance delta
+        /// @dev UNI_V2/V3/V4 only — if true, swap input = collateral balance delta
         /// produced during this execute() invocation. Prevents swapping
         /// pre-existing collateral balances acquired outside the flash pipeline.
         bool useFullBalance;
+        /// @dev UNI_V4 only — PoolManager address (must be in allowedTargets).
+        address v4PoolManager;
+        /// @dev UNI_V4 only — strict-encoded PoolKey fields:
+        ///   abi.encode(address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook)
+        /// Length must be exactly 160 bytes; shorter/longer payloads revert with InvalidV4Data.
+        bytes v4SwapData;
     }
 
     struct Action {
@@ -472,6 +520,18 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         address oldProvider = allowedFlashProviders[FLASH_PROVIDER_MORPHO];
         allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho;
         emit FlashProviderUpdated(FLASH_PROVIDER_MORPHO, oldProvider, morpho);
+    }
+
+    /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.
+    /// @dev Hooks execute arbitrary logic during `beforeSwap`/`afterSwap` on the
+    /// PoolManager; any non-zero hook that is NOT in this whitelist causes the
+    /// V4 path to revert with `V4HookNotAllowed`. Default is empty — operator
+    /// routes MUST stay on hook-less pools unless the owner explicitly enables
+    /// a hook after review.
+    function setV4HookAllowed(address hook, bool allowed) external onlyOwner {
+        if (hook == address(0)) revert ZeroAddress();
+        allowedV4Hooks[hook] = allowed;
+        emit V4HookAllowedUpdated(hook, allowed);
     }
 
     function pause() external onlyOwner {
@@ -640,6 +700,11 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         } else if (plan.swapPlan.mode == SwapMode.UNI_V3) {
             uint24 f = plan.swapPlan.v3Fee;
             if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
+            if (plan.swapPlan.minAmountOut == 0) revert InvalidPlan();
+        } else if (plan.swapPlan.mode == SwapMode.UNI_V4) {
+            if (plan.swapPlan.v4PoolManager == address(0)) revert ZeroAddress();
+            if (!allowedTargets[plan.swapPlan.v4PoolManager]) revert TargetNotAllowed(plan.swapPlan.v4PoolManager);
+            if (plan.swapPlan.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
             if (plan.swapPlan.minAmountOut == 0) revert InvalidPlan();
         } else {
             revert InvalidSwapMode();
@@ -951,6 +1016,8 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
             _executeUniV2(plan, collateralDelta);
         } else if (plan.mode == SwapMode.UNI_V3) {
             _executeUniV3(plan, collateralDelta);
+        } else if (plan.mode == SwapMode.UNI_V4) {
+            _executeUniV4(plan, collateralDelta);
         } else {
             revert InvalidSwapMode();
         }
@@ -1116,6 +1183,103 @@ contract LiquidationExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashL
         if (received < plan.minAmountOut) revert InsufficientRepayOutput(received, plan.minAmountOut);
 
         emit UniV3SwapExecuted(plan.srcToken, plan.repayToken, fee, amountIn, received);
+    }
+
+    // ─── Internal: Uniswap V4 single-hop exact-input swap ────────────
+    /// @dev Executes a single-hop exact-input swap via PoolManager's
+    /// unlock-callback pattern. Strict subset of V4:
+    ///   * exact-input only (amountSpecified negative)
+    ///   * single hop, srcToken → repayToken
+    ///   * sqrtPriceLimitX96 disabled (bounded by minAmountOut instead)
+    ///   * hook must be address(0) or in `allowedV4Hooks`
+    /// Anything else reverts before touching the PoolManager.
+    function _executeUniV4(SwapPlan memory plan, uint256 collateralDelta) internal {
+        if (plan.srcToken == address(0)) revert ZeroAddress();
+        if (plan.repayToken == address(0)) revert ZeroAddress();
+        if (plan.minAmountOut == 0) revert InvalidPlan();
+
+        address pm = plan.v4PoolManager;
+        if (pm == address(0)) revert ZeroAddress();
+        if (!allowedTargets[pm]) revert TargetNotAllowed(pm);
+        if (plan.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
+
+        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
+            abi.decode(plan.v4SwapData, (address, address, uint24, int24, address));
+
+        if (tokenIn != plan.srcToken) revert InvalidV4Data();
+        if (tokenOut != plan.repayToken) revert InvalidV4Data();
+        if (tokenIn == tokenOut) revert InvalidV4Data();
+        if (hook != address(0) && !allowedV4Hooks[hook]) revert V4HookNotAllowed(hook);
+
+        uint256 amountIn = plan.useFullBalance ? collateralDelta : plan.amountIn;
+        if (amountIn == 0) revert ZeroSwapInput();
+
+        uint256 srcBal = IERC20(tokenIn).balanceOf(address(this));
+        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
+
+        uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
+
+        _activeV4PoolManager = pm;
+        IPoolManager(pm).unlock(abi.encode(tokenIn, tokenOut, fee, tickSpacing, hook, amountIn));
+        _activeV4PoolManager = address(0);
+
+        uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
+        if (received < plan.minAmountOut) revert InsufficientRepayOutput(received, plan.minAmountOut);
+
+        emit UniV4SwapExecuted(tokenIn, tokenOut, fee, amountIn, received);
+    }
+
+    /// @inheritdoc IUnlockCallback
+    /// @dev Accepts only the PoolManager currently mid-unlock (pinned by
+    /// `_executeUniV4` in `_activeV4PoolManager`). Performs exactly one
+    /// `swap()`, settles the input currency via `sync+transfer+settle`, and
+    /// pulls the output via `take()`. Any other entry shape reverts.
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
+        address pm = _activeV4PoolManager;
+        if (pm == address(0)) revert V4CallbackInactive();
+        if (msg.sender != pm) revert InvalidCallbackCaller();
+
+        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint256 amountIn) =
+            abi.decode(data, (address, address, uint24, int24, address, uint256));
+
+        bool zeroForOne = tokenIn < tokenOut;
+        PoolKey memory key = PoolKey({
+            currency0: zeroForOne ? tokenIn : tokenOut,
+            currency1: zeroForOne ? tokenOut : tokenIn,
+            fee: fee,
+            tickSpacing: tickSpacing,
+            hooks: hook
+        });
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: -int256(amountIn),
+            sqrtPriceLimitX96: zeroForOne ? V4_MIN_SQRT_PRICE_LIMIT : V4_MAX_SQRT_PRICE_LIMIT
+        });
+
+        int256 swapDelta = IPoolManager(pm).swap(key, params, "");
+        int128 amount0 = int128(swapDelta >> 128);
+        int128 amount1 = int128(swapDelta);
+
+        int128 tokenInDelta = zeroForOne ? amount0 : amount1;
+        int128 tokenOutDelta = zeroForOne ? amount1 : amount0;
+
+        // Exact-input swap: PoolManager owes us tokenOut (positive), we owe
+        // tokenIn (negative). Any other shape — including zero-output trades —
+        // is a signal of unexpected pool/hook behaviour and fails closed.
+        if (tokenInDelta >= 0 || tokenOutDelta <= 0) revert V4UnexpectedDelta();
+
+        uint256 owedIn = uint256(int256(-tokenInDelta));
+        uint256 gainedOut = uint256(int256(tokenOutDelta));
+
+        IPoolManager(pm).sync(tokenIn);
+        IERC20(tokenIn).safeTransfer(pm, owedIn);
+        IPoolManager(pm).settle();
+
+        IPoolManager(pm).take(tokenOut, address(this), gainedOut);
+
+        return "";
     }
 
     // ─── Internal: Paraswap selector classification + decoders ───────
