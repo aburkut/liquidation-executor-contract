@@ -38,7 +38,10 @@
       "Bash(grep -v \"^commit\\\\|^Author\\\\|^Date\\\\|^$\\\\|^    \")",
       "Bash(git -C /Users/alexanderburkut/workspace/liquidation-executor-contract log --oneline -10)",
       "Bash(git -C /Users/alexanderburkut/workspace/liquidation-executor-contract show e296ecc --stat)",
-      "Bash(git -C /Users/alexanderburkut/workspace/liquidation-executor-contract show e296ecc -- test/Executor.t.sol)"
+      "Bash(git -C /Users/alexanderburkut/workspace/liquidation-executor-contract show e296ecc -- test/Executor.t.sol)",
+      "Bash(perl -i -pe 's/\\(leg2: _zeroLeg\\\\\\(\\\\\\),\\)\\\\n\\(\\\\s+profitToken:\\)/$1\\\\n            hasSplit: false,\\\\n            splitBps: 0,\\\\n$2/g' /Users/alexanderburkut/workspace/liquidation-executor-contract/test/Executor.t.sol)",
+      "Bash(perl -0777 -i -pe 's/\\(leg2: _zeroLeg\\\\\\(\\\\\\),\\)\\\\n\\(\\\\s+\\)\\(profitToken:\\)/$1\\\\n$2hasSplit: false,\\\\n$2splitBps: 0,\\\\n$2$3/g; s/\\(hasLeg2: true,\\\\n\\\\s+leg2: leg2,\\)\\\\n\\(\\\\s+\\)\\(profitToken:\\)/$1\\\\n$2hasSplit: false,\\\\n$2splitBps: 0,\\\\n$2$3/g' /Users/alexanderburkut/workspace/liquidation-executor-contract/test/Executor.t.sol)",
+      "Bash(perl -0777 -i -pe 's/\\(leg2: _zeroLeg\\\\\\(\\\\\\),\\)\\\\n\\(\\\\s+\\)\\(profitToken:\\)/$1\\\\n$2hasSplit: false,\\\\n$2splitBps: 0,\\\\n$2$3/g' /Users/alexanderburkut/workspace/liquidation-executor-contract/test/fork/ExecutorForkV4.t.sol)"
     ]
   }
 }

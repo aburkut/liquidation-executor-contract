@@ -112,7 +112,13 @@ contract ExecutorForkV4Test is Test {
             minAmountOut: 1
         });
         return LiquidationExecutor.SwapPlan({
-            leg1: leg1, hasLeg2: false, leg2: _zeroLeg(), profitToken: WETH, minProfitAmount: 0
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            profitToken: WETH,
+            minProfitAmount: 0
         });
     }
 
