@@ -648,6 +648,149 @@ contract ExecutorTest is Test {
         });
     }
 
+    /// @dev Assemble a two-leg SwapPlan. Caller supplies two already-built
+    /// SwapLeg values (via `_buildUniV2Leg` / `_buildUniV3Leg` / ... below)
+    /// plus the outer profit/minProfit fields. hasLeg2 is forced true.
+    function _buildTwoLegPlan(
+        LiquidationExecutor.SwapLeg memory leg1,
+        LiquidationExecutor.SwapLeg memory leg2,
+        address profitTkn,
+        uint256 minProfitAmt
+    ) internal pure returns (LiquidationExecutor.SwapPlan memory) {
+        return LiquidationExecutor.SwapPlan({
+            leg1: leg1, hasLeg2: true, leg2: leg2, profitToken: profitTkn, minProfitAmount: minProfitAmt
+        });
+    }
+
+    function _buildParaswapLeg(address srcToken, address dstToken, uint256 amountIn)
+        internal
+        view
+        returns (LiquidationExecutor.SwapLeg memory)
+    {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: _buildParaswapCalldata(srcToken, dstToken, amountIn, address(executor)),
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: 0
+        });
+    }
+
+    function _buildBebopLeg(
+        address srcToken,
+        uint256 amountIn,
+        address bebopTarget,
+        bytes memory bebopCd,
+        address repayTkn
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.BEBOP_MULTI,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: bebopTarget,
+            bebopCalldata: bebopCd,
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: repayTkn,
+            minAmountOut: 0
+        });
+    }
+
+    function _buildUniV2Leg(address srcToken, address dstToken, uint256 amountIn, uint256 minOut, bool fullBalance)
+        internal
+        view
+        returns (LiquidationExecutor.SwapLeg memory)
+    {
+        address[] memory path = new address[](2);
+        path[0] = srcToken;
+        path[1] = dstToken;
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V2,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: fullBalance,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: path,
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: minOut
+        });
+    }
+
+    function _buildUniV3Leg(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint24 fee,
+        uint256 minOut,
+        bool fullBalance
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: fullBalance,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: fee,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: minOut
+        });
+    }
+
+    function _buildUniV4Leg(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        uint24 fee,
+        int24 tickSpacing,
+        address hook,
+        address poolManager,
+        uint256 minOut,
+        bool fullBalance
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V4,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: fullBalance,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: poolManager,
+            v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook),
+            repayToken: dstToken,
+            minAmountOut: minOut
+        });
+    }
+
     function _buildPlan(
         uint8 flashProviderId,
         address lToken,
