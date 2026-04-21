@@ -6579,6 +6579,33 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
+    /// @notice leg2 MUST use useFullBalance — the on-chain tracked-leftover is
+    /// the only sanctioned amountIn source for the second swap. A plan where
+    /// hasLeg2==true but leg2.useFullBalance==false must revert with
+    /// InvalidPlan; flipping the flag to true on the same plan must succeed.
+    function test_leg2_requires_useFullBalance() public {
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3Leg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, 3000, 1, false);
+
+        // leg2 with useFullBalance=false — forbidden.
+        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+
+        // Flip the flag true — same plan now executes cleanly.
+        swapPlan.leg2.useFullBalance = true;
+        plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // TWO-LEG COINBASE REGRESSION
     // ═══════════════════════════════════════════════════════════════════

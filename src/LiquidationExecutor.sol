@@ -679,6 +679,7 @@ contract LiquidationExecutor is
             if (plan.swapPlan.leg1.repayToken != plan.swapPlan.leg2.srcToken) {
                 revert InvalidLegLink(plan.swapPlan.leg1.repayToken, plan.swapPlan.leg2.srcToken);
             }
+            if (!plan.swapPlan.leg2.useFullBalance) revert InvalidPlan();
             _validateLeg(plan.swapPlan.leg2);
         }
 
@@ -966,19 +967,15 @@ contract LiquidationExecutor is
         _dispatchLeg(leg1, leg1AmountIn, leg1RepayBefore);
 
         uint256 trackedLeftover;
-        uint256 leg2AmountIn;
         if (plan.hasLeg2) {
-            SwapLeg memory leg2 = plan.leg2;
-
             // leg2.srcToken == leg1.repayToken (enforced in execute() via InvalidLegLink),
-            // so leg1RepayBefore is the pre-leg1 intermediate balance.
-            uint256 intermediateAfter = IERC20(leg2.srcToken).balanceOf(address(this));
+            // so leg1RepayBefore is the pre-leg1 intermediate balance. leg2.useFullBalance
+            // is enforced true in execute(), so trackedLeftover is always the leg2 amountIn.
+            uint256 intermediateAfter = IERC20(plan.leg2.srcToken).balanceOf(address(this));
             trackedLeftover = intermediateAfter > leg1RepayBefore ? intermediateAfter - leg1RepayBefore : 0;
+            if (trackedLeftover == 0) revert Leg2ZeroLeftover();
 
-            leg2AmountIn = leg2.useFullBalance ? trackedLeftover : leg2.amountIn;
-            if (leg2AmountIn == 0) revert Leg2ZeroLeftover();
-
-            _dispatchLeg(leg2, leg2AmountIn, 0);
+            _dispatchLeg(plan.leg2, trackedLeftover, 0);
         }
 
         uint256 finalRepayAfter = IERC20(finalRepayToken).balanceOf(address(this));
@@ -986,7 +983,7 @@ contract LiquidationExecutor is
         if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
 
         if (plan.hasLeg2) {
-            emit TwoLegSwapExecuted(plan.leg2.srcToken, leg1AmountIn, trackedLeftover, leg2AmountIn, repayDelta);
+            emit TwoLegSwapExecuted(plan.leg2.srcToken, leg1AmountIn, trackedLeftover, trackedLeftover, repayDelta);
         }
     }
 
