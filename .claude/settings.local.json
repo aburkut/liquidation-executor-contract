@@ -31,7 +31,14 @@
       "Bash(forge inspect *)",
       "Bash(forge clean *)",
       "Bash(gh run *)",
-      "Bash(forge fmt *)"
+      "Bash(forge fmt *)",
+      "Bash(git -C /Users/alexanderburkut/workspace/liquidation-executor-contract show ddec9cf)",
+      "Bash(wait b6udhldya *)",
+      "Bash(wait b0amaxsss *)",
+      "Bash(grep -v \"^commit\\\\|^Author\\\\|^Date\\\\|^$\\\\|^    \")",
+      "Bash(git -C /Users/alexanderburkut/workspace/liquidation-executor-contract log --oneline -10)",
+      "Bash(git -C /Users/alexanderburkut/workspace/liquidation-executor-contract show e296ecc --stat)",
+      "Bash(git -C /Users/alexanderburkut/workspace/liquidation-executor-contract show e296ecc -- test/Executor.t.sol)"
     ]
   }
 }
