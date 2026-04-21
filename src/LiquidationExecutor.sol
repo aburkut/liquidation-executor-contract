@@ -15,6 +15,7 @@ import {IUniV2Router} from "./interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "./interfaces/IUniV3SwapRouter.sol";
 import {IPoolManager, IUnlockCallback, PoolKey, SwapParams} from "./interfaces/IPoolManager.sol";
 import {ParaswapDecoderLib} from "./libraries/ParaswapDecoderLib.sol";
+import {SwapLegExecutorLib} from "./libraries/SwapLegExecutorLib.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -300,10 +301,17 @@ contract LiquidationExecutor is
         uint256 minAmountOut;
     }
 
+    /// @dev When `hasSplit == true`, leg1 serves as the REPAY leg
+    /// (collateral → loanToken) and leg2 serves as the PROFIT leg
+    /// (collateral → WETH). `hasSplit` is mutually exclusive with `hasLeg2`.
+    /// `splitBps` (0..10000, exclusive) is the share of collateralDelta routed
+    /// into the PROFIT leg; the REPAY leg receives the remainder.
     struct SwapPlan {
         SwapLeg leg1;
         bool hasLeg2;
         SwapLeg leg2;
+        bool hasSplit;
+        uint16 splitBps;
         address profitToken;
         uint256 minProfitAmount;
     }
@@ -651,7 +659,9 @@ contract LiquidationExecutor is
         if (plan.actions.length == 0) revert NoActions();
         if (plan.actions.length > MAX_ACTIONS) revert TooManyActions(plan.actions.length);
 
-        // Final-leg repayToken MUST equal outer loanToken.
+        // Final-leg repayToken MUST equal outer loanToken. For hasSplit, leg1
+        // IS the repay leg (collateral → loanToken), matching the single-leg
+        // derivation since hasLeg2 is forbidden in split mode (see block below).
         address finalRepayToken = plan.swapPlan.hasLeg2 ? plan.swapPlan.leg2.repayToken : plan.swapPlan.leg1.repayToken;
         if (finalRepayToken != plan.loanToken) {
             revert RepayTokenMismatch(plan.loanToken, finalRepayToken);
@@ -680,6 +690,26 @@ contract LiquidationExecutor is
                 revert InvalidLegLink(plan.swapPlan.leg1.repayToken, plan.swapPlan.leg2.srcToken);
             }
             if (!plan.swapPlan.leg2.useFullBalance) revert InvalidPlan();
+            _validateLeg(plan.swapPlan.leg2);
+        }
+
+        // Validate SPLIT mode: leg1=repayLeg (collateral→loanToken), leg2=profitLeg
+        // (collateral→WETH), each sized by splitBps of collateralDelta at runtime.
+        // Mutually exclusive with hasLeg2. Both legs restricted to Uni modes
+        // (only modes accepting an explicit amountIn parameter).
+        if (plan.swapPlan.hasSplit) {
+            if (plan.swapPlan.hasLeg2) revert InvalidPlan();
+            uint16 bps = plan.swapPlan.splitBps;
+            if (bps == 0 || bps >= 10_000) revert InvalidPlan();
+            SwapMode m1 = plan.swapPlan.leg1.mode;
+            if (m1 != SwapMode.UNI_V2 && m1 != SwapMode.UNI_V3 && m1 != SwapMode.UNI_V4) revert InvalidPlan();
+            SwapMode mp = plan.swapPlan.leg2.mode;
+            if (mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4) revert InvalidPlan();
+            if (plan.swapPlan.leg2.repayToken != weth) revert InvalidPlan();
+            if (collateralAsset != address(0) && plan.swapPlan.leg2.srcToken != collateralAsset) {
+                revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.leg2.srcToken);
+            }
+            if (plan.swapPlan.leg1.useFullBalance || plan.swapPlan.leg2.useFullBalance) revert InvalidPlan();
             _validateLeg(plan.swapPlan.leg2);
         }
 
@@ -962,6 +992,24 @@ contract LiquidationExecutor is
         //     trackedLeftover after leg1 runs.
         uint256 leg1RepayBefore = IERC20(leg1.repayToken).balanceOf(address(this));
 
+        // SPLIT mode: partition collateralDelta between repay (leg1) and profit
+        // (leg2 → WETH); each leg runs with its explicitly-allocated amountIn.
+        // Validated in execute(): hasSplit XOR hasLeg2, both legs Uni-only,
+        // leg2.repayToken==weth, neither useFullBalance.
+        if (plan.hasSplit) {
+            uint256 profitAmount = (collateralDelta * plan.splitBps) / 10_000;
+            uint256 repayAmount = collateralDelta - profitAmount;
+            if (profitAmount == 0 || repayAmount == 0) revert InvalidPlan();
+
+            _dispatchLeg(leg1, repayAmount, leg1RepayBefore);
+            _dispatchLeg(plan.leg2, profitAmount, 0);
+
+            uint256 splitRepayAfter = IERC20(finalRepayToken).balanceOf(address(this));
+            uint256 splitRepayDelta = splitRepayAfter > finalRepayBefore ? splitRepayAfter - finalRepayBefore : 0;
+            if (splitRepayDelta < flashRepayAmount) revert InsufficientRepayOutput(splitRepayDelta, flashRepayAmount);
+            return;
+        }
+
         uint256 leg1AmountIn = leg1.useFullBalance ? collateralDelta : leg1.amountIn;
 
         _dispatchLeg(leg1, leg1AmountIn, leg1RepayBefore);
@@ -990,13 +1038,13 @@ contract LiquidationExecutor is
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
         SwapMode m = leg.mode;
         if (m == SwapMode.PARASWAP_SINGLE) {
-            _executeParaswapSingleLeg(leg);
+            SwapLegExecutorLib.executeParaswapLeg(_asLibLeg(leg), paraswapAugustusV6);
         } else if (m == SwapMode.BEBOP_MULTI) {
             _executeBebopLeg(leg, outBefore);
         } else if (m == SwapMode.UNI_V2) {
-            _executeUniV2Leg(leg, amountIn);
+            SwapLegExecutorLib.executeUniV2Leg(_asLibLeg(leg), amountIn, uniV2Router);
         } else if (m == SwapMode.UNI_V3) {
-            _executeUniV3Leg(leg, amountIn);
+            SwapLegExecutorLib.executeUniV3Leg(_asLibLeg(leg), amountIn, uniV3Router);
         } else if (m == SwapMode.UNI_V4) {
             _executeUniV4Leg(leg, amountIn);
         } else {
@@ -1004,25 +1052,20 @@ contract LiquidationExecutor is
         }
     }
 
-    // ─── Internal: Paraswap Single ───────────────────────────────────
-    function _executeParaswapSingleLeg(SwapLeg memory leg) internal {
-        (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut, bool isExactIn) =
-            _executeParaswapCall(leg.paraswapCalldata);
-
-        if (srcToken != leg.srcToken) revert ParaswapSrcTokenMismatch(leg.srcToken, srcToken);
-
-        if (isExactIn) {
-            // ExactIn (any family): consumed must equal declared.
-            if (amountIn != leg.amountIn) revert ParaswapAmountInMismatch(leg.amountIn, amountIn);
-        } else {
-            // ExactOut (any family): leg.amountIn is the declared maximum.
-            if (amountIn > leg.amountIn) revert ParaswapAmountInMismatch(leg.amountIn, amountIn);
+    /// @dev Reinterprets a main-contract `SwapLeg memory` pointer as a
+    /// `SwapLegExecutorLib.SwapLeg memory` pointer. The two struct
+    /// declarations are byte-for-byte identical (field order + types);
+    /// memory layout is identical by ABI rules. Pure pointer retype, no
+    /// memory copy. Keeping both declarations in sync is enforced by the
+    /// STRUCT DISCIPLINE comment in the library file.
+    function _asLibLeg(SwapLeg memory leg) internal pure returns (SwapLegExecutorLib.SwapLeg memory libLeg) {
+        assembly {
+            libLeg := leg
         }
-
-        if (dstToken != leg.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
-
-        emit ParaswapSwapExecuted(srcToken, dstToken, amountIn, amountOut);
     }
+
+    // Paraswap single leg moved to SwapLegExecutorLib (external library,
+    // DELEGATECALL). See `_dispatchLeg` for the call site.
 
     // ─── Internal: Bebop Multi ───────────────────────────────────────
     /// @dev Executes opaque Bebop settlement call. Security: allowlist + exact approval + output delta checks.
@@ -1047,65 +1090,8 @@ contract LiquidationExecutor is
         emit BebopSwapExecuted(target, leg.srcToken, leg.amountIn, repayDelta, 0);
     }
 
-    // ─── Internal: Uniswap V2 single-call swap ───────────────────────
-    /// @dev Executes `swapExactTokensForTokens` on the immutable V2 router.
-    /// Path endpoints are pinned to `leg.srcToken` and `leg.repayToken`
-    /// (also asserted up-front in `execute()` via `_validateLeg`). When
-    /// `useFullBalance=true`, `amountIn` is the collateral delta produced
-    /// by the current execute() call — never a pre-existing balance.
-    function _executeUniV2Leg(SwapLeg memory leg, uint256 amountIn) internal {
-        if (amountIn == 0) revert ZeroSwapInput();
-
-        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
-        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
-
-        address router = uniV2Router;
-        uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
-
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
-        IUniV2Router(router)
-            .swapExactTokensForTokens(amountIn, leg.minAmountOut, leg.v2Path, address(this), leg.deadline);
-        IERC20(leg.srcToken).forceApprove(router, 0);
-
-        uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
-        if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit UniV2SwapExecuted(leg.srcToken, leg.repayToken, amountIn, received);
-    }
-
-    // ─── Internal: Uniswap V3 single-hop swap ────────────────────────
-    /// @dev Executes `exactInputSingle` on the immutable V3 SwapRouter02.
-    /// Fee tier is restricted to the four canonical pools. A non-existent
-    /// pool reverts inside the router — no pre-call factory lookup needed.
-    function _executeUniV3Leg(SwapLeg memory leg, uint256 amountIn) internal {
-        if (amountIn == 0) revert ZeroSwapInput();
-
-        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
-        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
-
-        address router = uniV3Router;
-        uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
-
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
-        IUniV3SwapRouter(router)
-            .exactInputSingle(
-                IUniV3SwapRouter.ExactInputSingleParams({
-                    tokenIn: leg.srcToken,
-                    tokenOut: leg.repayToken,
-                    fee: leg.v3Fee,
-                    recipient: address(this),
-                    amountIn: amountIn,
-                    amountOutMinimum: leg.minAmountOut,
-                    sqrtPriceLimitX96: 0
-                })
-            );
-        IERC20(leg.srcToken).forceApprove(router, 0);
-
-        uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
-        if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, leg.v3Fee, amountIn, received);
-    }
+    // Uniswap V2 + V3 legs moved to SwapLegExecutorLib (external library,
+    // DELEGATECALL). See `_dispatchLeg` for the call sites.
 
     // ─── Internal: V4 leg validation (centralized fail-closed checks) ─
     /// @dev Single source of truth for V4 preconditions. Called from
@@ -1252,68 +1238,10 @@ contract LiquidationExecutor is
         return "";
     }
 
-    // ─── Internal: Paraswap selector classification + decoders ───────
-
-    /// @dev Maps a 4-byte selector to its ParaswapSelectorKind. Pure / no storage.
-    /// Every Augustus V6.2 swap entrypoint has an explicit branch — accepted
-    /// selectors return their decoder-bound kind; documented-reject selectors
-    /// (BalancerV2 direct, RFQ) return their dedicated reject kind so the caller
-    /// can revert with `InvalidParaswapSelector(selector)`. Unknown selectors
-    /// return `Unsupported`, which also reverts.
-    // ─── Internal: Decode + validate Paraswap calldata ───────────────
-    /// @dev Thin wrapper around `ParaswapDecoderLib.decodeAndValidate`. All
-    /// bulk decoding + classification lives in the library (DELEGATECALL)
-    /// to keep this contract under EIP-170. Returns `isExactIn` so the
-    /// orchestrator can pick strict vs lenient amount-in validation.
-    function _decodeAndValidateParaswap(bytes memory cd)
-        internal
-        view
-        returns (address srcToken, address dstToken, uint256 fromAmount, uint256 minAmountOut, bool isExactIn)
-    {
-        (srcToken, dstToken, fromAmount, minAmountOut, isExactIn) =
-            ParaswapDecoderLib.decodeAndValidate(cd, address(this));
-    }
-
-    // ─── Internal: Execute Single Paraswap Call ──────────────────────
-    /// @dev Executes a single Paraswap swap. Validation lives in
-    /// `_decodeAndValidateParaswap`; this orchestrator only handles approvals,
-    /// the call itself, and post-execution accounting. Belt-and-suspenders:
-    /// even though Augustus enforces `minAmountOut` internally, we re-check
-    /// `amountOut >= minAmountOut` so a future adapter that skips the check
-    /// cannot silently let a bad swap through.
-    function _executeParaswapCall(bytes memory cd)
-        internal
-        returns (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut, bool isExactIn)
-    {
-        uint256 minAmountOut;
-        (srcToken, dstToken, amountIn, minAmountOut, isExactIn) = _decodeAndValidateParaswap(cd);
-
-        address augustus = paraswapAugustusV6;
-        if (augustus == address(0)) revert ZeroAddress();
-        if (!allowedTargets[augustus]) revert TargetNotAllowed(augustus);
-
-        uint256 srcBefore = IERC20(srcToken).balanceOf(address(this));
-        if (srcBefore < amountIn) revert InsufficientSrcBalance(amountIn, srcBefore);
-        uint256 dstBefore = IERC20(dstToken).balanceOf(address(this));
-
-        IERC20(srcToken).forceApprove(augustus, amountIn);
-        (bool ok,) = augustus.call(cd);
-        IERC20(srcToken).forceApprove(augustus, 0);
-
-        if (!ok) revert ParaswapSwapFailed();
-
-        // Compute actual consumed input (handles ExactOut where actual < declared max).
-        {
-            uint256 srcAfter = IERC20(srcToken).balanceOf(address(this));
-            amountIn = srcBefore > srcAfter ? srcBefore - srcAfter : 0;
-        }
-        {
-            uint256 dstAfter = IERC20(dstToken).balanceOf(address(this));
-            amountOut = dstAfter - dstBefore;
-        }
-        if (amountOut == 0) revert ZeroSwapOutput();
-        if (amountOut < minAmountOut) revert InsufficientRepayOutput(amountOut, minAmountOut);
-    }
+    // Paraswap orchestration (decode + validate + approve + call + delta
+    // check) moved to SwapLegExecutorLib.executeParaswapLeg. The decoder
+    // itself (ParaswapDecoderLib) remains a separate external library
+    // that the SwapLegExecutor library calls into.
 
     // ─── Internal: Execute Target Action ─────────────────────────────
     function _executeTargetAction(uint8 protocolId, bytes memory actionData) internal {
