@@ -414,7 +414,7 @@ struct MorphoLiquidation {
 
 ```
 src/
-  LiquidationExecutor.sol              Main contract (~1473 lines)
+  LiquidationExecutor.sol              Main contract (~1533 lines)
   interfaces/
     IAaveV3Pool.sol                    Aave V3 Pool + getReserveData
     IBalancerVault.sol                 Balancer Vault + IFlashLoanRecipient
@@ -427,7 +427,7 @@ src/
     ParaswapDecoderLib.sol             Augustus V6.2 selector classifier + per-family decoders
 
 test/
-  Executor.t.sol                       219 unit tests
+  Executor.t.sol                       235 unit tests
   fork/
     ExecutorForkV4.t.sol                 8 mainnet-fork tests against real V4 PoolManager
   mocks/
@@ -447,7 +447,7 @@ test/
 ```bash
 forge install          # Install dependencies
 forge build            # Compile
-forge test             # Run 227 tests
+forge test             # Run 243 tests
 forge test -vvv        # Verbose output
 forge coverage         # Coverage report
 ```

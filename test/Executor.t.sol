@@ -6492,6 +6492,55 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
+    /// @notice Paraswap as leg1 with useFullBalance=true → LegUseFullBalanceNotAllowed(PARASWAP_SINGLE).
+    function test_twoLeg_leg1_paraswap_useFullBalance_reverts() public {
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+        // Mutate the built leg to enable useFullBalance — this is illegal for Paraswap.
+        leg1.useFullBalance = true;
+
+        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.LegUseFullBalanceNotAllowed.selector,
+                uint8(LiquidationExecutor.SwapMode.PARASWAP_SINGLE)
+            )
+        );
+        executor.execute(plan);
+    }
+
+    /// @notice Bebop as leg1 with useFullBalance=true → LegUseFullBalanceNotAllowed(BEBOP_MULTI).
+    function test_twoLeg_leg1_bebop_useFullBalance_reverts() public {
+        bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
+        LiquidationExecutor.SwapLeg memory leg1 = _buildBebopLeg(
+            address(collateralToken), DEFAULT_SWAP_AMOUNT, address(bebop), bebopCd, address(profitToken)
+        );
+        leg1.useFullBalance = true;
+
+        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.LegUseFullBalanceNotAllowed.selector,
+                uint8(LiquidationExecutor.SwapMode.BEBOP_MULTI)
+            )
+        );
+        executor.execute(plan);
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // TWO-LEG COINBASE REGRESSION
     // ═══════════════════════════════════════════════════════════════════
