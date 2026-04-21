@@ -614,6 +614,7 @@ contract LiquidationExecutor is
             if (leg.bebopTarget == address(0)) revert InvalidBebopTarget();
             if (leg.bebopCalldata.length < 4) revert InvalidBebopCalldata();
             if (leg.amountIn == 0) revert ZeroAmountIn();
+            if (leg.minAmountOut == 0) revert InvalidPlan();
         } else if (m == SwapMode.UNI_V2) {
             uint256 pLen = leg.v2Path.length;
             if (pLen < 2) revert InvalidV2Path();
@@ -1044,7 +1045,7 @@ contract LiquidationExecutor is
 
         uint256 repayAfter = IERC20(leg.repayToken).balanceOf(address(this));
         uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
-        if (repayDelta == 0) revert ZeroRepayOutput();
+        if (repayDelta < leg.minAmountOut) revert InsufficientRepayOutput(repayDelta, leg.minAmountOut);
 
         emit BebopSwapExecuted(target, leg.srcToken, leg.amountIn, repayDelta, 0);
     }

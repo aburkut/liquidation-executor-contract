@@ -549,7 +549,7 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: repayTkn,
-            minAmountOut: 0
+            minAmountOut: 1
         });
         return LiquidationExecutor.SwapPlan({
             leg1: leg1, hasLeg2: false, leg2: _zeroLeg(), profitToken: profitTkn, minProfitAmount: minProfitAmt
@@ -706,7 +706,7 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: repayTkn,
-            minAmountOut: 0
+            minAmountOut: 1
         });
     }
 
@@ -4877,6 +4877,44 @@ contract ExecutorTest is Test {
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
 
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    /// @notice Bebop leg must reject output below the operator-supplied per-leg
+    /// minAmountOut via balance-delta check, using the same InsufficientRepayOutput
+    /// error that the Uni modes raise. Mirror case: a Bebop delivery that is
+    /// comfortably above flashRepayAmount (so the pipeline-level gate would pass)
+    /// but below the leg's own minAmountOut must still revert.
+    function test_bebop_respects_minAmountOut() public {
+        uint256 debtToCover = 400e18;
+        uint256 collateralIn = COLLATERAL_REWARD;
+
+        // Bebop delivers 1050e18 loanToken — above flashRepay (1001e18), so the
+        // pipeline-level InsufficientRepayOutput would NOT fire.
+        uint256 delivered = 1050e18;
+        bebop.configure(address(collateralToken), collateralIn, address(loanToken), delivered, address(0), 0);
+
+        bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildBebopMultiSwapPlan(
+            address(collateralToken), collateralIn, address(bebop), bebopCd, address(loanToken), address(loanToken), 0
+        );
+        // Override the default minAmountOut=1 to force the per-leg floor above
+        // what Bebop delivers — this is what the new guard protects.
+        uint256 floor = 2000e18;
+        swapPlan.leg1.minAmountOut = floor;
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InsufficientRepayOutput.selector, delivered, floor));
+        executor.execute(plan);
+
+        // And confirm the happy-path counterpart (delivered >= minAmountOut) still passes.
+        swapPlan.leg1.minAmountOut = delivered;
+        plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
         vm.prank(operatorAddr);
         executor.execute(plan);
     }
