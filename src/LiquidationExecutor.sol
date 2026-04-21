@@ -153,7 +153,8 @@ contract LiquidationExecutor is
 
     /// @dev Uniswap V4 sqrt price limits, set one tick inside the allowed
     /// range so the swap is unconstrained by price (slippage is enforced
-    /// by the output delta check against `plan.minAmountOut`).
+    /// by the output delta check against the per-leg `leg.minAmountOut`
+    /// field on `SwapLeg`).
     /// Reference: v4-core TickMath.MIN_SQRT_PRICE / MAX_SQRT_PRICE.
     uint160 private constant V4_MIN_SQRT_PRICE_LIMIT = 4_295_128_740;
     uint160 private constant V4_MAX_SQRT_PRICE_LIMIT =
@@ -182,7 +183,8 @@ contract LiquidationExecutor is
     address public immutable uniV2Router;
     /// @dev Immutable — canonical Uniswap V3 SwapRouter02 (mainnet
     /// 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45). SwapRouter02 struct omits
-    /// deadline; the executor enforces its own via plan.deadline.
+    /// deadline; the executor enforces its own via the per-leg `leg.deadline`
+    /// field on `SwapLeg`.
     address public immutable uniV3Router;
 
     mapping(uint8 => address) public allowedFlashProviders;
@@ -196,7 +198,7 @@ contract LiquidationExecutor is
 
     bytes32 private _activePlanHash;
 
-    /// @dev PoolManager address currently mid-unlock. Set by `_executeUniV4`
+    /// @dev PoolManager address currently mid-unlock. Set by `_executeUniV4Leg`
     /// before `unlock()` and cleared on return. `unlockCallback` refuses any
     /// caller that is not this address, so stray `unlockCallback` invocations
     /// from an allow-listed PoolManager acting outside our pipeline revert.
@@ -951,24 +953,26 @@ contract LiquidationExecutor is
         address finalRepayToken = plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken;
         uint256 finalRepayBefore = IERC20(finalRepayToken).balanceOf(address(this));
 
-        uint256 intermediateBefore;
-        address intermediateToken;
-        if (plan.hasLeg2) {
-            intermediateToken = plan.leg2.srcToken;
-            intermediateBefore = IERC20(intermediateToken).balanceOf(address(this));
-        }
+        // Pre-leg1 snapshot of leg1.repayToken balance. Dual-purpose:
+        //   * Passed to _dispatchLeg as the Bebop repayDelta baseline (other modes ignore it).
+        //   * When hasLeg2==true, leg1.repayToken == leg2.srcToken (InvalidLegLink check),
+        //     so this same snapshot is the pre-leg1 intermediate balance used to compute
+        //     trackedLeftover after leg1 runs.
+        uint256 leg1RepayBefore = IERC20(leg1.repayToken).balanceOf(address(this));
 
         uint256 leg1AmountIn = leg1.useFullBalance ? collateralDelta : leg1.amountIn;
 
-        _dispatchLeg(leg1, leg1AmountIn, intermediateBefore);
+        _dispatchLeg(leg1, leg1AmountIn, leg1RepayBefore);
 
         uint256 trackedLeftover;
         uint256 leg2AmountIn;
         if (plan.hasLeg2) {
             SwapLeg memory leg2 = plan.leg2;
 
-            uint256 intermediateAfter = IERC20(intermediateToken).balanceOf(address(this));
-            trackedLeftover = intermediateAfter > intermediateBefore ? intermediateAfter - intermediateBefore : 0;
+            // leg2.srcToken == leg1.repayToken (enforced in execute() via InvalidLegLink),
+            // so leg1RepayBefore is the pre-leg1 intermediate balance.
+            uint256 intermediateAfter = IERC20(leg2.srcToken).balanceOf(address(this));
+            trackedLeftover = intermediateAfter > leg1RepayBefore ? intermediateAfter - leg1RepayBefore : 0;
 
             leg2AmountIn = leg2.useFullBalance ? trackedLeftover : leg2.amountIn;
             if (leg2AmountIn == 0) revert Leg2ZeroLeftover();
@@ -981,7 +985,7 @@ contract LiquidationExecutor is
         if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
 
         if (plan.hasLeg2) {
-            emit TwoLegSwapExecuted(intermediateToken, leg1AmountIn, trackedLeftover, leg2AmountIn, repayDelta);
+            emit TwoLegSwapExecuted(plan.leg2.srcToken, leg1AmountIn, trackedLeftover, leg2AmountIn, repayDelta);
         }
     }
 
@@ -1047,10 +1051,10 @@ contract LiquidationExecutor is
 
     // ─── Internal: Uniswap V2 single-call swap ───────────────────────
     /// @dev Executes `swapExactTokensForTokens` on the immutable V2 router.
-    /// Path endpoints are pinned to `plan.srcToken` and `plan.repayToken`
-    /// (also asserted up-front in `execute()`). When `useFullBalance=true`,
-    /// `amountIn` is the collateral delta produced by the current
-    /// execute() call — never a pre-existing balance.
+    /// Path endpoints are pinned to `leg.srcToken` and `leg.repayToken`
+    /// (also asserted up-front in `execute()` via `_validateLeg`). When
+    /// `useFullBalance=true`, `amountIn` is the collateral delta produced
+    /// by the current execute() call — never a pre-existing balance.
     function _executeUniV2Leg(SwapLeg memory leg, uint256 amountIn) internal {
         if (amountIn == 0) revert ZeroSwapInput();
 
@@ -1105,17 +1109,20 @@ contract LiquidationExecutor is
         emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, leg.v3Fee, amountIn, received);
     }
 
-    // ─── Internal: V4 plan validation (centralized fail-closed checks) ─
-    /// @dev Single source of truth for V4 preconditions. Called from both
-    /// `execute()` (fail-fast before flashloan) and `_executeUniV4` (defensive
-    /// re-check inside the pipeline). Returns the decoded PoolKey fields so
-    /// the caller can reuse them without re-decoding.
+    // ─── Internal: V4 leg validation (centralized fail-closed checks) ─
+    /// @dev Single source of truth for V4 preconditions. Called from
+    /// `_validateLeg` pre-flashloan for UNI_V4 legs. The per-leg executor
+    /// (`_executeUniV4Leg`) no longer re-runs these checks — `_validateLeg`
+    /// is authoritative. Returns the decoded PoolKey fields so the caller
+    /// can reuse them without re-decoding.
     ///
     /// PRODUCTION SCOPE — the V4 path is intentionally narrow:
-    ///   * single-hop only (one `swap()` call per execute())
+    ///   * single-hop only (one `swap()` call per leg)
     ///   * exact-input only (amountSpecified negative, see unlockCallback)
     ///   * ERC20 → ERC20 only (native ETH / Currency(0) is rejected)
-    ///   * tokenOut MUST equal plan.repayToken (no intermediate swaps)
+    ///   * tokenOut MUST equal `leg.repayToken` — which is the outer loan
+    ///     token for a one-leg plan (or leg2 of a two-leg plan), and the
+    ///     intermediate token (== leg2.srcToken) for leg1 of a two-leg plan
     ///   * hook MUST be address(0) or in `allowedV4Hooks`
     /// Any widening of this scope requires new tests and a fresh review.
     function _validateV4Leg(SwapLeg memory leg)
@@ -1181,7 +1188,7 @@ contract LiquidationExecutor is
     ///   exact-input single-hop ERC20→ERC20 swap inside the flashloan pipeline.
     /// @dev Three layers of protection against stray or adversarial calls:
     ///   1. `ExecutionPhase.FlashLoanActive` — only valid inside execute()
-    ///   2. `_activeV4PoolManager != 0`     — only while `_executeUniV4` is mid-unlock
+    ///   2. `_activeV4PoolManager != 0`     — only while `_executeUniV4Leg` is mid-unlock
     ///   3. `msg.sender == _activeV4PoolManager` — only the pinned PoolManager
     /// BalanceDelta invariant: tokenInDelta < 0 (we owe) AND tokenOutDelta > 0
     /// (we receive). Any other shape — including zero-output swaps, partial
@@ -1200,10 +1207,10 @@ contract LiquidationExecutor is
         // Defense-in-depth against a malicious/misconfigured PoolManager
         // echoing modified data back to us: re-assert the hook whitelist
         // against owner-curated state. tokenIn/tokenOut are NOT re-asserted
-        // here because `plan` is out of scope and adding storage is out of
-        // scope for this patch — tokenOut substitution is caught by the
-        // post-unlock `received` delta (computed against plan.repayToken) and
-        // the pipeline-level `repayDelta >= flashRepayAmount` gate.
+        // here because the leg is out of scope and adding storage is out
+        // of scope for this patch — tokenOut substitution is caught by the
+        // post-unlock `received` delta (computed against `leg.repayToken`)
+        // and the pipeline-level `repayDelta >= flashRepayAmount` gate.
         if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
 
         bool zeroForOne = tokenIn < tokenOut;
