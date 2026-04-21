@@ -588,13 +588,12 @@ contract LiquidationExecutor is
 
     /// @dev Per-leg fail-fast validation. Called once per leg from execute()
     /// BEFORE the flashloan is requested, so malformed plans never burn a
-    /// flash fee. Mirrors the shape-checks the per-mode executor runs
-    /// defensively inside the pipeline — this is the first line of defense.
-    /// `isLeg2` controls the useFullBalance/amountIn rules: a leg2 with
-    /// useFullBalance=true gets its amountIn from trackedLeftover (computed
-    /// inside _executeSwapPlan), so `leg.amountIn` is unused and a non-zero
-    /// value is tolerated silently; leg1 non-Uni modes must set amountIn > 0.
-    function _validateLeg(SwapLeg memory leg, bool isLeg2) internal view {
+    /// flash fee. This is authoritative: per-mode executors no longer
+    /// re-check shape defensively — the strict call-graph (execute →
+    /// activePlanHash pin → flashloan callback → _executeSwapPlan →
+    /// _dispatchLeg → leg executor) means any plan reaching a leg executor
+    /// has already passed _validateLeg.
+    function _validateLeg(SwapLeg memory leg) internal view {
         if (leg.srcToken == address(0)) revert ZeroAddress();
         if (leg.repayToken == address(0)) revert ZeroAddress();
         if (leg.srcToken == leg.repayToken) revert InvalidPlan();
@@ -628,15 +627,14 @@ contract LiquidationExecutor is
         } else {
             revert InvalidSwapMode();
         }
-        isLeg2;
     }
 
     // ─── Core Execute ────────────────────────────────────────────────
     function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
         Plan memory plan = abi.decode(planData, (Plan));
 
-        // Deadline: check leg1 (fail-fast before flashloan). leg2.deadline is
-        // re-checked inside _executeSwapPlan at leg2 boundary.
+        // Deadline: check leg1 and leg2 pre-flashloan. block.timestamp is
+        // monotonic within a transaction, so no in-pipeline re-check needed.
         if (block.timestamp > plan.swapPlan.leg1.deadline) {
             revert SwapDeadlineExpired(plan.swapPlan.leg1.deadline, block.timestamp);
         }
@@ -667,11 +665,7 @@ contract LiquidationExecutor is
         }
 
         // Validate leg1 (may be any mode).
-        _validateLeg(
-            plan.swapPlan.leg1,
-            /* isLeg2 */
-            false
-        );
+        _validateLeg(plan.swapPlan.leg1);
 
         // Validate leg2 (must be Uni V2/V3/V4, must link to leg1 output).
         if (plan.swapPlan.hasLeg2) {
@@ -682,11 +676,7 @@ contract LiquidationExecutor is
             if (plan.swapPlan.leg1.repayToken != plan.swapPlan.leg2.srcToken) {
                 revert InvalidLegLink(plan.swapPlan.leg1.repayToken, plan.swapPlan.leg2.srcToken);
             }
-            _validateLeg(
-                plan.swapPlan.leg2,
-                /* isLeg2 */
-                true
-            );
+            _validateLeg(plan.swapPlan.leg2);
         }
 
         address provider = allowedFlashProviders[plan.flashProviderId];
@@ -957,7 +947,6 @@ contract LiquidationExecutor is
         internal
     {
         SwapLeg memory leg1 = plan.leg1;
-        if (block.timestamp > leg1.deadline) revert SwapDeadlineExpired(leg1.deadline, block.timestamp);
 
         address finalRepayToken = plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken;
         uint256 finalRepayBefore = IERC20(finalRepayToken).balanceOf(address(this));
@@ -971,13 +960,12 @@ contract LiquidationExecutor is
 
         uint256 leg1AmountIn = leg1.useFullBalance ? collateralDelta : leg1.amountIn;
 
-        _dispatchLeg(leg1, leg1AmountIn, intermediateBefore, false);
+        _dispatchLeg(leg1, leg1AmountIn, intermediateBefore);
 
         uint256 trackedLeftover;
         uint256 leg2AmountIn;
         if (plan.hasLeg2) {
             SwapLeg memory leg2 = plan.leg2;
-            if (block.timestamp > leg2.deadline) revert SwapDeadlineExpired(leg2.deadline, block.timestamp);
 
             uint256 intermediateAfter = IERC20(intermediateToken).balanceOf(address(this));
             trackedLeftover = intermediateAfter > intermediateBefore ? intermediateAfter - intermediateBefore : 0;
@@ -985,7 +973,7 @@ contract LiquidationExecutor is
             leg2AmountIn = leg2.useFullBalance ? trackedLeftover : leg2.amountIn;
             if (leg2AmountIn == 0) revert Leg2ZeroLeftover();
 
-            _dispatchLeg(leg2, leg2AmountIn, 0, true);
+            _dispatchLeg(leg2, leg2AmountIn, 0);
         }
 
         uint256 finalRepayAfter = IERC20(finalRepayToken).balanceOf(address(this));
@@ -997,7 +985,7 @@ contract LiquidationExecutor is
         }
     }
 
-    function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore, bool isLeg2) internal {
+    function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
         SwapMode m = leg.mode;
         if (m == SwapMode.PARASWAP_SINGLE) {
             _executeParaswapSingleLeg(leg);
@@ -1012,14 +1000,10 @@ contract LiquidationExecutor is
         } else {
             revert InvalidSwapMode();
         }
-        isLeg2;
     }
 
     // ─── Internal: Paraswap Single ───────────────────────────────────
     function _executeParaswapSingleLeg(SwapLeg memory leg) internal {
-        if (leg.srcToken == address(0)) revert ZeroAddress();
-        if (leg.amountIn == 0) revert ZeroAmountIn();
-
         (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut, bool isExactIn) =
             _executeParaswapCall(leg.paraswapCalldata);
 
@@ -1042,12 +1026,8 @@ contract LiquidationExecutor is
     /// @dev Executes opaque Bebop settlement call. Security: allowlist + exact approval + output delta checks.
     function _executeBebopLeg(SwapLeg memory leg, uint256 repayBefore) internal {
         address target = leg.bebopTarget;
-        if (target == address(0)) revert InvalidBebopTarget();
         if (target.code.length == 0) revert BebopTargetNotContract();
         if (!allowedTargets[target]) revert TargetNotAllowed(target);
-        if (leg.srcToken == address(0)) revert ZeroAddress();
-        if (leg.amountIn == 0) revert ZeroAmountIn();
-        if (leg.bebopCalldata.length < 4) revert InvalidBebopCalldata();
 
         uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
         if (srcBal < leg.amountIn) revert InsufficientSrcBalance(leg.amountIn, srcBal);
@@ -1072,15 +1052,6 @@ contract LiquidationExecutor is
     /// `amountIn` is the collateral delta produced by the current
     /// execute() call — never a pre-existing balance.
     function _executeUniV2Leg(SwapLeg memory leg, uint256 amountIn) internal {
-        if (leg.srcToken == address(0)) revert ZeroAddress();
-        if (leg.repayToken == address(0)) revert ZeroAddress();
-
-        uint256 pLen = leg.v2Path.length;
-        if (pLen < 2) revert InvalidV2Path();
-        if (leg.v2Path[0] != leg.srcToken) revert InvalidV2Path();
-        if (leg.v2Path[pLen - 1] != leg.repayToken) revert InvalidV2Path();
-        if (leg.minAmountOut == 0) revert InvalidPlan();
-
         if (amountIn == 0) revert ZeroSwapInput();
 
         uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
@@ -1105,13 +1076,6 @@ contract LiquidationExecutor is
     /// Fee tier is restricted to the four canonical pools. A non-existent
     /// pool reverts inside the router — no pre-call factory lookup needed.
     function _executeUniV3Leg(SwapLeg memory leg, uint256 amountIn) internal {
-        if (leg.srcToken == address(0)) revert ZeroAddress();
-        if (leg.repayToken == address(0)) revert ZeroAddress();
-
-        uint24 fee = leg.v3Fee;
-        if (fee != 100 && fee != 500 && fee != 3000 && fee != 10000) revert InvalidV3Fee(fee);
-        if (leg.minAmountOut == 0) revert InvalidPlan();
-
         if (amountIn == 0) revert ZeroSwapInput();
 
         uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
@@ -1126,7 +1090,7 @@ contract LiquidationExecutor is
                 IUniV3SwapRouter.ExactInputSingleParams({
                     tokenIn: leg.srcToken,
                     tokenOut: leg.repayToken,
-                    fee: fee,
+                    fee: leg.v3Fee,
                     recipient: address(this),
                     amountIn: amountIn,
                     amountOutMinimum: leg.minAmountOut,
@@ -1138,7 +1102,7 @@ contract LiquidationExecutor is
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
-        emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, fee, amountIn, received);
+        emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, leg.v3Fee, amountIn, received);
     }
 
     // ─── Internal: V4 plan validation (centralized fail-closed checks) ─
@@ -1159,8 +1123,6 @@ contract LiquidationExecutor is
         view
         returns (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook)
     {
-        if (leg.srcToken == address(0)) revert ZeroAddress();
-        if (leg.repayToken == address(0)) revert ZeroAddress();
         if (leg.minAmountOut == 0) revert InvalidPlan();
 
         address pm = leg.v4PoolManager;
