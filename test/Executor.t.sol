@@ -481,28 +481,48 @@ contract ExecutorTest is Test {
         );
     }
 
+    function _zeroLeg() internal pure returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(0),
+            amountIn: 0,
+            useFullBalance: false,
+            deadline: 0,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(0),
+            minAmountOut: 0
+        });
+    }
+
     function _buildParaswapSingleSwapPlan(address srcToken, address dstToken, uint256 amountIn, uint256 minProfitAmt)
         internal
         view
         returns (LiquidationExecutor.SwapPlan memory)
     {
-        return LiquidationExecutor.SwapPlan({
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
             mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
             srcToken: srcToken,
             amountIn: amountIn,
+            useFullBalance: false,
             deadline: block.timestamp + 3600,
             paraswapCalldata: _buildParaswapCalldata(srcToken, dstToken, amountIn, address(executor)),
             bebopTarget: address(0),
             bebopCalldata: "",
-            repayToken: dstToken,
-            profitToken: dstToken,
-            minProfitAmount: minProfitAmt,
-            v3Fee: 0,
             v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
+            v3Fee: 0,
             v4PoolManager: address(0),
-            v4SwapData: ""
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: 0
+        });
+        return LiquidationExecutor.SwapPlan({
+            leg1: leg1, hasLeg2: false, leg2: _zeroLeg(), profitToken: dstToken, minProfitAmount: minProfitAmt
         });
     }
 
@@ -515,23 +535,24 @@ contract ExecutorTest is Test {
         address profitTkn,
         uint256 minProfitAmt
     ) internal view returns (LiquidationExecutor.SwapPlan memory) {
-        return LiquidationExecutor.SwapPlan({
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
             mode: LiquidationExecutor.SwapMode.BEBOP_MULTI,
             srcToken: srcToken,
             amountIn: amountIn,
+            useFullBalance: false,
             deadline: block.timestamp + 3600,
             paraswapCalldata: "",
             bebopTarget: bebopTarget,
             bebopCalldata: bebopCd,
-            repayToken: repayTkn,
-            profitToken: profitTkn,
-            minProfitAmount: minProfitAmt,
-            v3Fee: 0,
             v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
+            v3Fee: 0,
             v4PoolManager: address(0),
-            v4SwapData: ""
+            v4SwapData: "",
+            repayToken: repayTkn,
+            minAmountOut: 0
+        });
+        return LiquidationExecutor.SwapPlan({
+            leg1: leg1, hasLeg2: false, leg2: _zeroLeg(), profitToken: profitTkn, minProfitAmount: minProfitAmt
         });
     }
 
@@ -545,23 +566,24 @@ contract ExecutorTest is Test {
         address[] memory path = new address[](2);
         path[0] = srcToken;
         path[1] = dstToken;
-        return LiquidationExecutor.SwapPlan({
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
             mode: LiquidationExecutor.SwapMode.UNI_V2,
             srcToken: srcToken,
             amountIn: amountIn,
+            useFullBalance: false,
             deadline: block.timestamp + 3600,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
-            repayToken: dstToken,
-            profitToken: dstToken,
-            minProfitAmount: minProfitAmt,
-            v3Fee: 0,
             v2Path: path,
-            minAmountOut: minOut,
-            useFullBalance: false,
+            v3Fee: 0,
             v4PoolManager: address(0),
-            v4SwapData: ""
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: minOut
+        });
+        return LiquidationExecutor.SwapPlan({
+            leg1: leg1, hasLeg2: false, leg2: _zeroLeg(), profitToken: dstToken, minProfitAmount: minProfitAmt
         });
     }
 
@@ -573,23 +595,24 @@ contract ExecutorTest is Test {
         uint256 minOut,
         uint256 minProfitAmt
     ) internal view returns (LiquidationExecutor.SwapPlan memory) {
-        return LiquidationExecutor.SwapPlan({
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
             mode: LiquidationExecutor.SwapMode.UNI_V3,
             srcToken: srcToken,
             amountIn: amountIn,
+            useFullBalance: false,
             deadline: block.timestamp + 3600,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
-            repayToken: dstToken,
-            profitToken: dstToken,
-            minProfitAmount: minProfitAmt,
-            v3Fee: fee,
             v2Path: new address[](0),
-            minAmountOut: minOut,
-            useFullBalance: false,
+            v3Fee: fee,
             v4PoolManager: address(0),
-            v4SwapData: ""
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: minOut
+        });
+        return LiquidationExecutor.SwapPlan({
+            leg1: leg1, hasLeg2: false, leg2: _zeroLeg(), profitToken: dstToken, minProfitAmount: minProfitAmt
         });
     }
 
@@ -604,23 +627,24 @@ contract ExecutorTest is Test {
         uint256 minOut,
         uint256 minProfitAmt
     ) internal view returns (LiquidationExecutor.SwapPlan memory) {
-        return LiquidationExecutor.SwapPlan({
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
             mode: LiquidationExecutor.SwapMode.UNI_V4,
             srcToken: srcToken,
             amountIn: amountIn,
+            useFullBalance: false,
             deadline: block.timestamp + 3600,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
-            repayToken: dstToken,
-            profitToken: dstToken,
-            minProfitAmount: minProfitAmt,
-            v3Fee: 0,
             v2Path: new address[](0),
-            minAmountOut: minOut,
-            useFullBalance: false,
+            v3Fee: 0,
             v4PoolManager: poolManager,
-            v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook)
+            v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook),
+            repayToken: dstToken,
+            minAmountOut: minOut
+        });
+        return LiquidationExecutor.SwapPlan({
+            leg1: leg1, hasLeg2: false, leg2: _zeroLeg(), profitToken: dstToken, minProfitAmount: minProfitAmt
         });
     }
 
@@ -1097,24 +1121,28 @@ contract ExecutorTest is Test {
         bytes memory targetAction =
             _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), seizedAssets);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: collateralReward,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: collateralReward,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -1189,24 +1217,28 @@ contract ExecutorTest is Test {
     function test_paraswapSingle_revertsOnDeadlineExpired() public {
         uint256 expiredDeadline = block.timestamp - 1;
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: expiredDeadline,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(executor)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: expiredDeadline,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(executor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -1343,7 +1375,7 @@ contract ExecutorTest is Test {
             address(collateralToken), collateralIn, address(bebop), bebopCd, address(loanToken), address(loanToken), 0
         );
         // Fix beneficiary for freshExec
-        swapPlan.bebopCalldata = bebopCd;
+        swapPlan.leg1.bebopCalldata = bebopCd;
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
@@ -1988,24 +2020,28 @@ contract ExecutorTest is Test {
         loanToken.mint(address(augustus), DEFAULT_SWAP_AMOUNT);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(0)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(0)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2040,22 +2076,26 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2077,22 +2117,26 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2118,22 +2162,26 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2154,22 +2202,26 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken), // mismatch with cd dst
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2188,22 +2240,26 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT / 2, 0, address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2222,22 +2278,26 @@ contract ExecutorTest is Test {
         bytes memory cd = abi.encodePacked(fakeSelector, new bytes(420)); // pad past length checks
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2257,22 +2317,26 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, badRecipient
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2299,22 +2363,26 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2336,22 +2404,26 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2370,22 +2442,26 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken), // mismatch
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2404,22 +2480,26 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2435,22 +2515,26 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, badRecipient
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2475,22 +2559,26 @@ contract ExecutorTest is Test {
         bytes memory cd = abi.encodePacked(rfqSelector, new bytes(420));
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -2503,24 +2591,28 @@ contract ExecutorTest is Test {
     function test_revertIfSwapRecipientInvalid() public {
         address badRecipient = address(0xBAAD);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, badRecipient
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, badRecipient
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2539,22 +2631,26 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: specAmountIn,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: specAmountIn,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2587,22 +2683,26 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: badCalldata,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: badCalldata,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2679,24 +2779,28 @@ contract ExecutorTest is Test {
 
         // Build swap plan
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: collateralReward,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: collateralReward,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2760,24 +2864,28 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: collateralReward,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: collateralReward,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -2835,24 +2943,28 @@ contract ExecutorTest is Test {
         uint256 swapOutput = collateralReward * 0.836e18 / 1e18; // 501.6e18
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: collateralReward,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: collateralReward,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 10e18,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 10e18
         });
 
         bytes memory plan =
@@ -2927,24 +3039,28 @@ contract ExecutorTest is Test {
         });
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: totalCollateral,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), totalCollateral, address(freshExecutor)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: totalCollateral,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), totalCollateral, address(freshExecutor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan = _buildPlan(2, address(loanToken), totalDebt, flashFee, actions, swapPlan);
@@ -3012,24 +3128,28 @@ contract ExecutorTest is Test {
         });
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: collateralReward * 2,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), collateralReward * 2, address(freshExecutor)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: collateralReward * 2,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), collateralReward * 2, address(freshExecutor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan = _buildPlan(2, address(loanToken), debtToCover * 2, flashFee, actions, swapPlan);
@@ -3271,24 +3391,28 @@ contract ExecutorTest is Test {
         loanToken.mint(address(aavePool), 100_000e18);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: 1,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), 1, address(freshExec)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: 1,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), 1, address(freshExec)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan = _buildPlan(
@@ -3912,24 +4036,28 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: collateralReward,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: collateralReward,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -4024,24 +4152,28 @@ contract ExecutorTest is Test {
             _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), seizedAssets);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: collateralReward,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: _buildParaswapCalldata(
-                address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
-            ),
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: collateralReward,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), collateralReward, address(freshExecutor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -4171,7 +4303,7 @@ contract ExecutorTest is Test {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
         // Fix beneficiary for freshExec
-        swapPlan.paraswapCalldata = _buildParaswapCalldata(
+        swapPlan.leg1.paraswapCalldata = _buildParaswapCalldata(
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(freshExec)
         );
 
@@ -4239,7 +4371,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), COLLATERAL_REWARD, 0);
-        swapPlan.paraswapCalldata =
+        swapPlan.leg1.paraswapCalldata =
             _buildParaswapCalldata(address(collateralToken), address(loanToken), COLLATERAL_REWARD, address(freshExec));
 
         bytes memory plan =
@@ -4341,7 +4473,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
-        swapPlan.paraswapCalldata = _buildParaswapCalldata(
+        swapPlan.leg1.paraswapCalldata = _buildParaswapCalldata(
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(freshExec)
         );
 
@@ -4396,7 +4528,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
-        swapPlan.paraswapCalldata = _buildParaswapCalldata(
+        swapPlan.leg1.paraswapCalldata = _buildParaswapCalldata(
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(freshExec)
         );
 
@@ -4447,7 +4579,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
-        swapPlan.paraswapCalldata = _buildParaswapCalldata(
+        swapPlan.leg1.paraswapCalldata = _buildParaswapCalldata(
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(freshExec)
         );
 
@@ -4512,7 +4644,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
-        swapPlan.paraswapCalldata = _buildParaswapCalldata(
+        swapPlan.leg1.paraswapCalldata = _buildParaswapCalldata(
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, address(freshExec)
         );
 
@@ -4696,22 +4828,26 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: maxAmountIn, // declared max
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: maxAmountIn,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -4908,22 +5044,26 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken), // plan says collateralToken
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4939,22 +5079,26 @@ contract ExecutorTest is Test {
     function test_balancerV2_invalidBlobSelector_reverts() public {
         bytes memory cd = _buildBalancerV2InvalidBlobCalldata(SWAP_EXACT_IN_BALANCER_V2_SELECTOR);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: 1,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: 1,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -4974,22 +5118,26 @@ contract ExecutorTest is Test {
             badRecipient
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5014,22 +5162,26 @@ contract ExecutorTest is Test {
     /// regression in `_decodeAndValidateParaswap` surfaces as a test failure.
     function _runAcceptedSwap(bytes memory cd) internal {
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5044,22 +5196,26 @@ contract ExecutorTest is Test {
     /// Drives a rejected-selector swap and asserts the canonical revert.
     function _expectRejectedSwap(bytes memory cd, bytes4 expectedSelector) internal {
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5090,22 +5246,26 @@ contract ExecutorTest is Test {
 
         // Build a minimal plan using the crafted calldata.
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -5124,22 +5284,26 @@ contract ExecutorTest is Test {
         }
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
-            srcToken: address(collateralToken),
-            amountIn: DEFAULT_SWAP_AMOUNT,
-            deadline: block.timestamp + 3600,
-            paraswapCalldata: cd,
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            repayToken: address(loanToken),
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken),
+                amountIn: DEFAULT_SWAP_AMOUNT,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: cd,
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
             profitToken: address(loanToken),
-            minProfitAmount: 0,
-            v3Fee: 0,
-            v2Path: new address[](0),
-            minAmountOut: 0,
-            useFullBalance: false,
-            v4PoolManager: address(0),
-            v4SwapData: ""
+            minProfitAmount: 0
         });
 
         bytes memory plan =
@@ -5237,7 +5401,7 @@ contract ExecutorTest is Test {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 1, 0);
         // Corrupt path[0] to a non-collateral address.
-        swapPlan.v2Path[0] = address(profitToken);
+        swapPlan.leg1.v2Path[0] = address(profitToken);
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5250,7 +5414,7 @@ contract ExecutorTest is Test {
     function test_UniV2_invalidPath_wrongEnd_reverts() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 1, 0);
-        swapPlan.v2Path[1] = address(profitToken);
+        swapPlan.leg1.v2Path[1] = address(profitToken);
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5263,8 +5427,8 @@ contract ExecutorTest is Test {
     function test_UniV2_invalidPath_tooShort_reverts() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 1, 0);
-        swapPlan.v2Path = new address[](1);
-        swapPlan.v2Path[0] = address(collateralToken);
+        swapPlan.leg1.v2Path = new address[](1);
+        swapPlan.leg1.v2Path[0] = address(collateralToken);
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5280,7 +5444,7 @@ contract ExecutorTest is Test {
         // pre-existing pre-funded balance (DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD).
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), 0, 1, 0);
-        swapPlan.useFullBalance = true;
+        swapPlan.leg1.useFullBalance = true;
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5307,7 +5471,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), 0, 1, 0);
-        swapPlan.useFullBalance = true;
+        swapPlan.leg1.useFullBalance = true;
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5478,7 +5642,7 @@ contract ExecutorTest is Test {
             1,
             0
         );
-        swapPlan.v4SwapData = hex"aabbcc"; // 3 bytes — far under the required 160
+        swapPlan.leg1.v4SwapData = hex"aabbcc"; // 3 bytes — far under the required 160
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5501,7 +5665,8 @@ contract ExecutorTest is Test {
             0
         );
         // Re-encode with the wrong tokenIn so the strict check fires.
-        swapPlan.v4SwapData = abi.encode(address(profitToken), address(loanToken), uint24(3000), int24(60), address(0));
+        swapPlan.leg1.v4SwapData =
+            abi.encode(address(profitToken), address(loanToken), uint24(3000), int24(60), address(0));
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5613,7 +5778,7 @@ contract ExecutorTest is Test {
             1,
             0
         );
-        swapPlan.v4PoolManager = address(0);
+        swapPlan.leg1.v4PoolManager = address(0);
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5703,7 +5868,7 @@ contract ExecutorTest is Test {
             1,
             0
         );
-        swapPlan.v4SwapData = abi.encode(address(0), address(loanToken), uint24(3000), int24(60), address(0));
+        swapPlan.leg1.v4SwapData = abi.encode(address(0), address(loanToken), uint24(3000), int24(60), address(0));
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5725,7 +5890,7 @@ contract ExecutorTest is Test {
             1,
             0
         );
-        swapPlan.v4SwapData = abi.encode(address(collateralToken), address(0), uint24(3000), int24(60), address(0));
+        swapPlan.leg1.v4SwapData = abi.encode(address(collateralToken), address(0), uint24(3000), int24(60), address(0));
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
@@ -5747,7 +5912,7 @@ contract ExecutorTest is Test {
             1,
             0
         );
-        swapPlan.v4SwapData =
+        swapPlan.leg1.v4SwapData =
             abi.encode(address(collateralToken), address(profitToken), uint24(3000), int24(60), address(0));
 
         bytes memory plan =
@@ -5847,7 +6012,7 @@ contract ExecutorTest is Test {
             1,
             0
         );
-        swapPlan.v4SwapData =
+        swapPlan.leg1.v4SwapData =
             abi.encode(address(collateralToken), address(profitToken), uint24(3000), int24(60), address(0));
 
         bytes memory plan =

@@ -253,34 +253,57 @@ contract LiquidationExecutor is
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
-    struct SwapPlan {
+
+    /// @dev One leg of a swap plan. The same struct shape is reused for leg1
+    /// and leg2; fields irrelevant to the chosen `mode` are ignored (and
+    /// must be zero per the validation rules below). See `_executeSwapPlan`
+    /// for the two-leg execution flow.
+    ///
+    /// Invariants (enforced in execute()):
+    ///   * leg1 may be any SwapMode.
+    ///   * leg2, when present, MUST be one of UNI_V2 / UNI_V3 / UNI_V4.
+    ///   * leg2.srcToken MUST equal leg1.repayToken (leg-linking).
+    ///   * For PARASWAP_SINGLE / BEBOP_MULTI: useFullBalance MUST be false
+    ///     (both modes carry their own amountIn inside calldata — using a
+    ///     delta would desync the pre-declared amountIn from reality).
+    struct SwapLeg {
         SwapMode mode;
         address srcToken;
         uint256 amountIn;
+        bool useFullBalance;
         uint256 deadline;
+
+        // Paraswap (PARASWAP_SINGLE only — leg1 only)
         bytes paraswapCalldata;
+
+        // Bebop (BEBOP_MULTI only — leg1 only)
         address bebopTarget;
         bytes bebopCalldata;
+
+        // Uniswap V2 (UNI_V2 only)
+        address[] v2Path;
+
+        // Uniswap V3 (UNI_V3 only)
+        uint24 v3Fee;
+
+        // Uniswap V4 (UNI_V4 only)
+        address v4PoolManager;
+        bytes v4SwapData;
+
+        // Per-leg output binding.
+        // For leg1 in a one-leg plan: == outer plan.loanToken.
+        // For leg1 in a two-leg plan: == leg2.srcToken (intermediate).
+        // For leg2 always:            == outer plan.loanToken.
         address repayToken;
+        uint256 minAmountOut;
+    }
+
+    struct SwapPlan {
+        SwapLeg leg1;
+        bool hasLeg2;
+        SwapLeg leg2;
         address profitToken;
         uint256 minProfitAmount;
-        // Uniswap V2 / V3 / V4 fields (ignored for other modes)
-        /// @dev UNI_V3 only — pool fee tier, must be in {100, 500, 3000, 10000}.
-        uint24 v3Fee;
-        /// @dev UNI_V2 only — swap path, path[0]==srcToken, path[last]==repayToken, length >= 2.
-        address[] v2Path;
-        /// @dev UNI_V2/V3/V4 only — output floor (strict > 0).
-        uint256 minAmountOut;
-        /// @dev UNI_V2/V3/V4 only — if true, swap input = collateral balance delta
-        /// produced during this execute() invocation. Prevents swapping
-        /// pre-existing collateral balances acquired outside the flash pipeline.
-        bool useFullBalance;
-        /// @dev UNI_V4 only — PoolManager address (must be in allowedTargets).
-        address v4PoolManager;
-        /// @dev UNI_V4 only — strict-encoded PoolKey fields:
-        ///   abi.encode(address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook)
-        /// Length must be exactly 160 bytes; shorter/longer payloads revert with InvalidV4Data.
-        bytes v4SwapData;
     }
 
     struct Action {
@@ -563,13 +586,62 @@ contract LiquidationExecutor is
         trackingToken = (receiveAToken && aTokenAddr != address(0)) ? aTokenAddr : collateralAsset;
     }
 
+    /// @dev Per-leg fail-fast validation. Called once per leg from execute()
+    /// BEFORE the flashloan is requested, so malformed plans never burn a
+    /// flash fee. Mirrors the shape-checks the per-mode executor runs
+    /// defensively inside the pipeline — this is the first line of defense.
+    /// `isLeg2` controls the useFullBalance/amountIn rules: a leg2 with
+    /// useFullBalance=true gets its amountIn from trackedLeftover (computed
+    /// inside _executeSwapPlan), so `leg.amountIn` is unused and a non-zero
+    /// value is tolerated silently; leg1 non-Uni modes must set amountIn > 0.
+    function _validateLeg(SwapLeg memory leg, bool isLeg2) internal view {
+        if (leg.srcToken == address(0)) revert ZeroAddress();
+        if (leg.repayToken == address(0)) revert ZeroAddress();
+        if (leg.srcToken == leg.repayToken) revert InvalidPlan();
+
+        SwapMode m = leg.mode;
+
+        // Paraswap/Bebop: reject useFullBalance (amountIn is inside calldata).
+        if ((m == SwapMode.PARASWAP_SINGLE || m == SwapMode.BEBOP_MULTI) && leg.useFullBalance) {
+            revert LegUseFullBalanceNotAllowed(uint8(m));
+        }
+
+        if (m == SwapMode.PARASWAP_SINGLE) {
+            if (leg.paraswapCalldata.length < 4) revert InvalidParaswapCalldata();
+            if (leg.amountIn == 0) revert ZeroAmountIn();
+        } else if (m == SwapMode.BEBOP_MULTI) {
+            if (leg.bebopTarget == address(0)) revert InvalidBebopTarget();
+            if (leg.bebopCalldata.length < 4) revert InvalidBebopCalldata();
+            if (leg.amountIn == 0) revert ZeroAmountIn();
+        } else if (m == SwapMode.UNI_V2) {
+            uint256 pLen = leg.v2Path.length;
+            if (pLen < 2) revert InvalidV2Path();
+            if (leg.v2Path[0] != leg.srcToken) revert InvalidV2Path();
+            if (leg.v2Path[pLen - 1] != leg.repayToken) revert InvalidV2Path();
+            if (leg.minAmountOut == 0) revert InvalidPlan();
+        } else if (m == SwapMode.UNI_V3) {
+            uint24 f = leg.v3Fee;
+            if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
+            if (leg.minAmountOut == 0) revert InvalidPlan();
+        } else if (m == SwapMode.UNI_V4) {
+            _validateV4Leg(leg);
+        } else {
+            revert InvalidSwapMode();
+        }
+        isLeg2;
+    }
+
     // ─── Core Execute ────────────────────────────────────────────────
     function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
         Plan memory plan = abi.decode(planData, (Plan));
 
-        // Early deadline check — reject stale plans before any state changes
-        if (block.timestamp > plan.swapPlan.deadline) {
-            revert SwapDeadlineExpired(plan.swapPlan.deadline, block.timestamp);
+        // Deadline: check leg1 (fail-fast before flashloan). leg2.deadline is
+        // re-checked inside _executeSwapPlan at leg2 boundary.
+        if (block.timestamp > plan.swapPlan.leg1.deadline) {
+            revert SwapDeadlineExpired(plan.swapPlan.leg1.deadline, block.timestamp);
+        }
+        if (plan.swapPlan.hasLeg2 && block.timestamp > plan.swapPlan.leg2.deadline) {
+            revert SwapDeadlineExpired(plan.swapPlan.leg2.deadline, block.timestamp);
         }
 
         if (plan.loanToken == address(0)) revert ZeroAddress();
@@ -578,45 +650,43 @@ contract LiquidationExecutor is
         if (plan.actions.length == 0) revert NoActions();
         if (plan.actions.length > MAX_ACTIONS) revert TooManyActions(plan.actions.length);
 
-        // Repay token must equal loan token
-        if (plan.swapPlan.repayToken != plan.loanToken) {
-            revert RepayTokenMismatch(plan.loanToken, plan.swapPlan.repayToken);
+        // Final-leg repayToken MUST equal outer loanToken.
+        address finalRepayToken = plan.swapPlan.hasLeg2 ? plan.swapPlan.leg2.repayToken : plan.swapPlan.leg1.repayToken;
+        if (finalRepayToken != plan.loanToken) {
+            revert RepayTokenMismatch(plan.loanToken, finalRepayToken);
         }
 
         // Validate all actions use same debt/collateral assets
         (address collateralAsset,) = _validateActions(plan.actions, plan.loanToken);
 
-        // Collateral linkage: srcToken must match liquidation collateral
-        {
-            if (collateralAsset != address(0)) {
-                if (plan.swapPlan.srcToken != collateralAsset) {
-                    revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.srcToken);
-                }
+        // Collateral linkage: leg1.srcToken must match liquidation collateral
+        if (collateralAsset != address(0)) {
+            if (plan.swapPlan.leg1.srcToken != collateralAsset) {
+                revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.leg1.srcToken);
             }
         }
 
-        // Mode-specific validation
-        if (plan.swapPlan.mode == SwapMode.PARASWAP_SINGLE) {
-            if (plan.swapPlan.paraswapCalldata.length < 4) revert InvalidParaswapCalldata();
-        } else if (plan.swapPlan.mode == SwapMode.BEBOP_MULTI) {
-            if (plan.swapPlan.bebopTarget == address(0)) revert InvalidBebopTarget();
-            if (plan.swapPlan.bebopCalldata.length < 4) revert InvalidBebopCalldata();
-        } else if (plan.swapPlan.mode == SwapMode.UNI_V2) {
-            uint256 pLen = plan.swapPlan.v2Path.length;
-            if (pLen < 2) revert InvalidV2Path();
-            if (plan.swapPlan.v2Path[0] != plan.swapPlan.srcToken) revert InvalidV2Path();
-            if (plan.swapPlan.v2Path[pLen - 1] != plan.swapPlan.repayToken) revert InvalidV2Path();
-            if (plan.swapPlan.minAmountOut == 0) revert InvalidPlan();
-        } else if (plan.swapPlan.mode == SwapMode.UNI_V3) {
-            uint24 f = plan.swapPlan.v3Fee;
-            if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
-            if (plan.swapPlan.minAmountOut == 0) revert InvalidPlan();
-        } else if (plan.swapPlan.mode == SwapMode.UNI_V4) {
-            // Eager full-content validation — fails closed BEFORE the flashloan
-            // is requested, so misconfigured V4 plans never burn a flash fee.
-            _validateV4Plan(plan.swapPlan);
-        } else {
-            revert InvalidSwapMode();
+        // Validate leg1 (may be any mode).
+        _validateLeg(
+            plan.swapPlan.leg1,
+            /* isLeg2 */
+            false
+        );
+
+        // Validate leg2 (must be Uni V2/V3/V4, must link to leg1 output).
+        if (plan.swapPlan.hasLeg2) {
+            SwapMode m2 = plan.swapPlan.leg2.mode;
+            if (m2 != SwapMode.UNI_V2 && m2 != SwapMode.UNI_V3 && m2 != SwapMode.UNI_V4) {
+                revert Leg2ModeNotAllowed(uint8(m2));
+            }
+            if (plan.swapPlan.leg1.repayToken != plan.swapPlan.leg2.srcToken) {
+                revert InvalidLegLink(plan.swapPlan.leg1.repayToken, plan.swapPlan.leg2.srcToken);
+            }
+            _validateLeg(
+                plan.swapPlan.leg2,
+                /* isLeg2 */
+                true
+            );
         }
 
         address provider = allowedFlashProviders[plan.flashProviderId];
@@ -886,100 +956,113 @@ contract LiquidationExecutor is
     )
         internal
     {
-        if (block.timestamp > plan.deadline) revert SwapDeadlineExpired(plan.deadline, block.timestamp);
+        SwapLeg memory leg1 = plan.leg1;
+        if (block.timestamp > leg1.deadline) revert SwapDeadlineExpired(leg1.deadline, block.timestamp);
 
-        uint256 repayBefore = IERC20(plan.repayToken).balanceOf(address(this));
+        address finalRepayToken = plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken;
+        uint256 finalRepayBefore = IERC20(finalRepayToken).balanceOf(address(this));
 
-        if (plan.mode == SwapMode.PARASWAP_SINGLE) {
-            _executeParaswapSingle(plan);
-        } else if (plan.mode == SwapMode.BEBOP_MULTI) {
-            _executeBebopMulti(plan, repayBefore);
-        } else if (plan.mode == SwapMode.UNI_V2) {
-            _executeUniV2(plan, collateralDelta);
-        } else if (plan.mode == SwapMode.UNI_V3) {
-            _executeUniV3(plan, collateralDelta);
-        } else if (plan.mode == SwapMode.UNI_V4) {
-            _executeUniV4(plan, collateralDelta);
+        uint256 intermediateBefore;
+        address intermediateToken;
+        if (plan.hasLeg2) {
+            intermediateToken = plan.leg2.srcToken;
+            intermediateBefore = IERC20(intermediateToken).balanceOf(address(this));
+        }
+
+        uint256 leg1AmountIn = leg1.useFullBalance ? collateralDelta : leg1.amountIn;
+
+        _dispatchLeg(leg1, leg1AmountIn, intermediateBefore, false);
+
+        uint256 trackedLeftover;
+        uint256 leg2AmountIn;
+        if (plan.hasLeg2) {
+            SwapLeg memory leg2 = plan.leg2;
+            if (block.timestamp > leg2.deadline) revert SwapDeadlineExpired(leg2.deadline, block.timestamp);
+
+            uint256 intermediateAfter = IERC20(intermediateToken).balanceOf(address(this));
+            trackedLeftover = intermediateAfter > intermediateBefore ? intermediateAfter - intermediateBefore : 0;
+
+            leg2AmountIn = leg2.useFullBalance ? trackedLeftover : leg2.amountIn;
+            if (leg2AmountIn == 0) revert Leg2ZeroLeftover();
+
+            _dispatchLeg(leg2, leg2AmountIn, 0, true);
+        }
+
+        uint256 finalRepayAfter = IERC20(finalRepayToken).balanceOf(address(this));
+        uint256 repayDelta = finalRepayAfter > finalRepayBefore ? finalRepayAfter - finalRepayBefore : 0;
+        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+
+        if (plan.hasLeg2) {
+            emit TwoLegSwapExecuted(intermediateToken, leg1AmountIn, trackedLeftover, leg2AmountIn, repayDelta);
+        }
+    }
+
+    function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore, bool isLeg2) internal {
+        SwapMode m = leg.mode;
+        if (m == SwapMode.PARASWAP_SINGLE) {
+            _executeParaswapSingleLeg(leg);
+        } else if (m == SwapMode.BEBOP_MULTI) {
+            _executeBebopLeg(leg, outBefore);
+        } else if (m == SwapMode.UNI_V2) {
+            _executeUniV2Leg(leg, amountIn);
+        } else if (m == SwapMode.UNI_V3) {
+            _executeUniV3Leg(leg, amountIn);
+        } else if (m == SwapMode.UNI_V4) {
+            _executeUniV4Leg(leg, amountIn);
         } else {
             revert InvalidSwapMode();
         }
-
-        // Delta-based repay check: swap output alone must cover the flashloan
-        // obligation. Using the delta (not absolute balance) prevents a
-        // pre-funded or dust repayToken balance from masking an insufficient
-        // swap.
-        uint256 repayAfter = IERC20(plan.repayToken).balanceOf(address(this));
-        uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
-        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+        isLeg2;
     }
 
     // ─── Internal: Paraswap Single ───────────────────────────────────
-    function _executeParaswapSingle(SwapPlan memory plan) internal {
-        if (plan.srcToken == address(0)) revert ZeroAddress();
-        if (plan.amountIn == 0) revert ZeroAmountIn();
+    function _executeParaswapSingleLeg(SwapLeg memory leg) internal {
+        if (leg.srcToken == address(0)) revert ZeroAddress();
+        if (leg.amountIn == 0) revert ZeroAmountIn();
 
         (address srcToken, address dstToken, uint256 amountIn, uint256 amountOut, bool isExactIn) =
-            _executeParaswapCall(plan.paraswapCalldata);
+            _executeParaswapCall(leg.paraswapCalldata);
 
-        if (srcToken != plan.srcToken) revert ParaswapSrcTokenMismatch(plan.srcToken, srcToken);
+        if (srcToken != leg.srcToken) revert ParaswapSrcTokenMismatch(leg.srcToken, srcToken);
 
         if (isExactIn) {
             // ExactIn (any family): consumed must equal declared.
-            if (amountIn != plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
+            if (amountIn != leg.amountIn) revert ParaswapAmountInMismatch(leg.amountIn, amountIn);
         } else {
-            // ExactOut (any family): plan.amountIn is the declared maximum.
-            if (amountIn > plan.amountIn) revert ParaswapAmountInMismatch(plan.amountIn, amountIn);
+            // ExactOut (any family): leg.amountIn is the declared maximum.
+            if (amountIn > leg.amountIn) revert ParaswapAmountInMismatch(leg.amountIn, amountIn);
         }
 
-        if (dstToken != plan.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
+        if (dstToken != leg.repayToken) revert ParaswapDstTokenUnexpected(dstToken);
 
         emit ParaswapSwapExecuted(srcToken, dstToken, amountIn, amountOut);
     }
 
     // ─── Internal: Bebop Multi ───────────────────────────────────────
     /// @dev Executes opaque Bebop settlement call. Security: allowlist + exact approval + output delta checks.
-    function _executeBebopMulti(SwapPlan memory plan, uint256 repayBefore) internal {
-        address target = plan.bebopTarget;
+    function _executeBebopLeg(SwapLeg memory leg, uint256 repayBefore) internal {
+        address target = leg.bebopTarget;
         if (target == address(0)) revert InvalidBebopTarget();
         if (target.code.length == 0) revert BebopTargetNotContract();
         if (!allowedTargets[target]) revert TargetNotAllowed(target);
-        if (plan.srcToken == address(0)) revert ZeroAddress();
-        if (plan.amountIn == 0) revert ZeroAmountIn();
-        if (plan.bebopCalldata.length < 4) revert InvalidBebopCalldata();
+        if (leg.srcToken == address(0)) revert ZeroAddress();
+        if (leg.amountIn == 0) revert ZeroAmountIn();
+        if (leg.bebopCalldata.length < 4) revert InvalidBebopCalldata();
 
-        uint256 srcBal = IERC20(plan.srcToken).balanceOf(address(this));
-        if (srcBal < plan.amountIn) revert InsufficientSrcBalance(plan.amountIn, srcBal);
+        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
+        if (srcBal < leg.amountIn) revert InsufficientSrcBalance(leg.amountIn, srcBal);
 
-        // Snapshot profitToken for event (separate from repayToken if different)
-        uint256 profitSnapBefore;
-        if (plan.repayToken != plan.profitToken) {
-            profitSnapBefore = IERC20(plan.profitToken).balanceOf(address(this));
-        }
-
-        // Exact approval, call, reset
-        IERC20(plan.srcToken).forceApprove(target, plan.amountIn);
-        (bool ok,) = target.call(plan.bebopCalldata);
-        IERC20(plan.srcToken).forceApprove(target, 0);
+        IERC20(leg.srcToken).forceApprove(target, leg.amountIn);
+        (bool ok,) = target.call(leg.bebopCalldata);
+        IERC20(leg.srcToken).forceApprove(target, 0);
 
         if (!ok) revert BebopSwapFailed();
 
-        // Compute deltas for event only (safe subtraction — never reverts).
-        // Repay sufficiency is checked by _executeSwapPlan via absolute balance.
-        uint256 repayAfter = IERC20(plan.repayToken).balanceOf(address(this));
+        uint256 repayAfter = IERC20(leg.repayToken).balanceOf(address(this));
         uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
-        // Bebop has no mode-local minAmountOut; fail closed on zero output so a
-        // silent 0-delivery Bebop call cannot slip through when minProfitAmount
-        // is also 0 (the aggregate repay check catches it only transitively).
         if (repayDelta == 0) revert ZeroRepayOutput();
-        uint256 profitDelta;
-        if (plan.repayToken == plan.profitToken) {
-            profitDelta = repayDelta;
-        } else {
-            uint256 profitAfter = IERC20(plan.profitToken).balanceOf(address(this));
-            profitDelta = profitAfter > profitSnapBefore ? profitAfter - profitSnapBefore : 0;
-        }
 
-        emit BebopSwapExecuted(target, plan.srcToken, plan.amountIn, repayDelta, profitDelta);
+        emit BebopSwapExecuted(target, leg.srcToken, leg.amountIn, repayDelta, 0);
     }
 
     // ─── Internal: Uniswap V2 single-call swap ───────────────────────
@@ -988,79 +1071,74 @@ contract LiquidationExecutor is
     /// (also asserted up-front in `execute()`). When `useFullBalance=true`,
     /// `amountIn` is the collateral delta produced by the current
     /// execute() call — never a pre-existing balance.
-    function _executeUniV2(SwapPlan memory plan, uint256 collateralDelta) internal {
-        if (plan.srcToken == address(0)) revert ZeroAddress();
-        if (plan.repayToken == address(0)) revert ZeroAddress();
+    function _executeUniV2Leg(SwapLeg memory leg, uint256 amountIn) internal {
+        if (leg.srcToken == address(0)) revert ZeroAddress();
+        if (leg.repayToken == address(0)) revert ZeroAddress();
 
-        // Re-assert path shape (execute() already validated; this is the
-        // in-pipeline fail-closed check so no caller can reach here with a
-        // malformed path even if validation is skipped in the future).
-        uint256 pLen = plan.v2Path.length;
+        uint256 pLen = leg.v2Path.length;
         if (pLen < 2) revert InvalidV2Path();
-        if (plan.v2Path[0] != plan.srcToken) revert InvalidV2Path();
-        if (plan.v2Path[pLen - 1] != plan.repayToken) revert InvalidV2Path();
-        if (plan.minAmountOut == 0) revert InvalidPlan();
+        if (leg.v2Path[0] != leg.srcToken) revert InvalidV2Path();
+        if (leg.v2Path[pLen - 1] != leg.repayToken) revert InvalidV2Path();
+        if (leg.minAmountOut == 0) revert InvalidPlan();
 
-        uint256 amountIn = plan.useFullBalance ? collateralDelta : plan.amountIn;
         if (amountIn == 0) revert ZeroSwapInput();
 
-        uint256 srcBal = IERC20(plan.srcToken).balanceOf(address(this));
+        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
         if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
 
         address router = uniV2Router;
-        uint256 outBefore = IERC20(plan.repayToken).balanceOf(address(this));
+        uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        IERC20(plan.srcToken).forceApprove(router, amountIn);
+        IERC20(leg.srcToken).forceApprove(router, amountIn);
         IUniV2Router(router)
-            .swapExactTokensForTokens(amountIn, plan.minAmountOut, plan.v2Path, address(this), plan.deadline);
-        IERC20(plan.srcToken).forceApprove(router, 0);
+            .swapExactTokensForTokens(amountIn, leg.minAmountOut, leg.v2Path, address(this), leg.deadline);
+        IERC20(leg.srcToken).forceApprove(router, 0);
 
-        uint256 received = IERC20(plan.repayToken).balanceOf(address(this)) - outBefore;
-        if (received < plan.minAmountOut) revert InsufficientRepayOutput(received, plan.minAmountOut);
+        uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
+        if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
-        emit UniV2SwapExecuted(plan.srcToken, plan.repayToken, amountIn, received);
+        emit UniV2SwapExecuted(leg.srcToken, leg.repayToken, amountIn, received);
     }
 
     // ─── Internal: Uniswap V3 single-hop swap ────────────────────────
     /// @dev Executes `exactInputSingle` on the immutable V3 SwapRouter02.
     /// Fee tier is restricted to the four canonical pools. A non-existent
     /// pool reverts inside the router — no pre-call factory lookup needed.
-    function _executeUniV3(SwapPlan memory plan, uint256 collateralDelta) internal {
-        if (plan.srcToken == address(0)) revert ZeroAddress();
-        if (plan.repayToken == address(0)) revert ZeroAddress();
+    function _executeUniV3Leg(SwapLeg memory leg, uint256 amountIn) internal {
+        if (leg.srcToken == address(0)) revert ZeroAddress();
+        if (leg.repayToken == address(0)) revert ZeroAddress();
 
-        uint24 fee = plan.v3Fee;
+        uint24 fee = leg.v3Fee;
         if (fee != 100 && fee != 500 && fee != 3000 && fee != 10000) revert InvalidV3Fee(fee);
-        if (plan.minAmountOut == 0) revert InvalidPlan();
+        if (leg.minAmountOut == 0) revert InvalidPlan();
 
-        uint256 amountIn = plan.useFullBalance ? collateralDelta : plan.amountIn;
         if (amountIn == 0) revert ZeroSwapInput();
 
-        uint256 srcBal = IERC20(plan.srcToken).balanceOf(address(this));
+        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
         if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
 
         address router = uniV3Router;
-        uint256 outBefore = IERC20(plan.repayToken).balanceOf(address(this));
+        uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        IERC20(plan.srcToken).forceApprove(router, amountIn);
+        IERC20(leg.srcToken).forceApprove(router, amountIn);
         IUniV3SwapRouter(router)
             .exactInputSingle(
                 IUniV3SwapRouter.ExactInputSingleParams({
-                    tokenIn: plan.srcToken,
-                    tokenOut: plan.repayToken,
+                    tokenIn: leg.srcToken,
+                    tokenOut: leg.repayToken,
                     fee: fee,
                     recipient: address(this),
                     amountIn: amountIn,
-                    amountOutMinimum: plan.minAmountOut,
+                    amountOutMinimum: leg.minAmountOut,
                     sqrtPriceLimitX96: 0
                 })
             );
-        IERC20(plan.srcToken).forceApprove(router, 0);
+        IERC20(leg.srcToken).forceApprove(router, 0);
 
-        uint256 received = IERC20(plan.repayToken).balanceOf(address(this)) - outBefore;
-        if (received < plan.minAmountOut) revert InsufficientRepayOutput(received, plan.minAmountOut);
+        uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
+        if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
-        emit UniV3SwapExecuted(plan.srcToken, plan.repayToken, fee, amountIn, received);
+        emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, fee, amountIn, received);
     }
 
     // ─── Internal: V4 plan validation (centralized fail-closed checks) ─
@@ -1076,38 +1154,29 @@ contract LiquidationExecutor is
     ///   * tokenOut MUST equal plan.repayToken (no intermediate swaps)
     ///   * hook MUST be address(0) or in `allowedV4Hooks`
     /// Any widening of this scope requires new tests and a fresh review.
-    function _validateV4Plan(SwapPlan memory plan)
+    function _validateV4Leg(SwapLeg memory leg)
         internal
         view
         returns (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook)
     {
-        if (plan.srcToken == address(0)) revert ZeroAddress();
-        if (plan.repayToken == address(0)) revert ZeroAddress();
-        if (plan.minAmountOut == 0) revert InvalidPlan();
+        if (leg.srcToken == address(0)) revert ZeroAddress();
+        if (leg.repayToken == address(0)) revert ZeroAddress();
+        if (leg.minAmountOut == 0) revert InvalidPlan();
 
-        address pm = plan.v4PoolManager;
+        address pm = leg.v4PoolManager;
         if (pm == address(0)) revert ZeroAddress();
         if (!allowedTargets[pm]) revert TargetNotAllowed(pm);
-        if (plan.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
+        if (leg.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
 
         (tokenIn, tokenOut, fee, tickSpacing, hook) =
-            abi.decode(plan.v4SwapData, (address, address, uint24, int24, address));
+            abi.decode(leg.v4SwapData, (address, address, uint24, int24, address));
 
-        // ERC20 → ERC20 only. V4 Currency(0) is native ETH; explicitly blocked
-        // because the executor's accounting assumes `IERC20.balanceOf` deltas.
         if (tokenIn == address(0) || tokenOut == address(0)) revert InvalidV4NativeToken();
-
-        if (tokenIn != plan.srcToken) revert InvalidV4Data();
-        // Distinct error for the single most common operator misconfiguration
-        // (routing to profit token instead of repay token).
-        if (tokenOut != plan.repayToken) revert InvalidV4TokenOut(plan.repayToken, tokenOut);
+        if (tokenIn != leg.srcToken) revert InvalidV4Data();
+        if (tokenOut != leg.repayToken) revert InvalidV4TokenOut(leg.repayToken, tokenOut);
         if (tokenIn == tokenOut) revert InvalidV4Data();
 
-        // Reject clearly-broken PoolKey params. Canonical V4 pools require
-        // positive tickSpacing and a non-zero fee.
         if (fee == 0 || tickSpacing <= 0) revert InvalidV4FeeOrSpacing();
-        // Explicitly reject dynamic-fee pools (V4 sets the high bit of `fee`
-        // for dynamic-fee pools — out of scope for this executor).
         if (fee & 0x800000 != 0) revert InvalidV4Fee();
 
         if (hook != address(0) && !allowedV4Hooks[hook]) revert V4HookNotAllowed(hook);
@@ -1121,13 +1190,12 @@ contract LiquidationExecutor is
     /// requires new tests and security review.
     /// @dev Executes a single-hop exact-input swap via PoolManager's
     /// unlock-callback pattern. Full validation already ran in `execute()`
-    /// via `_validateV4Plan`; this function re-decodes inline to keep the
+    /// via `_validateV4Leg`; this function re-decodes inline to keep the
     /// runtime size down.
-    function _executeUniV4(SwapPlan memory plan, uint256 collateralDelta) internal {
+    function _executeUniV4Leg(SwapLeg memory leg, uint256 amountIn) internal {
         (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
-            abi.decode(plan.v4SwapData, (address, address, uint24, int24, address));
+            abi.decode(leg.v4SwapData, (address, address, uint24, int24, address));
 
-        uint256 amountIn = plan.useFullBalance ? collateralDelta : plan.amountIn;
         if (amountIn == 0) revert ZeroSwapInput();
 
         uint256 srcBal = IERC20(tokenIn).balanceOf(address(this));
@@ -1135,13 +1203,13 @@ contract LiquidationExecutor is
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
 
-        address pm = plan.v4PoolManager;
+        address pm = leg.v4PoolManager;
         _activeV4PoolManager = pm;
         IPoolManager(pm).unlock(abi.encode(tokenIn, tokenOut, fee, tickSpacing, hook, amountIn));
         _activeV4PoolManager = address(0);
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
-        if (received < plan.minAmountOut) revert InsufficientRepayOutput(received, plan.minAmountOut);
+        if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
         emit UniV4SwapExecuted(tokenIn, tokenOut, fee, amountIn, received);
     }
