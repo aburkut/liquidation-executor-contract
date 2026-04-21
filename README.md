@@ -8,7 +8,7 @@
 | **Deploy tx** | `0x95383aabc6cf9b092ac9809facd9c1eb966be3c824e0f5f6ca583fd4374c7976` |
 | **ParaswapDecoderLib** | `0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16` (linked via `--libraries`) |
 | **Library deploy tx** | `0x1446d0fc56087032a8872d3bf09083cf341bfb91cc3924e3baa0cb6cfca17dac` |
-| **Runtime bytecode size** | 24 521 bytes (55 bytes margin under EIP-170) |
+| **Runtime bytecode size** | 24 553 bytes (23 bytes margin under EIP-170) |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
 | **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
 | **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
@@ -139,7 +139,7 @@ Operator Bot
 | Mode | Description | Notes |
 |---|---|---|
 | `PARASWAP_SINGLE` | Single Paraswap swap, `srcToken → repayToken` (leg1 only — not allowed as leg2) | Augustus V6.2 selector-classified; ExactIn requires `amountIn == declared`, ExactOut requires `amountIn <= declared`. Selector validation is done by `ParaswapDecoderLib` (external library, DELEGATECALL). |
-| `BEBOP_MULTI` | Opaque Bebop settlement call, multi-output (leg1 only — not allowed as leg2) | Output validated via balance delta; both `repayDelta > 0` and `repayAfter >= repayBefore + flashRepay` asserted. Allow-listed target only; exact approval + reset pattern. |
+| `BEBOP_MULTI` | Opaque Bebop settlement call, multi-output (leg1 only — not allowed as leg2) | Output validated via balance delta against `leg.minAmountOut` (matches UniV2/V3/V4 — `InsufficientRepayOutput` on underdelivery); `leg.minAmountOut > 0` required pre-flashloan; pipeline-level `repayDelta >= flashRepayAmount` layered on top. Allow-listed target only; exact approval + reset pattern. |
 | `UNI_V2` | Uniswap V2 Router02 `swapExactTokensForTokens`, multi-hop path | Path endpoints pinned: `v2Path[0] == srcToken`, `v2Path[last] == repayToken`, `length >= 2`. Optional `useFullBalance=true` to swap the exact collateral delta produced this call when used as leg1; when used as leg2 the amountIn is the tracked leftover of `leg2.srcToken` produced by leg1. |
 | `UNI_V3` | Uniswap V3 SwapRouter02 `exactInputSingle` | Fee tier restricted to `{100, 500, 3000, 10000}`. SwapRouter02 has no deadline — the executor enforces `plan.deadline` itself. When used as leg2, `useFullBalance=true` sets amountIn to the tracked leftover of `leg2.srcToken` produced by leg1. |
 | `UNI_V4` | Uniswap V4 PoolManager `unlock` → `swap` via callback | `v4SwapData` must be exactly **160 bytes** encoding `(tokenIn, tokenOut, fee, tickSpacing, hook)`. `hook` must be `address(0)` **or** in `allowedV4Hooks`. Sqrt-price limits set one tick inside allowed range — slippage is enforced by `minAmountOut`. When used as leg2, `useFullBalance=true` sets amountIn to the tracked leftover of `leg2.srcToken` produced by leg1. |
@@ -160,8 +160,9 @@ struct SwapLeg {
     address srcToken;
     uint256 amountIn;           // Used when useFullBalance == false
     bool    useFullBalance;     // leg1: amountIn = collateralDelta produced this call.
-                                // leg2: amountIn = balanceOf(srcToken)_after_leg1 -
-                                //                  balanceOf(srcToken)_before_leg1
+                                // leg2: MUST be true (enforced on-chain) — amountIn =
+                                //       balanceOf(srcToken)_after_leg1 -
+                                //       balanceOf(srcToken)_before_leg1
                                 //       (tracked leftover — pre-existing dust is NOT consumed).
                                 // Paraswap / Bebop: MUST be false.
     uint256 deadline;
@@ -176,7 +177,7 @@ struct SwapLeg {
     address repayToken;         // leg1 one-leg plan: == outer loanToken.
                                 // leg1 two-leg plan: == leg2.srcToken (intermediate).
                                 // leg2 always:       == outer loanToken.
-    uint256 minAmountOut;       // Per-leg output floor (must be > 0 for UNI_V2/V3/V4)
+    uint256 minAmountOut;       // Per-leg output floor (must be > 0 for UNI_V2/V3/V4 and BEBOP_MULTI)
 }
 
 struct SwapPlan {
@@ -217,12 +218,14 @@ Invariants enforced on-chain in `execute()` BEFORE the flashloan is requested:
     would decouple from the tracked-leftover semantic.
   - `leg1.repayToken == leg2.srcToken` (`InvalidLegLink`) — the intermediate token
     is pinned by the plan, not inferred from trace.
+  - `leg2.useFullBalance == true` (`InvalidPlan`) — leg2's `amountIn` MUST come from
+    the on-chain tracked leftover; off-chain-supplied `leg2.amountIn` is rejected.
   - `leg2.repayToken == outer loanToken` — the final leg always delivers into the
     flashloan repay token.
 - `finalRepayToken == outer loanToken` — where `finalRepayToken` is `leg2.repayToken`
   when `hasLeg2`, else `leg1.repayToken`.
 
-Leg2 `useFullBalance == true` computes `amountIn` as:
+Leg2 `amountIn` is always computed on-chain as:
 
     leg2AmountIn = balanceOf(leg2.srcToken)_after_leg1 - balanceOf(leg2.srcToken)_before_leg1
 
@@ -373,6 +376,11 @@ struct MorphoLiquidation {
 | `InsufficientSrcBalance(required, available)` | Swap source balance < `amountIn` |
 | `InsufficientEth(required, available)` | Coinbase payment needs more ETH than held / unwrappable |
 | `BalancerSingleTokenOnly()` | Balancer flashloan with > 1 asset |
+| `Leg2ModeNotAllowed(mode)` | leg2 uses a mode outside `{UNI_V2, UNI_V3, UNI_V4}` (Paraswap / Bebop rejected as leg2) |
+| `InvalidLegLink(leg1Out, leg2In)` | `leg1.repayToken != leg2.srcToken` (two-leg intermediate token mismatch) |
+| `Leg2ZeroLeftover()` | Two-leg plan: `leg2.srcToken` balance delta across leg1 is zero (defensive; normally unreachable because leg1's own `minAmountOut >= 1` forces a non-zero delta) |
+| `LegUseFullBalanceNotAllowed(mode)` | Paraswap / Bebop leg set `useFullBalance=true` (both modes carry their own `amountIn` in calldata) |
+| `InvalidPlan()` | Generic plan-shape rejection — includes `hasLeg2 && !leg2.useFullBalance` (leg2 must use on-chain tracked leftover), `leg.srcToken == leg.repayToken`, `minAmountOut == 0` on UNI_V2/V3/V4 and BEBOP_MULTI legs, and Morpho `maxRepayAssets == 0` |
 
 ## Configuration
 
@@ -414,7 +422,7 @@ struct MorphoLiquidation {
 
 ```
 src/
-  LiquidationExecutor.sol              Main contract (~1533 lines)
+  LiquidationExecutor.sol              Main contract (~1531 lines)
   interfaces/
     IAaveV3Pool.sol                    Aave V3 Pool + getReserveData
     IBalancerVault.sol                 Balancer Vault + IFlashLoanRecipient
@@ -427,7 +435,7 @@ src/
     ParaswapDecoderLib.sol             Augustus V6.2 selector classifier + per-family decoders
 
 test/
-  Executor.t.sol                       235 unit tests
+  Executor.t.sol                       237 unit tests
   fork/
     ExecutorForkV4.t.sol                 8 mainnet-fork tests against real V4 PoolManager
   mocks/
@@ -447,7 +455,7 @@ test/
 ```bash
 forge install          # Install dependencies
 forge build            # Compile
-forge test             # Run 243 tests
+forge test             # Run 245 tests
 forge test -vvv        # Verbose output
 forge coverage         # Coverage report
 ```
