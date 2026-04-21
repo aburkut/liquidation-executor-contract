@@ -527,6 +527,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: dstToken,
             minProfitAmount: minProfitAmt
         });
@@ -563,6 +564,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: profitTkn,
             minProfitAmount: minProfitAmt
         });
@@ -600,6 +602,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: dstToken,
             minProfitAmount: minProfitAmt
         });
@@ -635,6 +638,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: dstToken,
             minProfitAmount: minProfitAmt
         });
@@ -673,6 +677,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: dstToken,
             minProfitAmount: minProfitAmt
         });
@@ -693,6 +698,7 @@ contract ExecutorTest is Test {
             leg2: leg2,
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: profitTkn,
             minProfitAmount: minProfitAmt
         });
@@ -1322,6 +1328,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -1420,6 +1427,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2225,6 +2233,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2281,6 +2290,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2324,6 +2334,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2371,6 +2382,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2413,6 +2425,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2453,6 +2466,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2493,6 +2507,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2534,6 +2549,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2582,6 +2598,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2625,6 +2642,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2665,6 +2683,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2705,6 +2724,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2742,6 +2762,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2788,6 +2809,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2824,6 +2846,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2864,6 +2887,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -2918,6 +2942,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -3018,6 +3043,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -3105,6 +3131,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -3186,6 +3213,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 10e18
         });
@@ -3284,6 +3312,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -3375,6 +3404,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -3640,6 +3670,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -4287,6 +4318,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -4405,6 +4437,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -5119,6 +5152,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -5337,6 +5371,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -5374,6 +5409,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -5415,6 +5451,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -5461,6 +5498,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -5497,6 +5535,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -5549,6 +5588,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -5589,6 +5629,7 @@ contract ExecutorTest is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: address(loanToken),
             minProfitAmount: 0
         });
@@ -6769,6 +6810,7 @@ contract ExecutorTest is Test {
             leg2: profitLeg,
             hasSplit: true,
             splitBps: splitBps_,
+            hasMixedSplit: false,
             profitToken: profitTkn,
             minProfitAmount: minProfitAmt
         });
@@ -6866,6 +6908,244 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MIXED_SPLIT MODE — leg1 any mode (Paraswap/Bebop for deep repay routing)
+    // + leg2 Uni coll→WETH on residual collateral for coinbase-capable profit.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @dev Build a SwapPlan for hasMixedSplit mode.
+    function _buildMixedSplitPlan(
+        LiquidationExecutor.SwapLeg memory repayLeg,
+        LiquidationExecutor.SwapLeg memory profitLeg,
+        address profitTkn,
+        uint256 minProfitAmt
+    ) internal pure returns (LiquidationExecutor.SwapPlan memory) {
+        return LiquidationExecutor.SwapPlan({
+            leg1: repayLeg,
+            hasLeg2: false,
+            leg2: profitLeg,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: true,
+            profitToken: profitTkn,
+            minProfitAmount: minProfitAmt
+        });
+    }
+
+    /// @notice Happy path: MIXED_SPLIT with Uni leg1 (coll→debt) + Uni leg2
+    /// (residual coll→WETH). leg1 consumes a fixed amountIn; leg2 runs on
+    /// whatever collateral is left. After: repay leg covers flashRepay,
+    /// WETH remainder fuels coinbase.
+    function test_mixed_split_happy_path() public {
+        // 2000e18 coll; leg1 consumes 1100e18 for repay (covers 1001e18
+        // flashRepay at 1:1 Uni rate), leg2 takes the remaining 900e18 →
+        // WETH.
+        uint256 reward = 2000e18;
+        aavePool.setLiquidationCollateralReward(reward);
+        collateralToken.mint(address(aavePool), 100_000e18);
+
+        address coinbase = address(0xC01C);
+        vm.coinbase(coinbase);
+
+        LiquidationExecutor.SwapLeg memory repayLeg =
+            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        LiquidationExecutor.SwapLeg memory profitLeg =
+            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
+
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(
+                address(collateralToken), address(loanToken), address(0x1234), 500e18, false
+            )
+        });
+        actions[1] = _buildCoinbasePaymentAction(500); // 5% of realized WETH profit
+
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, swapPlan);
+
+        uint256 cbBefore = coinbase.balance;
+        uint256 wethBefore = mockWeth.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(coinbase.balance, cbBefore, "coinbase did not receive ETH on MIXED_SPLIT profit leg");
+        assertGt(mockWeth.balanceOf(address(executor)), wethBefore, "MIXED_SPLIT profit leg produced no WETH");
+    }
+
+    /// @notice MIXED_SPLIT rejects leg2 with a non-Uni mode (e.g. Paraswap).
+    function test_mixed_split_rejects_non_uni_leg2() public {
+        LiquidationExecutor.SwapLeg memory repayLeg =
+            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        // leg2 set to PARASWAP_SINGLE — not allowed in MIXED_SPLIT.
+        LiquidationExecutor.SwapLeg memory profitLeg = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(collateralToken),
+            amountIn: 1,
+            useFullBalance: false,
+            deadline: block.timestamp + 60,
+            paraswapCalldata: hex"deadbeef",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(mockWeth),
+            minAmountOut: 1
+        });
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.Leg2ModeNotAllowed.selector, uint8(0)));
+        executor.execute(plan);
+    }
+
+    /// @notice MIXED_SPLIT rejects leg2.repayToken != WETH.
+    function test_mixed_split_rejects_non_weth_profit_leg() public {
+        LiquidationExecutor.SwapLeg memory repayLeg =
+            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        // profit leg attempts to output loanToken instead of WETH.
+        LiquidationExecutor.SwapLeg memory profitLeg =
+            _buildUniV3Leg(address(collateralToken), address(loanToken), 0, 3000, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// @notice MIXED_SPLIT rejects leg1.repayToken != loanToken (repay leg
+    /// must produce the flashloan token directly — unlike hasLeg2 where
+    /// leg1 outputs an intermediate).
+    function test_mixed_split_rejects_leg1_repay_not_loan_token() public {
+        // leg1 outputs WETH (not loanToken) — this is the hasLeg2 shape.
+        LiquidationExecutor.SwapLeg memory repayLeg =
+            _buildUniV3Leg(address(collateralToken), address(mockWeth), 1100e18, 3000, 1, false);
+        LiquidationExecutor.SwapLeg memory profitLeg =
+            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.RepayTokenMismatch.selector, address(loanToken), address(mockWeth)
+            )
+        );
+        executor.execute(plan);
+    }
+
+    /// @notice MIXED_SPLIT rejects leg2.srcToken != collateralAsset — the
+    /// profit leg MUST run on the same collateral as leg1 (parallel split,
+    /// not sequential routing).
+    function test_mixed_split_rejects_leg2_src_not_collateral() public {
+        LiquidationExecutor.SwapLeg memory repayLeg =
+            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        // leg2.srcToken is loanToken (not collateral) — violates MIXED_SPLIT
+        // invariant.
+        LiquidationExecutor.SwapLeg memory profitLeg =
+            _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.SrcTokenNotCollateral.selector, address(collateralToken), address(loanToken)
+            )
+        );
+        executor.execute(plan);
+    }
+
+    /// @notice MIXED_SPLIT rejects useFullBalance on either leg — both
+    /// legs get an explicit amountIn (leg1 from its own calldata / struct,
+    /// leg2 from the runtime-measured residual).
+    function test_mixed_split_rejects_use_full_balance() public {
+        LiquidationExecutor.SwapLeg memory repayLeg =
+            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        LiquidationExecutor.SwapLeg memory profitLeg = _buildUniV3Leg(
+            address(collateralToken),
+            address(mockWeth),
+            0,
+            3000,
+            1,
+            true /* useFullBalance */
+        );
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// @notice MIXED_SPLIT reverts `MixedSplitLeg1Overspent` when leg1's
+    /// fixed amountIn exceeds collateralDelta (e.g. Paraswap /swap target
+    /// sized against a stale collateral estimate). Leg2 would have zero
+    /// (or negative) residual.
+    function test_mixed_split_rejects_leg1_overspend() public {
+        // Liquidation produces 500e18 collateral, but leg1 asks for 1000e18.
+        aavePool.setLiquidationCollateralReward(500e18);
+        collateralToken.mint(address(aavePool), 100_000e18);
+
+        LiquidationExecutor.SwapLeg memory repayLeg =
+            _buildUniV3Leg(address(collateralToken), address(loanToken), 1000e18, 3000, 1, false);
+        LiquidationExecutor.SwapLeg memory profitLeg =
+            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        // leg1 reverts InsufficientSrcBalance before we measure leg1Consumed
+        // — the Uni executor catches the shortage first. Accept either revert
+        // path since both are fail-closed outcomes for this scenario.
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    /// @notice Plan-shape XOR guard: setting `hasSplit=true` AND
+    /// `hasMixedSplit=true` simultaneously reverts `PlanShapeConflict`.
+    function test_mixed_split_rejects_shape_conflict() public {
+        LiquidationExecutor.SwapLeg memory repayLeg =
+            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        LiquidationExecutor.SwapLeg memory profitLeg =
+            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: repayLeg,
+            hasLeg2: false,
+            leg2: profitLeg,
+            hasSplit: true,
+            splitBps: 5000,
+            hasMixedSplit: true,
+            profitToken: address(mockWeth),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.PlanShapeConflict.selector);
         executor.execute(plan);
     }
 

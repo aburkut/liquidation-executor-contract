@@ -91,6 +91,20 @@ contract LiquidationExecutor is
     error Leg2ZeroLeftover();
     error LegUseFullBalanceNotAllowed(uint8 mode);
 
+    // MIXED_SPLIT errors
+    /// @dev Only one of {hasLeg2, hasSplit, hasMixedSplit} may be true.
+    error PlanShapeConflict();
+    /// @dev Raised when leg1 of MIXED_SPLIT consumed >= collateralDelta,
+    /// leaving nothing for the profit leg. leg1 over-approved or the
+    /// Paraswap /swap calldata was sized larger than the opportunity's
+    /// realized collateral — caller must downsize leg1 target.
+    error MixedSplitLeg1Overspent(uint256 consumed, uint256 collateralDelta);
+    /// @dev Raised when leg1 of MIXED_SPLIT did not consume any collateral
+    /// (e.g. Paraswap call failed silently, or srcToken didn't match).
+    /// The leg1 executor's own revert path should fire first in practice —
+    /// this is a belt-and-suspenders check.
+    error MixedSplitLeg1NoConsumption();
+
     // Paraswap errors
     error InvalidParaswapCalldata();
     error InvalidSwapSelector();
@@ -301,17 +315,36 @@ contract LiquidationExecutor is
         uint256 minAmountOut;
     }
 
-    /// @dev When `hasSplit == true`, leg1 serves as the REPAY leg
-    /// (collateral → loanToken) and leg2 serves as the PROFIT leg
-    /// (collateral → WETH). `hasSplit` is mutually exclusive with `hasLeg2`.
-    /// `splitBps` (0..10000, exclusive) is the share of collateralDelta routed
-    /// into the PROFIT leg; the REPAY leg receives the remainder.
+    /// @dev Plan-shape matrix — EXACTLY ONE of {hasLeg2, hasSplit,
+    /// hasMixedSplit} may be true (or all false = single-leg).
+    ///
+    /// hasSplit (PURE SPLIT) — leg1 + leg2 both Uni, parallel on
+    /// collateralDelta with an explicit splitBps partition. Gives
+    /// coinbase-capable WETH profit; both legs must accept a runtime
+    /// `amountIn` (hence Uni-only).
+    ///
+    /// hasMixedSplit (MIXED_SPLIT) — leg1 is ANY mode (typical:
+    /// Paraswap / Bebop for deep routing on the repay leg), leg2 is
+    /// Uni-only (collateral → WETH). leg1's consumption is measured
+    /// from the collateral-balance delta during its execution; leg2
+    /// swaps whatever collateral is left. splitBps is IGNORED in this
+    /// mode. Primary use case: non-WETH / non-WETH pairs where no
+    /// direct Uni coll→debt pool exists, so SPLIT's Uni-only
+    /// constraint would block the plan — but Paraswap can route
+    /// coll→debt via any DEX graph while Uni handles the small
+    /// coll→WETH coinbase leg.
+    ///
+    /// hasLeg2 (SEQUENTIAL) — leg1 → intermediate, leg2 (Uni,
+    /// useFullBalance=true) → loanToken. No coinbase (leg2 consumes
+    /// the whole intermediate balance). Used for deep-liquidity
+    /// routing through WETH bridge when direct coll→debt is thin.
     struct SwapPlan {
         SwapLeg leg1;
         bool hasLeg2;
         SwapLeg leg2;
         bool hasSplit;
         uint16 splitBps;
+        bool hasMixedSplit;
         address profitToken;
         uint256 minProfitAmount;
     }
@@ -677,6 +710,18 @@ contract LiquidationExecutor is
             }
         }
 
+        // Plan-shape XOR guard: at most ONE of {hasLeg2, hasSplit,
+        // hasMixedSplit} may be true. All-false = single-leg plan.
+        // Fail-closed before running any leg validation so a malformed
+        // plan can never reach the flashloan layer.
+        {
+            uint256 shapeCount = 0;
+            if (plan.swapPlan.hasLeg2) shapeCount++;
+            if (plan.swapPlan.hasSplit) shapeCount++;
+            if (plan.swapPlan.hasMixedSplit) shapeCount++;
+            if (shapeCount > 1) revert PlanShapeConflict();
+        }
+
         // Validate leg1 (may be any mode).
         _validateLeg(plan.swapPlan.leg1);
 
@@ -695,10 +740,9 @@ contract LiquidationExecutor is
 
         // Validate SPLIT mode: leg1=repayLeg (collateral→loanToken), leg2=profitLeg
         // (collateral→WETH), each sized by splitBps of collateralDelta at runtime.
-        // Mutually exclusive with hasLeg2. Both legs restricted to Uni modes
-        // (only modes accepting an explicit amountIn parameter).
+        // Both legs restricted to Uni modes (only modes accepting an explicit
+        // amountIn parameter).
         if (plan.swapPlan.hasSplit) {
-            if (plan.swapPlan.hasLeg2) revert InvalidPlan();
             uint16 bps = plan.swapPlan.splitBps;
             if (bps == 0 || bps >= 10_000) revert InvalidPlan();
             SwapMode m1 = plan.swapPlan.leg1.mode;
@@ -710,6 +754,59 @@ contract LiquidationExecutor is
                 revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.leg2.srcToken);
             }
             if (plan.swapPlan.leg1.useFullBalance || plan.swapPlan.leg2.useFullBalance) revert InvalidPlan();
+            _validateLeg(plan.swapPlan.leg2);
+        }
+
+        // Validate MIXED_SPLIT mode: leg1 = any mode (typical Paraswap /
+        // Bebop) routes coll → loanToken for repay; leg2 = Uni-only
+        // (coll → WETH) runs on whatever collateral is left after leg1.
+        //   * leg1.repayToken MUST equal loanToken (its swap directly
+        //     produces the token that settles the flashloan).
+        //   * leg2 mode ∈ {UNI_V2, UNI_V3, UNI_V4} — those accept a
+        //     runtime `amountIn` which we supply from the measured
+        //     collateral balance delta.
+        //   * leg2.srcToken == collateralAsset (same source token as
+        //     leg1) — leg2 is a parallel profit split, not sequential
+        //     routing. This is also what distinguishes MIXED_SPLIT from
+        //     hasLeg2 (which requires leg2.srcToken == leg1.repayToken).
+        //   * leg2.repayToken == weth (contract-pinned profit leg).
+        //   * Neither leg may set `useFullBalance` in the on-wire payload
+        //     — leg1 uses calldata-embedded amountIn, leg2's amountIn is
+        //     filled in at runtime from the measured leg1 consumption.
+        //     (If we accepted useFullBalance here the profit leg would
+        //     race the repay leg for "all collateral" and produce
+        //     non-deterministic output.)
+        if (plan.swapPlan.hasMixedSplit) {
+            SwapMode m1 = plan.swapPlan.leg1.mode;
+            // leg1 can be ANY of the five modes. No mode restriction.
+            // (The contract's per-mode executor already enforces the
+            // relevant calldata / approval invariants.)
+            if (plan.swapPlan.leg1.repayToken != plan.loanToken) {
+                revert RepayTokenMismatch(plan.loanToken, plan.swapPlan.leg1.repayToken);
+            }
+
+            SwapMode mp = plan.swapPlan.leg2.mode;
+            if (mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4) {
+                revert Leg2ModeNotAllowed(uint8(mp));
+            }
+            if (plan.swapPlan.leg2.repayToken != weth) revert InvalidPlan();
+            if (collateralAsset != address(0) && plan.swapPlan.leg2.srcToken != collateralAsset) {
+                revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.leg2.srcToken);
+            }
+            if (plan.swapPlan.leg1.useFullBalance || plan.swapPlan.leg2.useFullBalance) {
+                revert InvalidPlan();
+            }
+            // PARASWAP_SINGLE / BEBOP_MULTI embed `amountIn` in calldata
+            // — that's fine here (leg1 runs first, we measure what it
+            // consumed). For Uni leg1 modes we still require an explicit
+            // amountIn inside the leg struct because Uni executors read
+            // it at dispatch time.
+            if (
+                (m1 == SwapMode.UNI_V2 || m1 == SwapMode.UNI_V3 || m1 == SwapMode.UNI_V4)
+                    && plan.swapPlan.leg1.amountIn == 0
+            ) {
+                revert ZeroAmountIn();
+            }
             _validateLeg(plan.swapPlan.leg2);
         }
 
@@ -975,14 +1072,12 @@ contract LiquidationExecutor is
     function _executeSwapPlan(
         SwapPlan memory plan,
         uint256 flashRepayAmount,
-        address, /* collateralAsset */
+        address collateralAsset,
         uint256 collateralDelta
-    )
-        internal
-    {
+    ) internal {
         SwapLeg memory leg1 = plan.leg1;
 
-        address finalRepayToken = plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken;
+        address finalRepayToken = (plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken);
         uint256 finalRepayBefore = IERC20(finalRepayToken).balanceOf(address(this));
 
         // Pre-leg1 snapshot of leg1.repayToken balance. Dual-purpose:
@@ -994,8 +1089,8 @@ contract LiquidationExecutor is
 
         // SPLIT mode: partition collateralDelta between repay (leg1) and profit
         // (leg2 → WETH); each leg runs with its explicitly-allocated amountIn.
-        // Validated in execute(): hasSplit XOR hasLeg2, both legs Uni-only,
-        // leg2.repayToken==weth, neither useFullBalance.
+        // Validated in execute(): hasSplit XOR hasLeg2 XOR hasMixedSplit, both
+        // legs Uni-only, leg2.repayToken==weth, neither useFullBalance.
         if (plan.hasSplit) {
             uint256 profitAmount = (collateralDelta * plan.splitBps) / 10_000;
             uint256 repayAmount = collateralDelta - profitAmount;
@@ -1007,6 +1102,80 @@ contract LiquidationExecutor is
             uint256 splitRepayAfter = IERC20(finalRepayToken).balanceOf(address(this));
             uint256 splitRepayDelta = splitRepayAfter > finalRepayBefore ? splitRepayAfter - finalRepayBefore : 0;
             if (splitRepayDelta < flashRepayAmount) revert InsufficientRepayOutput(splitRepayDelta, flashRepayAmount);
+            return;
+        }
+
+        // MIXED_SPLIT mode: leg1 = any swap mode (coll → loanToken,
+        // typical Paraswap/Bebop for deep routing), leg2 = Uni-only
+        // (coll → WETH) on the residual collateral. Measured execution:
+        //
+        //   1. Snapshot collateral balance BEFORE leg1.
+        //   2. Run leg1 with its own embedded amountIn (calldata for
+        //      Paraswap/Bebop, amount_in field for Uni).
+        //   3. Measure leg1_consumed = collBefore - collAfter. Must be
+        //      strictly < collateralDelta (leaves room for leg2) and
+        //      strictly > 0 (leg1 actually did something).
+        //   4. Run leg2 on the residual: leg2_amountIn =
+        //      collateralDelta - leg1_consumed.
+        //   5. Assert final repayDelta on loanToken ≥ flashRepayAmount
+        //      (leg1 alone must cover repay; leg2 output is WETH profit).
+        //
+        // Invariants pinned upstream in execute():
+        //   * Exactly one of {hasLeg2, hasSplit, hasMixedSplit} is true.
+        //   * leg1.srcToken == collateralAsset (general leg1 check).
+        //   * leg1.repayToken == loanToken (MIXED_SPLIT-specific).
+        //   * leg2 mode ∈ {UNI_V2, UNI_V3, UNI_V4}.
+        //   * leg2.srcToken == collateralAsset (same collateral, parallel
+        //     split — NOT the leg1.repayToken link that hasLeg2 uses).
+        //   * leg2.repayToken == weth (pinned profit token).
+        //   * Neither leg sets useFullBalance (deterministic sizing).
+        if (plan.hasMixedSplit) {
+            // Safety: if the caller didn't pass collateralAsset we can't
+            // measure leg1 consumption — reject here rather than let the
+            // mode silently degrade into a no-op profit leg.
+            if (collateralAsset == address(0)) revert InvalidPlan();
+
+            uint256 collBeforeLeg1 = IERC20(collateralAsset).balanceOf(address(this));
+
+            // leg1 executes with its own amountIn. The leg1RepayBefore
+            // snapshot is still the Bebop delta baseline when leg1 is
+            // BEBOP_MULTI — other modes ignore the third arg.
+            _dispatchLeg(leg1, leg1.amountIn, leg1RepayBefore);
+
+            uint256 collAfterLeg1 = IERC20(collateralAsset).balanceOf(address(this));
+            // Strict: leg1 must consume SOME collateral (non-zero) AND
+            // leave strictly positive residual for the profit leg. This
+            // prevents both "no-op leg1" (saturate to zero) and "leg1
+            // over-approved and consumed more than the opportunity
+            // produced" (which would leave zero for leg2 → revert
+            // InsufficientRepayOutput or ZeroSwapInput downstream, but
+            // a precise error is operationally preferable).
+            if (collAfterLeg1 >= collBeforeLeg1) revert MixedSplitLeg1NoConsumption();
+            uint256 leg1Consumed;
+            unchecked {
+                // Safe: checked above that collAfterLeg1 < collBeforeLeg1.
+                leg1Consumed = collBeforeLeg1 - collAfterLeg1;
+            }
+            if (leg1Consumed >= collateralDelta) {
+                revert MixedSplitLeg1Overspent(leg1Consumed, collateralDelta);
+            }
+            uint256 leg2AmountIn;
+            unchecked {
+                // Safe: checked above that leg1Consumed < collateralDelta.
+                leg2AmountIn = collateralDelta - leg1Consumed;
+            }
+
+            _dispatchLeg(plan.leg2, leg2AmountIn, 0);
+
+            // Final repay check: leg1's output (loanToken) alone must
+            // cover flashRepayAmount. leg2's output is WETH (profit leg)
+            // so it does NOT contribute to the repay balance — the
+            // finalRepayToken snapshot is taken against loanToken.
+            uint256 splitRepayAfter = IERC20(finalRepayToken).balanceOf(address(this));
+            uint256 splitRepayDelta = splitRepayAfter > finalRepayBefore ? splitRepayAfter - finalRepayBefore : 0;
+            if (splitRepayDelta < flashRepayAmount) {
+                revert InsufficientRepayOutput(splitRepayDelta, flashRepayAmount);
+            }
             return;
         }
 

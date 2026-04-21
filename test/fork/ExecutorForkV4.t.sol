@@ -117,6 +117,7 @@ contract ExecutorForkV4Test is Test {
             leg2: _zeroLeg(),
             hasSplit: false,
             splitBps: 0,
+            hasMixedSplit: false,
             profitToken: WETH,
             minProfitAmount: 0
         });
