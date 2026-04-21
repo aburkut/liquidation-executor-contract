@@ -7,8 +7,9 @@
 | **Contract (V4)** | `0xB5C7881500F0A7A56E985266Da6AD9d19a5CCBB4` |
 | **Deploy tx** | `0x95383aabc6cf9b092ac9809facd9c1eb966be3c824e0f5f6ca583fd4374c7976` |
 | **ParaswapDecoderLib** | `0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16` (linked via `--libraries`) |
-| **Library deploy tx** | `0x1446d0fc56087032a8872d3bf09083cf341bfb91cc3924e3baa0cb6cfca17dac` |
-| **Runtime bytecode size** | 24 553 bytes (23 bytes margin under EIP-170) |
+| **ParaswapDecoderLib deploy tx** | `0x1446d0fc56087032a8872d3bf09083cf341bfb91cc3924e3baa0cb6cfca17dac` |
+| **SwapLegExecutorLib** | _(new — deploy address pending redeploy with SPLIT + leg-executor extraction)_ |
+| **Runtime bytecode size** | 23 468 bytes (1 108 bytes margin under EIP-170) — source-tree state after V5 split-mode + library extraction |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
 | **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
 | **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
@@ -37,9 +38,10 @@ Production-grade **Flashloan → Multi-Liquidation → Multi-Swap → Repay** ex
 DeFi liquidation bots.
 
 Supports **five swap modes** (Paraswap single, Bebop multi-output, Uniswap V2 / V3 / V4),
-**three liquidation protocols** (Aave V3, Aave V2, Morpho Blue), **two flashloan sources**
-(Balancer Vault, Morpho Blue), and **basis-points coinbase builder payments** sized from
-on-chain-measured realized profit.
+**three composition patterns** (single leg, sequential two-leg with on-chain tracked
+leftover, parallel split between repay and WETH-profit), **three liquidation protocols**
+(Aave V3, Aave V2, Morpho Blue), **two flashloan sources** (Balancer Vault, Morpho Blue),
+and **basis-points coinbase builder payments** sized from on-chain-measured realized profit.
 
 ## Architecture
 
@@ -144,6 +146,16 @@ Operator Bot
 | `UNI_V3` | Uniswap V3 SwapRouter02 `exactInputSingle` | Fee tier restricted to `{100, 500, 3000, 10000}`. SwapRouter02 has no deadline — the executor enforces `plan.deadline` itself. When used as leg2, `useFullBalance=true` sets amountIn to the tracked leftover of `leg2.srcToken` produced by leg1. |
 | `UNI_V4` | Uniswap V4 PoolManager `unlock` → `swap` via callback | `v4SwapData` must be exactly **160 bytes** encoding `(tokenIn, tokenOut, fee, tickSpacing, hook)`. `hook` must be `address(0)` **or** in `allowedV4Hooks`. Sqrt-price limits set one tick inside allowed range — slippage is enforced by `minAmountOut`. When used as leg2, `useFullBalance=true` sets amountIn to the tracked leftover of `leg2.srcToken` produced by leg1. |
 
+### Composition Patterns
+
+A `SwapPlan` runs in one of three mutually-exclusive shapes:
+
+| Pattern | Flag | leg1 role | leg2 role | Allowed leg modes |
+|---|---|---|---|---|
+| **Single-leg** | `hasLeg2 == false && hasSplit == false` | Swap collateral → loanToken | ignored | Any (Paraswap / Bebop / Uni V2/V3/V4) |
+| **Sequential two-leg** | `hasLeg2 == true` | Swap collateral → intermediate | Swap intermediate → loanToken via on-chain tracked leftover (`leg2.useFullBalance==true`) | leg1: any; leg2: Uni V2/V3/V4 only |
+| **Parallel split** | `hasSplit == true` (mutually exclusive with `hasLeg2`) | Swap `(1 − splitBps/10000) × collateralDelta` → loanToken (repay leg) | Swap `splitBps/10000 × collateralDelta` → WETH (profit leg for coinbase) | Both legs: Uni V2/V3/V4 only |
+
 ## Plan Format
 
 ```solidity
@@ -181,10 +193,17 @@ struct SwapLeg {
 }
 
 struct SwapPlan {
-    SwapLeg leg1;
-    bool    hasLeg2;            // If false, leg2 is ignored and _zeroLeg() semantics apply.
-    SwapLeg leg2;               // Must be UNI_V2 / UNI_V3 / UNI_V4 when hasLeg2 == true.
-    address profitToken;        // Token to measure profit in
+    SwapLeg leg1;               // Sequential: the one-leg / first-leg swap.
+                                // Split:      the REPAY leg (collateral → loanToken).
+    bool    hasLeg2;            // If false AND hasSplit==false, leg2 is ignored.
+    SwapLeg leg2;               // Sequential (hasLeg2==true):  must be UNI_V2/V3/V4.
+                                // Split     (hasSplit==true):  the PROFIT leg
+                                //                              (collateral → WETH).
+    bool    hasSplit;           // Parallel split mode (mutually exclusive with hasLeg2).
+    uint16  splitBps;           // Split only: share of collateralDelta routed into the
+                                // profit leg (0 < splitBps < 10000). The repay leg
+                                // receives (10000 - splitBps) / 10000.
+    address profitToken;        // Token to measure profit in. For split mode MUST be WETH.
     uint256 minProfitAmount;    // Effective profit floor (after coinbase)
 }
 
@@ -199,7 +218,7 @@ struct Plan {
     uint256  loanAmount;       // Amount to borrow
     uint256  maxFlashFee;      // Max acceptable flash fee
     Action[] actions;          // Ordered actions (1-10, at least 1 liquidation)
-    SwapPlan swapPlan;         // Post-liquidation swap configuration (one- or two-leg)
+    SwapPlan swapPlan;         // Post-liquidation swap configuration (single-leg, sequential two-leg, or parallel split)
 }
 ```
 
@@ -238,6 +257,46 @@ Final flashrepay gate is delta-based against `finalRepayToken`, unchanged from t
 one-leg contract:
 
     balanceOf(finalRepayToken)_after_all_legs - balanceOf(finalRepayToken)_before_leg1 >= flashRepayAmount
+
+### Split execution model
+
+When `hasSplit == true`, a single `execute()` routes `collateralDelta` in parallel
+into two independent on-chain swaps: one leg delivers into the loanToken for flash
+repay, the other delivers into WETH so a coinbase BPS action can unwrap + bid on
+the same transaction. This is mutually exclusive with `hasLeg2` (sequential chain)
+and reuses the `leg1` / `leg2` slots as repay / profit legs respectively.
+
+Invariants enforced on-chain in `execute()` BEFORE the flashloan is requested:
+
+- `hasSplit && !hasLeg2` — the two composition modes cannot combine.
+- `splitBps ∈ (0, 10000)` — `splitBps == 0` or `splitBps >= 10000` rejects
+  with `InvalidPlan`; the repay leg gets `(10000 − splitBps)/10000` of the delta.
+- `leg1.mode ∈ {UNI_V2, UNI_V3, UNI_V4}` and `leg2.mode ∈ {UNI_V2, UNI_V3, UNI_V4}`
+  — Paraswap / Bebop are disallowed in split mode (their `amountIn` is baked into
+  calldata; only Uni legs accept a runtime-computed `amountIn`).
+- `leg1.srcToken == leg2.srcToken == collateralAsset` — both legs source from
+  the liquidation output.
+- `leg1.repayToken == outer loanToken` and `leg2.repayToken == WETH` —
+  repay routes into the flashloan-repay token; profit routes into WETH for
+  coinbase payment.
+- Neither leg may set `useFullBalance` — amounts come from the split split, not
+  from a "consume everything" read.
+
+Runtime split arithmetic (inside `_executeSwapPlan`):
+
+    profitAmount = (collateralDelta × splitBps) / 10000
+    repayAmount  = collateralDelta − profitAmount
+    assert(profitAmount > 0 && repayAmount > 0)   // else revert InvalidPlan
+
+    dispatch leg1 (repay leg) with amountIn = repayAmount
+    dispatch leg2 (profit leg) with amountIn = profitAmount
+
+The outer `repayDelta >= flashRepayAmount` gate is unchanged — it measures the
+loanToken balance delta across the whole `_executeSwapPlan` invocation, which
+in split mode comes entirely from the repay leg. The coinbase BPS flow is
+untouched: `profitToken == WETH`, realized profit is the WETH balance delta,
+and `ACTION_PAY_COINBASE(bps)` unwraps `bps/10000 × realizedProfit` for the
+builder.
 
 ### Action Data Encoding
 
@@ -422,7 +481,7 @@ struct MorphoLiquidation {
 
 ```
 src/
-  LiquidationExecutor.sol              Main contract (~1531 lines)
+  LiquidationExecutor.sol              Main contract (~1459 lines)
   interfaces/
     IAaveV3Pool.sol                    Aave V3 Pool + getReserveData
     IBalancerVault.sol                 Balancer Vault + IFlashLoanRecipient
@@ -433,9 +492,10 @@ src/
     IUniV4PoolManager.sol              Uniswap V4 PoolManager + PoolKey
   libraries/
     ParaswapDecoderLib.sol             Augustus V6.2 selector classifier + per-family decoders
+    SwapLegExecutorLib.sol             Paraswap / UniV2 / UniV3 leg executors (DELEGATECALL)
 
 test/
-  Executor.t.sol                       237 unit tests
+  Executor.t.sol                       240 unit tests
   fork/
     ExecutorForkV4.t.sol                 8 mainnet-fork tests against real V4 PoolManager
   mocks/
@@ -455,7 +515,7 @@ test/
 ```bash
 forge install          # Install dependencies
 forge build            # Compile
-forge test             # Run 245 tests
+forge test             # Run 248 tests
 forge test -vvv        # Verbose output
 forge coverage         # Coverage report
 ```
@@ -472,19 +532,30 @@ ETHEREUM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
 ETHERSCAN_API_KEY=...
 ```
 
-### 2. Deploy (two steps — external library)
+### 2. Deploy (three steps — two external libraries)
 
-The Paraswap Augustus V6.2 selector classifier and per-family decoders live in
-`src/libraries/ParaswapDecoderLib.sol` as an **external library** called via
-`DELEGATECALL` from the main contract.  Pulling the decoder out of the main
-contract's own bytecode is what keeps the deployed executor comfortably under
-the EIP-170 24,576-byte limit — but the price is that the main contract's
-compiled bytecode contains an unresolved link placeholder (`__$...$__`) where
-the library address needs to be spliced in at deploy time.  `forge create`
-refuses to deploy such bytecode without a concrete library address, hence the
-two-step flow below.
+Two external libraries are called via `DELEGATECALL` from the main contract:
 
-#### 2.1 — Deploy `ParaswapDecoderLib` first
+1. `src/libraries/ParaswapDecoderLib.sol` — Augustus V6.2 selector classifier
+   and per-family decoders (pure decode, no state).
+2. `src/libraries/SwapLegExecutorLib.sol` — Paraswap single + UniV2 + UniV3
+   leg execution orchestrators (approve / call / delta check / event). V4
+   stays in the main contract (depends on `_activeV4PoolManager` storage +
+   `unlockCallback` entrypoint). Bebop stays in the main contract
+   (runtime `allowedTargets[target]` lookup against operator-supplied target).
+
+Pulling these out of the main contract's own bytecode is what keeps the
+deployed executor comfortably under the EIP-170 24,576-byte limit — but the
+price is that the main contract's compiled bytecode contains **two**
+unresolved link placeholders (`__$...$__`) where the library addresses need to
+be spliced in at deploy time. `forge create` refuses to deploy such bytecode
+without concrete library addresses, hence the three-step flow below.
+
+Both libraries are stateless and ownerless — once deployed, each can be reused
+for every future `LiquidationExecutor` deployment on the same chain, so steps
+2.1 and 2.2 normally only run once.
+
+#### 2.1 — Deploy `ParaswapDecoderLib`
 
 ```bash
 forge create src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib \
@@ -496,21 +567,37 @@ forge create src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib \
 Copy the `Deployed to:` address from the output:
 
 ```bash
-export LIB_ADDR=<deployed-library-address>
+export PARASWAP_LIB_ADDR=<deployed-paraswap-decoder-library-address>
 ```
 
-The library is stateless and has no owner — once deployed, it can be reused for
-every future `LiquidationExecutor` deployment, so this step normally only runs
-once per chain.
+#### 2.2 — Deploy `SwapLegExecutorLib` (linked to `ParaswapDecoderLib`)
 
-#### 2.2 — Deploy `LiquidationExecutor` linked to the library
+`SwapLegExecutorLib` itself calls into `ParaswapDecoderLib`, so the Paraswap
+decoder address must be linked into the swap-leg library's bytecode at deploy:
+
+```bash
+forge create src/libraries/SwapLegExecutorLib.sol:SwapLegExecutorLib \
+  --rpc-url $ETHEREUM_RPC_URL \
+  --private-key $PRIVATE_KEY \
+  --broadcast \
+  --libraries "src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib:$PARASWAP_LIB_ADDR"
+```
+
+Copy the `Deployed to:` address:
+
+```bash
+export SWAPLEG_LIB_ADDR=<deployed-swap-leg-executor-library-address>
+```
+
+#### 2.3 — Deploy `LiquidationExecutor` linked to both libraries
 
 ```bash
 forge create src/LiquidationExecutor.sol:LiquidationExecutor \
   --rpc-url $ETHEREUM_RPC_URL \
   --private-key $PRIVATE_KEY \
   --broadcast \
-  --libraries "src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib:$LIB_ADDR" \
+  --libraries "src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib:$PARASWAP_LIB_ADDR" \
+  --libraries "src/libraries/SwapLegExecutorLib.sol:SwapLegExecutorLib:$SWAPLEG_LIB_ADDR" \
   --constructor-args \
     <OWNER_ADDRESS> \
     <OPERATOR_ADDRESS> \
@@ -523,13 +610,13 @@ forge create src/LiquidationExecutor.sol:LiquidationExecutor \
     "[0xbbbbbBB520d69a9775E85b458C58c648259FAD5F,0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb,0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9,0x000000000004444c5dc75cB358380D2e3dE08A90]"
 ```
 
-The `--libraries` flag format is `<file>:<name>:<address>` — forge replaces the
-placeholder in the linker with `$LIB_ADDR` before broadcast.  To verify both
-the library and the main contract on Etherscan in the same run, append
-`--verify --etherscan-api-key $ETHERSCAN_API_KEY` to each of the two `forge
-create` commands above (Etherscan needs the library address to reproduce the
-linked bytecode for the main contract, which is why the library must be
-verified first).
+The `--libraries` flag format is `<file>:<name>:<address>` — pass it **twice**,
+once per library; forge replaces both placeholders before broadcast. To verify
+each contract on Etherscan in the same run, append
+`--verify --etherscan-api-key $ETHERSCAN_API_KEY` to every `forge create` above.
+Etherscan needs upstream library addresses to reproduce each linked bytecode,
+so verification order MUST be `ParaswapDecoderLib` → `SwapLegExecutorLib` →
+`LiquidationExecutor`.
 
 Constructor arg order:
 1. Owner (Safe multisig)
