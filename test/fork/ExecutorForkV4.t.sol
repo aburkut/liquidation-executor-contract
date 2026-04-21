@@ -17,7 +17,7 @@ import {LiquidationExecutor} from "../../src/LiquidationExecutor.sol";
 /// - Validation fork tests exercise the fail-closed gates (native ETH,
 ///   wrong tokenOut, zero fee, zero tickSpacing, unwhitelisted hook,
 ///   malformed v4SwapData). These fire in `execute()`'s eager
-///   `_validateV4Plan` call BEFORE any flashloan request, so they work
+///   `_validateV4Leg` call BEFORE any flashloan request, so they work
 ///   against the real PoolManager without needing a liquidatable position.
 /// - Happy-path fork tests (real swap through mainnet V4) are gated
 ///   behind `test_fork_UniV4_happyPath_skipped_needsLiquidatablePosition`
@@ -75,24 +75,44 @@ contract ExecutorForkV4Test is Test {
 
     // ─── Helpers ──────────────────────────────────────────────────────
 
+    function _zeroLeg() internal pure returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            srcToken: address(0),
+            amountIn: 0,
+            useFullBalance: false,
+            deadline: 0,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(0),
+            minAmountOut: 0
+        });
+    }
+
     function _basePlan(bytes memory v4Data) internal view returns (LiquidationExecutor.SwapPlan memory) {
-        return LiquidationExecutor.SwapPlan({
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
             mode: LiquidationExecutor.SwapMode.UNI_V4,
             srcToken: USDC,
             amountIn: 1000e6,
+            useFullBalance: false,
             deadline: block.timestamp + 3600,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
-            repayToken: WETH,
-            profitToken: WETH,
-            minProfitAmount: 0,
-            v3Fee: 0,
             v2Path: new address[](0),
-            minAmountOut: 1,
-            useFullBalance: false,
+            v3Fee: 0,
             v4PoolManager: V4_POOL_MANAGER,
-            v4SwapData: v4Data
+            v4SwapData: v4Data,
+            repayToken: WETH,
+            minAmountOut: 1
+        });
+        return LiquidationExecutor.SwapPlan({
+            leg1: leg1, hasLeg2: false, leg2: _zeroLeg(), profitToken: WETH, minProfitAmount: 0
         });
     }
 
@@ -124,13 +144,13 @@ contract ExecutorForkV4Test is Test {
     }
 
     // ─── Validation fork tests ────────────────────────────────────────
-    // These run the eager `_validateV4Plan` against the real PoolManager
+    // These run the eager `_validateV4Leg` against the real PoolManager
     // allowlist slot and revert before any flashloan request.
 
     function test_fork_UniV4_nativeETH_tokenIn_reverts() public forkOnly {
         bytes memory v4Data = abi.encode(address(0), WETH, uint24(3000), int24(60), address(0));
         LiquidationExecutor.SwapPlan memory sp = _basePlan(v4Data);
-        sp.srcToken = address(0);
+        sp.leg1.srcToken = address(0);
         bytes memory plan = _wrapInPlan(sp);
 
         vm.prank(operatorAddr);
@@ -196,11 +216,11 @@ contract ExecutorForkV4Test is Test {
     function test_fork_UniV4_unwhitelistedPoolManager_reverts() public forkOnly {
         // A PoolManager address that was not added to allowedTargets at
         // construction — even if the payload is otherwise well-formed,
-        // _validateV4Plan must reject.
+        // _validateV4Leg must reject.
         address stranger = address(0x1234);
         bytes memory v4Data = abi.encode(USDC, WETH, uint24(3000), int24(60), address(0));
         LiquidationExecutor.SwapPlan memory sp = _basePlan(v4Data);
-        sp.v4PoolManager = stranger;
+        sp.leg1.v4PoolManager = stranger;
         bytes memory plan = _wrapInPlan(sp);
 
         vm.prank(operatorAddr);
