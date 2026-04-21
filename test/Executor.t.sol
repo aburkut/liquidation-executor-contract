@@ -6169,6 +6169,194 @@ contract ExecutorTest is Test {
         );
         executor.execute(plan);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // TWO-LEG HAPPY PATHS
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice Task 12: Paraswap (collateral → profit) → UniV2 (profit → loan)
+    function test_twoLeg_paraswap_to_uniV2_happyPath() public {
+        // leg1: collateral → profitToken via Paraswap (SWAP_RATE = 1.1)
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+
+        // leg2: profitToken → loanToken via UniV2, useFullBalance=true
+        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "profit remained after flash repay");
+    }
+
+    /// @notice Task 13a: Paraswap (collateral → profit) → UniV3 (profit → loan)
+    function test_twoLeg_paraswap_to_uniV3_happyPath() public {
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+
+        LiquidationExecutor.SwapLeg memory leg2 =
+            _buildUniV3Leg(address(profitToken), address(loanToken), 0, 3000, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0);
+    }
+
+    /// @notice Task 13b: Paraswap (collateral → profit) → UniV4 (profit → loan)
+    function test_twoLeg_paraswap_to_uniV4_happyPath() public {
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+
+        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV4Leg(
+            address(profitToken), address(loanToken), 0, 3000, int24(60), address(0), address(uniV4Mock), 1, true
+        );
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0);
+    }
+
+    /// @notice Task 14a: Bebop (collateral → profit) → UniV2 (profit → loan)
+    /// Bebop mock is configured to pull collateralToken and emit profitToken.
+    /// Calldata pattern: abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1)) — any
+    /// non-empty bytes trigger the fallback which executes the pre-configured swap.
+    function test_twoLeg_bebop_to_uniV2_happyPath() public {
+        uint256 bebopOut = 1100e18; // 1.1× collateral at SWAP_RATE
+        bebop.configure(address(collateralToken), DEFAULT_SWAP_AMOUNT, address(profitToken), bebopOut, address(0), 0);
+
+        bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildBebopLeg(
+            address(collateralToken), DEFAULT_SWAP_AMOUNT, address(bebop), bebopCd, address(profitToken)
+        );
+
+        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "profit remained after flash repay");
+    }
+
+    /// @notice Task 14b: Bebop (collateral → profit) → UniV3 (profit → loan)
+    function test_twoLeg_bebop_to_uniV3_happyPath() public {
+        uint256 bebopOut = 1100e18;
+        bebop.configure(address(collateralToken), DEFAULT_SWAP_AMOUNT, address(profitToken), bebopOut, address(0), 0);
+
+        bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildBebopLeg(
+            address(collateralToken), DEFAULT_SWAP_AMOUNT, address(bebop), bebopCd, address(profitToken)
+        );
+
+        LiquidationExecutor.SwapLeg memory leg2 =
+            _buildUniV3Leg(address(profitToken), address(loanToken), 0, 3000, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0);
+    }
+
+    /// @notice Task 14c: Bebop (collateral → profit) → UniV4 (profit → loan)
+    function test_twoLeg_bebop_to_uniV4_happyPath() public {
+        uint256 bebopOut = 1100e18;
+        bebop.configure(address(collateralToken), DEFAULT_SWAP_AMOUNT, address(profitToken), bebopOut, address(0), 0);
+
+        bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildBebopLeg(
+            address(collateralToken), DEFAULT_SWAP_AMOUNT, address(bebop), bebopCd, address(profitToken)
+        );
+
+        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV4Leg(
+            address(profitToken), address(loanToken), 0, 3000, int24(60), address(0), address(uniV4Mock), 1, true
+        );
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0);
+    }
+
+    /// @notice Task 15a: UniV3 (collateral → profit) → UniV3 (profit → loan)
+    function test_twoLeg_uniV3_to_uniV3_happyPath() public {
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3Leg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, 3000, 1, false);
+
+        LiquidationExecutor.SwapLeg memory leg2 =
+            _buildUniV3Leg(address(profitToken), address(loanToken), 0, 500, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0);
+    }
+
+    /// @notice Task 15b: UniV4 (collateral → profit) → UniV3 (profit → loan)
+    function test_twoLeg_uniV4_to_uniV3_happyPath() public {
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4Leg(
+            address(collateralToken),
+            address(profitToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            1,
+            false
+        );
+
+        LiquidationExecutor.SwapLeg memory leg2 =
+            _buildUniV3Leg(address(profitToken), address(loanToken), 0, 3000, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0);
+    }
 }
 
 /// @dev Contract that rejects ETH -- used to test coinbase payment failure
