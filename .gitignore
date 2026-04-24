@@ -2,6 +2,12 @@
 cache/
 out/
 
+# Hardhat (used only for Sentio verification — see hardhat.config.js)
+node_modules/
+artifacts/
+cache-hardhat/
+.hardhat-empty-tests/
+
 # Ignores development broadcast logs
 !/broadcast
 /broadcast/*/31337/

@@ -1,0 +1,19 @@
+{
+  "name": "liquidation-executor-contract",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hardhat overlay used ONLY for Sentio private contract verification via @sentio/hardhat-sentio. Production build/test workflow stays on Foundry — see README.",
+  "scripts": {
+    "sentio:login": "sentio login",
+    "sentio:upload": "hardhat sentio:upload LiquidationExecutor,SwapLegExecutorLib,ParaswapDecoderLib",
+    "sentio:verify:main": "hardhat sentio:verify --contract LiquidationExecutor --address 0x4AEdDDF5E0D18D454E5F0Cc5E37E86B061fC0D1c --chain 1",
+    "sentio:verify:swapleg": "hardhat sentio:verify --contract SwapLegExecutorLib --address 0x0846BE913D89B91B92276AEAf546205529b94979 --chain 1",
+    "sentio:verify:paraswap": "hardhat sentio:verify --contract ParaswapDecoderLib --address 0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16 --chain 1"
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "5.5.0",
+    "@sentio/cli": "^3.6.0",
+    "@sentio/hardhat-sentio": "^1.1.3",
+    "hardhat": "^2.22.0"
+  }
+}

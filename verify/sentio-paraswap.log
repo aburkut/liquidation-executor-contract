@@ -1,0 +1,103 @@
+2026-04-23T23:36:58.999Z hardhat:core:vars:varsManager Creating a new instance of VarsManager
+2026-04-23T23:36:59.002Z hardhat:core:vars:varsManager Loading ENV variables if any
+2026-04-23T23:36:59.014Z hardhat:core:config Loading Hardhat config from /Users/alexanderburkut/workspace/liquidation-executor-contract/hardhat.config.js
+2026-04-23T23:36:59.108Z hardhat:core:hre Creating HardhatRuntimeEnvironment
+2026-04-23T23:36:59.110Z hardhat:core:global-dir Looking up Client Id at /Users/alexanderburkut/Library/Application Support/hardhat-nodejs/analytics.json
+2026-04-23T23:36:59.111Z hardhat:core:global-dir Client Id found: 98733d76-27e7-4043-8466-aed9da6a3974
+2026-04-23T23:36:59.184Z hardhat:core:analytics Sending hit for task
+2026-04-23T23:36:59.184Z hardhat:core:analytics Hit payload: {"client_id":"98733d76-27e7-4043-8466-aed9da6a3974","user_id":"98733d76-27e7-4043-8466-aed9da6a3974","user_properties":{"projectId":{"value":"hardhat-project"},"userType":{"value":"Developer"},"hardhatVersion":{"value":"Hardhat 2.28.6"},"operatingSystem":{"value":"darwin"},"nodeVersion":{"value":"v22.14.0"}},"events":[{"name":"task","params":{"engagement_time_msec":"10000","session_id":"0.8642854978945029"}}]}
+2026-04-23T23:36:59.248Z hardhat:core:hre Running task sentio:verify
+initializing sentio plugin
+sentio config: {
+  host: 'https://app.sentio.xyz',
+  project: 'a_burkut90/liquidation-bot'
+}
+uploading ParaswapDecoderLib
+2026-04-23T23:36:59.274Z hardhat:core:hre Running task compile:solidity:get-source-paths
+2026-04-23T23:36:59.279Z hardhat:core:hre Running task compile:solidity:get-source-names
+2026-04-23T23:36:59.285Z hardhat:core:hre Running task compile:solidity:get-dependency-graph
+2026-04-23T23:36:59.285Z hardhat:core:hre Running task compile:solidity:get-remappings
+2026-04-23T23:36:59.288Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.288Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.289Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.289Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.289Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.289Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.289Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.290Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.290Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.290Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.290Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.300Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.300Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.300Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.300Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.301Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.320Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.320Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.321Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.321Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.321Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.321Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.321Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.322Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.322Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.323Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.323Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.324Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.324Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.330Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.330Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.330Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.330Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.331Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.332Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.332Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.335Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.336Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.336Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.337Z hardhat:core:hre Running task compile:solidity:transform-import-name
+2026-04-23T23:36:59.340Z hardhat:core:hre Running task compile:solidity:read-file
+2026-04-23T23:36:59.346Z hardhat:core:hre Running task compile:solidity:get-compilation-job-for-file
+2026-04-23T23:36:59.347Z hardhat:core:compilation-job File '/Users/alexanderburkut/workspace/liquidation-executor-contract/src/libraries/ParaswapDecoderLib.sol' will be compiled with version '0.8.24'
+verify 0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16 on chain 1 with visibility PROJECT
+[sentio-debug] REQUEST {
+  "projectOwner": "a_burkut90",
+  "projectSlug": "liquidation-bot",
+  "compileSpec": {
+    "solidityVersion": "0.8.24",
+    "contractName": "ParaswapDecoderLib",
+    "multiFile": {
+      "compilerSettings": "{\"evmVersion\":\"shanghai\",\"viaIR\":true,\"optimizer\":{\"enabled\":true,\"runs\":1},\"metadata\":{\"bytecodeHash\":\"none\",\"appendCBOR\":false},\"outputSelection\":{\"*\":{\"*\":[\"abi\",\"evm.bytecode\",\"evm.deployedBytecode\",\"evm.methodIdentifiers\",\"metadata\"],\"\":[\"ast\"]}}}",
+      "source": {
+        "src/libraries/ParaswapDecoderLib.sol": "<11954 chars>"
+      }
+    }
+  },
+  "verifySpec": {
+    "networkId": "1",
+    "address": "0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16",
+    "visibility": "PROJECT"
+  }
+}
+2026-04-23T23:36:59.579Z hardhat:core:analytics Hit for task sent successfully
+[sentio-debug] RESPONSE 200 OK:
+{"userCompilationId":"k7cJGPee","verified":false}
+successfully uploaded contract ParaswapDecoderLib { userCompilationId: 'k7cJGPee', verified: false }
+failed to verify the contract
+2026-04-23T23:37:00.509Z hardhat:core:cli Killing Hardhat after successfully running task sentio:verify
