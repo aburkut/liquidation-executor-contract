@@ -266,7 +266,8 @@ contract LiquidationExecutor is
         BEBOP_MULTI,
         UNI_V2,
         UNI_V3,
-        UNI_V4
+        UNI_V4,
+        NO_SWAP // Same-token liquidation: srcToken == repayToken, no DEX call.
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
@@ -338,6 +339,15 @@ contract LiquidationExecutor is
     /// useFullBalance=true) → loanToken. No coinbase (leg2 consumes
     /// the whole intermediate balance). Used for deep-liquidity
     /// routing through WETH bridge when direct coll→debt is thin.
+    /// @dev When a liquidation uses `receiveAToken=true`, leg1.srcToken
+    /// selects the behaviour: setting it to the underlying collateral
+    /// triggers the usual `pool.withdraw(...)` unwrap step, while setting
+    /// it to the aToken itself skips the unwrap and lets the swap plan
+    /// consume the aToken directly (e.g. via an aToken/underlying peg
+    /// pool). Use the aToken path when the reserve's underlying liquidity
+    /// is insufficient to satisfy `withdraw` — over-utilized reserves
+    /// would otherwise revert with an arithmetic overflow inside
+    /// Aave's `calculateInterestRates`.
     struct SwapPlan {
         SwapLeg leg1;
         bool hasLeg2;
@@ -639,9 +649,16 @@ contract LiquidationExecutor is
     function _validateLeg(SwapLeg memory leg) internal view {
         if (leg.srcToken == address(0)) revert ZeroAddress();
         if (leg.repayToken == address(0)) revert ZeroAddress();
-        if (leg.srcToken == leg.repayToken) revert InvalidPlan();
 
         SwapMode m = leg.mode;
+
+        // NO_SWAP: same-token path (e.g. WETH/WETH). Leg-level checks are
+        // skipped; a mismatched src/repay silently early-returns in
+        // _executeSwapPlan and the final flash-repay balance check
+        // reverts if the plan didn't actually produce enough loanToken.
+        if (m == SwapMode.NO_SWAP) return;
+
+        if (leg.srcToken == leg.repayToken) revert InvalidPlan();
 
         // Paraswap/Bebop: reject useFullBalance (amountIn is inside calldata).
         if ((m == SwapMode.PARASWAP_SINGLE || m == SwapMode.BEBOP_MULTI) && leg.useFullBalance) {
@@ -701,12 +718,18 @@ contract LiquidationExecutor is
         }
 
         // Validate all actions use same debt/collateral assets
-        (address collateralAsset,) = _validateActions(plan.actions, plan.loanToken);
+        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
 
-        // Collateral linkage: leg1.srcToken must match liquidation collateral
+        // Collateral linkage: leg1.srcToken must be either the underlying
+        // collateral (standard path, contract unwraps aToken after
+        // liquidation) or the aToken itself (skip-unwrap path, the aToken
+        // becomes the swap input). trackingToken differs from
+        // collateralAsset only when receiveAToken=true, so the aToken
+        // path is only reachable with that setting.
         if (collateralAsset != address(0)) {
-            if (plan.swapPlan.leg1.srcToken != collateralAsset) {
-                revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.leg1.srcToken);
+            address src = plan.swapPlan.leg1.srcToken;
+            if (src != collateralAsset && src != trackingToken) {
+                revert SrcTokenNotCollateral(collateralAsset, src);
             }
         }
 
@@ -722,7 +745,8 @@ contract LiquidationExecutor is
             if (shapeCount > 1) revert PlanShapeConflict();
         }
 
-        // Validate leg1 (may be any mode).
+        // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
+        // a single-leg plan; the multi-leg guard lives in _executeSwapPlan.
         _validateLeg(plan.swapPlan.leg1);
 
         // Validate leg2 (must be Uni V2/V3/V4, must link to leg1 output).
@@ -950,25 +974,27 @@ contract LiquidationExecutor is
             }
         }
 
-        // Post-action: verify liquidation produced collateral (delta-based, all modes)
+        // Post-action: verify liquidation produced collateral AND
+        // optionally unwrap aTokens to underlying in the same block.
+        // Unwrap is skipped when leg1.srcToken is the aToken itself
+        // (the plan consumes the aToken directly, typically via an
+        // aToken/underlying peg pool).
         if (trackingToken != address(0)) {
-            if (IERC20(trackingToken).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
-        }
+            uint256 trackingAfter = IERC20(trackingToken).balanceOf(address(this));
+            if (trackingAfter <= collateralBefore) revert NoCollateralReceived();
 
-        // Unwrap aTokens to underlying if receiveAToken was used — delta only
-        if (trackingToken != address(0) && trackingToken != collateralAsset) {
-            uint256 aTokenDelta = IERC20(trackingToken).balanceOf(address(this)) - collateralBefore;
-            if (aTokenDelta > 0) {
+            if (trackingToken != collateralAsset && plan.swapPlan.leg1.srcToken != trackingToken) {
+                uint256 aTokenDelta = trackingAfter - collateralBefore;
                 uint256 underlyingBefore = IERC20(collateralAsset).balanceOf(address(this));
                 _unwrapATokens(collateralAsset, aTokenDelta);
                 if (IERC20(collateralAsset).balanceOf(address(this)) <= underlyingBefore) revert UnwrapFailed();
             }
         }
 
-        // Post-pipeline collateral delta (underlying asset only) — consumed by
-        // UNI_V2/V3 useFullBalance mode. Computed AFTER aToken unwrap so the
-        // full produced amount is available for swapping regardless of
-        // receiveAToken setting.
+        // Post-pipeline collateral delta (underlying only). In skip-unwrap
+        // mode the underlying balance is unchanged, so collateralDelta=0
+        // — useFullBalance modes would read zero and fail fast, forcing
+        // the caller to use a fixed `amountIn` for the aToken path.
         uint256 collateralDelta;
         if (collateralAsset != address(0)) {
             uint256 collateralAssetAfter = IERC20(collateralAsset).balanceOf(address(this));
@@ -1076,6 +1102,11 @@ contract LiquidationExecutor is
         uint256 collateralDelta
     ) internal {
         SwapLeg memory leg1 = plan.leg1;
+
+        // NO_SWAP: same-token liquidation (e.g. WETH/WETH). The liquidation
+        // already deposited loanToken on the contract; _finalizeFlashloan's
+        // absolute balance check settles the flashloan.
+        if (leg1.mode == SwapMode.NO_SWAP) return;
 
         address finalRepayToken = (plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken);
         uint256 finalRepayBefore = IERC20(finalRepayToken).balanceOf(address(this));
