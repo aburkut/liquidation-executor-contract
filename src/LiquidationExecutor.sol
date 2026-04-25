@@ -67,6 +67,7 @@ contract LiquidationExecutor is
     error CoinbasePaymentFailed();
     error ATokenAddressRequired();
     error InvalidATokenAddress(address provided, address canonical);
+    error InvalidATokenReturndata(uint256 size);
     error MixedReceiveAToken();
     error MorphoExecutionFailed();
     error UnwrapFailed();
@@ -139,6 +140,8 @@ contract LiquidationExecutor is
     error V4HookNotAllowed(address hook);
     error V4UnexpectedDelta();
     error InvalidV4CallbackHook();
+    error V4CallbackTokenInMismatch(address pinned, address actual);
+    error V4CallbackReentry();
 
     // Profit / payment errors
     error InsufficientProfit(uint256 actual, uint256 required);
@@ -219,12 +222,32 @@ contract LiquidationExecutor is
     /// from an allow-listed PoolManager acting outside our pipeline revert.
     address private _activeV4PoolManager;
 
-    /// @dev Execution phase guard — prevents unexpected callbacks
+    /// @dev Execution phase guard — prevents unexpected callbacks. Slot
+    /// layout note: kept directly after `_activeV4PoolManager` so both
+    /// pack into the same storage slot (test_morphoCallbackRejectsCaller
+    /// relies on this layout via vm.store at slot 11).
     enum ExecutionPhase {
         Idle,
         FlashLoanActive
     }
     ExecutionPhase private _executionPhase;
+
+    /// @dev tokenIn currently pinned for the active V4 unlock. Re-asserted
+    /// inside `unlockCallback` against the data the PoolManager echoes back,
+    /// so a malicious / misconfigured PM cannot substitute an unrelated
+    /// token (e.g. WETH the contract holds for an unrelated reason) and
+    /// drain it through the swap path. Cleared together with
+    /// `_activeV4PoolManager`. Declared AFTER `_executionPhase` to keep
+    /// the legacy slot 11 packing untouched.
+    address private _activeV4TokenIn;
+
+    /// @dev Re-entry depth flag for `unlockCallback`. The unlock pattern
+    /// gives the PM (and any whitelisted hook called from inside swap)
+    /// the ability to invoke `pm.unlock()` again, which would in turn
+    /// re-enter `unlockCallback` while `_activeV4PoolManager` is still
+    /// pinned. Without this flag the nested call would pass every guard
+    /// and execute a second swap consuming arbitrary tokens.
+    bool private _v4InCallback;
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
@@ -696,10 +719,15 @@ contract LiquidationExecutor is
 
         // Deadline: check leg1 and leg2 pre-flashloan. block.timestamp is
         // monotonic within a transaction, so no in-pipeline re-check needed.
+        // leg2 actually runs whenever ANY of {hasLeg2, hasSplit,
+        // hasMixedSplit} is set — all three branches dispatch leg2 inside
+        // _executeSwapPlan. Only `hasLeg2` enforced this deadline historically;
+        // the other two paths silently ignored stale leg2 calldata.
         if (block.timestamp > plan.swapPlan.leg1.deadline) {
             revert SwapDeadlineExpired(plan.swapPlan.leg1.deadline, block.timestamp);
         }
-        if (plan.swapPlan.hasLeg2 && block.timestamp > plan.swapPlan.leg2.deadline) {
+        bool runsLeg2 = plan.swapPlan.hasLeg2 || plan.swapPlan.hasSplit || plan.swapPlan.hasMixedSplit;
+        if (runsLeg2 && block.timestamp > plan.swapPlan.leg2.deadline) {
             revert SwapDeadlineExpired(plan.swapPlan.leg2.deadline, block.timestamp);
         }
 
@@ -743,6 +771,18 @@ contract LiquidationExecutor is
             if (plan.swapPlan.hasSplit) shapeCount++;
             if (plan.swapPlan.hasMixedSplit) shapeCount++;
             if (shapeCount > 1) revert PlanShapeConflict();
+        }
+
+        // NO_SWAP is a single-leg-only mode (same-token liquidation, no
+        // routing). Combined with any multi-leg flag the runtime would
+        // early-return inside _executeSwapPlan BEFORE reaching the
+        // hasLeg2 / hasSplit / hasMixedSplit branches — leg2 silently
+        // never executes. Reject the combination at validation time so
+        // the operator's intent can never silently degrade.
+        if (plan.swapPlan.leg1.mode == SwapMode.NO_SWAP) {
+            if (plan.swapPlan.hasLeg2 || plan.swapPlan.hasSplit || plan.swapPlan.hasMixedSplit) {
+                revert PlanShapeConflict();
+            }
         }
 
         // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
@@ -1358,7 +1398,9 @@ contract LiquidationExecutor is
 
         address pm = leg.v4PoolManager;
         _activeV4PoolManager = pm;
+        _activeV4TokenIn = tokenIn;
         IPoolManager(pm).unlock(abi.encode(tokenIn, tokenOut, fee, tickSpacing, hook, amountIn));
+        _activeV4TokenIn = address(0);
         _activeV4PoolManager = address(0);
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
@@ -1381,6 +1423,17 @@ contract LiquidationExecutor is
     /// new tests and security review.
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
+        // Re-entry guard. The unlock-callback pattern lets the PM (or any
+        // hook called from inside swap()) invoke `pm.unlock()` again —
+        // which would re-enter this function while every other guard
+        // (phase, sender, hook whitelist) still passes. Without this
+        // flag a malicious PM / hook can chain a second swap consuming
+        // arbitrary tokens the contract holds. Setting on entry and
+        // clearing on the single happy-path exit is sufficient: any
+        // revert rolls back storage anyway.
+        if (_v4InCallback) revert V4CallbackReentry();
+        _v4InCallback = true;
+
         address pm = _activeV4PoolManager;
         // pm == 0 covered by the strict caller check below (msg.sender can never be 0).
         if (msg.sender != pm) revert InvalidCallbackCaller();
@@ -1389,13 +1442,15 @@ contract LiquidationExecutor is
             abi.decode(data, (address, address, uint24, int24, address, uint256));
 
         // Defense-in-depth against a malicious/misconfigured PoolManager
-        // echoing modified data back to us: re-assert the hook whitelist
-        // against owner-curated state. tokenIn/tokenOut are NOT re-asserted
-        // here because the leg is out of scope and adding storage is out
-        // of scope for this patch — tokenOut substitution is caught by the
-        // post-unlock `received` delta (computed against `leg.repayToken`)
-        // and the pipeline-level `repayDelta >= flashRepayAmount` gate.
+        // echoing modified data back to us. The hook whitelist re-check
+        // is the original layer; the tokenIn pin (added later) closes
+        // the substitution drain where the PM swaps in a different
+        // token than the leg validated. tokenOut substitution remains
+        // caught by the post-unlock `received` delta (computed against
+        // `leg.repayToken`) and the pipeline-level `repayDelta >=
+        // flashRepayAmount` gate.
         if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
+        if (tokenIn != _activeV4TokenIn) revert V4CallbackTokenInMismatch(_activeV4TokenIn, tokenIn);
 
         bool zeroForOne = tokenIn < tokenOut;
         PoolKey memory key = PoolKey({
@@ -1435,6 +1490,9 @@ contract LiquidationExecutor is
 
         IPoolManager(pm).take(tokenOut, address(this), gainedOut);
 
+        // Clear the re-entry flag on the single happy-path exit. Reverts
+        // anywhere above roll back storage so the flag self-resets.
+        _v4InCallback = false;
         return "";
     }
 
@@ -1532,14 +1590,26 @@ contract LiquidationExecutor is
                 // getReserveData(address) selector = 0x35ea6a75
                 // aTokenAddress is the 9th return value (offset 8*32 = 256 in returndata)
                 address canonical;
+                uint256 retSize;
                 assembly {
                     let ptr := mload(0x40)
                     mstore(ptr, 0x35ea6a7500000000000000000000000000000000000000000000000000000000)
                     mstore(add(ptr, 4), collateralAsset)
                     let ok := staticcall(gas(), pool, ptr, 36, ptr, 480)
                     if iszero(ok) { revert(0, 0) }
+                    retSize := returndatasize()
                     canonical := mload(add(ptr, 256)) // 9th slot
                 }
+                // Defense-in-depth: getReserveData returns 15 slots
+                // (480 bytes) on a real Aave V3 Pool. The 9th slot
+                // (offset 256, length 32) is `aTokenAddress`. If the
+                // configured `pool` returns shorter data, the mload at
+                // offset 256 inside the assembly read stale memory —
+                // yielding a garbage `canonical` value whose comparison
+                // against `suppliedAToken` is meaningless (and may
+                // succeed by accident). Reject any returndata shorter
+                // than the slot we actually read.
+                if (retSize < 288) revert InvalidATokenReturndata(retSize);
                 if (suppliedAToken != canonical) revert InvalidATokenAddress(suppliedAToken, canonical);
                 return;
             }
