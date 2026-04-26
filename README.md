@@ -4,13 +4,13 @@
 
 | Parameter | Value |
 |---|---|
-| **Contract (V6)** | `0x4AEdDDF5E0D18D454E5F0Cc5E37E86B061fC0D1c` |
-| **Deploy tx** | `0xeefff46d96063f64479253849b41d25468a53a5cdbf794d5ec520a26edb6fa62` |
-| **SwapLegExecutorLib** | `0x0846BE913D89B91B92276AEAf546205529b94979` (reused from V5 — source unchanged; linked via `--libraries`) |
+| **Contract (V7)** | `0xb18e3A861961BF399b08Bdd8500019319Be58779` |
+| **Deploy tx** | `0x1a48be1e2fffecb1486542d23a40eec6747fc6a1b711c62b13846f012e2ddfd3` |
+| **SwapLegExecutorLib** | `0x0846BE913D89B91B92276AEAf546205529b94979` (reused from V5/V6 — source unchanged; linked via `--libraries`) |
 | **SwapLegExecutorLib deploy tx** | `0x903045a07f29f90f208875cbdb68af511e442dcfa1225b6d804d48e5861c056b` |
-| **ParaswapDecoderLib** | `0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16` (reused from V4/V5 — source unchanged; linked via `--libraries`) |
+| **ParaswapDecoderLib** | `0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16` (reused from V4/V5/V6 — source unchanged; linked via `--libraries`) |
 | **ParaswapDecoderLib deploy tx** | `0x1446d0fc56087032a8872d3bf09083cf341bfb91cc3924e3baa0cb6cfca17dac` |
-| **Runtime bytecode size** | 24 479 bytes (97 bytes margin under EIP-170) — post-MIXED_SPLIT mode addition |
+| **Runtime bytecode size** | 24 546 bytes (30 bytes margin under EIP-170) — post-V4 callback hardening + NO_SWAP plan-shape guards |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
 | **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
 | **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
@@ -26,10 +26,18 @@
 | **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (allowlisted — set via `setAaveV2LendingPool` when V2 liquidations are wired) |
 | **Solidity** | 0.8.24, Shanghai, optimizer 1 run, `via_ir=true`, `bytecode_hash=none` |
 
-V6 adds `hasMixedSplit` plan shape: leg1 any mode (Paraswap / Bebop for deep repay routing) + leg2 Uni-only (`coll → WETH`) on the residual collateral, giving coinbase-capable WETH profit on non-WETH / non-WETH pairs even when no direct Uni `coll → debt` pool exists. Existing plan shapes (single / hasLeg2 / hasSplit) unchanged; the new `bool hasMixedSplit` slot sits after `splitBps` in `SwapPlan`. All three of {`hasLeg2`, `hasSplit`, `hasMixedSplit`} are mutually exclusive — enforced pre-flashloan with `PlanShapeConflict`.
+V7 adds three security hardenings (no functional changes vs V6):
+
+1. **V4 unlock-callback re-entry + tokenIn pin** — `_activeV4TokenIn` storage slot pinned at unlock time, read back inside `unlockCallback` instead of trusting decoded calldata. Prevents a malicious / mis-allowlisted V4 hook from substituting `tokenIn` mid-callback. Clear-on-entry doubles as a re-entry guard.
+2. **`NO_SWAP + hasMixedSplit` revert** (`PlanShapeConflict`) — explicit pre-flashloan guard closing a validator/executor mismatch where the mixed-split branch silently dropped leg1 if `mode = NO_SWAP`.
+3. **`NO_SWAP + hasLeg2` revert** (`PlanShapeConflict`) — same explicit guard for the two-leg path.
+
+V6 introduced `hasMixedSplit` plan shape: leg1 any mode (Paraswap / Bebop for deep repay routing) + leg2 Uni-only (`coll → WETH`) on the residual collateral, giving coinbase-capable WETH profit on non-WETH / non-WETH pairs even when no direct Uni `coll → debt` pool exists. All three of {`hasLeg2`, `hasSplit`, `hasMixedSplit`} are mutually exclusive — enforced pre-flashloan with `PlanShapeConflict`. Carried forward in V7 unchanged.
 
 | Previous deployments | |
 |---|---|
+| **V6 Contract** | `0x4AEdDDF5E0D18D454E5F0Cc5E37E86B061fC0D1c` (deprecated — superseded by V7 security hardening: V4 callback re-entry + tokenIn pin, explicit NO_SWAP + hasLeg2 / hasMixedSplit guards) |
+| **V6 deploy tx** | `0xeefff46d96063f64479253849b41d25468a53a5cdbf794d5ec520a26edb6fa62` |
 | **V5 Contract** | `0xECf5F37Ff877a787a75777Ab054048d590684b48` (deprecated — SPLIT mode required both legs Uni, so thin coll↔debt pairs couldn't use SPLIT for coinbase; superseded by V6 MIXED_SPLIT which permits any-mode leg1) |
 | **V5 deploy tx** | `0x53daf1d6b8a88dd3cf5d22ad42a775e672b57c3334b8c713b0848531ae1ea1d7` |
 | **V4 Contract** | `0xB5C7881500F0A7A56E985266Da6AD9d19a5CCBB4` (deprecated — flat SwapPlan (16 fields) without two-leg / SPLIT; superseded by V5 leg-based + SPLIT mode) |
