@@ -52,9 +52,10 @@ V6 introduced `hasMixedSplit` plan shape: leg1 any mode (Paraswap / Bebop for de
 Production-grade **Flashloan → Multi-Liquidation → Multi-Swap → Repay** execution contract for
 DeFi liquidation bots.
 
-Supports **five swap modes** (Paraswap single, Bebop multi-output, Uniswap V2 / V3 / V4),
-**three composition patterns** (single leg, sequential two-leg with on-chain tracked
-leftover, parallel split between repay and WETH-profit), **three liquidation protocols**
+Supports **six swap modes** (Paraswap single, Bebop multi-output, Uniswap V2 / V3 / V4,
+NO_SWAP for same-token liquidations), **four composition patterns** (single leg, sequential
+two-leg with on-chain tracked leftover, parallel split between repay and WETH-profit,
+mixed-split with any-mode repay leg + Uni-only profit leg), **three liquidation protocols**
 (Aave V3, Aave V2, Morpho Blue), **two flashloan sources** (Balancer Vault, Morpho Blue),
 and **basis-points coinbase builder payments** sized from on-chain-measured realized profit.
 
@@ -87,12 +88,13 @@ Operator Bot
 |    |   +-- Morpho Blue liquidation       |
 |    +-- Collateral delta check            |
 |    +-- aToken unwrap (if receiveAToken)  |
-|    +-- Swap (5 modes)                    |
+|    +-- Swap (6 modes)                    |
 |    |   +-- PARASWAP_SINGLE               |
 |    |   +-- BEBOP_MULTI                   |
 |    |   +-- UNI_V2                        |
 |    |   +-- UNI_V3                        |
 |    |   +-- UNI_V4 (hook-allow-listed)    |
+|    |   +-- NO_SWAP (same-token liq)      |
 |    +-- Repay sufficiency (delta-based)   |
 |    +-- Realized profit snapshot          |
 |    +-- Internal actions                  |
@@ -137,6 +139,7 @@ Operator Bot
 | Swap | Uniswap V2 Router02 | — | `UNI_V2` (multi-hop path, input = collateral delta option) |
 | Swap | Uniswap V3 SwapRouter02 | — | `UNI_V3` (single-hop, fee tier pinned) |
 | Swap | Uniswap V4 PoolManager | — | `UNI_V4` (single-hop, hook-allow-listed, struct-encoded PoolKey) |
+| Swap | (no DEX) | — | `NO_SWAP` — same-token liquidation (debt asset == collateral asset). `srcToken == repayToken` required; bypasses all DEX paths and the leg validator. Allowed only for single-leg plans (rejected with `PlanShapeConflict` when combined with `hasLeg2` / `hasMixedSplit`). |
 | Payment | Coinbase (ETH) | — | Requires `profitToken == WETH`; amount = **bps of realized profit** |
 
 > **Stable IDs**: `FLASH_PROVIDER_AAVE_V3` was id `1`. The identifier is not reused — id `1` is
@@ -163,13 +166,14 @@ Operator Bot
 
 ### Composition Patterns
 
-A `SwapPlan` runs in one of three mutually-exclusive shapes:
+A `SwapPlan` runs in one of four mutually-exclusive shapes (`hasLeg2`, `hasSplit`, `hasMixedSplit` are mutually exclusive — `PlanShapeConflict` if more than one is set; all-false = single-leg):
 
 | Pattern | Flag | leg1 role | leg2 role | Allowed leg modes |
 |---|---|---|---|---|
-| **Single-leg** | `hasLeg2 == false && hasSplit == false` | Swap collateral → loanToken | ignored | Any (Paraswap / Bebop / Uni V2/V3/V4) |
-| **Sequential two-leg** | `hasLeg2 == true` | Swap collateral → intermediate | Swap intermediate → loanToken via on-chain tracked leftover (`leg2.useFullBalance==true`) | leg1: any; leg2: Uni V2/V3/V4 only |
-| **Parallel split** | `hasSplit == true` (mutually exclusive with `hasLeg2`) | Swap `(1 − splitBps/10000) × collateralDelta` → loanToken (repay leg) | Swap `splitBps/10000 × collateralDelta` → WETH (profit leg for coinbase) | Both legs: Uni V2/V3/V4 only |
+| **Single-leg** | all flags false | Swap collateral → loanToken (or `NO_SWAP` when collateral == loanToken) | ignored | Any (Paraswap / Bebop / Uni V2/V3/V4 / NO_SWAP) |
+| **Sequential two-leg** | `hasLeg2 == true` | Swap collateral → intermediate | Swap intermediate → loanToken via on-chain tracked leftover (`leg2.useFullBalance==true`) | leg1: any (NO_SWAP rejected with `PlanShapeConflict`); leg2: Uni V2/V3/V4 only |
+| **Parallel split** | `hasSplit == true` | Swap `(1 − splitBps/10000) × collateralDelta` → loanToken (repay leg) | Swap `splitBps/10000 × collateralDelta` → WETH (profit leg for coinbase) | Both legs: Uni V2/V3/V4 only |
+| **Mixed split** | `hasMixedSplit == true` | Any-mode repay leg with `(1 − splitBps/10000) × collateralDelta` → loanToken (Paraswap / Bebop allowed for deep repay routing) | Uni-only profit leg with `splitBps/10000 × collateralDelta` → WETH for coinbase | leg1: any (NO_SWAP rejected with `PlanShapeConflict`); leg2: Uni V2/V3/V4 only |
 
 ## Plan Format
 
@@ -179,7 +183,10 @@ enum SwapMode {
     BEBOP_MULTI,
     UNI_V2,
     UNI_V3,
-    UNI_V4
+    UNI_V4,
+    NO_SWAP            // Same-token liquidation: srcToken == repayToken, no DEX call.
+                       // Allowed only for single-leg plans; combining with hasLeg2 /
+                       // hasMixedSplit reverts with PlanShapeConflict.
 }
 
 struct SwapLeg {
@@ -208,17 +215,26 @@ struct SwapLeg {
 }
 
 struct SwapPlan {
-    SwapLeg leg1;               // Sequential: the one-leg / first-leg swap.
-                                // Split:      the REPAY leg (collateral → loanToken).
-    bool    hasLeg2;            // If false AND hasSplit==false, leg2 is ignored.
-    SwapLeg leg2;               // Sequential (hasLeg2==true):  must be UNI_V2/V3/V4.
-                                // Split     (hasSplit==true):  the PROFIT leg
-                                //                              (collateral → WETH).
-    bool    hasSplit;           // Parallel split mode (mutually exclusive with hasLeg2).
-    uint16  splitBps;           // Split only: share of collateralDelta routed into the
-                                // profit leg (0 < splitBps < 10000). The repay leg
-                                // receives (10000 - splitBps) / 10000.
-    address profitToken;        // Token to measure profit in. For split mode MUST be WETH.
+    SwapLeg leg1;               // Sequential:  the one-leg / first-leg swap.
+                                // Split:       the REPAY leg (collateral → loanToken).
+                                // MixedSplit:  the REPAY leg (any mode, deep routing).
+    bool    hasLeg2;            // If false AND hasSplit==false AND hasMixedSplit==false,
+                                // leg2 is ignored.
+    SwapLeg leg2;               // Sequential (hasLeg2==true):       must be UNI_V2/V3/V4.
+                                // Split     (hasSplit==true):       the PROFIT leg
+                                //                                   (collateral → WETH).
+                                // MixedSplit(hasMixedSplit==true):  the PROFIT leg
+                                //                                   (collateral → WETH,
+                                //                                   Uni-only).
+    bool    hasSplit;           // Parallel split (both legs Uni; mutually exclusive
+                                // with hasLeg2 and hasMixedSplit).
+    uint16  splitBps;           // Split / MixedSplit only: share of collateralDelta
+                                // routed into the profit leg (0 < splitBps < 10000).
+                                // The repay leg receives (10000 - splitBps) / 10000.
+    bool    hasMixedSplit;      // Mixed split (any-mode repay leg + Uni-only profit
+                                // leg; mutually exclusive with hasLeg2 and hasSplit).
+    address profitToken;        // Token to measure profit in. For split / mixedSplit
+                                // mode MUST be WETH.
     uint256 minProfitAmount;    // Effective profit floor (after coinbase)
 }
 
@@ -395,6 +411,8 @@ struct MorphoLiquidation {
 - **Pausable** — owner can pause/unpause all execution.
 - **ReentrancyGuard** — prevents reentrant calls to `execute`.
 - **V4 PoolManager callback isolation** — `_activeV4PoolManager` pins exactly which PoolManager may invoke `unlockCallback`; stray callbacks from other allow-listed managers revert.
+- **V4 unlock-callback `tokenIn` pin** (V7) — `_activeV4TokenIn` is set at unlock time and read back inside `unlockCallback` instead of trusting decoded calldata. A malicious / mis-allowlisted hook re-entering and substituting `tokenIn` mid-callback is structurally impossible. The slot is cleared on entry, doubling as a re-entry guard.
+- **NO_SWAP plan-shape guards** (V7) — `NO_SWAP + hasLeg2` and `NO_SWAP + hasMixedSplit` revert pre-flashloan with `PlanShapeConflict`. Closes a validator/executor mismatch where the two/mixed-split branches silently dropped `leg1` if its mode was `NO_SWAP`.
 
 ### Custom Errors (selected — full list in `src/LiquidationExecutor.sol`)
 
@@ -454,7 +472,8 @@ struct MorphoLiquidation {
 | `InvalidLegLink(leg1Out, leg2In)` | `leg1.repayToken != leg2.srcToken` (two-leg intermediate token mismatch) |
 | `Leg2ZeroLeftover()` | Two-leg plan: `leg2.srcToken` balance delta across leg1 is zero (defensive; normally unreachable because leg1's own `minAmountOut >= 1` forces a non-zero delta) |
 | `LegUseFullBalanceNotAllowed(mode)` | Paraswap / Bebop leg set `useFullBalance=true` (both modes carry their own `amountIn` in calldata) |
-| `InvalidPlan()` | Generic plan-shape rejection — includes `hasLeg2 && !leg2.useFullBalance` (leg2 must use on-chain tracked leftover), `leg.srcToken == leg.repayToken`, `minAmountOut == 0` on UNI_V2/V3/V4 and BEBOP_MULTI legs, and Morpho `maxRepayAssets == 0` |
+| `PlanShapeConflict()` | More than one of `{hasLeg2, hasSplit, hasMixedSplit}` is set, OR `NO_SWAP` leg1 combined with `hasLeg2` / `hasMixedSplit` (V7 guards). |
+| `InvalidPlan()` | Generic plan-shape rejection — includes `hasLeg2 && !leg2.useFullBalance` (leg2 must use on-chain tracked leftover), `leg.srcToken == leg.repayToken` for non-NO_SWAP modes, `minAmountOut == 0` on UNI_V2/V3/V4 and BEBOP_MULTI legs, and Morpho `maxRepayAssets == 0` |
 
 ## Configuration
 
@@ -496,7 +515,7 @@ struct MorphoLiquidation {
 
 ```
 src/
-  LiquidationExecutor.sol              Main contract (~1459 lines)
+  LiquidationExecutor.sol              Main contract (~1701 lines)
   interfaces/
     IAaveV3Pool.sol                    Aave V3 Pool + getReserveData
     IBalancerVault.sol                 Balancer Vault + IFlashLoanRecipient
@@ -506,17 +525,18 @@ src/
     IUniV3Router.sol                   Uniswap V3 SwapRouter02 + QuoterV2
     IUniV4PoolManager.sol              Uniswap V4 PoolManager + PoolKey
   libraries/
-    ParaswapDecoderLib.sol             Augustus V6.2 selector classifier + per-family decoders
-    SwapLegExecutorLib.sol             Paraswap / UniV2 / UniV3 leg executors (DELEGATECALL)
+    ParaswapDecoderLib.sol             Augustus V6.2 selector classifier + per-family decoders (~271 lines)
+    SwapLegExecutorLib.sol             Paraswap / UniV2 / UniV3 leg executors (DELEGATECALL, ~182 lines)
 
 test/
-  Executor.t.sol                       240 unit tests
+  Executor.t.sol                       258 unit tests
   fork/
     ExecutorForkV4.t.sol                 8 mainnet-fork tests against real V4 PoolManager
   mocks/
     MockERC20, MockAavePool, MockBalancerVault, MockParaswapAugustus,
     MockAaveV2LendingPool, MockMorphoBlue, MockBebopSettlement,
-    MockUniV2Router, MockUniV3Router, MockV4PoolManager, MockSwapRouter
+    MockUniV2Router, MockUniV3Router, MockV4PoolManager, MockSwapRouter,
+    MaliciousV4PoolManager (V7 callback-substitution attack mock)
 ```
 
 ## Build & Test
@@ -530,7 +550,7 @@ test/
 ```bash
 forge install          # Install dependencies
 forge build            # Compile
-forge test             # Run 248 tests
+forge test             # Run 266 tests (258 unit + 8 fork)
 forge test -vvv        # Verbose output
 forge coverage         # Coverage report
 ```
