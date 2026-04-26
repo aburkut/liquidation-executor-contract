@@ -21,6 +21,7 @@ import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockUniV2Router} from "./mocks/MockUniV2Router.sol";
 import {MockUniV3Router} from "./mocks/MockUniV3Router.sol";
 import {MockV4PoolManager} from "./mocks/MockV4PoolManager.sol";
+import {MaliciousV4PoolManager} from "./mocks/MaliciousV4PoolManager.sol";
 
 /// Test-only struct mirroring Augustus V6.2 UniswapV2Data / UniswapV3Data. Both
 /// real V6.2 structs share this exact 8-field shape (`bytes pools` makes the
@@ -7237,3 +7238,600 @@ contract MockBalancerVaultAmountLiar {
         IFlashLoanRecipient(recipient).receiveFlashLoan(tokens, fakeAmounts, feeAmounts, userData);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// FEATURE: SwapMode.NO_SWAP (same-token liquidation) and skip-unwrap
+// (receiveAToken=true with leg1.srcToken == aToken). Regression
+// coverage for LIQ-141.
+// ═══════════════════════════════════════════════════════════════════
+
+contract ExecutorNoSwapTest is ExecutorTest {
+    /// @dev Build a NO_SWAP single-leg plan with matching src==repay.
+    function _buildNoSwapPlan(address token, uint256 minProfitAmt)
+        internal
+        view
+        returns (LiquidationExecutor.SwapPlan memory)
+    {
+        return LiquidationExecutor.SwapPlan({
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.NO_SWAP,
+                srcToken: token,
+                amountIn: 0,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: "",
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: token,
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: token,
+            minProfitAmount: minProfitAmt
+        });
+    }
+
+    function test_noSwap_sameToken_happyPath() public {
+        // Same-token liquidation: loanToken is both collateral and debt.
+        // MockAavePool.liquidationCall pulls `debtToCover` of debtAsset and
+        // sends `liquidationCollateralReward` of collateralAsset back. When
+        // they are the same token, net balance change = reward - debtToCover.
+        uint256 debtToCover = 500e18;
+        uint256 reward = 550e18; // 10% bonus ≡ profit
+        aavePool.setLiquidationCollateralReward(reward);
+
+        // Pre-fund Aave pool with enough loanToken to send `reward` back.
+        loanToken.mint(address(aavePool), 100_000e18);
+
+        // Same-token action: collateral == debt == loanToken.
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), debtToCover, false);
+        LiquidationExecutor.Action[] memory actions = _singleAction(1, action);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildNoSwapPlan(address(loanToken), MIN_PROFIT);
+
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, swapPlan);
+
+        uint256 before = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 afterBal = loanToken.balanceOf(address(executor));
+
+        // Net gain = reward - debtToCover - flashFee
+        // = 550 - 500 - 1 = 49e18
+        assertEq(afterBal - before, reward - debtToCover - FLASH_FEE, "NO_SWAP profit must be bonus net of flash fee");
+    }
+
+    function test_noSwap_insufficientBalance_reverts() public {
+        // NO_SWAP where liquidation reward is too small to cover flash
+        // repay. The contract's NO_SWAP path skips the swap delta check
+        // in _executeSwapPlan, so the guard fires later inside
+        // _finalizeFlashloan (absolute balance < repayAmount).
+        uint256 debtToCover = 500e18;
+        uint256 reward = 499e18; // Less than debtToCover → net loss
+        aavePool.setLiquidationCollateralReward(reward);
+        loanToken.mint(address(aavePool), 100_000e18);
+
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), debtToCover, false);
+        LiquidationExecutor.Action[] memory actions = _singleAction(1, action);
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildNoSwapPlan(address(loanToken), 0);
+
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_noSwap_validateLeg_acceptsSameSrcRepay() public {
+        // Normal swap modes reject srcToken == repayToken with InvalidPlan.
+        // NO_SWAP is the inverse — same token is required (the liquidation
+        // is the swap). This test pins the behaviour: a NO_SWAP leg with
+        // src == repay reaches the action and succeeds, proving validation
+        // doesn't trip the default self-swap guard.
+        aavePool.setLiquidationCollateralReward(550e18);
+        loanToken.mint(address(aavePool), 100_000e18);
+
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildNoSwapPlan(address(loanToken), 0);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        // No revert on validation (no InvalidPlan / InvalidLegLink).
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    function test_skipUnwrap_aTokenSrc_skipsPoolWithdraw() public {
+        // receiveAToken=true + leg1.srcToken == aToken → pool.withdraw is
+        // NOT called. Verify by starving the Aave pool of underlying
+        // collateralToken: a `withdraw` call would revert, but skip-unwrap
+        // bypasses it entirely and the tx succeeds via the aToken swap.
+        uint256 debtToCover = 500e18;
+        // Reward must be large enough so Paraswap at 1.1x covers
+        // LOAN_AMOUNT + FLASH_FEE = 1001e18 → reward >= ~910e18.
+        uint256 reward = 1000e18;
+
+        aavePool.setLiquidationCollateralReward(reward);
+        aavePool.setAToken(address(aToken));
+        aavePool.setReserveAToken(address(collateralToken), address(aToken));
+
+        // Pre-fund:
+        //   * loanToken on Aave — liquidationCall pulls debt from caller, we need it back on augustus
+        //   * aToken on Aave — given to executor on liquidationCall (receiveAToken=true)
+        //   * loanToken on augustus — funds the aToken -> loanToken swap
+        // INTENTIONALLY NOT minting collateralToken to Aave — a withdraw
+        // call would revert with insufficient balance.
+        aToken.mint(address(aavePool), 100_000e18);
+        loanToken.mint(address(augustus), 100_000e18);
+
+        bytes memory action = _buildAaveV3LiquidationActionWithAToken(
+            address(collateralToken), address(loanToken), address(0x1234), debtToCover, address(aToken)
+        );
+
+        // leg1: srcToken == aToken (skip-unwrap signal), repayToken == loanToken.
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(aToken),
+                amountIn: reward,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(aToken), address(loanToken), reward, address(executor)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // Post-condition: executor has loanToken profit from the aToken swap.
+        assertGt(loanToken.balanceOf(address(executor)), 0, "executor must hold loanToken profit");
+        // Executor should NOT be left holding aToken (Paraswap consumed it).
+        assertEq(aToken.balanceOf(address(executor)), 0, "aToken must be consumed by the swap");
+    }
+
+    function test_skipUnwrap_underlyingSrc_stillUnwraps() public {
+        // Backward-compat: receiveAToken=true + leg1.srcToken == underlying
+        // must still unwrap via pool.withdraw (default behaviour). Verified
+        // by requiring the Aave pool to hold enough underlying for the
+        // withdraw to succeed — the existing test_receiveAToken_true_fullPipeline
+        // asserts the same invariant, so this test is a stability guard.
+        uint256 debtToCover = 500e18;
+        uint256 reward = 1000e18; // covers 1001e18 flash repay at 1.1x swap rate
+
+        address[] memory targets = new address[](2);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        LiquidationExecutor fresh = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+
+        aavePool.setLiquidationCollateralReward(reward);
+        aavePool.setAToken(address(aToken));
+        aavePool.setReserveAToken(address(collateralToken), address(aToken));
+
+        // Critically mint collateralToken to Aave pool — withdraw path is
+        // exercised, so underlying must be available.
+        aToken.mint(address(aavePool), 100_000e18);
+        collateralToken.mint(address(aavePool), 100_000e18);
+        loanToken.mint(address(augustus), 100_000e18);
+
+        bytes memory action = _buildAaveV3LiquidationActionWithAToken(
+            address(collateralToken), address(loanToken), address(0x1234), debtToCover, address(aToken)
+        );
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: address(collateralToken), // underlying, NOT aToken
+                amountIn: reward,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(
+                    address(collateralToken), address(loanToken), reward, address(fresh)
+                ),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        uint256 poolCollBefore = collateralToken.balanceOf(address(aavePool));
+
+        vm.prank(operatorAddr);
+        fresh.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(fresh)), 0, "executor must hold loanToken profit");
+        // Withdraw path fires: Aave pool's underlying collateralToken balance
+        // drops by the unwrapped amount (exact value depends on mock which
+        // doesn't burn aToken — only the pool's side is checked here).
+        uint256 poolCollAfter = collateralToken.balanceOf(address(aavePool));
+        assertLt(poolCollAfter, poolCollBefore, "pool.withdraw must have consumed underlying on the unwrap path");
+    }
+
+    // ─── Security regression: NO_SWAP + multi-leg shape ─────────────
+    //
+    // NO_SWAP is meaningful ONLY as a single-leg plan. When combined with
+    // any multi-leg flag, _executeSwapPlan early-returns at the NO_SWAP
+    // gate BEFORE reaching the hasSplit/hasMixedSplit/hasLeg2 branches —
+    // leg2 silently never runs, but the operator's plan said it should.
+    // Concrete impact for hasMixedSplit when collateralAsset == loanToken
+    // (e.g. same-token liquidation paired with a "skim leftover into WETH"
+    // profit leg): the WETH profit leg is dropped, the contract keeps the
+    // raw loanToken bonus, and no error surfaces.
+    //
+    // Fix: execute() must reject leg1.mode == NO_SWAP combined with any
+    // of {hasLeg2, hasSplit, hasMixedSplit} via PlanShapeConflict.
+
+    function test_noSwap_with_mixedSplit_reverts() public {
+        // Same-token liquidation (loanToken acts as both collateral and
+        // debt) — collateralAsset == loanToken so the leg2.srcToken check
+        // (must equal collateralAsset) and the leg1.repayToken check
+        // (must equal loanToken) both pass. The only thing left to fail
+        // closed is the NO_SWAP + hasMixedSplit shape itself.
+        aavePool.setLiquidationCollateralReward(550e18);
+        loanToken.mint(address(aavePool), 100_000e18);
+
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
+
+        LiquidationExecutor.SwapLeg memory noSwapLeg = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.NO_SWAP,
+            srcToken: address(loanToken),
+            amountIn: 0,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(loanToken),
+            minAmountOut: 0
+        });
+        LiquidationExecutor.SwapLeg memory profitLeg =
+            _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: noSwapLeg,
+            hasLeg2: false,
+            leg2: profitLeg,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: true,
+            profitToken: address(mockWeth),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.PlanShapeConflict.selector);
+        executor.execute(plan);
+    }
+
+    function test_noSwap_with_hasLeg2_reverts() public {
+        // The validator/executor mismatch flagged by the security review:
+        // _executeSwapPlan early-returns when leg1.mode == NO_SWAP BEFORE
+        // reaching the hasLeg2 branch, silently dropping leg2 even though
+        // execute() accepts the plan. Operationally this would silently
+        // break skip-unwrap sequential plans (receiveAToken=true → leg1
+        // NO_SWAP on the aToken → leg2 swap on a peg pool). Validation
+        // must reject NO_SWAP + hasLeg2 at the front gate.
+        aavePool.setLiquidationCollateralReward(550e18);
+        loanToken.mint(address(aavePool), 100_000e18);
+        collateralToken.mint(address(aavePool), 100_000e18);
+
+        // Same-token NO_SWAP (collateral == debt token) so the
+        // SrcTokenNotCollateral and RepayTokenMismatch upstream gates
+        // pass cleanly; the only thing left to fail-closed is the
+        // shape conflict itself.
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
+
+        LiquidationExecutor.SwapLeg memory noSwapLeg = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.NO_SWAP,
+            srcToken: address(loanToken),
+            amountIn: 0,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(loanToken),
+            minAmountOut: 0
+        });
+        // leg2 must satisfy: leg1.repayToken == leg2.srcToken (loanToken
+        // → loanToken won't pass _validateLeg's src!=repay; we need
+        // leg2.repayToken == loanToken to satisfy RepayTokenMismatch).
+        // Construct leg2 = loanToken → loanToken — this normally fails
+        // _validateLeg but it doesn't matter: the new shape guard fires
+        // FIRST so the test pins the correct error class.
+        LiquidationExecutor.SwapLeg memory leg2 =
+            _buildUniV3Leg(address(loanToken), address(loanToken), 0, 3000, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: noSwapLeg,
+            hasLeg2: true,
+            leg2: leg2,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.PlanShapeConflict.selector);
+        executor.execute(plan);
+    }
+
+    function test_skipUnwrap_leg1SrcUnrelatedToken_reverts() public {
+        // Collateral linkage guard: leg1.srcToken must be collateralAsset
+        // OR trackingToken. A third unrelated address reverts
+        // SrcTokenNotCollateral pre-flashloan.
+        uint256 debtToCover = 500e18;
+        aavePool.setLiquidationCollateralReward(COLLATERAL_REWARD);
+        aavePool.setAToken(address(aToken));
+        aavePool.setReserveAToken(address(collateralToken), address(aToken));
+
+        bytes memory action = _buildAaveV3LiquidationActionWithAToken(
+            address(collateralToken), address(loanToken), address(0x1234), debtToCover, address(aToken)
+        );
+
+        address bogus = address(0xBAD1);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: LiquidationExecutor.SwapLeg({
+                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+                srcToken: bogus, // neither collateralToken nor aToken
+                amountIn: 100e18,
+                useFullBalance: false,
+                deadline: block.timestamp + 3600,
+                paraswapCalldata: _buildParaswapCalldata(bogus, address(loanToken), 100e18, address(executor)),
+                bebopTarget: address(0),
+                bebopCalldata: "",
+                v2Path: new address[](0),
+                v3Fee: 0,
+                v4PoolManager: address(0),
+                v4SwapData: "",
+                repayToken: address(loanToken),
+                minAmountOut: 0
+            }),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSignature("SrcTokenNotCollateral(address,address)", address(collateralToken), bogus)
+        );
+        executor.execute(plan);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SECURITY REGRESSION: V4 callback adversarial PoolManager
+//
+// The v4 unlock pattern hands control back to the caller via
+// `unlockCallback(data)`, where `data` is whatever the PoolManager
+// chooses to pass — NOT necessarily what the executor sent in
+// `unlock(data)`. The current callback re-validates the `hook` field
+// against the owner-curated allowlist (defense-in-depth) but trusts
+// the `tokenIn` / `tokenOut` / `amountIn` fields. With a malicious or
+// compromised PoolManager (or whitelisted hook turned malicious), this
+// trust gives two distinct drain vectors:
+//
+//   * Lead #2 — tokenIn substitution: the PM echoes back data with a
+//     different `tokenIn`. The executor swaps a token it holds for an
+//     unrelated reason (e.g. WETH from a previous step) into the pm's
+//     vault. The post-unlock `received >= leg.minAmountOut` check on
+//     the original `tokenOut` may still pass (if the pm gives output
+//     of the expected token), so nothing surfaces.
+//   * Lead #3 — nested re-entry: a malicious whitelisted hook re-enters
+//     `pm.unlock(craftedData)` from within `swap()`. The PM dutifully
+//     calls `executor.unlockCallback(craftedData)` while
+//     `_activeV4PoolManager` is still pinned, all guards pass, and the
+//     contract performs a second swap consuming arbitrary tokens.
+//
+// Both fixes land together: re-pin tokenIn alongside the pm in
+// `_executeUniV4Leg` and re-assert in `unlockCallback`; depth-track
+// callback recursion to reject nested invocations.
+// ═══════════════════════════════════════════════════════════════════
+
+contract ExecutorV4SecurityTest is ExecutorTest {
+    MaliciousV4PoolManager internal evilPm;
+    LiquidationExecutor internal evilExec;
+
+    function _deployEvilExecutor() internal {
+        evilPm = new MaliciousV4PoolManager(SWAP_RATE);
+
+        // Allow both the evil pm AND the legitimate aave pool / paraswap /
+        // bebop / morpho — needed for the action+flashloan parts of the
+        // pipeline to behave normally.
+        address[] memory targets = new address[](6);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        targets[2] = address(aaveV2Pool);
+        targets[3] = address(bebop);
+        targets[4] = address(morphoBlue);
+        targets[5] = address(evilPm);
+
+        evilExec = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+
+        // Pre-fund evil pm with both the legitimate output token AND the
+        // attacker's substituted tokenIn so the malicious settle/take
+        // paths don't fail for cosmetic reasons.
+        loanToken.mint(address(evilPm), 100_000e18);
+        collateralToken.mint(address(evilPm), 100_000e18);
+        mockWeth.mint(address(evilPm), 100_000e18);
+
+        // Pre-fund the executor with WETH (the substitution target) and
+        // the gap collateral (so the legitimate Aave liquidation path
+        // produces enough collateral for the V4 leg input).
+        loanToken.mint(address(evilExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
+        collateralToken.mint(address(evilExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
+        // Critically: the contract holds WETH that the attacker wants to
+        // drain. Without WETH on the executor the substitution attack
+        // can't actually transfer anything (settle would revert).
+        mockWeth.mint(address(evilExec), 5000e18);
+    }
+
+    function test_v4_callback_tokenIn_substitution_reverts() public {
+        _deployEvilExecutor();
+
+        // PM substitutes the callback payload — tries to redirect tokenOut
+        // to mockWeth (operator's plan is collateralToken→loanToken).
+        // After fix: tokenIn is read from STORAGE (pinned by
+        // _executeUniV4Leg) so the PM cannot influence which token gets
+        // settled. The substituted tokenOut/fee/etc. cause downstream
+        // mismatches (post-unlock `received` delta on leg.repayToken
+        // catches it), so the tx still reverts. Today (pre-fix): the
+        // contract trusted the data field and would have settled
+        // mockWeth — a real drain.
+        // Payload format (post-fix): (tokenOut, fee, tickSpacing, hook, amountIn).
+        bytes memory substituted = abi.encode(
+            address(mockWeth), // ← substituted tokenOut (legit was loanToken)
+            uint24(3000),
+            int24(60),
+            address(0),
+            uint256(2000e18)
+        );
+        evilPm.setSubstituteCallback(substituted);
+
+        // Build a legitimate plan: collateralToken → loanToken via V4.
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(evilPm),
+            1,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        // After fix: tokenIn re-assertion in unlockCallback rejects the
+        // substituted payload. Today: silently succeeds and drains WETH.
+        vm.expectRevert();
+        evilExec.execute(plan);
+    }
+
+    function test_v4_callback_reentry_blocked() public {
+        _deployEvilExecutor();
+
+        // Re-entry payload: a SECOND unlockCallback invocation made from
+        // within swap(). After fix: the outer callback claims
+        // _activeV4TokenIn (clears it to address(0)) on entry. The
+        // nested call sees tokenIn == 0 in storage and the combined
+        // entry guard reverts InvalidCallbackCaller before any swap
+        // logic. Today (pre-fix): both swaps run, executor leaks tokens.
+        // Payload format (post-fix): (tokenOut, fee, tickSpacing, hook, amountIn).
+        bytes memory innerData = abi.encode(address(loanToken), uint24(3000), int24(60), address(0), uint256(1000e18));
+        evilPm.setReentryAttack(innerData);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            address(0),
+            address(evilPm),
+            1,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        // After fix: depth tracking on unlockCallback rejects the nested
+        // invocation. Today: both swaps run, executor leaks WETH.
+        vm.expectRevert();
+        evilExec.execute(plan);
+    }
+}
+

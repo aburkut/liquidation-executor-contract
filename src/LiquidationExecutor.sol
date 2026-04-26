@@ -219,12 +219,27 @@ contract LiquidationExecutor is
     /// from an allow-listed PoolManager acting outside our pipeline revert.
     address private _activeV4PoolManager;
 
-    /// @dev Execution phase guard — prevents unexpected callbacks
+    /// @dev Execution phase guard — prevents unexpected callbacks. Slot
+    /// layout note: kept directly after `_activeV4PoolManager` so both
+    /// pack into the same storage slot (test_morphoCallbackRejectsCaller
+    /// relies on this layout via vm.store at slot 11).
     enum ExecutionPhase {
         Idle,
         FlashLoanActive
     }
     ExecutionPhase private _executionPhase;
+
+    /// @dev tokenIn pinned for the active V4 unlock. Set by
+    /// `_executeUniV4Leg` BEFORE `unlock()`, CLEARED to address(0) by
+    /// `unlockCallback` on entry. The clear-on-entry semantics double as
+    /// a re-entry guard: a nested `unlockCallback` (e.g. from a malicious
+    /// hook calling `pm.unlock()` mid-swap) would see `_activeV4TokenIn
+    /// == 0` and the entry guard rejects it. Reading tokenIn from
+    /// storage (rather than decoding from `data`) also closes the
+    /// substitution drain — `pm` cannot influence storage, only the
+    /// callback payload. Declared AFTER `_executionPhase` so the legacy
+    /// slot 11 packing (read by storage-poking tests) stays untouched.
+    address private _activeV4TokenIn;
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
@@ -266,7 +281,8 @@ contract LiquidationExecutor is
         BEBOP_MULTI,
         UNI_V2,
         UNI_V3,
-        UNI_V4
+        UNI_V4,
+        NO_SWAP // Same-token liquidation: srcToken == repayToken, no DEX call.
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
@@ -338,6 +354,15 @@ contract LiquidationExecutor is
     /// useFullBalance=true) → loanToken. No coinbase (leg2 consumes
     /// the whole intermediate balance). Used for deep-liquidity
     /// routing through WETH bridge when direct coll→debt is thin.
+    /// @dev When a liquidation uses `receiveAToken=true`, leg1.srcToken
+    /// selects the behaviour: setting it to the underlying collateral
+    /// triggers the usual `pool.withdraw(...)` unwrap step, while setting
+    /// it to the aToken itself skips the unwrap and lets the swap plan
+    /// consume the aToken directly (e.g. via an aToken/underlying peg
+    /// pool). Use the aToken path when the reserve's underlying liquidity
+    /// is insufficient to satisfy `withdraw` — over-utilized reserves
+    /// would otherwise revert with an arithmetic overflow inside
+    /// Aave's `calculateInterestRates`.
     struct SwapPlan {
         SwapLeg leg1;
         bool hasLeg2;
@@ -639,9 +664,16 @@ contract LiquidationExecutor is
     function _validateLeg(SwapLeg memory leg) internal view {
         if (leg.srcToken == address(0)) revert ZeroAddress();
         if (leg.repayToken == address(0)) revert ZeroAddress();
-        if (leg.srcToken == leg.repayToken) revert InvalidPlan();
 
         SwapMode m = leg.mode;
+
+        // NO_SWAP: same-token path (e.g. WETH/WETH). Leg-level checks are
+        // skipped; a mismatched src/repay silently early-returns in
+        // _executeSwapPlan and the final flash-repay balance check
+        // reverts if the plan didn't actually produce enough loanToken.
+        if (m == SwapMode.NO_SWAP) return;
+
+        if (leg.srcToken == leg.repayToken) revert InvalidPlan();
 
         // Paraswap/Bebop: reject useFullBalance (amountIn is inside calldata).
         if ((m == SwapMode.PARASWAP_SINGLE || m == SwapMode.BEBOP_MULTI) && leg.useFullBalance) {
@@ -701,19 +733,27 @@ contract LiquidationExecutor is
         }
 
         // Validate all actions use same debt/collateral assets
-        (address collateralAsset,) = _validateActions(plan.actions, plan.loanToken);
+        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
 
-        // Collateral linkage: leg1.srcToken must match liquidation collateral
+        // Collateral linkage: leg1.srcToken must be either the underlying
+        // collateral (standard path, contract unwraps aToken after
+        // liquidation) or the aToken itself (skip-unwrap path, the aToken
+        // becomes the swap input). trackingToken differs from
+        // collateralAsset only when receiveAToken=true, so the aToken
+        // path is only reachable with that setting.
         if (collateralAsset != address(0)) {
-            if (plan.swapPlan.leg1.srcToken != collateralAsset) {
-                revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.leg1.srcToken);
+            address src = plan.swapPlan.leg1.srcToken;
+            if (src != collateralAsset && src != trackingToken) {
+                revert SrcTokenNotCollateral(collateralAsset, src);
             }
         }
 
         // Plan-shape XOR guard: at most ONE of {hasLeg2, hasSplit,
         // hasMixedSplit} may be true. All-false = single-leg plan.
-        // Fail-closed before running any leg validation so a malformed
-        // plan can never reach the flashloan layer.
+        // NO_SWAP + hasMixedSplit is the one combination NOT already
+        // rejected by existing per-shape validation (hasSplit's m1-Uni
+        // check + hasLeg2's InvalidLegLink), so it gets a dedicated
+        // PlanShapeConflict guard inside the hasMixedSplit block below.
         {
             uint256 shapeCount = 0;
             if (plan.swapPlan.hasLeg2) shapeCount++;
@@ -722,11 +762,23 @@ contract LiquidationExecutor is
             if (shapeCount > 1) revert PlanShapeConflict();
         }
 
-        // Validate leg1 (may be any mode).
+        // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
+        // a single-leg plan — combined with hasLeg2 / hasMixedSplit it
+        // would silently bypass the second leg in _executeSwapPlan. Both
+        // combinations are rejected explicitly inside the corresponding
+        // shape-validation blocks below. NO_SWAP + hasSplit is rejected
+        // by hasSplit's m1-must-be-Uni check.
         _validateLeg(plan.swapPlan.leg1);
 
         // Validate leg2 (must be Uni V2/V3/V4, must link to leg1 output).
         if (plan.swapPlan.hasLeg2) {
+            // NO_SWAP is single-leg-only — _executeSwapPlan early-returns
+            // BEFORE the hasLeg2 branch, silently dropping leg2 even
+            // though validation accepted it. This is a validator/executor
+            // mismatch (worse than a per-mode bug) and would silently
+            // break skip-unwrap sequential plans (receiveAToken=true →
+            // leg1 NO_SWAP → leg2 peg-pool swap). Reject at validation.
+            if (plan.swapPlan.leg1.mode == SwapMode.NO_SWAP) revert PlanShapeConflict();
             SwapMode m2 = plan.swapPlan.leg2.mode;
             if (m2 != SwapMode.UNI_V2 && m2 != SwapMode.UNI_V3 && m2 != SwapMode.UNI_V4) {
                 revert Leg2ModeNotAllowed(uint8(m2));
@@ -778,9 +830,14 @@ contract LiquidationExecutor is
         //     non-deterministic output.)
         if (plan.swapPlan.hasMixedSplit) {
             SwapMode m1 = plan.swapPlan.leg1.mode;
-            // leg1 can be ANY of the five modes. No mode restriction.
-            // (The contract's per-mode executor already enforces the
-            // relevant calldata / approval invariants.)
+            // NO_SWAP is single-leg-only — combined with hasMixedSplit
+            // the runtime early-returns in _executeSwapPlan BEFORE
+            // reaching the leg2 branch and silently skips the profit
+            // leg. Reject at validation time.
+            if (m1 == SwapMode.NO_SWAP) revert PlanShapeConflict();
+            // leg1 can otherwise be ANY of the four real swap modes.
+            // (The contract's per-mode executor enforces the relevant
+            // calldata / approval invariants.)
             if (plan.swapPlan.leg1.repayToken != plan.loanToken) {
                 revert RepayTokenMismatch(plan.loanToken, plan.swapPlan.leg1.repayToken);
             }
@@ -950,25 +1007,27 @@ contract LiquidationExecutor is
             }
         }
 
-        // Post-action: verify liquidation produced collateral (delta-based, all modes)
+        // Post-action: verify liquidation produced collateral AND
+        // optionally unwrap aTokens to underlying in the same block.
+        // Unwrap is skipped when leg1.srcToken is the aToken itself
+        // (the plan consumes the aToken directly, typically via an
+        // aToken/underlying peg pool).
         if (trackingToken != address(0)) {
-            if (IERC20(trackingToken).balanceOf(address(this)) <= collateralBefore) revert NoCollateralReceived();
-        }
+            uint256 trackingAfter = IERC20(trackingToken).balanceOf(address(this));
+            if (trackingAfter <= collateralBefore) revert NoCollateralReceived();
 
-        // Unwrap aTokens to underlying if receiveAToken was used — delta only
-        if (trackingToken != address(0) && trackingToken != collateralAsset) {
-            uint256 aTokenDelta = IERC20(trackingToken).balanceOf(address(this)) - collateralBefore;
-            if (aTokenDelta > 0) {
+            if (trackingToken != collateralAsset && plan.swapPlan.leg1.srcToken != trackingToken) {
+                uint256 aTokenDelta = trackingAfter - collateralBefore;
                 uint256 underlyingBefore = IERC20(collateralAsset).balanceOf(address(this));
                 _unwrapATokens(collateralAsset, aTokenDelta);
                 if (IERC20(collateralAsset).balanceOf(address(this)) <= underlyingBefore) revert UnwrapFailed();
             }
         }
 
-        // Post-pipeline collateral delta (underlying asset only) — consumed by
-        // UNI_V2/V3 useFullBalance mode. Computed AFTER aToken unwrap so the
-        // full produced amount is available for swapping regardless of
-        // receiveAToken setting.
+        // Post-pipeline collateral delta (underlying only). In skip-unwrap
+        // mode the underlying balance is unchanged, so collateralDelta=0
+        // — useFullBalance modes would read zero and fail fast, forcing
+        // the caller to use a fixed `amountIn` for the aToken path.
         uint256 collateralDelta;
         if (collateralAsset != address(0)) {
             uint256 collateralAssetAfter = IERC20(collateralAsset).balanceOf(address(this));
@@ -1076,6 +1135,11 @@ contract LiquidationExecutor is
         uint256 collateralDelta
     ) internal {
         SwapLeg memory leg1 = plan.leg1;
+
+        // NO_SWAP: same-token liquidation (e.g. WETH/WETH). The liquidation
+        // already deposited loanToken on the contract; _finalizeFlashloan's
+        // absolute balance check settles the flashloan.
+        if (leg1.mode == SwapMode.NO_SWAP) return;
 
         address finalRepayToken = (plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken);
         uint256 finalRepayBefore = IERC20(finalRepayToken).balanceOf(address(this));
@@ -1327,7 +1391,13 @@ contract LiquidationExecutor is
 
         address pm = leg.v4PoolManager;
         _activeV4PoolManager = pm;
-        IPoolManager(pm).unlock(abi.encode(tokenIn, tokenOut, fee, tickSpacing, hook, amountIn));
+        _activeV4TokenIn = tokenIn;
+        // tokenIn is NOT included in the unlock payload — the callback
+        // reads it from storage so the PM cannot substitute it. Encode
+        // the remaining five fields only.
+        IPoolManager(pm).unlock(abi.encode(tokenOut, fee, tickSpacing, hook, amountIn));
+        // _activeV4TokenIn cleared by callback on entry. _activeV4PoolManager
+        // cleared so the existing pm-pin guard re-arms for the next leg.
         _activeV4PoolManager = address(0);
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
@@ -1350,20 +1420,25 @@ contract LiquidationExecutor is
     /// new tests and security review.
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
-        address pm = _activeV4PoolManager;
-        // pm == 0 covered by the strict caller check below (msg.sender can never be 0).
-        if (msg.sender != pm) revert InvalidCallbackCaller();
+        // tokenIn is read from storage (pinned by _executeUniV4Leg) rather
+        // than from `data` — PM controls the data, not storage, so
+        // substitution is impossible by construction. Clearing on entry
+        // doubles as the re-entry guard: a nested unlockCallback from
+        // inside swap() finds tokenIn == 0 and the combined check below
+        // fails closed. The msg.sender check covers the not-in-flow case
+        // (_activeV4PoolManager == 0 → msg.sender != 0 = always true).
+        address tokenIn = _activeV4TokenIn;
+        if (tokenIn == address(0) || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
+        _activeV4TokenIn = address(0); // CLAIM
 
-        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint256 amountIn) =
-            abi.decode(data, (address, address, uint24, int24, address, uint256));
+        (address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint256 amountIn) =
+            abi.decode(data, (address, uint24, int24, address, uint256));
 
-        // Defense-in-depth against a malicious/misconfigured PoolManager
-        // echoing modified data back to us: re-assert the hook whitelist
-        // against owner-curated state. tokenIn/tokenOut are NOT re-asserted
-        // here because the leg is out of scope and adding storage is out
-        // of scope for this patch — tokenOut substitution is caught by the
-        // post-unlock `received` delta (computed against `leg.repayToken`)
-        // and the pipeline-level `repayDelta >= flashRepayAmount` gate.
+        // Hook whitelist re-check defends against a malicious/
+        // misconfigured PoolManager substituting the hook field.
+        // tokenOut substitution remains caught by the post-unlock
+        // `received` delta (computed against `leg.repayToken`) and
+        // the pipeline-level `repayDelta >= flashRepayAmount` gate.
         if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
 
         bool zeroForOne = tokenIn < tokenOut;
@@ -1381,7 +1456,7 @@ contract LiquidationExecutor is
             sqrtPriceLimitX96: zeroForOne ? V4_MIN_SQRT_PRICE_LIMIT : V4_MAX_SQRT_PRICE_LIMIT
         });
 
-        int256 swapDelta = IPoolManager(pm).swap(key, params, "");
+        int256 swapDelta = IPoolManager(msg.sender).swap(key, params, "");
         int128 amount0 = int128(swapDelta >> 128);
         int128 amount1 = int128(swapDelta);
 
@@ -1398,12 +1473,10 @@ contract LiquidationExecutor is
         uint256 owedIn = uint256(int256(-tokenInDelta));
         uint256 gainedOut = uint256(int256(tokenOutDelta));
 
-        IPoolManager(pm).sync(tokenIn);
-        IERC20(tokenIn).safeTransfer(pm, owedIn);
-        IPoolManager(pm).settle();
-
-        IPoolManager(pm).take(tokenOut, address(this), gainedOut);
-
+        IPoolManager(msg.sender).sync(tokenIn);
+        IERC20(tokenIn).safeTransfer(msg.sender, owedIn);
+        IPoolManager(msg.sender).settle();
+        IPoolManager(msg.sender).take(tokenOut, address(this), gainedOut);
         return "";
     }
 
