@@ -7565,6 +7565,68 @@ contract ExecutorNoSwapTest is ExecutorTest {
         executor.execute(plan);
     }
 
+    function test_noSwap_with_hasLeg2_reverts() public {
+        // The validator/executor mismatch flagged by the security review:
+        // _executeSwapPlan early-returns when leg1.mode == NO_SWAP BEFORE
+        // reaching the hasLeg2 branch, silently dropping leg2 even though
+        // execute() accepts the plan. Operationally this would silently
+        // break skip-unwrap sequential plans (receiveAToken=true → leg1
+        // NO_SWAP on the aToken → leg2 swap on a peg pool). Validation
+        // must reject NO_SWAP + hasLeg2 at the front gate.
+        aavePool.setLiquidationCollateralReward(550e18);
+        loanToken.mint(address(aavePool), 100_000e18);
+        collateralToken.mint(address(aavePool), 100_000e18);
+
+        // Same-token NO_SWAP (collateral == debt token) so the
+        // SrcTokenNotCollateral and RepayTokenMismatch upstream gates
+        // pass cleanly; the only thing left to fail-closed is the
+        // shape conflict itself.
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
+
+        LiquidationExecutor.SwapLeg memory noSwapLeg = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.NO_SWAP,
+            srcToken: address(loanToken),
+            amountIn: 0,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(loanToken),
+            minAmountOut: 0
+        });
+        // leg2 must satisfy: leg1.repayToken == leg2.srcToken (loanToken
+        // → loanToken won't pass _validateLeg's src!=repay; we need
+        // leg2.repayToken == loanToken to satisfy RepayTokenMismatch).
+        // Construct leg2 = loanToken → loanToken — this normally fails
+        // _validateLeg but it doesn't matter: the new shape guard fires
+        // FIRST so the test pins the correct error class.
+        LiquidationExecutor.SwapLeg memory leg2 =
+            _buildUniV3Leg(address(loanToken), address(loanToken), 0, 3000, 1, true);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: noSwapLeg,
+            hasLeg2: true,
+            leg2: leg2,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.PlanShapeConflict.selector);
+        executor.execute(plan);
+    }
+
     function test_skipUnwrap_leg1SrcUnrelatedToken_reverts() public {
         // Collateral linkage guard: leg1.srcToken must be collateralAsset
         // OR trackingToken. A third unrelated address reverts

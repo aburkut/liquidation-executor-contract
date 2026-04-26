@@ -763,11 +763,22 @@ contract LiquidationExecutor is
         }
 
         // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
-        // a single-leg plan; the multi-leg guard lives in _executeSwapPlan.
+        // a single-leg plan — combined with hasLeg2 / hasMixedSplit it
+        // would silently bypass the second leg in _executeSwapPlan. Both
+        // combinations are rejected explicitly inside the corresponding
+        // shape-validation blocks below. NO_SWAP + hasSplit is rejected
+        // by hasSplit's m1-must-be-Uni check.
         _validateLeg(plan.swapPlan.leg1);
 
         // Validate leg2 (must be Uni V2/V3/V4, must link to leg1 output).
         if (plan.swapPlan.hasLeg2) {
+            // NO_SWAP is single-leg-only — _executeSwapPlan early-returns
+            // BEFORE the hasLeg2 branch, silently dropping leg2 even
+            // though validation accepted it. This is a validator/executor
+            // mismatch (worse than a per-mode bug) and would silently
+            // break skip-unwrap sequential plans (receiveAToken=true →
+            // leg1 NO_SWAP → leg2 peg-pool swap). Reject at validation.
+            if (plan.swapPlan.leg1.mode == SwapMode.NO_SWAP) revert PlanShapeConflict();
             SwapMode m2 = plan.swapPlan.leg2.mode;
             if (m2 != SwapMode.UNI_V2 && m2 != SwapMode.UNI_V3 && m2 != SwapMode.UNI_V4) {
                 revert Leg2ModeNotAllowed(uint8(m2));
