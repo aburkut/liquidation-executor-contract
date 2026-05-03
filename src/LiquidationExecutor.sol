@@ -728,9 +728,7 @@ contract LiquidationExecutor is
         // IS the repay leg (collateral → loanToken), matching the single-leg
         // derivation since hasLeg2 is forbidden in split mode (see block below).
         address finalRepayToken = plan.swapPlan.hasLeg2 ? plan.swapPlan.leg2.repayToken : plan.swapPlan.leg1.repayToken;
-        if (finalRepayToken != plan.loanToken) {
-            revert RepayTokenMismatch(plan.loanToken, finalRepayToken);
-        }
+        if (finalRepayToken != plan.loanToken) revert InvalidPlan();
 
         // Validate all actions use same debt/collateral assets
         (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
@@ -803,7 +801,7 @@ contract LiquidationExecutor is
             if (mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4) revert InvalidPlan();
             if (plan.swapPlan.leg2.repayToken != weth) revert InvalidPlan();
             if (collateralAsset != address(0) && plan.swapPlan.leg2.srcToken != collateralAsset) {
-                revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.leg2.srcToken);
+                revert InvalidPlan();
             }
             if (plan.swapPlan.leg1.useFullBalance || plan.swapPlan.leg2.useFullBalance) revert InvalidPlan();
             _validateLeg(plan.swapPlan.leg2);
@@ -830,25 +828,20 @@ contract LiquidationExecutor is
         //     non-deterministic output.)
         if (plan.swapPlan.hasMixedSplit) {
             SwapMode m1 = plan.swapPlan.leg1.mode;
-            // NO_SWAP is single-leg-only — combined with hasMixedSplit
-            // the runtime early-returns in _executeSwapPlan BEFORE
-            // reaching the leg2 branch and silently skips the profit
-            // leg. Reject at validation time.
-            if (m1 == SwapMode.NO_SWAP) revert PlanShapeConflict();
-            // leg1 can otherwise be ANY of the four real swap modes.
-            // (The contract's per-mode executor enforces the relevant
-            // calldata / approval invariants.)
-            if (plan.swapPlan.leg1.repayToken != plan.loanToken) {
-                revert RepayTokenMismatch(plan.loanToken, plan.swapPlan.leg1.repayToken);
+            // NO_SWAP + hasMixedSplit: same-asset path only (col == loanToken).
+            // src must equal loanToken since NO_SWAP doesn't convert.
+            if (m1 == SwapMode.NO_SWAP && plan.swapPlan.leg1.srcToken != plan.loanToken) {
+                revert InvalidPlan();
             }
+            if (plan.swapPlan.leg1.repayToken != plan.loanToken) revert InvalidPlan();
 
             SwapMode mp = plan.swapPlan.leg2.mode;
             if (mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4) {
-                revert Leg2ModeNotAllowed(uint8(mp));
+                revert InvalidPlan();
             }
             if (plan.swapPlan.leg2.repayToken != weth) revert InvalidPlan();
             if (collateralAsset != address(0) && plan.swapPlan.leg2.srcToken != collateralAsset) {
-                revert SrcTokenNotCollateral(collateralAsset, plan.swapPlan.leg2.srcToken);
+                revert InvalidPlan();
             }
             if (plan.swapPlan.leg1.useFullBalance || plan.swapPlan.leg2.useFullBalance) {
                 revert InvalidPlan();
@@ -1136,10 +1129,15 @@ contract LiquidationExecutor is
     ) internal {
         SwapLeg memory leg1 = plan.leg1;
 
-        // NO_SWAP: same-token liquidation (e.g. WETH/WETH). The liquidation
-        // already deposited loanToken on the contract; _finalizeFlashloan's
-        // absolute balance check settles the flashloan.
-        if (leg1.mode == SwapMode.NO_SWAP) return;
+        // NO_SWAP: same-token liquidation (col == loanToken).
+        //   * Single-leg variant (e.g. WETH/WETH): liquidation already
+        //     deposited loanToken — `_finalizeFlashloan`'s absolute
+        //     balance check settles. Early-return here.
+        //   * NO_SWAP + hasMixedSplit (e.g. USDC/USDC with WETH bribe):
+        //     leg2 still has to run on the residual collateral. Fall
+        //     through to the hasMixedSplit branch below, where the
+        //     leg2.amountIn is computed as `collateralDelta - flashRepayAmount`.
+        if (leg1.mode == SwapMode.NO_SWAP && !plan.hasMixedSplit) return;
 
         address finalRepayToken = (plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken);
         uint256 finalRepayBefore = IERC20(finalRepayToken).balanceOf(address(this));
@@ -1198,6 +1196,14 @@ contract LiquidationExecutor is
             // measure leg1 consumption — reject here rather than let the
             // mode silently degrade into a no-op profit leg.
             if (collateralAsset == address(0)) revert InvalidPlan();
+
+            // NO_SWAP + hasMixedSplit (same-asset path): sweep
+            // `loanBalance - flashRepayAmount` through leg2; residual
+            // settles the flashloan. Underflow → native Panic(0x11).
+            if (leg1.mode == SwapMode.NO_SWAP) {
+                _dispatchLeg(plan.leg2, leg1RepayBefore - flashRepayAmount, 0);
+                return;
+            }
 
             uint256 collBeforeLeg1 = IERC20(collateralAsset).balanceOf(address(this));
 
