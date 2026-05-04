@@ -7155,8 +7155,7 @@ contract ExecutorTest is Test {
 /// @dev Contract that rejects ETH -- used to test coinbase payment failure
 contract ETHRejecter {
     // No receive() or fallback() -- rejects all ETH transfers
-
-    }
+}
 
 /// @dev Mock WETH for testing auto-unwrap in coinbase payment
 contract MockWETH is ERC20 {

@@ -163,14 +163,14 @@ library SwapLegExecutorLib {
         IUniV3SwapRouter(router)
             .exactInputSingle(
                 IUniV3SwapRouter.ExactInputSingleParams({
-                    tokenIn: leg.srcToken,
-                    tokenOut: leg.repayToken,
-                    fee: leg.v3Fee,
-                    recipient: address(this),
-                    amountIn: amountIn,
-                    amountOutMinimum: leg.minAmountOut,
-                    sqrtPriceLimitX96: 0
-                })
+                tokenIn: leg.srcToken,
+                tokenOut: leg.repayToken,
+                fee: leg.v3Fee,
+                recipient: address(this),
+                amountIn: amountIn,
+                amountOutMinimum: leg.minAmountOut,
+                sqrtPriceLimitX96: 0
+            })
             );
         IERC20(leg.srcToken).forceApprove(router, 0);
 
