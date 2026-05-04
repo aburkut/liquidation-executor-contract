@@ -2963,18 +2963,14 @@ contract ExecutorTest is Test {
     // ═══════════════════════════════════════════════════════════════════
 
     function test_revertIfRepayTokenNotLoanToken() public {
-        // repayToken != loanToken -> RepayTokenMismatch
+        // repayToken != loanToken -> InvalidPlan
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(loanToken), address(collateralToken), LOAN_AMOUNT, 0);
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.RepayTokenMismatch.selector, address(loanToken), address(collateralToken)
-            )
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7006,7 +7002,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.Leg2ModeNotAllowed.selector, uint8(0)));
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7042,11 +7038,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.RepayTokenMismatch.selector, address(loanToken), address(mockWeth)
-            )
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7066,11 +7058,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.SrcTokenNotCollateral.selector, address(collateralToken), address(loanToken)
-            )
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7167,8 +7155,7 @@ contract ExecutorTest is Test {
 /// @dev Contract that rejects ETH -- used to test coinbase payment failure
 contract ETHRejecter {
     // No receive() or fallback() -- rejects all ETH transfers
-
-    }
+}
 
 /// @dev Mock WETH for testing auto-unwrap in coinbase payment
 contract MockWETH is ERC20 {
@@ -7502,28 +7489,137 @@ contract ExecutorNoSwapTest is ExecutorTest {
         assertLt(poolCollAfter, poolCollBefore, "pool.withdraw must have consumed underlying on the unwrap path");
     }
 
-    // ─── Security regression: NO_SWAP + multi-leg shape ─────────────
+    // ─── Same-asset NO_SWAP + MIXED_SPLIT (col→WETH bribe leg) ──────
     //
-    // NO_SWAP is meaningful ONLY as a single-leg plan. When combined with
-    // any multi-leg flag, _executeSwapPlan early-returns at the NO_SWAP
-    // gate BEFORE reaching the hasSplit/hasMixedSplit/hasLeg2 branches —
-    // leg2 silently never runs, but the operator's plan said it should.
-    // Concrete impact for hasMixedSplit when collateralAsset == loanToken
-    // (e.g. same-token liquidation paired with a "skim leftover into WETH"
-    // profit leg): the WETH profit leg is dropped, the contract keeps the
-    // raw loanToken bonus, and no error surfaces.
+    // For same-asset liquidations (col == debt != WETH, e.g. USDC/USDC)
+    // leg1 has nothing to swap (col already equals loanToken), but a
+    // bribe leg is still needed to convert part of the residual into
+    // WETH for coinbase. The contract handles this by accepting
+    // leg1.mode == NO_SWAP combined with hasMixedSplit, computing
+    // `leg2.amountIn = balance - flashRepayAmount` at runtime.
     //
-    // Fix: execute() must reject leg1.mode == NO_SWAP combined with any
-    // of {hasLeg2, hasSplit, hasMixedSplit} via PlanShapeConflict.
+    // The OUTSIDE-same-asset combination (col != loanToken) remains
+    // rejected — see `test_noSwap_with_mixedSplit_diffAsset_reverts`.
 
-    function test_noSwap_with_mixedSplit_reverts() public {
-        // Same-token liquidation (loanToken acts as both collateral and
-        // debt) — collateralAsset == loanToken so the leg2.srcToken check
-        // (must equal collateralAsset) and the leg1.repayToken check
-        // (must equal loanToken) both pass. The only thing left to fail
-        // closed is the NO_SWAP + hasMixedSplit shape itself.
+    /// @dev NO_SWAP + MIXED_SPLIT happy path. col == debt == loanToken
+    /// (same-token); leg2 swaps the residual loanToken → WETH so the
+    /// flashloan repay sits on the balance unchanged.
+    function test_noSwap_with_mixedSplit_sameAsset_executes_leg2() public {
+        // Net liquidation profit (collateralDelta) needs to exceed
+        // FLASH_FEE so leg2 has something to swap. With reward=550 and
+        // debtToCover=500, collateralDelta = 50e18; flashRepayAmount =
+        // LOAN_AMOUNT + FLASH_FEE; balanceBeforeLeg2 = LOAN_AMOUNT + 50;
+        // leg2.amountIn = balance - repay = 50 - FLASH_FEE = 49e18.
         aavePool.setLiquidationCollateralReward(550e18);
         loanToken.mint(address(aavePool), 100_000e18);
+
+        // Pre-fund Uni V3 mock with mockWeth so leg2 swap succeeds.
+        mockWeth.mint(address(uniV3Mock), 100_000e18);
+
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
+
+        LiquidationExecutor.SwapLeg memory noSwapLeg = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.NO_SWAP,
+            srcToken: address(loanToken),
+            amountIn: 0,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(loanToken),
+            minAmountOut: 0
+        });
+        // leg2 amountIn=0 — contract fills it at runtime from balance.
+        LiquidationExecutor.SwapLeg memory profitLeg =
+            _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: noSwapLeg,
+            hasLeg2: false,
+            leg2: profitLeg,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: true,
+            profitToken: address(mockWeth),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        uint256 wethBefore = mockWeth.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        uint256 wethAfter = mockWeth.balanceOf(address(executor));
+
+        // leg2 spent (collateralDelta - FLASH_FEE) = (50e18 - 1e18) = 49e18
+        // loanToken into mockWeth at the Uni V3 mock's swap rate.
+        assertGt(wethAfter, wethBefore, "leg2 must produce mockWeth profit");
+    }
+
+    /// @dev NO_SWAP + MIXED_SPLIT must still revert when col != loanToken
+    /// — the same-asset relaxation only applies when they coincide.
+    function test_noSwap_with_mixedSplit_diffAsset_reverts() public {
+        // Standard cross-asset MIXED_SPLIT setup, but with leg1=NO_SWAP.
+        // Validation must reject: col != loanToken so the leg1 has no
+        // semantic meaning (the liquidation reward isn't already in
+        // loanToken — leg1 must do an actual swap).
+        aavePool.setLiquidationCollateralReward(COLLATERAL_REWARD);
+        collateralToken.mint(address(aavePool), 100_000e18);
+
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(collateralToken), address(loanToken), address(0x1234), 500e18, false);
+
+        LiquidationExecutor.SwapLeg memory noSwapLeg = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.NO_SWAP,
+            srcToken: address(collateralToken),
+            amountIn: 0,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(loanToken),
+            minAmountOut: 0
+        });
+        LiquidationExecutor.SwapLeg memory profitLeg =
+            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: noSwapLeg,
+            hasLeg2: false,
+            leg2: profitLeg,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: true,
+            profitToken: address(mockWeth),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// @dev Same-asset NO_SWAP + MIXED_SPLIT but the liquidation reward
+    /// is too small to cover flashRepayAmount → reverts.
+    function test_noSwap_with_mixedSplit_repayReserveUnderflow_reverts() public {
+        // reward < debtToCover → collateralDelta would be negative;
+        // MockAavePool clamps but balance ends up below flashRepayAmount.
+        aavePool.setLiquidationCollateralReward(499e18);
+        loanToken.mint(address(aavePool), 100_000e18);
+        mockWeth.mint(address(uniV3Mock), 100_000e18);
 
         bytes memory action =
             _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
@@ -7561,7 +7657,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.PlanShapeConflict.selector);
+        vm.expectRevert(); // RepayReserveUnderflow
         executor.execute(plan);
     }
 

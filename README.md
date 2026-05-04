@@ -4,13 +4,13 @@
 
 | Parameter | Value |
 |---|---|
-| **Contract (V7)** | `0xb18e3A861961BF399b08Bdd8500019319Be58779` |
-| **Deploy tx** | `0x1a48be1e2fffecb1486542d23a40eec6747fc6a1b711c62b13846f012e2ddfd3` |
-| **SwapLegExecutorLib** | `0x0846BE913D89B91B92276AEAf546205529b94979` (reused from V5/V6 — source unchanged; linked via `--libraries`) |
+| **Contract (V8)** | `0xB48378b1035dDA425bB9AA76F81c7f1695B0aeE0` |
+| **Deploy tx** | `0xe011e1029adb704e0f64a37b072bc17a82d9ddd1a403a6d06ad5370f63cc6827` |
+| **SwapLegExecutorLib** | `0x0846BE913D89B91B92276AEAf546205529b94979` (reused from V5/V6/V7 — source unchanged; linked via `--libraries`) |
 | **SwapLegExecutorLib deploy tx** | `0x903045a07f29f90f208875cbdb68af511e442dcfa1225b6d804d48e5861c056b` |
-| **ParaswapDecoderLib** | `0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16` (reused from V4/V5/V6 — source unchanged; linked via `--libraries`) |
+| **ParaswapDecoderLib** | `0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16` (reused from V4/V5/V6/V7 — source unchanged; linked via `--libraries`) |
 | **ParaswapDecoderLib deploy tx** | `0x1446d0fc56087032a8872d3bf09083cf341bfb91cc3924e3baa0cb6cfca17dac` |
-| **Runtime bytecode size** | 24 546 bytes (30 bytes margin under EIP-170) — post-V4 callback hardening + NO_SWAP plan-shape guards |
+| **Runtime bytecode size** | 24 537 bytes (39 bytes margin under EIP-170) — V8 unlocks NO_SWAP + hasMixedSplit for same-asset bribe path; arg-bearing reverts in MIXED_SPLIT validation collapsed to `InvalidPlan()` to fit the limit |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
 | **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
 | **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
@@ -26,16 +26,24 @@
 | **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (allowlisted — set via `setAaveV2LendingPool` when V2 liquidations are wired) |
 | **Solidity** | 0.8.24, Shanghai, optimizer 1 run, `via_ir=true`, `bytecode_hash=none` |
 
-V7 adds three security hardenings (no functional changes vs V6):
+V8 unlocks **same-asset NO_SWAP + hasMixedSplit** so the bot can serve `col == debt != WETH` opportunities (e.g. USDC/USDC) with a coinbase-capable WETH bribe leg:
 
-1. **V4 unlock-callback re-entry + tokenIn pin** — `_activeV4TokenIn` storage slot pinned at unlock time, read back inside `unlockCallback` instead of trusting decoded calldata. Prevents a malicious / mis-allowlisted V4 hook from substituting `tokenIn` mid-callback. Clear-on-entry doubles as a re-entry guard.
-2. **`NO_SWAP + hasMixedSplit` revert** (`PlanShapeConflict`) — explicit pre-flashloan guard closing a validator/executor mismatch where the mixed-split branch silently dropped leg1 if `mode = NO_SWAP`.
-3. **`NO_SWAP + hasLeg2` revert** (`PlanShapeConflict`) — same explicit guard for the two-leg path.
+1. **NO_SWAP + hasMixedSplit allowed for same-asset path** — when `leg1.mode == NO_SWAP`, validation now requires `leg1.srcToken == leg1.repayToken == loanToken` (i.e. `col == loanToken`), and `_executeSwapPlan` dispatches leg2 with `amountIn = leg1RepayBefore - flashRepayAmount` so the residual loanToken is converted to WETH for the bribe + profit. `NO_SWAP + hasLeg2` (sequential) remains rejected as before.
+2. **Diff-asset NO_SWAP + hasMixedSplit rejected at validation** — explicit `srcToken == loanToken` guard ensures cross-asset misconfigurations revert `InvalidPlan()` pre-flashloan instead of underflowing inside the callback.
+3. **Custom-error consolidation** — arg-bearing reverts in the MIXED_SPLIT validation block (`RepayTokenMismatch`, `SrcTokenNotCollateral`, `Leg2ModeNotAllowed`) collapsed to `InvalidPlan()` to keep the contract at 24 537 / +39 bytes under EIP-170. No semantic change for valid plans; failure diagnostics are slightly less specific.
 
-V6 introduced `hasMixedSplit` plan shape: leg1 any mode (Paraswap / Bebop for deep repay routing) + leg2 Uni-only (`coll → WETH`) on the residual collateral, giving coinbase-capable WETH profit on non-WETH / non-WETH pairs even when no direct Uni `coll → debt` pool exists. All three of {`hasLeg2`, `hasSplit`, `hasMixedSplit`} are mutually exclusive — enforced pre-flashloan with `PlanShapeConflict`. Carried forward in V7 unchanged.
+V7 added three security hardenings (carried forward in V8):
+
+- **V4 unlock-callback re-entry + tokenIn pin** — `_activeV4TokenIn` storage slot pinned at unlock time, read back inside `unlockCallback` instead of trusting decoded calldata. Prevents a malicious / mis-allowlisted V4 hook from substituting `tokenIn` mid-callback. Clear-on-entry doubles as a re-entry guard.
+- **`NO_SWAP + hasLeg2` revert** (`PlanShapeConflict`) — explicit pre-flashloan guard closing a validator/executor mismatch where the two-leg branch silently dropped leg1 if `mode = NO_SWAP`.
+- **`NO_SWAP + hasMixedSplit` revert** (V7 only — V8 replaces this rejection with the same-asset allowance described above).
+
+V6 introduced `hasMixedSplit` plan shape: leg1 any mode (Paraswap / Bebop for deep repay routing) + leg2 Uni-only (`coll → WETH`) on the residual collateral, giving coinbase-capable WETH profit on non-WETH / non-WETH pairs even when no direct Uni `coll → debt` pool exists. All three of {`hasLeg2`, `hasSplit`, `hasMixedSplit`} are mutually exclusive — enforced pre-flashloan with `PlanShapeConflict`. Carried forward in V7/V8 unchanged.
 
 | Previous deployments | |
 |---|---|
+| **V7 Contract** | `0xb18e3A861961BF399b08Bdd8500019319Be58779` (deprecated — superseded by V8 same-asset NO_SWAP + hasMixedSplit support; V7 rejected the combination outright) |
+| **V7 deploy tx** | `0x1a48be1e2fffecb1486542d23a40eec6747fc6a1b711c62b13846f012e2ddfd3` |
 | **V6 Contract** | `0x4AEdDDF5E0D18D454E5F0Cc5E37E86B061fC0D1c` (deprecated — superseded by V7 security hardening: V4 callback re-entry + tokenIn pin, explicit NO_SWAP + hasLeg2 / hasMixedSplit guards) |
 | **V6 deploy tx** | `0xeefff46d96063f64479253849b41d25468a53a5cdbf794d5ec520a26edb6fa62` |
 | **V5 Contract** | `0xECf5F37Ff877a787a75777Ab054048d590684b48` (deprecated — SPLIT mode required both legs Uni, so thin coll↔debt pairs couldn't use SPLIT for coinbase; superseded by V6 MIXED_SPLIT which permits any-mode leg1) |
@@ -139,7 +147,7 @@ Operator Bot
 | Swap | Uniswap V2 Router02 | — | `UNI_V2` (multi-hop path, input = collateral delta option) |
 | Swap | Uniswap V3 SwapRouter02 | — | `UNI_V3` (single-hop, fee tier pinned) |
 | Swap | Uniswap V4 PoolManager | — | `UNI_V4` (single-hop, hook-allow-listed, struct-encoded PoolKey) |
-| Swap | (no DEX) | — | `NO_SWAP` — same-token liquidation (debt asset == collateral asset). `srcToken == repayToken` required; bypasses all DEX paths and the leg validator. Allowed only for single-leg plans (rejected with `PlanShapeConflict` when combined with `hasLeg2` / `hasMixedSplit`). |
+| Swap | (no DEX) | — | `NO_SWAP` — same-token liquidation (debt asset == collateral asset). `srcToken == repayToken` required; bypasses all DEX paths and the leg validator. Allowed for **single-leg** plans, and (V8+) for **`hasMixedSplit` when `col == loanToken`** so the residual loanToken can be swapped to WETH via the leg2 profit leg for coinbase bribe. Combining with `hasLeg2` is still rejected with `PlanShapeConflict`. |
 | Payment | Coinbase (ETH) | — | Requires `profitToken == WETH`; amount = **bps of realized profit** |
 
 > **Stable IDs**: `FLASH_PROVIDER_AAVE_V3` was id `1`. The identifier is not reused — id `1` is
@@ -173,7 +181,7 @@ A `SwapPlan` runs in one of four mutually-exclusive shapes (`hasLeg2`, `hasSplit
 | **Single-leg** | all flags false | Swap collateral → loanToken (or `NO_SWAP` when collateral == loanToken) | ignored | Any (Paraswap / Bebop / Uni V2/V3/V4 / NO_SWAP) |
 | **Sequential two-leg** | `hasLeg2 == true` | Swap collateral → intermediate | Swap intermediate → loanToken via on-chain tracked leftover (`leg2.useFullBalance==true`) | leg1: any (NO_SWAP rejected with `PlanShapeConflict`); leg2: Uni V2/V3/V4 only |
 | **Parallel split** | `hasSplit == true` | Swap `(1 − splitBps/10000) × collateralDelta` → loanToken (repay leg) | Swap `splitBps/10000 × collateralDelta` → WETH (profit leg for coinbase) | Both legs: Uni V2/V3/V4 only |
-| **Mixed split** | `hasMixedSplit == true` | Any-mode repay leg with `(1 − splitBps/10000) × collateralDelta` → loanToken (Paraswap / Bebop allowed for deep repay routing) | Uni-only profit leg with `splitBps/10000 × collateralDelta` → WETH for coinbase | leg1: any (NO_SWAP rejected with `PlanShapeConflict`); leg2: Uni V2/V3/V4 only |
+| **Mixed split** | `hasMixedSplit == true` | Any-mode repay leg with `(1 − splitBps/10000) × collateralDelta` → loanToken (Paraswap / Bebop allowed for deep repay routing) | Uni-only profit leg with `splitBps/10000 × collateralDelta` → WETH for coinbase | leg1: any incl. **NO_SWAP when `col == loanToken`** (V8+, same-asset bribe path); leg2: Uni V2/V3/V4 only |
 
 ## Plan Format
 
@@ -185,8 +193,10 @@ enum SwapMode {
     UNI_V3,
     UNI_V4,
     NO_SWAP            // Same-token liquidation: srcToken == repayToken, no DEX call.
-                       // Allowed only for single-leg plans; combining with hasLeg2 /
-                       // hasMixedSplit reverts with PlanShapeConflict.
+                       // Allowed for single-leg plans, and (V8+) for hasMixedSplit when
+                       // col == loanToken (same-asset bribe path: leg2 swaps the residual
+                       // loanToken to WETH for coinbase). Combining with hasLeg2 still
+                       // reverts with PlanShapeConflict.
 }
 
 struct SwapLeg {
@@ -412,7 +422,8 @@ struct MorphoLiquidation {
 - **ReentrancyGuard** — prevents reentrant calls to `execute`.
 - **V4 PoolManager callback isolation** — `_activeV4PoolManager` pins exactly which PoolManager may invoke `unlockCallback`; stray callbacks from other allow-listed managers revert.
 - **V4 unlock-callback `tokenIn` pin** (V7) — `_activeV4TokenIn` is set at unlock time and read back inside `unlockCallback` instead of trusting decoded calldata. A malicious / mis-allowlisted hook re-entering and substituting `tokenIn` mid-callback is structurally impossible. The slot is cleared on entry, doubling as a re-entry guard.
-- **NO_SWAP plan-shape guards** (V7) — `NO_SWAP + hasLeg2` and `NO_SWAP + hasMixedSplit` revert pre-flashloan with `PlanShapeConflict`. Closes a validator/executor mismatch where the two/mixed-split branches silently dropped `leg1` if its mode was `NO_SWAP`.
+- **NO_SWAP plan-shape guards** (V7) — `NO_SWAP + hasLeg2` reverts pre-flashloan with `PlanShapeConflict`. Closes a validator/executor mismatch where the two-leg branch silently dropped `leg1` if its mode was `NO_SWAP`.
+- **Same-asset NO_SWAP + hasMixedSplit** (V8) — allowed only when `leg1.srcToken == leg1.repayToken == loanToken` (i.e. `col == loanToken`). Diff-asset misconfigurations revert `InvalidPlan` at validation time; runtime path sweeps `leg1RepayBefore − flashRepayAmount` of the residual loanToken through the Uni-only leg2 → WETH for the coinbase bribe.
 
 ### Custom Errors (selected — full list in `src/LiquidationExecutor.sol`)
 
@@ -468,12 +479,12 @@ struct MorphoLiquidation {
 | `InsufficientSrcBalance(required, available)` | Swap source balance < `amountIn` |
 | `InsufficientEth(required, available)` | Coinbase payment needs more ETH than held / unwrappable |
 | `BalancerSingleTokenOnly()` | Balancer flashloan with > 1 asset |
-| `Leg2ModeNotAllowed(mode)` | leg2 uses a mode outside `{UNI_V2, UNI_V3, UNI_V4}` (Paraswap / Bebop rejected as leg2) |
+| `Leg2ModeNotAllowed(mode)` | leg2 uses a mode outside `{UNI_V2, UNI_V3, UNI_V4}` in the two-leg path (`hasLeg2`). The `hasSplit` / `hasMixedSplit` branches collapsed this to `InvalidPlan()` in V8 to fit the EIP-170 limit. |
 | `InvalidLegLink(leg1Out, leg2In)` | `leg1.repayToken != leg2.srcToken` (two-leg intermediate token mismatch) |
 | `Leg2ZeroLeftover()` | Two-leg plan: `leg2.srcToken` balance delta across leg1 is zero (defensive; normally unreachable because leg1's own `minAmountOut >= 1` forces a non-zero delta) |
 | `LegUseFullBalanceNotAllowed(mode)` | Paraswap / Bebop leg set `useFullBalance=true` (both modes carry their own `amountIn` in calldata) |
-| `PlanShapeConflict()` | More than one of `{hasLeg2, hasSplit, hasMixedSplit}` is set, OR `NO_SWAP` leg1 combined with `hasLeg2` / `hasMixedSplit` (V7 guards). |
-| `InvalidPlan()` | Generic plan-shape rejection — includes `hasLeg2 && !leg2.useFullBalance` (leg2 must use on-chain tracked leftover), `leg.srcToken == leg.repayToken` for non-NO_SWAP modes, `minAmountOut == 0` on UNI_V2/V3/V4 and BEBOP_MULTI legs, and Morpho `maxRepayAssets == 0` |
+| `PlanShapeConflict()` | More than one of `{hasLeg2, hasSplit, hasMixedSplit}` is set, OR `NO_SWAP` leg1 combined with `hasLeg2` (V7+ guard). V8 lifted the `NO_SWAP + hasMixedSplit` rejection for the same-asset path. |
+| `InvalidPlan()` | Generic plan-shape rejection — includes `hasLeg2 && !leg2.useFullBalance`, `leg.srcToken == leg.repayToken` for non-NO_SWAP modes, `minAmountOut == 0` on UNI_V2/V3/V4 and BEBOP_MULTI legs, Morpho `maxRepayAssets == 0`, and (V8) the consolidated MIXED_SPLIT validation rejections that previously used `RepayTokenMismatch`, `SrcTokenNotCollateral`, and `Leg2ModeNotAllowed`. |
 
 ## Configuration
 
@@ -550,7 +561,7 @@ test/
 ```bash
 forge install          # Install dependencies
 forge build            # Compile
-forge test             # Run 266 tests (258 unit + 8 fork)
+forge test             # Run 764 tests (756 unit + 8 fork)
 forge test -vvv        # Verbose output
 forge coverage         # Coverage report
 ```
