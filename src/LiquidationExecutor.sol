@@ -147,7 +147,11 @@ contract LiquidationExecutor is
     error InvalidCoinbaseBps();
     error InsufficientRepayBalance(uint256 required, uint256 available);
     error InsufficientSrcBalance(uint256 required, uint256 available);
-    error TargetNotAllowed(address target);
+    /// @dev Was `TargetNotAllowed(address target)`; arg dropped to free
+    /// EIP-170 budget for the BUY-side V3 dispatch. The address is
+    /// always reconstructible by the caller (it's the address they
+    /// just passed in), and no on-chain consumer parses the arg.
+    error TargetNotAllowed();
 
     // ─── Constants ───────────────────────────────────────────────────
     // FLASH_PROVIDER_AAVE_V3 (1) removed — Aave V3 flashloan path deleted.
@@ -282,7 +286,15 @@ contract LiquidationExecutor is
         UNI_V2,
         UNI_V3,
         UNI_V4,
-        NO_SWAP // Same-token liquidation: srcToken == repayToken, no DEX call.
+        NO_SWAP, // Same-token liquidation: srcToken == repayToken, no DEX call.
+        // BUY-side V3 — caller specifies EXACT `amountOut` (in
+        // `minAmountOut`) and MAX input (in `amountIn`, semantically
+        // `amountInMaximum`). Router refunds unused source. Library
+        // dispatches to `exactOutputSingle`. leg1-only; leg2 / split /
+        // sequential paths reject this mode. V2_BUY / V4_BUY are not
+        // implemented (no production caller); when added they get the
+        // next contiguous indices to preserve ABI ordering.
+        UNI_V3_BUY
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
@@ -478,7 +490,7 @@ contract LiquidationExecutor is
     // ─── Owner Config Functions ──────────────────────────────────────
     function setMorphoBlue(address morpho) external onlyOwner {
         if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
+        if (!allowedTargets[morpho]) revert TargetNotAllowed();
         address old = morphoBlue;
         morphoBlue = morpho;
         emit ConfigUpdated("morphoBlue", old, morpho);
@@ -486,7 +498,7 @@ contract LiquidationExecutor is
 
     function setAaveV2LendingPool(address pool) external onlyOwner {
         if (pool == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
+        if (!allowedTargets[pool]) revert TargetNotAllowed();
         address old = aaveV2LendingPool;
         aaveV2LendingPool = pool;
         emit ConfigUpdated("aaveV2Pool", old, pool);
@@ -494,7 +506,7 @@ contract LiquidationExecutor is
 
     function setFlashProvider(uint8 providerId, address provider) external onlyOwner {
         if (provider == address(0)) revert ZeroAddress();
-        if (!allowedTargets[provider]) revert TargetNotAllowed(provider);
+        if (!allowedTargets[provider]) revert TargetNotAllowed();
         address old = allowedFlashProviders[providerId];
         allowedFlashProviders[providerId] = provider;
         emit FlashProviderUpdated(providerId, old, provider);
@@ -512,7 +524,7 @@ contract LiquidationExecutor is
     /// the rare case the two roles intentionally diverge (testnets, migrations).
     function configureMorpho(address morpho) external onlyOwner {
         if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
+        if (!allowedTargets[morpho]) revert TargetNotAllowed();
 
         address oldMorpho = morphoBlue;
         morphoBlue = morpho;
@@ -666,6 +678,12 @@ contract LiquidationExecutor is
         if (leg.repayToken == address(0)) revert ZeroAddress();
 
         SwapMode m = leg.mode;
+        // BUY-side variants share their validation + dispatch branch
+        // with the corresponding SELL mode — the library reads the
+        // ORIGINAL `leg.mode` to pick exactInput vs exactOutput.
+        // Normalising once here saves bytecode vs duplicating
+        // selectors with `||` at every branch (EIP-170 budget).
+        if (m == SwapMode.UNI_V3_BUY) m = SwapMode.UNI_V3;
 
         // NO_SWAP: same-token path (e.g. WETH/WETH). Leg-level checks are
         // skipped; a mismatched src/repay silently early-returns in
@@ -695,6 +713,10 @@ contract LiquidationExecutor is
             if (leg.v2Path[pLen - 1] != leg.repayToken) revert InvalidV2Path();
             if (leg.minAmountOut == 0) revert InvalidPlan();
         } else if (m == SwapMode.UNI_V3) {
+            // Both UNI_V3 (SELL) and UNI_V3_BUY (mode normalised above)
+            // land here — fee + non-zero output checks are identical;
+            // BUY-specific invariants (amountInMax > 0, amountOut > 0)
+            // are re-checked by the library at dispatch.
             uint24 f = leg.v3Fee;
             if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
             if (leg.minAmountOut == 0) revert InvalidPlan();
@@ -1282,7 +1304,9 @@ contract LiquidationExecutor is
             _executeBebopLeg(leg, outBefore);
         } else if (m == SwapMode.UNI_V2) {
             SwapLegExecutorLib.executeUniV2Leg(_asLibLeg(leg), amountIn, uniV2Router);
-        } else if (m == SwapMode.UNI_V3) {
+        } else if (m == SwapMode.UNI_V3 || m == SwapMode.UNI_V3_BUY) {
+            // Library reads `leg.mode` to pick exactInput vs
+            // exactOutput. Single dispatch entrypoint for both modes.
             SwapLegExecutorLib.executeUniV3Leg(_asLibLeg(leg), amountIn, uniV3Router);
         } else if (m == SwapMode.UNI_V4) {
             _executeUniV4Leg(leg, amountIn);
@@ -1311,7 +1335,7 @@ contract LiquidationExecutor is
     function _executeBebopLeg(SwapLeg memory leg, uint256 repayBefore) internal {
         address target = leg.bebopTarget;
         if (target.code.length == 0) revert BebopTargetNotContract();
-        if (!allowedTargets[target]) revert TargetNotAllowed(target);
+        if (!allowedTargets[target]) revert TargetNotAllowed();
 
         uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
         if (srcBal < leg.amountIn) revert InsufficientSrcBalance(leg.amountIn, srcBal);
@@ -1357,7 +1381,7 @@ contract LiquidationExecutor is
 
         address pm = leg.v4PoolManager;
         if (pm == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pm]) revert TargetNotAllowed(pm);
+        if (!allowedTargets[pm]) revert TargetNotAllowed();
         if (leg.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
 
         (tokenIn, tokenOut, fee, tickSpacing, hook) =
@@ -1509,7 +1533,7 @@ contract LiquidationExecutor is
 
         address pool = aavePool;
         if (pool == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
+        if (!allowedTargets[pool]) revert TargetNotAllowed();
         if (action.actionType != 4) revert UnsupportedActionType(action.actionType);
         if (action.user == address(0)) revert ZeroAddress();
         if (action.debtToCover == 0) revert InvalidPlan();
@@ -1529,7 +1553,7 @@ contract LiquidationExecutor is
 
         address pool = aaveV2LendingPool;
         if (pool == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
+        if (!allowedTargets[pool]) revert TargetNotAllowed();
 
         IERC20(liq.debtAsset).forceApprove(pool, liq.debtToCover);
         IAaveV2LendingPool(pool)
@@ -1544,7 +1568,7 @@ contract LiquidationExecutor is
 
         address morpho = morphoBlue;
         if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
+        if (!allowedTargets[morpho]) revert TargetNotAllowed();
         if (liq.borrower == address(0)) revert ZeroAddress();
         if (liq.seizedAssets == 0) revert MorphoShareModeUnsupported();
         if (liq.repaidShares != 0) revert MorphoMixedModeUnsupported();

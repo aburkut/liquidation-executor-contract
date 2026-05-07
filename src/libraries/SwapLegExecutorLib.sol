@@ -46,7 +46,9 @@ library SwapLegExecutorLib {
         BEBOP_MULTI,
         UNI_V2,
         UNI_V3,
-        UNI_V4
+        UNI_V4,
+        NO_SWAP,
+        UNI_V3_BUY
     }
 
     struct SwapLeg {
@@ -150,7 +152,13 @@ library SwapLegExecutorLib {
         emit UniV2SwapExecuted(leg.srcToken, leg.repayToken, amountIn, received);
     }
 
-    // ─── Uniswap V3 leg ──────────────────────────────────────────────
+    // ─── Uniswap V3 leg (SELL via exactInputSingle / BUY via exactOutputSingle) ─
+    /// @dev Single entrypoint for both UNI_V3 and UNI_V3_BUY — the
+    /// library branches on `leg.mode`. Keeping one external function
+    /// saves a selector + call-site in `LiquidationExecutor` (EIP-170
+    /// budget is tight). The BUY branch reads `leg.minAmountOut` as
+    /// the EXACT target `amountOut` and treats the `amountIn` arg as
+    /// `amountInMaximum`; SELL keeps the original semantics.
     function executeUniV3Leg(SwapLeg memory leg, uint256 amountIn, address router) external {
         if (amountIn == 0) revert ZeroSwapInput();
 
@@ -160,23 +168,49 @@ library SwapLegExecutorLib {
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
         IERC20(leg.srcToken).forceApprove(router, amountIn);
-        IUniV3SwapRouter(router)
-            .exactInputSingle(
-                IUniV3SwapRouter.ExactInputSingleParams({
-                tokenIn: leg.srcToken,
-                tokenOut: leg.repayToken,
-                fee: leg.v3Fee,
-                recipient: address(this),
-                amountIn: amountIn,
-                amountOutMinimum: leg.minAmountOut,
-                sqrtPriceLimitX96: 0
-            })
-            );
+
+        uint256 actualIn;
+        if (leg.mode == SwapMode.UNI_V3_BUY) {
+            if (leg.minAmountOut == 0) revert ZeroSwapOutput();
+            actualIn = IUniV3SwapRouter(router)
+                .exactOutputSingle(
+                    IUniV3SwapRouter.ExactOutputSingleParams({
+                    tokenIn: leg.srcToken,
+                    tokenOut: leg.repayToken,
+                    fee: leg.v3Fee,
+                    recipient: address(this),
+                    amountOut: leg.minAmountOut,
+                    amountInMaximum: amountIn,
+                    sqrtPriceLimitX96: 0
+                })
+                );
+        } else {
+            IUniV3SwapRouter(router)
+                .exactInputSingle(
+                    IUniV3SwapRouter.ExactInputSingleParams({
+                    tokenIn: leg.srcToken,
+                    tokenOut: leg.repayToken,
+                    fee: leg.v3Fee,
+                    recipient: address(this),
+                    amountIn: amountIn,
+                    amountOutMinimum: leg.minAmountOut,
+                    sqrtPriceLimitX96: 0
+                })
+                );
+            actualIn = amountIn;
+        }
         IERC20(leg.srcToken).forceApprove(router, 0);
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
-        emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, leg.v3Fee, amountIn, received);
+        // Single event for SELL + BUY: `actualIn` is consumed input
+        // (== amountIn for SELL, ≤ amountInMaximum for BUY) and
+        // `received` is delivered output. Per-mode discrimination is
+        // off-chain via the indexed token pair + the bundle's
+        // exactInput vs exactOutput selector recovered from the call
+        // trace, so a separate event saves bytecode (EIP-170 budget)
+        // without losing observability.
+        emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, leg.v3Fee, actualIn, received);
     }
 }

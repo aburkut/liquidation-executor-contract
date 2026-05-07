@@ -231,7 +231,7 @@ contract ExecutorForkV4Test is Test {
         bytes memory plan = _wrapInPlan(sp);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, stranger));
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.execute(plan);
     }
 

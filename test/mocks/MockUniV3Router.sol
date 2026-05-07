@@ -46,4 +46,37 @@ contract MockUniV3Router {
 
         IERC20(params.tokenOut).safeTransfer(params.recipient, amountOut);
     }
+
+    /// @dev BUY-side: caller wants EXACT `amountOut`. Mock derives
+    /// required input from the same constant `rate` used by
+    /// `exactInputSingle`:
+    ///   actualIn = amountOut * 1e18 / rate (round up to mirror
+    ///              chain protocol-favored rounding).
+    /// Reverts if `actualIn > amountInMaximum`. Pulls only `actualIn`
+    /// from the caller and refunds nothing (deterministic mock — no
+    /// "approve more than spent" logic, the executor-side approval
+    /// reset still works because forceApprove(...,0) zeroes whatever
+    /// was set).
+    function exactOutputSingle(IUniV3SwapRouter.ExactOutputSingleParams calldata params)
+        external
+        payable
+        returns (uint256 amountIn)
+    {
+        require(!swapReverts, "MockUniV3Router: swap reverts");
+        require(!poolMissing, "MockUniV3Router: pool missing");
+        require(rate > 0, "MockUniV3Router: zero rate");
+
+        // Ceiling division so the mock never silently under-pulls when
+        // amountOut * 1e18 isn't divisible by rate (matches chain
+        // protocol-favored rounding for exactOutput).
+        uint256 num = params.amountOut * 1e18;
+        amountIn = num / rate;
+        if (amountIn * rate < num) {
+            amountIn += 1;
+        }
+        require(amountIn <= params.amountInMaximum, "MockUniV3Router: amountIn exceeds max");
+
+        IERC20(params.tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        IERC20(params.tokenOut).safeTransfer(params.recipient, params.amountOut);
+    }
 }

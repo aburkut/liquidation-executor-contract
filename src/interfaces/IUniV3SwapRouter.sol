@@ -17,4 +17,21 @@ interface IUniV3SwapRouter {
     }
 
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+
+    /// @dev BUY-side single-hop. Router pulls AT MOST `amountInMaximum`
+    /// of `tokenIn` from msg.sender, transfers EXACTLY `amountOut` of
+    /// `tokenOut` to `recipient`, and refunds any unused input. Reverts
+    /// if the pool can't deliver `amountOut` within `amountInMaximum`.
+    /// Returns the actual input consumed.
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactOutputSingle(ExactOutputSingleParams calldata params) external payable returns (uint256 amountIn);
 }

@@ -805,6 +805,39 @@ contract ExecutorTest is Test {
         });
     }
 
+    /// @dev BUY-side leg1 — caller specifies EXACT output (`amountOut`)
+    /// and MAX input (`amountInMaximum`). Field remap on the
+    /// canonical `SwapLeg`:
+    ///   * `amountIn`     → `amountInMaximum`  (max source tokens spent)
+    ///   * `minAmountOut` → `amountOut`        (exact target output)
+    /// Router refunds unused source tokens to the executor; leftover
+    /// stays on contract (= collateral residual for MIXED_SPLIT leg2,
+    /// or profit / sweep for single-leg).
+    function _buildUniV3BuyLeg(
+        address srcToken,
+        address dstToken,
+        uint256 amountInMaximum,
+        uint24 fee,
+        uint256 amountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3_BUY,
+            srcToken: srcToken,
+            amountIn: amountInMaximum,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: fee,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: amountOut
+        });
+    }
+
     function _buildUniV4Leg(
         address srcToken,
         address dstToken,
@@ -1263,7 +1296,7 @@ contract ExecutorTest is Test {
 
         address notWhitelisted = address(0xDEADBEEF);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.configureMorpho(notWhitelisted);
     }
 
@@ -1898,7 +1931,7 @@ contract ExecutorTest is Test {
     function test_setFlashProviderRejectsNonWhitelisted() public {
         address notWhitelisted = address(0xDEAD3);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.setFlashProvider(1, notWhitelisted);
     }
 
@@ -1912,7 +1945,7 @@ contract ExecutorTest is Test {
     function test_setAaveV2LendingPoolRejectsNonWhitelisted() public {
         address notWhitelisted = address(0xDEAD2);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.setAaveV2LendingPool(notWhitelisted);
     }
 
@@ -5882,6 +5915,62 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
+    /// @notice V3 BUY-side leg1: caller specifies EXACT loanToken output
+    /// and MAX collateral input. Mock rate 1.1 → exactOut=1100e18 costs
+    /// actualIn = 1000e18 of collateral. amountInMaximum=1500e18 leaves
+    /// 500e18 collateral residual on the executor for sweep / leg2.
+    /// After: loanToken balance ≥ flashRepay (1001e18) + minProfit.
+    function test_UniV3_buy_singleLeg_happy_path() public {
+        // Pre-fund a bit more collateral so we visibly test "actualIn < max".
+        // Default setUp: 600 reward + 400 pre-fund = 1000e18; mint another 500.
+        collateralToken.mint(address(executor), 500e18);
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3BuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            1500e18,
+            3000,
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // Router consumed exactly amountOut/rate of collateral; the rest
+        // remains on contract.
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        // Net collateral consumption = (pre-balance + liquidation reward) - post-balance.
+        // The liquidation step credits COLLATERAL_REWARD to the executor BEFORE
+        // leg1 fires, so a naive `collBefore - collAfter` would understate
+        // the swap's input by exactly COLLATERAL_REWARD.
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        assertLt(swapConsumed, uint256(1500e18), "BUY-side leg1 must consume LESS than amountInMaximum");
+        assertEq(swapConsumed, expectedActualIn, "BUY-side actualIn must equal amountOut/rate");
+
+        // Profit: exact output (1100e18) - flashRepay (1001e18) = 99e18,
+        // plus whatever was already on the contract.
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side leg1 must leave loanToken profit");
+    }
+
     function test_UniV3_minAmountOutZero_reverts() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV3SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 3000, 0, 0);
@@ -6087,7 +6176,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, address(stranger)));
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.execute(plan);
     }
 
