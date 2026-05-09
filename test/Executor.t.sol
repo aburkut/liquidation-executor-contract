@@ -896,6 +896,39 @@ contract ExecutorTest is Test {
         });
     }
 
+    /// @dev V4 BUY-side leg — exact-output single-hop. `amountInMaximum`
+    /// is the spend ceiling; `amountOut` is the EXACT target. Library
+    /// reads `leg.mode == UNI_V4_BUY` to flip the V4 amountSpecified
+    /// sign (positive = exact-output) and to enforce `consumed <=
+    /// amountInMax` post-unlock.
+    function _buildUniV4BuyLeg(
+        address srcToken,
+        address dstToken,
+        uint256 amountInMaximum,
+        uint24 fee,
+        int24 tickSpacing,
+        address hook,
+        address poolManager,
+        uint256 amountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V4_BUY,
+            srcToken: srcToken,
+            amountIn: amountInMaximum,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: poolManager,
+            v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook),
+            repayToken: dstToken,
+            minAmountOut: amountOut
+        });
+    }
+
     function _buildPlan(
         uint8 flashProviderId,
         address lToken,
@@ -6149,6 +6182,58 @@ contract ExecutorTest is Test {
         // Profit: exact output (1100e18) - flashRepay (1001e18) = 99e18,
         // plus whatever was already on the contract.
         assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side leg1 must leave loanToken profit");
+    }
+
+    function test_UniV4_buy_singleLeg_happy_path() public {
+        // V4 BUY mirrors V3 BUY field semantics: amountIn = amountInMax,
+        // minAmountOut = EXACT amountOut. Pre-fund extra collateral so
+        // the assertion "actualIn < amountInMax" is meaningful (otherwise
+        // pre-balance == amountInMax and the inequality is uninteresting).
+        collateralToken.mint(address(executor), 500e18);
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4BuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            1500e18,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        // Net collateral consumption = (pre + COLLATERAL_REWARD) - post.
+        // The liquidation step credits COLLATERAL_REWARD to the executor
+        // before leg1 fires, so a naive pre-vs-post would understate the
+        // swap input by exactly that reward. Same reasoning as V2/V3 BUY.
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        assertLt(swapConsumed, uint256(1500e18), "BUY-side V4 leg1 must consume LESS than amountInMaximum");
+        assertEq(swapConsumed, expectedActualIn, "BUY-side V4 actualIn must equal amountOut/rate");
+
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V4 leg1 must leave loanToken profit");
     }
 
     function test_UniV3_minAmountOutZero_reverts() public {

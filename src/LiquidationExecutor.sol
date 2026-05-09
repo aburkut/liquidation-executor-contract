@@ -292,7 +292,16 @@ contract LiquidationExecutor is
         // dispatches to V2 router's `swapTokensForExactTokens`. Router
         // consumes only the required input, the rest stays on the
         // caller. leg1-only.
-        UNI_V2_BUY
+        UNI_V2_BUY,
+        // BUY-side V4 — same field remap as the other *_BUY modes
+        // (`minAmountOut` = EXACT amountOut, `amountIn` = amountInMax).
+        // The unlock callback feeds the V4 PoolManager a positive
+        // `amountSpecified` (= EXACT amountOut) so the pool returns a
+        // variable-input / fixed-output delta. Post-unlock the main
+        // contract additionally enforces `consumed <= amountInMax` —
+        // the V4 PM has no client-side input ceiling, so the executor
+        // must police it. leg1-only (mirrors UNI_V3_BUY scope).
+        UNI_V4_BUY
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
@@ -683,6 +692,7 @@ contract LiquidationExecutor is
         // selectors with `||` at every branch (EIP-170 budget).
         if (m == SwapMode.UNI_V3_BUY) m = SwapMode.UNI_V3;
         if (m == SwapMode.UNI_V2_BUY) m = SwapMode.UNI_V2;
+        if (m == SwapMode.UNI_V4_BUY) m = SwapMode.UNI_V4;
 
         // NO_SWAP: same-token path (e.g. WETH/WETH). Leg-level checks are
         // skipped; a mismatched src/repay silently early-returns in
@@ -1309,7 +1319,10 @@ contract LiquidationExecutor is
             // Library reads `leg.mode` to pick exactInput vs
             // exactOutput. Single dispatch entrypoint for both modes.
             SwapLegExecutorLib.executeUniV3Leg(_asLibLeg(leg), amountIn, uniV3Router);
-        } else if (m == SwapMode.UNI_V4) {
+        } else if (m == SwapMode.UNI_V4 || m == SwapMode.UNI_V4_BUY) {
+            // _executeUniV4Leg reads `leg.mode` to flip the V4
+            // amountSpecified sign (BUY → positive = exact-output)
+            // and to enforce the post-unlock consumed-input ceiling.
             _executeUniV4Leg(leg, amountIn);
         } else {
             revert InvalidSwapMode();
@@ -1418,6 +1431,15 @@ contract LiquidationExecutor is
         uint256 srcBal = IERC20(tokenIn).balanceOf(address(this));
         if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
 
+        // Mode-dependent amountSpecified for V4:
+        //   * SELL (UNI_V4):     -int256(amountIn)         exact-input
+        //   * BUY  (UNI_V4_BUY): +int256(leg.minAmountOut) exact-output
+        // The lib treats both uniformly — the only invariant it enforces
+        // is `tokenInDelta < 0 && tokenOutDelta > 0`, which holds for
+        // either direction of `amountSpecified`.
+        bool isBuy = leg.mode == SwapMode.UNI_V4_BUY;
+        int256 amountSpec = isBuy ? int256(leg.minAmountOut) : -int256(amountIn);
+
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
 
         address pm = leg.v4PoolManager;
@@ -1426,7 +1448,7 @@ contract LiquidationExecutor is
         // tokenIn is NOT included in the unlock payload — the callback
         // reads it from storage so the PM cannot substitute it. Encode
         // the remaining five fields only.
-        IPoolManager(pm).unlock(abi.encode(tokenOut, fee, tickSpacing, hook, amountIn));
+        IPoolManager(pm).unlock(abi.encode(tokenOut, fee, tickSpacing, hook, amountSpec));
         // _activeV4TokenIn cleared by callback on entry. _activeV4PoolManager
         // cleared so the existing pm-pin guard re-arms for the next leg.
         _activeV4PoolManager = address(0);
@@ -1434,7 +1456,16 @@ contract LiquidationExecutor is
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
-        emit UniV4SwapExecuted(tokenIn, tokenOut, fee, amountIn, received);
+        // BUY: enforce `consumed <= amountInMax` post-unlock. The V4
+        // PoolManager has no client-side input ceiling so the executor
+        // must police it — otherwise an honest-but-thin pool could pull
+        // more srcToken than the operator approved (subject to whatever
+        // pre-existing balance the executor happened to hold). amountIn
+        // here is the on-wire `amountInMaximum` field.
+        uint256 consumed = isBuy ? srcBal - IERC20(tokenIn).balanceOf(address(this)) : amountIn;
+        if (isBuy && consumed > amountIn) revert InsufficientSrcBalance(consumed, amountIn);
+
+        emit UniV4SwapExecuted(tokenIn, tokenOut, fee, consumed, received);
     }
 
     /// @inheritdoc IUnlockCallback
@@ -1462,7 +1493,7 @@ contract LiquidationExecutor is
         if (tokenIn == address(0) || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
         _activeV4TokenIn = address(0); // CLAIM
 
-        (address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint256 amountIn) =
+        (address tokenOut, uint24 fee, int24 tickSpacing, address hook, int256 amountSpec) =
             UniswapLib.decodeV4UnlockData(data);
 
         // Hook whitelist re-check defends against a malicious/
@@ -1476,7 +1507,11 @@ contract LiquidationExecutor is
         // contract, EIP-170 budget). The library runs under the same
         // DELEGATECALL semantics so token transfers, the swap call, and
         // settle/take all execute with `address(this) == executor`.
-        UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountIn);
+        // amountSpec sign selects SELL (negative=exact-input) vs BUY
+        // (positive=exact-output) at the pool level; the lib treats
+        // both uniformly because the BalanceDelta invariant is
+        // identical.
+        UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec);
         return "";
     }
 

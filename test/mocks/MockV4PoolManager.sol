@@ -45,9 +45,20 @@ contract MockV4PoolManager is IPoolManager {
     }
 
     function swap(PoolKey memory key, SwapParams memory params, bytes calldata) external returns (int256 swapDelta) {
-        require(params.amountSpecified < 0, "MockV4PM: exact-input only");
-        uint256 amountIn = uint256(-params.amountSpecified);
-        uint256 amountOut = zeroOut ? 0 : amountIn * rate / 1e18;
+        require(params.amountSpecified != 0, "MockV4PM: amountSpec=0");
+        uint256 amountIn;
+        uint256 amountOut;
+        if (params.amountSpecified < 0) {
+            // Exact-input (SELL): caller fixes input, output = input * rate.
+            amountIn = uint256(-params.amountSpecified);
+            amountOut = zeroOut ? 0 : amountIn * rate / 1e18;
+        } else {
+            // Exact-output (BUY): caller fixes output, input = output / rate
+            // (deterministic inverse of SELL — same SWAP_RATE numerics so
+            // BUY tests can re-use the same expected-input formula).
+            amountOut = zeroOut ? 0 : uint256(params.amountSpecified);
+            amountIn = amountOut == 0 ? 0 : amountOut * 1e18 / rate;
+        }
 
         int128 tokenInD = -int128(int256(amountIn));
         int128 tokenOutD = int128(int256(amountOut));

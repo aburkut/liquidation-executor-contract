@@ -45,15 +45,22 @@ library UniswapLib {
 
     /// @dev Decode the 5-tuple payload that `LiquidationExecutor.
     /// _executeUniV4Leg` packs into `pm.unlock(...)`'s `data` argument.
-    /// Layout: `(tokenOut, fee, tickSpacing, hook, amountIn)` —
+    /// Layout: `(tokenOut, fee, tickSpacing, hook, amountSpec)` —
     /// tokenIn is INTENTIONALLY pinned in storage by the caller so the
-    /// PoolManager cannot substitute it via callback.
+    /// PoolManager cannot substitute it via callback. `amountSpec`
+    /// carries the V4 sign convention directly: negative = exact-input
+    /// (SELL), positive = exact-output (BUY). The library does not
+    /// branch on the sign — the BalanceDelta invariant
+    /// `tokenInDelta < 0 && tokenOutDelta > 0` is identical for both
+    /// directions, and the caller (LiquidationExecutor) is responsible
+    /// for any mode-specific post-unlock checks (e.g. enforcing
+    /// `consumed <= amountInMax` for BUY).
     function decodeV4UnlockData(bytes calldata data)
         external
         pure
-        returns (address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint256 amountIn)
+        returns (address tokenOut, uint24 fee, int24 tickSpacing, address hook, int256 amountSpec)
     {
-        return abi.decode(data, (address, uint24, int24, address, uint256));
+        return abi.decode(data, (address, uint24, int24, address, int256));
     }
 
     /// @dev The inner swap+settle body that runs inside
@@ -61,12 +68,14 @@ library UniswapLib {
     /// (a) verified the PoolManager identity, (b) re-checked the hook
     /// against `allowedV4Hooks`, and (c) cleared `_activeV4TokenIn`.
     ///
-    /// Keeps the exact-input single-hop invariants enforced by the
-    /// pre-extraction inline body:
+    /// Keeps the single-hop invariants enforced by the pre-extraction
+    /// inline body:
     ///   * `tokenInDelta < 0` (we owe input)
     ///   * `tokenOutDelta > 0` (we receive output)
     /// Any other shape (zero-output, positive input, partial settle)
-    /// fails closed via `V4UnexpectedDelta`.
+    /// fails closed via `V4UnexpectedDelta`. `amountSpec` is forwarded
+    /// to V4's `SwapParams.amountSpecified` verbatim; sign selects
+    /// exact-input vs exact-output at the pool level.
     function runV4UnlockSwap(
         IPoolManager pm,
         address tokenIn,
@@ -74,7 +83,7 @@ library UniswapLib {
         uint24 fee,
         int24 tickSpacing,
         address hook,
-        uint256 amountIn
+        int256 amountSpec
     ) external {
         bool zeroForOne = tokenIn < tokenOut;
         PoolKey memory key = PoolKey({
@@ -87,7 +96,7 @@ library UniswapLib {
 
         SwapParams memory params = SwapParams({
             zeroForOne: zeroForOne,
-            amountSpecified: -int256(amountIn),
+            amountSpecified: amountSpec,
             sqrtPriceLimitX96: zeroForOne ? V4_MIN_SQRT_PRICE_LIMIT : V4_MAX_SQRT_PRICE_LIMIT
         });
 
