@@ -48,7 +48,8 @@ library SwapLegExecutorLib {
         UNI_V3,
         UNI_V4,
         NO_SWAP,
-        UNI_V3_BUY
+        UNI_V3_BUY,
+        UNI_V2_BUY
     }
 
     struct SwapLeg {
@@ -139,17 +140,35 @@ library SwapLegExecutorLib {
         uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
         if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
 
+        uint256 srcBefore = IERC20(leg.srcToken).balanceOf(address(this));
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
         IERC20(leg.srcToken).forceApprove(router, amountIn);
-        IUniV2Router(router)
-            .swapExactTokensForTokens(amountIn, leg.minAmountOut, leg.v2Path, address(this), leg.deadline);
+
+        uint256 actualIn;
+        if (leg.mode == SwapMode.UNI_V2_BUY) {
+            // BUY-side: caller specifies EXACT amountOut (= minAmountOut)
+            // and MAX input (= amountIn). Router consumes only what's
+            // needed to satisfy amountOut along v2Path.
+            if (leg.minAmountOut == 0) revert ZeroSwapOutput();
+            IUniV2Router(router)
+                .swapTokensForExactTokens(leg.minAmountOut, amountIn, leg.v2Path, address(this), leg.deadline);
+            // Router's `amounts[0]` is the actual input, but the
+            // canonical V2 router has historically returned this
+            // correctly only on success — re-derive from the balance
+            // delta to stay defensive against router misreporting.
+            actualIn = srcBefore - IERC20(leg.srcToken).balanceOf(address(this));
+        } else {
+            IUniV2Router(router)
+                .swapExactTokensForTokens(amountIn, leg.minAmountOut, leg.v2Path, address(this), leg.deadline);
+            actualIn = amountIn;
+        }
         IERC20(leg.srcToken).forceApprove(router, 0);
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
-        emit UniV2SwapExecuted(leg.srcToken, leg.repayToken, amountIn, received);
+        emit UniV2SwapExecuted(leg.srcToken, leg.repayToken, actualIn, received);
     }
 
     // ─── Uniswap V3 leg (SELL via exactInputSingle / BUY via exactOutputSingle) ─

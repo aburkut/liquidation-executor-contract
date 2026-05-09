@@ -805,6 +805,34 @@ contract ExecutorTest is Test {
         });
     }
 
+    /// @dev V2 BUY-side leg — same field remap as `_buildUniV3BuyLeg`,
+    /// but routes via `swapTokensForExactTokens` on the V2 router.
+    function _buildUniV2BuyLeg(address srcToken, address dstToken, uint256 amountInMaximum, uint256 amountOut)
+        internal
+        view
+        returns (LiquidationExecutor.SwapLeg memory)
+    {
+        address[] memory path = new address[](2);
+        path[0] = srcToken;
+        path[1] = dstToken;
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V2_BUY,
+            srcToken: srcToken,
+            amountIn: amountInMaximum,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: path,
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: amountOut
+        });
+    }
+
     /// @dev BUY-side leg1 — caller specifies EXACT output (`amountOut`)
     /// and MAX input (`amountInMaximum`). Field remap on the
     /// canonical `SwapLeg`:
@@ -5920,6 +5948,51 @@ contract ExecutorTest is Test {
     /// actualIn = 1000e18 of collateral. amountInMaximum=1500e18 leaves
     /// 500e18 collateral residual on the executor for sweep / leg2.
     /// After: loanToken balance ≥ flashRepay (1001e18) + minProfit.
+    function test_UniV2_buy_singleLeg_happy_path() public {
+        // Mirror of test_UniV3_buy_singleLeg_happy_path. Pre-fund extra
+        // collateral so we visibly test "actualIn < amountInMax".
+        collateralToken.mint(address(executor), 500e18);
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV2BuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            1500e18,
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        // Net collateral consumption: pre-balance + liquidation reward minus
+        // post-balance. Liquidation reward credits BEFORE leg1 fires so a
+        // naive `collBefore - collAfter` would understate by COLLATERAL_REWARD.
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        assertLt(swapConsumed, uint256(1500e18), "BUY-side V2 leg1 must consume LESS than amountInMaximum");
+        assertEq(swapConsumed, expectedActualIn, "BUY-side V2 actualIn must equal amountOut/rate");
+
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V2 leg1 must leave loanToken profit");
+    }
+
     function test_UniV3_buy_singleLeg_happy_path() public {
         // Pre-fund a bit more collateral so we visibly test "actualIn < max".
         // Default setUp: 600 reward + 400 pre-fund = 1000e18; mint another 500.

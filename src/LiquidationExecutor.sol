@@ -291,10 +291,14 @@ contract LiquidationExecutor is
         // `minAmountOut`) and MAX input (in `amountIn`, semantically
         // `amountInMaximum`). Router refunds unused source. Library
         // dispatches to `exactOutputSingle`. leg1-only; leg2 / split /
-        // sequential paths reject this mode. V2_BUY / V4_BUY are not
-        // implemented (no production caller); when added they get the
-        // next contiguous indices to preserve ABI ordering.
-        UNI_V3_BUY
+        // sequential paths reject this mode.
+        UNI_V3_BUY,
+        // BUY-side V2 — same field remap as UNI_V3_BUY (`minAmountOut`
+        // is the EXACT amountOut, `amountIn` is amountInMax). Library
+        // dispatches to V2 router's `swapTokensForExactTokens`. Router
+        // consumes only the required input, the rest stays on the
+        // caller. leg1-only.
+        UNI_V2_BUY
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
@@ -684,6 +688,7 @@ contract LiquidationExecutor is
         // Normalising once here saves bytecode vs duplicating
         // selectors with `||` at every branch (EIP-170 budget).
         if (m == SwapMode.UNI_V3_BUY) m = SwapMode.UNI_V3;
+        if (m == SwapMode.UNI_V2_BUY) m = SwapMode.UNI_V2;
 
         // NO_SWAP: same-token path (e.g. WETH/WETH). Leg-level checks are
         // skipped; a mismatched src/repay silently early-returns in
@@ -1302,7 +1307,9 @@ contract LiquidationExecutor is
             SwapLegExecutorLib.executeParaswapLeg(_asLibLeg(leg), paraswapAugustusV6);
         } else if (m == SwapMode.BEBOP_MULTI) {
             _executeBebopLeg(leg, outBefore);
-        } else if (m == SwapMode.UNI_V2) {
+        } else if (m == SwapMode.UNI_V2 || m == SwapMode.UNI_V2_BUY) {
+            // Library reads `leg.mode` to pick swapExactTokensForTokens
+            // vs swapTokensForExactTokens. Single dispatch entrypoint.
             SwapLegExecutorLib.executeUniV2Leg(_asLibLeg(leg), amountIn, uniV2Router);
         } else if (m == SwapMode.UNI_V3 || m == SwapMode.UNI_V3_BUY) {
             // Library reads `leg.mode` to pick exactInput vs
