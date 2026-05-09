@@ -13,9 +13,10 @@ import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 import {IMorphoBlue, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/IMorphoBlue.sol";
 import {IUniV2Router} from "./interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "./interfaces/IUniV3SwapRouter.sol";
-import {IPoolManager, IUnlockCallback, PoolKey, SwapParams} from "./interfaces/IPoolManager.sol";
+import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
 import {ParaswapDecoderLib} from "./libraries/ParaswapDecoderLib.sol";
 import {SwapLegExecutorLib} from "./libraries/SwapLegExecutorLib.sol";
+import {UniswapLib} from "./libraries/UniswapLib.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -137,7 +138,6 @@ contract LiquidationExecutor is
     error InvalidV4NativeToken();
     error InvalidV4FeeOrSpacing();
     error V4HookNotAllowed(address hook);
-    error V4UnexpectedDelta();
     error InvalidV4CallbackHook();
 
     // Profit / payment errors
@@ -170,15 +170,9 @@ contract LiquidationExecutor is
     /// malicious block.coinbase from grinding gas in the callback.
     uint256 private constant COINBASE_CALL_GAS = 10_000;
 
-    /// @dev Uniswap V4 sqrt price limits, set one tick inside the allowed
-    /// range so the swap is unconstrained by price (slippage is enforced
-    /// by the output delta check against the per-leg `leg.minAmountOut`
-    /// field on `SwapLeg`).
-    /// Reference: v4-core TickMath.MIN_SQRT_PRICE / MAX_SQRT_PRICE.
-    uint160 private constant V4_MIN_SQRT_PRICE_LIMIT = 4_295_128_740;
-    uint160 private constant V4_MAX_SQRT_PRICE_LIMIT =
-        1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261;
-
+    /// @dev V4 sqrt-price-limit constants moved to UniswapLib (used only
+    /// inside the unlock callback now). Slippage enforcement remains the
+    /// per-leg `leg.minAmountOut` delta check at the main-contract level.
     /// @dev Strict size of encoded v4SwapData: 5 × 32-byte words
     /// (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook).
     uint256 private constant V4_SWAP_DATA_LENGTH = 160;
@@ -1469,7 +1463,7 @@ contract LiquidationExecutor is
         _activeV4TokenIn = address(0); // CLAIM
 
         (address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint256 amountIn) =
-            abi.decode(data, (address, uint24, int24, address, uint256));
+            UniswapLib.decodeV4UnlockData(data);
 
         // Hook whitelist re-check defends against a malicious/
         // misconfigured PoolManager substituting the hook field.
@@ -1478,42 +1472,11 @@ contract LiquidationExecutor is
         // the pipeline-level `repayDelta >= flashRepayAmount` gate.
         if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
 
-        bool zeroForOne = tokenIn < tokenOut;
-        PoolKey memory key = PoolKey({
-            currency0: zeroForOne ? tokenIn : tokenOut,
-            currency1: zeroForOne ? tokenOut : tokenIn,
-            fee: fee,
-            tickSpacing: tickSpacing,
-            hooks: hook
-        });
-
-        SwapParams memory params = SwapParams({
-            zeroForOne: zeroForOne,
-            amountSpecified: -int256(amountIn),
-            sqrtPriceLimitX96: zeroForOne ? V4_MIN_SQRT_PRICE_LIMIT : V4_MAX_SQRT_PRICE_LIMIT
-        });
-
-        int256 swapDelta = IPoolManager(msg.sender).swap(key, params, "");
-        int128 amount0 = int128(swapDelta >> 128);
-        int128 amount1 = int128(swapDelta);
-
-        int128 tokenInDelta = zeroForOne ? amount0 : amount1;
-        int128 tokenOutDelta = zeroForOne ? amount1 : amount0;
-
-        // Exact-input single-hop invariant: owe strictly positive tokenIn
-        // (tokenInDelta < 0), gain strictly positive tokenOut (tokenOutDelta > 0).
-        // Any other shape — including zero-output, positive-input, or partial
-        // settlement — fails closed. Strict `< 0` / `> 0` makes owedIn > 0
-        // and gainedOut > 0 by construction (no extra zero-guards needed).
-        if (tokenInDelta >= 0 || tokenOutDelta <= 0) revert V4UnexpectedDelta();
-
-        uint256 owedIn = uint256(int256(-tokenInDelta));
-        uint256 gainedOut = uint256(int256(tokenOutDelta));
-
-        IPoolManager(msg.sender).sync(tokenIn);
-        IERC20(tokenIn).safeTransfer(msg.sender, owedIn);
-        IPoolManager(msg.sender).settle();
-        IPoolManager(msg.sender).take(tokenOut, address(this), gainedOut);
+        // Swap-and-settle moved to UniswapLib (~250 bytes off the main
+        // contract, EIP-170 budget). The library runs under the same
+        // DELEGATECALL semantics so token transfers, the swap call, and
+        // settle/take all execute with `address(this) == executor`.
+        UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountIn);
         return "";
     }
 

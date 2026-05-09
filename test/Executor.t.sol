@@ -8,6 +8,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
+import {UniswapLib} from "../src/libraries/UniswapLib.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
 import {MarketParams} from "../src/interfaces/IMorphoBlue.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -6315,7 +6316,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.V4UnexpectedDelta.selector);
+        vm.expectRevert(UniswapLib.V4UnexpectedDelta.selector);
         executor.execute(plan);
 
         uniV4Mock.setZeroOut(false);
