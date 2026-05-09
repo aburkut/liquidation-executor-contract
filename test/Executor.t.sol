@@ -6543,6 +6543,368 @@ contract ExecutorTest is Test {
         assertGt(loanToken.balanceOf(address(executor)), loanBefore, "V4 multihop BUY must leave loanToken profit");
     }
 
+    // ─── Negative tests for multihop / BUY validation ──────────────────
+
+    function test_UniV3_multihop_sell_pathFirstNotSrc_reverts() public {
+        // Path[0] address must equal leg.srcToken on SELL multihop.
+        // The lib's `_v3PathEndpoints` check fires inside executeUniV3Leg
+        // (post-flashloan) and reverts InvalidV2Path.
+        MockERC20 wrongFirst = new MockERC20("Wrong", "WRG", 18);
+        bytes memory path =
+            _encodeV3PathSell(address(wrongFirst), 500, address(collateralToken), 3000, address(loanToken));
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, path, 1);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(UniswapLib.InvalidV2Path.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV3_multihop_sell_pathLastNotRepay_reverts() public {
+        MockERC20 wrongLast = new MockERC20("Wrong", "WRG", 18);
+        bytes memory path =
+            _encodeV3PathSell(address(collateralToken), 500, address(loanToken), 3000, address(wrongLast));
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, path, 1);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(UniswapLib.InvalidV2Path.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV3_multihop_badPathLength_reverts() public {
+        // Path length must satisfy >= 66 AND (len - 20) % 23 == 0.
+        // 50 bytes fails both — validator catches pre-flashloan (InvalidPlan).
+        bytes memory badPath = new bytes(50);
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, badPath, 1);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV3_multihop_buy_forwardPath_reverts() public {
+        // V3 BUY expects path REVERSED (tokenOut-first). Passing forward
+        // SELL-shape path means path[0] == srcToken — but the BUY branch
+        // expects path[0] == repayToken. Mismatch → InvalidV2Path.
+        // Pre-fund 1000e18 extra so the executor has > amountInMax
+        // (1500e18) — otherwise the pre-check fires first with
+        // InsufficientSrcBalance and we never reach the endpoint check.
+        collateralToken.mint(address(executor), 1000e18);
+
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        bytes memory forwardPath =
+            _encodeV3PathSell(address(collateralToken), 500, address(intermediateToken), 3000, address(loanToken));
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3MultihopBuyLeg(address(collateralToken), address(loanToken), 1500e18, forwardPath, 1100e18);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(UniswapLib.InvalidV2Path.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_oneHop_reverts() public {
+        // Multihop is signalled by v4SwapData.length > 160. A single-hop
+        // V4Hop[] (length 1) decodes as multihop but fails the lib's
+        // `nHops < 2 → InvalidPlan` check inside decodeAndValidateV4MultihopShape.
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](1);
+        hops[0] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 3000, tickSpacing: int24(60), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_finalTokenOutMismatch_reverts() public {
+        // Last hop's tokenOut != leg.repayToken → InvalidPlan.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        MockERC20 wrongFinal = new MockERC20("Wrong", "WRG", 18);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(wrongFinal), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_zeroFee_reverts() public {
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] =
+            UniswapLib.V4Hop({tokenOut: address(intermediateToken), fee: 0, tickSpacing: int24(60), hook: address(0)});
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_zeroTickSpacing_reverts() public {
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(0), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_dynamicFeeBit_reverts() public {
+        // V4 reserves bit 0x800000 of `fee` for dynamic-fee pools. The
+        // production-scope validator rejects them — set the bit on hop[0].
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: uint24(0x800000) | 3000, tickSpacing: int24(60), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV2_buy_amountInMaxExceeded_reverts() public {
+        // V2 BUY: router (mock) reverts when input required to satisfy
+        // exact amountOut exceeds amountInMaximum. Set rate=0.5e18 so
+        // the input demand (= amountOut * 1e18 / rate = 2200) exceeds
+        // amountInMax=100. Mock's swapTokensForExactTokens reverts;
+        // the executor's flashloan callback unwinds to a top-level
+        // revert. Assert it reverts (not asserting selector — mock
+        // string revert isn't a Solidity error type).
+        collateralToken.mint(address(executor), 5000e18);
+        uniV2Mock.setRate(0.5e18);
+
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV2BuyLeg(address(collateralToken), address(loanToken), 100e18, 1100e18);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_UniV4_buy_consumedExceedsMax_reverts() public {
+        // V4 PoolManager has no client-side amountInMax — main contract
+        // enforces it post-unlock. Distort the mock rate so input
+        // demand FAR exceeds amountInMax: rate=0.5e18 means input =
+        // amountOut * 2. Pre-fund 5000 collateral so the mock can
+        // physically pull 2200 (executor isn't liquidity-blocked) but
+        // post-unlock check catches `consumed=2200 > amountInMax=100`.
+        collateralToken.mint(address(executor), 5000e18);
+        uniV4Mock.setRate(0.5e18);
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4BuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            100e18,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        // Pre-check `srcBal >= amountIn` reads amountIn=100e18 — the
+        // executor has 5000+ so passes. After the unlock the mock
+        // pulled 2200e18 (= 1100/0.5). Post-unlock check
+        // `consumed > amountInMax` reverts with the expected selector.
+        // We accept either revert form: the new post-check guard
+        // (InsufficientSrcBalance(consumed, amountInMax)) OR an
+        // earlier balance-driven revert in the mock chain — assert
+        // the call REVERTS, that's the security guarantee.
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_unallowlistedHook_reverts() public {
+        // Each hop's hook must be address(0) OR in allowedV4Hooks. The
+        // function-pointer callback (`this.isV4HookAllowed`) returns
+        // false → lib reverts InvalidPlan inside the per-hop loop.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        address strangerHook = address(0xBADC0DE);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: strangerHook
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
     function test_UniV3_minAmountOutZero_reverts() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV3SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 3000, 0, 0);
