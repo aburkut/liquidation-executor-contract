@@ -5994,6 +5994,112 @@ contract ExecutorTest is Test {
         assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V2 leg1 must leave loanToken profit");
     }
 
+    function test_UniV2_multihop_sell_happy_path() public {
+        // V2 multihop is supported "for free" by the existing
+        // executeUniV2Leg path: validator only checks path[0] / path[last]
+        // (length already permitted >= 2), library passes leg.v2Path
+        // through to the router, and Router02 natively supports any
+        // path.length >= 2. This regression test pins the behaviour so
+        // future validation tightening can't silently break multihop.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        address[] memory path = new address[](3);
+        path[0] = address(collateralToken);
+        path[1] = address(intermediateToken);
+        path[2] = address(loanToken);
+
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V2,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: path,
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(loanToken),
+            minAmountOut: 1
+        });
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "V2 multihop SELL must produce loanToken profit");
+    }
+
+    function test_UniV2_multihop_buy_happy_path() public {
+        // V2 BUY-side multihop — same field remap as singlehop BUY but
+        // with a 3-token path. Router consumes only the input required
+        // to satisfy the EXACT amountOut, leaving the rest on the
+        // executor. Mock applies rate to endpoints; intermediate hop
+        // is bookkeeping-only.
+        collateralToken.mint(address(executor), 500e18);
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        address[] memory path = new address[](3);
+        path[0] = address(collateralToken);
+        path[1] = address(intermediateToken);
+        path[2] = address(loanToken);
+
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V2_BUY,
+            srcToken: address(collateralToken),
+            amountIn: 1500e18, // amountInMaximum
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: path,
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(loanToken),
+            minAmountOut: 1100e18 // exact amountOut
+        });
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        assertLt(swapConsumed, uint256(1500e18), "BUY-side V2 multihop must consume < amountInMax");
+        assertEq(swapConsumed, expectedActualIn, "BUY-side V2 multihop actualIn must equal amountOut/rate");
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V2 multihop must leave loanToken profit");
+    }
+
     function test_UniV3_buy_singleLeg_happy_path() public {
         // Pre-fund a bit more collateral so we visibly test "actualIn < max".
         // Default setUp: 600 reward + 400 pre-fund = 1000e18; mint another 500.
