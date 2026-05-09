@@ -896,6 +896,82 @@ contract ExecutorTest is Test {
         });
     }
 
+    /// @dev Encode a 3-token V3 multihop path for SELL: tokenA-feeAB-tokenB-feeBC-tokenC.
+    /// Standard Uniswap V3 path layout: 20+3+20+3+20 = 66 bytes.
+    function _encodeV3PathSell(address tA, uint24 feeAB, address tB, uint24 feeBC, address tC)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(tA, feeAB, tB, feeBC, tC);
+    }
+
+    /// @dev Encode a 3-token V3 multihop path for BUY (V3 SwapRouter02 expects
+    /// path REVERSED on exactOutput): tokenC-feeBC-tokenB-feeAB-tokenA.
+    function _encodeV3PathBuy(address tA, uint24 feeAB, address tB, uint24 feeBC, address tC)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(tC, feeBC, tB, feeAB, tA);
+    }
+
+    /// @dev V3 multihop SELL leg — `v4SwapData` carries V3 path bytes;
+    /// when non-empty the lib dispatches to `exactInput` instead of
+    /// `exactInputSingle`. `v3Fee` is ignored on the multihop branch
+    /// (fees come from the path).
+    function _buildUniV3MultihopSellLeg(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        bytes memory path,
+        uint256 minAmountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: path,
+            repayToken: dstToken,
+            minAmountOut: minAmountOut
+        });
+    }
+
+    /// @dev V3 multihop BUY leg — `v4SwapData` carries REVERSED path
+    /// bytes (V3 router contract); lib dispatches to `exactOutput`.
+    function _buildUniV3MultihopBuyLeg(
+        address srcToken,
+        address dstToken,
+        uint256 amountInMaximum,
+        bytes memory pathReversed,
+        uint256 amountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3_BUY,
+            srcToken: srcToken,
+            amountIn: amountInMaximum,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: pathReversed,
+            repayToken: dstToken,
+            minAmountOut: amountOut
+        });
+    }
+
     /// @dev V4 BUY-side leg — exact-output single-hop. `amountInMaximum`
     /// is the spend ceiling; `amountOut` is the EXACT target. Library
     /// reads `leg.mode == UNI_V4_BUY` to flip the V4 amountSpecified
@@ -6182,6 +6258,94 @@ contract ExecutorTest is Test {
         // Profit: exact output (1100e18) - flashRepay (1001e18) = 99e18,
         // plus whatever was already on the contract.
         assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side leg1 must leave loanToken profit");
+    }
+
+    function test_UniV3_multihop_sell_happy_path() public {
+        // V3 multihop SELL — `v4SwapData` carries the standard V3 path
+        // (tokenA-feeAB-tokenB-feeBC-tokenC, 66 bytes for 3 tokens).
+        // Mock applies SWAP_RATE to endpoints so expected output mirrors
+        // the single-hop case: amountIn * rate / 1e18.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        bytes memory path = _encodeV3PathSell(
+            address(collateralToken),
+            500, // tier collateral→intermediate
+            address(intermediateToken),
+            3000, // tier intermediate→loan
+            address(loanToken)
+        );
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3MultihopSellLeg(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            path,
+            /* minOut */
+            1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "V3 multihop SELL must produce loanToken profit");
+    }
+
+    function test_UniV3_multihop_buy_happy_path() public {
+        // V3 multihop BUY — path is REVERSED (tokenOut-first, tokenIn-last).
+        // Validator + lib enforce that the FIRST 20 bytes of the path equal
+        // `leg.repayToken` and the LAST 20 bytes equal `leg.srcToken`.
+        // Mock applies SWAP_RATE inverse to endpoints, so consumed input
+        // is the same deterministic 1100/1.1 = 1000 used by single-hop BUY.
+        collateralToken.mint(address(executor), 500e18);
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        bytes memory pathReversed =
+            _encodeV3PathBuy(address(collateralToken), 500, address(intermediateToken), 3000, address(loanToken));
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3MultihopBuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            1500e18,
+            pathReversed,
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        assertLt(swapConsumed, uint256(1500e18), "BUY-side V3 multihop must consume LESS than amountInMaximum");
+        assertEq(swapConsumed, expectedActualIn, "BUY-side V3 multihop actualIn must equal amountOut/rate");
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V3 multihop must leave loanToken profit");
     }
 
     function test_UniV4_buy_singleLeg_happy_path() public {

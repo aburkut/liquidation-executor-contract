@@ -723,11 +723,29 @@ contract LiquidationExecutor is
             if (leg.minAmountOut == 0) revert InvalidPlan();
         } else if (m == SwapMode.UNI_V3) {
             // Both UNI_V3 (SELL) and UNI_V3_BUY (mode normalised above)
-            // land here — fee + non-zero output checks are identical;
-            // BUY-specific invariants (amountInMax > 0, amountOut > 0)
-            // are re-checked by the library at dispatch.
-            uint24 f = leg.v3Fee;
-            if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
+            // land here. Single-hop vs multihop is signalled by
+            // `leg.v4SwapData.length`:
+            //   * empty  → single-hop, validate `v3Fee` against the
+            //              canonical Uniswap V3 fee tier set
+            //   * non-empty → multihop, fees are inside the path bytes;
+            //              skip v3Fee here. Path-shape sanity (length,
+            //              endpoint tokens) is enforced by the lib at
+            //              dispatch — bad fees inside the path get
+            //              naturally caught when the router fails to
+            //              find a pool. BUY-specific invariants
+            //              (amountInMax > 0, amountOut > 0) are
+            //              re-checked by the library at dispatch.
+            if (leg.v4SwapData.length == 0) {
+                uint24 f = leg.v3Fee;
+                if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
+            } else {
+                // Multihop: cheap length sanity (>= 66, (len - 20) % 23 == 0).
+                // Lib re-checks endpoints; we keep this here so a malformed
+                // length fails fast pre-flashloan.
+                if (leg.v4SwapData.length < 66 || (leg.v4SwapData.length - 20) % 23 != 0) {
+                    revert InvalidPlan();
+                }
+            }
             if (leg.minAmountOut == 0) revert InvalidPlan();
         } else if (m == SwapMode.UNI_V4) {
             _validateV4Leg(leg);

@@ -34,4 +34,35 @@ interface IUniV3SwapRouter {
     }
 
     function exactOutputSingle(ExactOutputSingleParams calldata params) external payable returns (uint256 amountIn);
+
+    /// @dev Multihop SELL — path is ABI-encoded as
+    /// `tokenIn (20 bytes) || fee0 (3 bytes) || token1 (20 bytes) ||
+    ///  fee1 (3 bytes) || ... || tokenOut (20 bytes)`.
+    /// Total length = 20 + 23 * (numHops); single-hop is 43 bytes,
+    /// two-hop is 66 bytes, three-hop is 89 bytes, etc. Router walks
+    /// the path token-by-token charging msg.sender amountIn and
+    /// crediting `recipient` the final hop's output.
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+
+    /// @dev Multihop BUY — path is REVERSED relative to ExactInput:
+    /// `tokenOut (20 bytes) || feeLast (3 bytes) || tokenPrev (20 bytes)
+    ///  || ... || tokenIn (20 bytes)`. Router pulls AT MOST
+    /// `amountInMaximum` of the LAST token (== tokenIn) and credits
+    /// `recipient` exactly `amountOut` of the FIRST token (== tokenOut).
+    /// Refunds any unused input.
+    struct ExactOutputParams {
+        bytes path;
+        address recipient;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+    }
+
+    function exactOutput(ExactOutputParams calldata params) external payable returns (uint256 amountIn);
 }
