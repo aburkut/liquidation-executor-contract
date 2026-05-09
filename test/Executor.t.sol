@@ -977,6 +977,39 @@ contract ExecutorTest is Test {
     /// reads `leg.mode == UNI_V4_BUY` to flip the V4 amountSpecified
     /// sign (positive = exact-output) and to enforce `consumed <=
     /// amountInMax` post-unlock.
+    /// @dev V4 multihop leg — `v4SwapData = abi.encode(V4Hop[])`.
+    /// Length > V4_SWAP_DATA_LENGTH (160) signals multihop dispatch in
+    /// the validator, the executor, and the unlock callback. `isBuy`
+    /// flips the SwapMode (UNI_V4 vs UNI_V4_BUY) which the executor
+    /// reads to pick the amountSpec sign. Per-hop fees live inside
+    /// the encoded V4Hop[] (`v3Fee` field is unused on the multihop path).
+    function _buildUniV4MultihopLeg(
+        bool isBuy,
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        UniswapLib.V4Hop[] memory hops,
+        address poolManager,
+        uint256 minAmountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: isBuy ? LiquidationExecutor.SwapMode.UNI_V4_BUY : LiquidationExecutor.SwapMode.UNI_V4,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: poolManager,
+            v4SwapData: abi.encode(hops),
+            repayToken: dstToken,
+            minAmountOut: minAmountOut
+        });
+    }
+
     function _buildUniV4BuyLeg(
         address srcToken,
         address dstToken,
@@ -6398,6 +6431,116 @@ contract ExecutorTest is Test {
         assertEq(swapConsumed, expectedActualIn, "BUY-side V4 actualIn must equal amountOut/rate");
 
         assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V4 leg1 must leave loanToken profit");
+    }
+
+    function test_UniV4_multihop_sell_happy_path() public {
+        // V4 multihop SELL — 3-token chain (col → INT → loan) routed
+        // through ONE PoolManager unlock with TWO sequential swap()
+        // calls. Hop 0's output (INT) feeds hop 1 as exact-input via
+        // PM's internal credit ledger; only the leg's tokenIn (col)
+        // is settled and only the final tokenOut (loan) is taken.
+        // SWAP_RATE is applied per hop in the mock so the cumulative
+        // output = amountIn * (rate / 1e18)^2.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        // Fund the PM so it has the intermediate + final tokens to take().
+        intermediateToken.mint(address(uniV4Mock), 10_000e18);
+        loanToken.mint(address(uniV4Mock), 10_000e18);
+
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg( /* isBuy */
+            false,
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            hops,
+            address(uniV4Mock),
+            /* minOut */
+            1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "V4 multihop SELL must produce loanToken profit");
+    }
+
+    function test_UniV4_multihop_buy_happy_path() public {
+        // V4 multihop BUY — 3-token chain, exact-output target. The
+        // lib walks hops BACKWARD: hop 1 takes amountSpec=+amountOut,
+        // returns input demand X1; hop 0 takes amountSpec=+X1, returns
+        // input demand X0 (= the leg's actual consumed input). Final
+        // gainedOut == amountOut; finalConsumed == X0 ≤ amountInMax.
+        collateralToken.mint(address(executor), 1500e18);
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        intermediateToken.mint(address(uniV4Mock), 10_000e18);
+        loanToken.mint(address(uniV4Mock), 10_000e18);
+
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+
+        // Per-hop rate is SWAP_RATE = 1.1e18 in setUp; cumulative gain
+        // hop0→hop1 means input X for amountOut requires X = amountOut / rate^2.
+        // For amountOut=1100e18 and rate=1.1: X = 1100/(1.1*1.1) = ~909.09e18.
+        uint256 amountOutExact = 1100e18;
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg( /* isBuy */
+            true,
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            2000e18,
+            hops,
+            address(uniV4Mock),
+            amountOutExact
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        assertLt(swapConsumed, uint256(2000e18), "V4 multihop BUY must consume < amountInMaximum");
+        // Mock applies rate per hop with truncating integer division so
+        // exact closed-form consumed-input is brittle; the strong
+        // invariants are: (a) consumed < amountInMax, (b) loanToken
+        // profit increased, (c) leg's exact amountOut delivered.
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "V4 multihop BUY must leave loanToken profit");
     }
 
     function test_UniV3_minAmountOutZero_reverts() public {

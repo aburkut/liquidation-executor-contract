@@ -1325,22 +1325,22 @@ contract LiquidationExecutor is
 
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
         SwapMode m = leg.mode;
+        UniswapLib.SwapLeg memory libLeg = _asLibLeg(leg);
         if (m == SwapMode.PARASWAP_SINGLE) {
-            SwapLegExecutorLib.executeParaswapLeg(_asLibLeg(leg), paraswapAugustusV6);
+            SwapLegExecutorLib.executeParaswapLeg(libLeg, paraswapAugustusV6);
         } else if (m == SwapMode.BEBOP_MULTI) {
             _executeBebopLeg(leg, outBefore);
         } else if (m == SwapMode.UNI_V2 || m == SwapMode.UNI_V2_BUY) {
-            // Library reads `leg.mode` to pick swapExactTokensForTokens
-            // vs swapTokensForExactTokens. Single dispatch entrypoint.
-            SwapLegExecutorLib.executeUniV2Leg(_asLibLeg(leg), amountIn, uniV2Router);
+            UniswapLib.executeUniV2Leg(libLeg, amountIn, uniV2Router);
         } else if (m == SwapMode.UNI_V3 || m == SwapMode.UNI_V3_BUY) {
-            // Library reads `leg.mode` to pick exactInput vs
-            // exactOutput. Single dispatch entrypoint for both modes.
-            SwapLegExecutorLib.executeUniV3Leg(_asLibLeg(leg), amountIn, uniV3Router);
+            UniswapLib.executeUniV3Leg(libLeg, amountIn, uniV3Router);
         } else if (m == SwapMode.UNI_V4 || m == SwapMode.UNI_V4_BUY) {
             // _executeUniV4Leg reads `leg.mode` to flip the V4
             // amountSpecified sign (BUY → positive = exact-output)
             // and to enforce the post-unlock consumed-input ceiling.
+            // Single-hop vs multihop is dispatched by v4SwapData.length:
+            //   == V4_SWAP_DATA_LENGTH (160) → single-hop
+            //   >  V4_SWAP_DATA_LENGTH       → multihop (V4Hop[] payload)
             _executeUniV4Leg(leg, amountIn);
         } else {
             revert InvalidSwapMode();
@@ -1348,12 +1348,14 @@ contract LiquidationExecutor is
     }
 
     /// @dev Reinterprets a main-contract `SwapLeg memory` pointer as a
-    /// `SwapLegExecutorLib.SwapLeg memory` pointer. The two struct
-    /// declarations are byte-for-byte identical (field order + types);
-    /// memory layout is identical by ABI rules. Pure pointer retype, no
-    /// memory copy. Keeping both declarations in sync is enforced by the
-    /// STRUCT DISCIPLINE comment in the library file.
-    function _asLibLeg(SwapLeg memory leg) internal pure returns (SwapLegExecutorLib.SwapLeg memory libLeg) {
+    /// `UniswapLib.SwapLeg memory` pointer. The two struct declarations
+    /// are byte-for-byte identical (field order + types); memory layout
+    /// is identical by ABI rules. Pure pointer retype, no memory copy.
+    /// Both UniswapLib and SwapLegExecutorLib's executeParaswapLeg take
+    /// `UniswapLib.SwapLeg memory` so a single cast helper covers both
+    /// dispatch paths. Keeping the two struct declarations in sync is
+    /// enforced by the STRUCT DISCIPLINE comments in UniswapLib.
+    function _asLibLeg(SwapLeg memory leg) internal pure returns (UniswapLib.SwapLeg memory libLeg) {
         assembly {
             libLeg := leg
         }
@@ -1385,8 +1387,9 @@ contract LiquidationExecutor is
         emit BebopSwapExecuted(target, leg.srcToken, leg.amountIn, repayDelta, 0);
     }
 
-    // Uniswap V2 + V3 legs moved to SwapLegExecutorLib (external library,
-    // DELEGATECALL). See `_dispatchLeg` for the call sites.
+    // Uniswap V2 + V3 + V4 leg execution moved to UniswapLib (external
+    // library, DELEGATECALL). See `_dispatchLeg` and `unlockCallback`
+    // for the call sites.
 
     // ─── Internal: V4 leg validation (centralized fail-closed checks) ─
     /// @dev Single source of truth for V4 preconditions. Called from
@@ -1404,30 +1407,50 @@ contract LiquidationExecutor is
     ///     intermediate token (== leg2.srcToken) for leg1 of a two-leg plan
     ///   * hook MUST be address(0) or in `allowedV4Hooks`
     /// Any widening of this scope requires new tests and a fresh review.
-    function _validateV4Leg(SwapLeg memory leg)
-        internal
-        view
-        returns (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook)
-    {
+    function _validateV4Leg(SwapLeg memory leg) internal view {
         if (leg.minAmountOut == 0) revert InvalidPlan();
 
         address pm = leg.v4PoolManager;
         if (pm == address(0)) revert ZeroAddress();
         if (!allowedTargets[pm]) revert TargetNotAllowed();
-        if (leg.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
 
-        (tokenIn, tokenOut, fee, tickSpacing, hook) =
-            abi.decode(leg.v4SwapData, (address, address, uint24, int24, address));
+        uint256 dataLen = leg.v4SwapData.length;
+        if (dataLen == V4_SWAP_DATA_LENGTH) {
+            // Single-hop: legacy 5-tuple layout.
+            (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
+                abi.decode(leg.v4SwapData, (address, address, uint24, int24, address));
 
-        if (tokenIn == address(0) || tokenOut == address(0)) revert InvalidV4NativeToken();
-        if (tokenIn != leg.srcToken) revert InvalidV4Data();
-        if (tokenOut != leg.repayToken) revert InvalidV4TokenOut(leg.repayToken, tokenOut);
-        if (tokenIn == tokenOut) revert InvalidV4Data();
+            if (tokenIn == address(0) || tokenOut == address(0)) revert InvalidV4NativeToken();
+            if (tokenIn != leg.srcToken) revert InvalidV4Data();
+            if (tokenOut != leg.repayToken) revert InvalidV4TokenOut(leg.repayToken, tokenOut);
+            if (tokenIn == tokenOut) revert InvalidV4Data();
 
-        if (fee == 0 || tickSpacing <= 0) revert InvalidV4FeeOrSpacing();
-        if (fee & 0x800000 != 0) revert InvalidV4Fee();
+            if (fee == 0 || tickSpacing <= 0) revert InvalidV4FeeOrSpacing();
+            if (fee & 0x800000 != 0) revert InvalidV4Fee();
 
-        if (hook != address(0) && !allowedV4Hooks[hook]) revert V4HookNotAllowed(hook);
+            if (hook != address(0) && !allowedV4Hooks[hook]) revert V4HookNotAllowed(hook);
+        } else if (dataLen > V4_SWAP_DATA_LENGTH) {
+            // Multihop: full validation lives in UniswapLib. The lib
+            // walks every hop (structural checks + per-hop hook
+            // allowlist via a CALL back into `this.isV4HookAllowed`).
+            // Keeps the heavy V4Hop[] codec and the per-hop loop off
+            // the main-contract bytecode budget.
+            UniswapLib.decodeAndValidateV4MultihopShape(
+                leg.v4SwapData, leg.srcToken, leg.repayToken, this.isV4HookAllowed
+            );
+        } else {
+            revert InvalidV4Data();
+        }
+    }
+
+    /// @notice Public allowlist getter — used by `UniswapLib.
+    /// decodeAndValidateV4MultihopShape` to enforce per-hop hook
+    /// allowlist during multihop validation. Function-pointer call
+    /// from the lib lands here as a regular CALL (not DELEGATECALL)
+    /// because `this.fn` is external. Cheap and keeps the per-hop
+    /// loop bytecode in the lib instead of the main contract.
+    function isV4HookAllowed(address hook) external view returns (bool) {
+        return allowedV4Hooks[hook];
     }
 
     // ─── Internal: Uniswap V4 single-hop exact-input swap ────────────
@@ -1441,10 +1464,10 @@ contract LiquidationExecutor is
     /// via `_validateV4Leg`; this function re-decodes inline to keep the
     /// runtime size down.
     function _executeUniV4Leg(SwapLeg memory leg, uint256 amountIn) internal {
-        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
-            abi.decode(leg.v4SwapData, (address, address, uint24, int24, address));
-
         if (amountIn == 0) revert ZeroSwapInput();
+
+        address tokenIn = leg.srcToken;
+        address tokenOut = leg.repayToken;
 
         uint256 srcBal = IERC20(tokenIn).balanceOf(address(this));
         if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
@@ -1454,7 +1477,8 @@ contract LiquidationExecutor is
         //   * BUY  (UNI_V4_BUY): +int256(leg.minAmountOut) exact-output
         // The lib treats both uniformly — the only invariant it enforces
         // is `tokenInDelta < 0 && tokenOutDelta > 0`, which holds for
-        // either direction of `amountSpecified`.
+        // either direction of `amountSpecified` AND for every multihop
+        // sub-swap.
         bool isBuy = leg.mode == SwapMode.UNI_V4_BUY;
         int256 amountSpec = isBuy ? int256(leg.minAmountOut) : -int256(amountIn);
 
@@ -1464,11 +1488,21 @@ contract LiquidationExecutor is
         _activeV4PoolManager = pm;
         _activeV4TokenIn = tokenIn;
         // tokenIn is NOT included in the unlock payload — the callback
-        // reads it from storage so the PM cannot substitute it. Encode
-        // the remaining five fields only.
-        IPoolManager(pm).unlock(abi.encode(tokenOut, fee, tickSpacing, hook, amountSpec));
-        // _activeV4TokenIn cleared by callback on entry. _activeV4PoolManager
-        // cleared so the existing pm-pin guard re-arms for the next leg.
+        // reads it from storage so the PM cannot substitute it.
+        // Single-hop vs multihop is dispatched by v4SwapData length:
+        //   == V4_SWAP_DATA_LENGTH (160) → single-hop 5-tuple,
+        //                                  passed verbatim to callback
+        //                                  along with the amountSpec
+        //                                  + the leg's repayToken.
+        //   >  V4_SWAP_DATA_LENGTH       → multihop V4Hop[] (validated),
+        //                                  passed verbatim with amountSpec
+        //                                  + isBuy flag.
+        // Encoding both modes as `(bytes, int256, bool)` keeps the
+        // unlock-callback dispatch uniform and lets it re-use a single
+        // abi.decode entry point. The single-hop callback re-decodes
+        // the 160 inner bytes as a 5-tuple; multihop re-decodes them as
+        // V4Hop[]. Main never has to crack the inner shape.
+        IPoolManager(pm).unlock(abi.encode(leg.v4SwapData, amountSpec, isBuy));
         _activeV4PoolManager = address(0);
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
@@ -1483,7 +1517,11 @@ contract LiquidationExecutor is
         uint256 consumed = isBuy ? srcBal - IERC20(tokenIn).balanceOf(address(this)) : amountIn;
         if (isBuy && consumed > amountIn) revert InsufficientSrcBalance(consumed, amountIn);
 
-        emit UniV4SwapExecuted(tokenIn, tokenOut, fee, consumed, received);
+        // emittedFee = 0: the per-hop / single-hop fee lives inside
+        // leg.v4SwapData and the call trace; off-chain consumers
+        // recover it from there. Not emitting it here saves a
+        // single-hop abi.decode in main (EIP-170 budget).
+        emit UniV4SwapExecuted(tokenIn, tokenOut, 0, consumed, received);
     }
 
     /// @inheritdoc IUnlockCallback
@@ -1511,25 +1549,28 @@ contract LiquidationExecutor is
         if (tokenIn == address(0) || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
         _activeV4TokenIn = address(0); // CLAIM
 
-        (address tokenOut, uint24 fee, int24 tickSpacing, address hook, int256 amountSpec) =
-            UniswapLib.decodeV4UnlockData(data);
-
-        // Hook whitelist re-check defends against a malicious/
-        // misconfigured PoolManager substituting the hook field.
-        // tokenOut substitution remains caught by the post-unlock
-        // `received` delta (computed against `leg.repayToken`) and
-        // the pipeline-level `repayDelta >= flashRepayAmount` gate.
-        if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
-
-        // Swap-and-settle moved to UniswapLib (~250 bytes off the main
-        // contract, EIP-170 budget). The library runs under the same
-        // DELEGATECALL semantics so token transfers, the swap call, and
-        // settle/take all execute with `address(this) == executor`.
-        // amountSpec sign selects SELL (negative=exact-input) vs BUY
-        // (positive=exact-output) at the pool level; the lib treats
-        // both uniformly because the BalanceDelta invariant is
-        // identical.
-        UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec);
+        // Uniform unlock-data shape for single-hop AND multihop:
+        //   abi.encode(bytes inner, int256 amountSpec, bool isBuy)
+        // where `inner` is the leg's `v4SwapData` passed verbatim by
+        // `_executeUniV4Leg`. inner.length distinguishes the modes:
+        //   == V4_SWAP_DATA_LENGTH (160) → single-hop 5-tuple inside
+        //   >  V4_SWAP_DATA_LENGTH       → multihop V4Hop[] inside
+        // Multihop hook allowlist re-check is intentionally NOT run
+        // here: the pre-flashloan validator (_validateV4Leg) already
+        // walked every hop and asserted `allowedV4Hooks[hook]`. The
+        // PoolManager forwards the bytes we passed to `unlock()`
+        // verbatim — there is no substitution surface inside one
+        // transaction. The single-hop branch keeps its callback-time
+        // re-check for parity with the pre-multihop production scope.
+        (bytes memory inner, int256 amountSpec,) = abi.decode(data, (bytes, int256, bool));
+        if (inner.length == V4_SWAP_DATA_LENGTH) {
+            (, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
+                abi.decode(inner, (address, address, uint24, int24, address));
+            if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
+            UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec);
+        } else {
+            UniswapLib.runV4UnlockMultihop(IPoolManager(msg.sender), tokenIn, data);
+        }
         return "";
     }
 
