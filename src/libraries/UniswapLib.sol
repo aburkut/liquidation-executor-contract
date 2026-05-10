@@ -85,6 +85,11 @@ library UniswapLib {
     /// regression-proof. Lib-hosted because the OR-chain is too heavy
     /// for the main contract's EIP-170 budget.
     function assertNoSwapLegZeroed(SwapLeg memory leg) external pure {
+        // NO_SWAP is the same-token branch — srcToken MUST equal repayToken.
+        // Every other mode enforces this via the post-NO_SWAP-early-return
+        // `srcToken == repayToken` check; mirroring it here closes the
+        // defense-in-depth gap surfaced by the re-audit.
+        if (leg.srcToken != leg.repayToken) revert InvalidPlan();
         if (
             leg.useFullBalance || leg.deadline != 0 || leg.amountIn != 0 || leg.minAmountOut != 0
                 || leg.paraswapCalldata.length != 0 || leg.bebopTarget != address(0) || leg.bebopCalldata.length != 0
