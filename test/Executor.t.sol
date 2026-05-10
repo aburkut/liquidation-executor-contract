@@ -109,8 +109,8 @@ contract ExecutorTest is Test {
     uint256 constant FLASH_FEE = 1e18;
     uint256 constant SWAP_RATE = 1.1e18; // 10% gain
     uint256 constant MIN_PROFIT = 5e18;
-    uint256 constant COLLATERAL_REWARD = 600e18;
-    uint256 constant DEFAULT_SWAP_AMOUNT = 1000e18; // Pre-funded collateral balance used in default swaps
+    uint256 constant COLLATERAL_REWARD = 1000e18;
+    uint256 constant DEFAULT_SWAP_AMOUNT = 1000e18; // Default swap covers full collateralReward (no pre-fund — leg1.amountIn capped at collateralDelta)
 
     // ─── Augustus V6.2 swap entrypoint selectors (all 11) ────────────────
     // Verified against Sourcify metadata for 0x6A000F20005980200259B80c5102003040001068.
@@ -233,7 +233,8 @@ contract ExecutorTest is Test {
         collateralToken.mint(address(augustus), 100_000e18);
         collateralToken.mint(address(aavePool), 100_000e18); // Pool needs collateral to send as reward
         loanToken.mint(address(executor), LOAN_AMOUNT + FLASH_FEE + 100e18);
-        collateralToken.mint(address(executor), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD); // Pre-fund gap (swap needs more than liquidation produces)
+        // No pre-fund: contract requires leg1.amountIn ≤ collateralDelta,
+        // and DEFAULT_SWAP_AMOUNT == COLLATERAL_REWARD by construction.
         collateralToken.mint(address(aaveV2Pool), 100_000e18);
         loanToken.mint(address(aaveV2Pool), 100_000e18);
         collateralToken.mint(address(morphoBlue), 100_000e18);
@@ -2340,7 +2341,8 @@ contract ExecutorTest is Test {
 
     function test_aave_v3_liquidation_executes_and_resets_allowance() public {
         uint256 debtToCover = 500e18;
-        uint256 collateralReward = 600e18;
+        // Reward must match the swap amountIn — the cap rejects amountIn > collateralDelta.
+        uint256 collateralReward = DEFAULT_SWAP_AMOUNT;
 
         aavePool.setLiquidationCollateralReward(collateralReward);
         loanToken.mint(address(aavePool), 100_000e18);
@@ -3921,7 +3923,8 @@ contract ExecutorTest is Test {
         // Set liquidation reward to 0 — liquidation won't increase collateral
         aavePool.setLiquidationCollateralReward(0);
 
-        // Executor still has pre-funded collateral from setUp (DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD = 400e18)
+        // Inject stale collateral explicitly (default setUp no longer pre-funds).
+        collateralToken.mint(address(executor), 400e18);
         assertTrue(collateralToken.balanceOf(address(executor)) > 0, "precondition: stale collateral exists");
 
         bytes memory plan =
@@ -3935,6 +3938,7 @@ contract ExecutorTest is Test {
     /// @notice Same stale-collateral test but with Balancer flash provider.
     function test_staleCollateral_doesNotMaskMissingDelta_balancer() public {
         aavePool.setLiquidationCollateralReward(0);
+        collateralToken.mint(address(executor), 400e18);
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan());
@@ -5968,9 +5972,16 @@ contract ExecutorTest is Test {
     }
 
     function test_UniV2_fullBalance_usesDelta() public {
-        // The liquidation produces COLLATERAL_REWARD of collateralToken. With
-        // useFullBalance=true, the swap input must equal that delta — never the
-        // pre-existing pre-funded balance (DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD).
+        // useFullBalance=true sets leg1.amountIn = collateralDelta at runtime;
+        // the swap input MUST equal that delta and not any pre-existing balance.
+        // To prove delta-only behaviour we set local reward small enough that
+        // swap output is too low to cover repay, then pre-fund extra dust that
+        // a balance-based formula would silently consume. Pipeline reverts
+        // with InsufficientRepayOutput because delta-only output (800*1.1)
+        // < 1001 flashRepay.
+        uint256 smallReward = 800e18;
+        aavePool.setLiquidationCollateralReward(smallReward);
+        collateralToken.mint(address(executor), 200e18); // dust — must be ignored
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), 0, 1, 0);
         swapPlan.leg1.useFullBalance = true;
@@ -5978,14 +5989,11 @@ contract ExecutorTest is Test {
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
-        // With SWAP_RATE = 1.1e18 and delta = 600e18, expected output ≈ 660e18,
-        // which is well below flashRepay (1001e18). The swap succeeds at the
-        // router level but the pipeline-level repay check must reject.
         vm.prank(operatorAddr);
         vm.expectRevert(
             abi.encodeWithSelector(
                 LiquidationExecutor.InsufficientRepayOutput.selector,
-                COLLATERAL_REWARD * SWAP_RATE / 1e18,
+                smallReward * SWAP_RATE / 1e18,
                 LOAN_AMOUNT + FLASH_FEE
             )
         );
@@ -6092,15 +6100,14 @@ contract ExecutorTest is Test {
     /// 500e18 collateral residual on the executor for sweep / leg2.
     /// After: loanToken balance ≥ flashRepay (1001e18) + minProfit.
     function test_UniV2_buy_singleLeg_happy_path() public {
-        // Mirror of test_UniV3_buy_singleLeg_happy_path. Pre-fund extra
-        // collateral so we visibly test "actualIn < amountInMax".
-        collateralToken.mint(address(executor), 500e18);
+        // BUY-side single-hop V2. amountInMax capped at collateralDelta
+        // (= COLLATERAL_REWARD); router consumes amountOut/rate of it.
 
         LiquidationExecutor.SwapLeg memory leg1 = _buildUniV2BuyLeg(
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
-            1500e18,
+            1000e18,
             /* exact amountOut = */
             1100e18
         );
@@ -6130,7 +6137,7 @@ contract ExecutorTest is Test {
         // post-balance. Liquidation reward credits BEFORE leg1 fires so a
         // naive `collBefore - collAfter` would understate by COLLATERAL_REWARD.
         uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
-        assertLt(swapConsumed, uint256(1500e18), "BUY-side V2 leg1 must consume LESS than amountInMaximum");
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
         assertEq(swapConsumed, expectedActualIn, "BUY-side V2 actualIn must equal amountOut/rate");
 
         assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V2 leg1 must leave loanToken profit");
@@ -6186,12 +6193,8 @@ contract ExecutorTest is Test {
     }
 
     function test_UniV2_multihop_buy_happy_path() public {
-        // V2 BUY-side multihop — same field remap as singlehop BUY but
-        // with a 3-token path. Router consumes only the input required
-        // to satisfy the EXACT amountOut, leaving the rest on the
-        // executor. Mock applies rate to endpoints; intermediate hop
-        // is bookkeeping-only.
-        collateralToken.mint(address(executor), 500e18);
+        // V2 BUY-side multihop — amountInMax capped at collateralDelta.
+        // Router consumes exactly amountOut/rate of the new collateral.
         MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
         address[] memory path = new address[](3);
         path[0] = address(collateralToken);
@@ -6201,7 +6204,7 @@ contract ExecutorTest is Test {
         LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
             mode: LiquidationExecutor.SwapMode.UNI_V2_BUY,
             srcToken: address(collateralToken),
-            amountIn: 1500e18, // amountInMaximum
+            amountIn: 1000e18, // amountInMaximum
             useFullBalance: false,
             deadline: block.timestamp + 3600,
             paraswapCalldata: "",
@@ -6237,21 +6240,20 @@ contract ExecutorTest is Test {
         uint256 collAfter = collateralToken.balanceOf(address(executor));
         uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
         uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
-        assertLt(swapConsumed, uint256(1500e18), "BUY-side V2 multihop must consume < amountInMax");
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
         assertEq(swapConsumed, expectedActualIn, "BUY-side V2 multihop actualIn must equal amountOut/rate");
         assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V2 multihop must leave loanToken profit");
     }
 
     function test_UniV3_buy_singleLeg_happy_path() public {
-        // Pre-fund a bit more collateral so we visibly test "actualIn < max".
-        // Default setUp: 600 reward + 400 pre-fund = 1000e18; mint another 500.
-        collateralToken.mint(address(executor), 500e18);
+        // BUY-side single-hop V3. amountInMax capped at collateralDelta;
+        // router consumes exactly amountOut/rate.
 
         LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3BuyLeg(
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
-            1500e18,
+            1000e18,
             3000,
             /* exact amountOut = */
             1100e18
@@ -6285,7 +6287,7 @@ contract ExecutorTest is Test {
         // leg1 fires, so a naive `collBefore - collAfter` would understate
         // the swap's input by exactly COLLATERAL_REWARD.
         uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
-        assertLt(swapConsumed, uint256(1500e18), "BUY-side leg1 must consume LESS than amountInMaximum");
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
         assertEq(swapConsumed, expectedActualIn, "BUY-side actualIn must equal amountOut/rate");
 
         // Profit: exact output (1100e18) - flashRepay (1001e18) = 99e18,
@@ -6340,7 +6342,6 @@ contract ExecutorTest is Test {
         // `leg.repayToken` and the LAST 20 bytes equal `leg.srcToken`.
         // Mock applies SWAP_RATE inverse to endpoints, so consumed input
         // is the same deterministic 1100/1.1 = 1000 used by single-hop BUY.
-        collateralToken.mint(address(executor), 500e18);
         MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
         bytes memory pathReversed =
             _encodeV3PathBuy(address(collateralToken), 500, address(intermediateToken), 3000, address(loanToken));
@@ -6348,7 +6349,7 @@ contract ExecutorTest is Test {
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
-            1500e18,
+            1000e18,
             pathReversed,
             /* exact amountOut = */
             1100e18
@@ -6376,23 +6377,21 @@ contract ExecutorTest is Test {
         uint256 collAfter = collateralToken.balanceOf(address(executor));
         uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
         uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
-        assertLt(swapConsumed, uint256(1500e18), "BUY-side V3 multihop must consume LESS than amountInMaximum");
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
         assertEq(swapConsumed, expectedActualIn, "BUY-side V3 multihop actualIn must equal amountOut/rate");
         assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V3 multihop must leave loanToken profit");
     }
 
     function test_UniV4_buy_singleLeg_happy_path() public {
         // V4 BUY mirrors V3 BUY field semantics: amountIn = amountInMax,
-        // minAmountOut = EXACT amountOut. Pre-fund extra collateral so
-        // the assertion "actualIn < amountInMax" is meaningful (otherwise
-        // pre-balance == amountInMax and the inequality is uninteresting).
-        collateralToken.mint(address(executor), 500e18);
+        // minAmountOut = EXACT amountOut. amountInMax capped at
+        // collateralDelta (= COLLATERAL_REWARD).
 
         LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4BuyLeg(
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
-            1500e18,
+            1000e18,
             3000,
             int24(60),
             address(0),
@@ -6427,7 +6426,7 @@ contract ExecutorTest is Test {
         // before leg1 fires, so a naive pre-vs-post would understate the
         // swap input by exactly that reward. Same reasoning as V2/V3 BUY.
         uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
-        assertLt(swapConsumed, uint256(1500e18), "BUY-side V4 leg1 must consume LESS than amountInMaximum");
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
         assertEq(swapConsumed, expectedActualIn, "BUY-side V4 actualIn must equal amountOut/rate");
 
         assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V4 leg1 must leave loanToken profit");
@@ -6488,7 +6487,7 @@ contract ExecutorTest is Test {
         // returns input demand X1; hop 0 takes amountSpec=+X1, returns
         // input demand X0 (= the leg's actual consumed input). Final
         // gainedOut == amountOut; finalConsumed == X0 ≤ amountInMax.
-        collateralToken.mint(address(executor), 1500e18);
+        // amountInMax capped at collateralDelta (= COLLATERAL_REWARD).
         MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
         intermediateToken.mint(address(uniV4Mock), 10_000e18);
         loanToken.mint(address(uniV4Mock), 10_000e18);
@@ -6508,7 +6507,7 @@ contract ExecutorTest is Test {
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
-            2000e18,
+            1000e18,
             hops,
             address(uniV4Mock),
             amountOutExact
@@ -6535,7 +6534,7 @@ contract ExecutorTest is Test {
 
         uint256 collAfter = collateralToken.balanceOf(address(executor));
         uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
-        assertLt(swapConsumed, uint256(2000e18), "V4 multihop BUY must consume < amountInMaximum");
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
         // Mock applies rate per hop with truncating integer division so
         // exact closed-form consumed-input is brittle; the strong
         // invariants are: (a) consumed < amountInMax, (b) loanToken
@@ -6624,16 +6623,13 @@ contract ExecutorTest is Test {
         // V3 BUY expects path REVERSED (tokenOut-first). Passing forward
         // SELL-shape path means path[0] == srcToken — but the BUY branch
         // expects path[0] == repayToken. Mismatch → InvalidV2Path.
-        // Pre-fund 1000e18 extra so the executor has > amountInMax
-        // (1500e18) — otherwise the pre-check fires first with
-        // InsufficientSrcBalance and we never reach the endpoint check.
-        collateralToken.mint(address(executor), 1000e18);
-
+        // amountInMax capped at collateralDelta (= COLLATERAL_REWARD);
+        // path-shape mismatch fires regardless.
         MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
         bytes memory forwardPath =
             _encodeV3PathSell(address(collateralToken), 500, address(intermediateToken), 3000, address(loanToken));
         LiquidationExecutor.SwapLeg memory leg1 =
-            _buildUniV3MultihopBuyLeg(address(collateralToken), address(loanToken), 1500e18, forwardPath, 1100e18);
+            _buildUniV3MultihopBuyLeg(address(collateralToken), address(loanToken), 1000e18, forwardPath, 1100e18);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: leg1,
             hasLeg2: false,

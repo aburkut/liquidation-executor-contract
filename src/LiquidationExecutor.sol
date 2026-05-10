@@ -1324,6 +1324,15 @@ contract LiquidationExecutor is
         }
 
         uint256 leg1AmountIn = leg1.useFullBalance ? collateralDelta : leg1.amountIn;
+        // Cap leg1AmountIn at collateralDelta when leg1 swaps the underlying
+        // collateral directly — same delta-vs-absolute invariant SPLIT and
+        // MIXED_SPLIT already enforce. Skip-unwrap (leg1.srcToken == aToken)
+        // is exempted because the aToken has its own delta semantics and
+        // collateralAsset's balance hasn't changed.
+        // Closes the operator-coinbase dipping vector surfaced by re-audit;
+        // production bot already keeps amountIn ≤ 0.99 * collateral_to_receive
+        // (worker.rs:2153), so the cap has no operational impact.
+        if (leg1.srcToken == collateralAsset && leg1AmountIn > collateralDelta) revert InvalidPlan();
 
         _dispatchLeg(leg1, leg1AmountIn, leg1RepayBefore);
 
