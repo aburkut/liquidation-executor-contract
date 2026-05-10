@@ -77,6 +77,22 @@ library UniswapLib {
         uint256 minAmountOut;
     }
 
+    /// @dev Defensive zero-check for NO_SWAP legs. NO_SWAP doesn't
+    /// consult any DEX, so every DEX-related field must be zero/empty.
+    /// Currently NO consumer reads these for NO_SWAP, but a regression
+    /// in any future code path would silently inherit an attacker-
+    /// controlled payload. Asserting upstream makes the contract
+    /// regression-proof. Lib-hosted because the OR-chain is too heavy
+    /// for the main contract's EIP-170 budget.
+    function assertNoSwapLegZeroed(SwapLeg memory leg) external pure {
+        if (
+            leg.useFullBalance || leg.deadline != 0 || leg.amountIn != 0 || leg.minAmountOut != 0
+                || leg.paraswapCalldata.length != 0 || leg.bebopTarget != address(0) || leg.bebopCalldata.length != 0
+                || leg.v2Path.length != 0 || leg.v3Fee != 0 || leg.v4PoolManager != address(0)
+                || leg.v4SwapData.length != 0
+        ) revert InvalidPlan();
+    }
+
     // ─── Errors (must match LiquidationExecutor signatures by name) ──
     error InsufficientSrcBalance(uint256 required, uint256 available);
     error InsufficientRepayOutput(uint256 actual, uint256 required);
@@ -337,6 +353,29 @@ library UniswapLib {
     ///   * fee & 0x800000 (dynamic-fee bit)       → InvalidPlan
     ///   * final tokenOut != expectedFinalOut     → InvalidPlan
     ///   * !hookAllowed(h.hook) for non-zero hook → InvalidPlan
+    /// @dev Single-hop V4 leg structural validation. Decodes the 5-tuple
+    /// `v4SwapData` and asserts: non-native tokens, tokenIn==srcToken,
+    /// tokenOut==repayToken, distinct tokens, fee != 0, tickSpacing > 0,
+    /// dynamic-fee bit clear. Returns the hook address for the caller's
+    /// `allowedV4Hooks` re-check (lib has no view of that storage).
+    /// Hosted in lib to keep the byte-heavy decode + check chain off
+    /// the main contract's EIP-170 budget. Reverts use `InvalidPlan` /
+    /// `V4UnexpectedDelta` (lib namespace) — granular V4 errors removed
+    /// from the main contract; tests target `InvalidPlan` selector.
+    function decodeAndValidateV4SingleHopShape(bytes memory data, address srcToken, address repayToken)
+        external
+        pure
+        returns (address hook)
+    {
+        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address h) =
+            abi.decode(data, (address, address, uint24, int24, address));
+        if (
+            tokenIn == address(0) || tokenOut == address(0) || tokenIn != srcToken || tokenOut != repayToken
+                || tokenIn == tokenOut || fee == 0 || tickSpacing <= 0 || fee & 0x800000 != 0
+        ) revert InvalidPlan();
+        return h;
+    }
+
     function decodeAndValidateV4MultihopShape(
         bytes memory data,
         address srcToken,
@@ -377,10 +416,12 @@ library UniswapLib {
     /// `tokenOutDelta_k > 0`. Any other shape (zero output, partial
     /// settlement, positive input) reverts via `V4UnexpectedDelta`.
     function runV4UnlockMultihop(IPoolManager pm, address tokenIn, bytes calldata data) external {
-        (bytes memory hopsBlob, int256 amountSpec, bool isBuy) = abi.decode(data, (bytes, int256, bool));
+        (bytes memory hopsBlob, int256 amountSpec) = abi.decode(data, (bytes, int256));
         V4Hop[] memory hops = abi.decode(hopsBlob, (V4Hop[]));
         uint256 nHops = hops.length;
         if (nHops < 2) revert InvalidPlan();
+        // BUY = positive amountSpec (exact-output target); SELL = negative.
+        bool isBuy = amountSpec > 0;
 
         // The chain of token addresses the swap walks through:
         //   tokens[0] = leg.srcToken (= tokenIn)

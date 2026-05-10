@@ -6996,7 +6996,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidV4Data.selector);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7020,7 +7020,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidV4Data.selector);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7041,7 +7041,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.V4HookNotAllowed.selector, rogueHook));
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7115,6 +7115,10 @@ contract ExecutorTest is Test {
     }
 
     function test_UniV4_zeroPoolManager_reverts() public {
+        // address(0) is rejected by the `allowedTargets[pm]` check
+        // (mapping default is false) → TargetNotAllowed. The previous
+        // explicit ZeroAddress revert was redundant; removing it freed
+        // bytes for the audit-fix pass.
         LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
             address(collateralToken),
             address(loanToken),
@@ -7132,7 +7136,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.execute(plan);
     }
 
@@ -7222,7 +7226,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidV4NativeToken.selector);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7244,7 +7248,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidV4NativeToken.selector);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7267,11 +7271,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.InvalidV4TokenOut.selector, address(loanToken), address(profitToken)
-            )
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7292,9 +7292,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(0), int24(60))
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7315,9 +7313,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(3000), int24(0))
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7338,9 +7334,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(3000), int24(-60))
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7367,11 +7361,7 @@ contract ExecutorTest is Test {
             _buildPlan(99, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.InvalidV4TokenOut.selector, address(loanToken), address(profitToken)
-            )
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -8268,7 +8258,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
                 srcToken: token,
                 amountIn: 0,
                 useFullBalance: false,
-                deadline: block.timestamp + 3600,
+                deadline: 0,
                 paraswapCalldata: "",
                 bebopTarget: address(0),
                 bebopCalldata: "",
@@ -8547,7 +8537,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: false,
-            deadline: block.timestamp + 3600,
+            deadline: 0,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
@@ -8603,7 +8593,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             srcToken: address(collateralToken),
             amountIn: 0,
             useFullBalance: false,
-            deadline: block.timestamp + 3600,
+            deadline: 0,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
@@ -8652,7 +8642,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: false,
-            deadline: block.timestamp + 3600,
+            deadline: 0,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
@@ -8708,7 +8698,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: false,
-            deadline: block.timestamp + 3600,
+            deadline: 0,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",

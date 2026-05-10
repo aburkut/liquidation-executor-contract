@@ -132,12 +132,12 @@ contract LiquidationExecutor is
     error ZeroRepayOutput();
     error InvalidV2Path();
     error InvalidV3Fee(uint24 fee);
-    error InvalidV4Data();
-    error InvalidV4Fee();
-    error InvalidV4TokenOut(address expected, address actual);
-    error InvalidV4NativeToken();
-    error InvalidV4FeeOrSpacing();
-    error V4HookNotAllowed(address hook);
+    // V4-specific granular errors (InvalidV4Data, InvalidV4Fee,
+    // InvalidV4TokenOut, InvalidV4NativeToken, InvalidV4FeeOrSpacing,
+    // V4HookNotAllowed) were removed in the audit-fix pass — single-hop /
+    // multihop validation is hosted in `UniswapLib`, which reverts with
+    // `InvalidPlan` (or `V4UnexpectedDelta` for native-zero token).
+    // Tests target those selectors instead.
     error InvalidV4CallbackHook();
 
     // Profit / payment errors
@@ -204,7 +204,7 @@ contract LiquidationExecutor is
     mapping(address => bool) public allowedTargets;
     /// @dev Owner-curated whitelist of V4 hook contracts. A V4 swap whose
     /// PoolKey references a hook that is neither address(0) nor allow-listed
-    /// reverts with `V4HookNotAllowed`. Hooks run arbitrary code inside
+    /// reverts with `InvalidPlan`. Hooks run arbitrary code inside
     /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
@@ -545,7 +545,7 @@ contract LiquidationExecutor is
     /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.
     /// @dev Hooks execute arbitrary logic during `beforeSwap`/`afterSwap` on the
     /// PoolManager; any non-zero hook that is NOT in this whitelist causes the
-    /// V4 path to revert with `V4HookNotAllowed`. Default is empty — operator
+    /// V4 path to revert with `InvalidPlan`. Default is empty — operator
     /// routes MUST stay on hook-less pools unless the owner explicitly enables
     /// a hook after review.
     function setV4HookAllowed(address hook, bool allowed) external onlyOwner {
@@ -694,12 +694,17 @@ contract LiquidationExecutor is
         if (m == SwapMode.UNI_V2_BUY) m = SwapMode.UNI_V2;
         if (m == SwapMode.UNI_V4_BUY) m = SwapMode.UNI_V4;
 
-        // NO_SWAP: same-token path (e.g. WETH/WETH). Leg-level checks are
-        // skipped; a mismatched src/repay silently early-returns in
-        // _executeSwapPlan and the final flash-repay balance check
-        // reverts if the plan didn't actually produce enough loanToken.
-        if (m == SwapMode.NO_SWAP) return;
+        // NO_SWAP: same-token path (e.g. WETH/WETH). No DEX is
+        // consulted, so every DEX-related field MUST be zero/empty —
+        // defense-in-depth against future consumers reading these
+        // fields without re-checking the mode. The OR-chain is hosted
+        // in UniswapLib to fit the main contract's EIP-170 budget.
+        if (m == SwapMode.NO_SWAP) {
+            UniswapLib.assertNoSwapLegZeroed(_asLibLeg(leg));
+            return;
+        }
 
+        if (block.timestamp > leg.deadline) revert SwapDeadlineExpired(leg.deadline, block.timestamp);
         if (leg.srcToken == leg.repayToken) revert InvalidPlan();
 
         // Paraswap/Bebop: reject useFullBalance (amountIn is inside calldata).
@@ -758,14 +763,10 @@ contract LiquidationExecutor is
     function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
         Plan memory plan = abi.decode(planData, (Plan));
 
-        // Deadline: check leg1 and leg2 pre-flashloan. block.timestamp is
-        // monotonic within a transaction, so no in-pipeline re-check needed.
-        if (block.timestamp > plan.swapPlan.leg1.deadline) {
-            revert SwapDeadlineExpired(plan.swapPlan.leg1.deadline, block.timestamp);
-        }
-        if (plan.swapPlan.hasLeg2 && block.timestamp > plan.swapPlan.leg2.deadline) {
-            revert SwapDeadlineExpired(plan.swapPlan.leg2.deadline, block.timestamp);
-        }
+        // Deadline check is hoisted into `_validateLeg` (after the NO_SWAP
+        // early-return) so NO_SWAP legs with deadline=0 are exempt and the
+        // selector lives at one revert site. block.timestamp is monotonic
+        // within a transaction, so no in-pipeline re-check needed.
 
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
@@ -1077,7 +1078,14 @@ contract LiquidationExecutor is
                 collateralAssetAfter > collateralAssetBefore ? collateralAssetAfter - collateralAssetBefore : 0;
         }
 
-        _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset, collateralDelta);
+        // flashFee is the flashloan provider's fee for this advance.
+        // Subtracted from `collateralDelta` (the bonus collateral) when
+        // computing surplus for parallel-split branches — keeps pre-
+        // existing executor balance OUT of the swap-plan accounting.
+        // Underflow → loss-making opp; native Panic(0x11) is a fail-
+        // closed signal the operator should never have submitted.
+        uint256 flashFee = flashRepayAmount - plan.loanAmount;
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount, flashFee, collateralAsset, collateralDelta);
 
         // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
         // BEFORE flash repay. This is the authoritative base that ACTION_PAY_COINBASE
@@ -1173,6 +1181,7 @@ contract LiquidationExecutor is
     function _executeSwapPlan(
         SwapPlan memory plan,
         uint256 flashRepayAmount,
+        uint256 flashFee,
         address collateralAsset,
         uint256 collateralDelta
     ) internal {
@@ -1246,11 +1255,27 @@ contract LiquidationExecutor is
             // mode silently degrade into a no-op profit leg.
             if (collateralAsset == address(0)) revert InvalidPlan();
 
-            // NO_SWAP + hasMixedSplit (same-asset path): sweep
-            // `loanBalance - flashRepayAmount` through leg2; residual
-            // settles the flashloan. Underflow → native Panic(0x11).
+            // NO_SWAP + hasMixedSplit (same-asset path): sweep ONLY
+            // the new value added by THIS opp through leg2 — i.e.
+            // `collateralDelta - flashFee` (bonus collateral minus
+            // the cost of borrowing). Pre-existing balance and the
+            // flashloan principal stay reserved for repay.
+            //
+            // Audit fix (5-agent convergence): the prior formula
+            // `leg1RepayBefore - flashRepayAmount` measured ABSOLUTE
+            // post-liquidation balance, which includes any pre-existing
+            // executor balance of loanToken (== collateralAsset for
+            // this same-asset branch). That delta-vs-absolute asymmetry
+            // contradicted the design used by every other multi-leg
+            // branch (SPLIT, MIXED_SPLIT non-NO_SWAP) where leg2 is
+            // sized strictly off `collateralDelta`. The fixed formula
+            // restores that invariant.
+            //
+            // Underflow (collateralDelta < flashFee) means the opp is
+            // loss-making; native Panic(0x11) is a fail-closed signal
+            // — operator should never have submitted it.
             if (leg1.mode == SwapMode.NO_SWAP) {
-                _dispatchLeg(plan.leg2, leg1RepayBefore - flashRepayAmount, 0);
+                _dispatchLeg(plan.leg2, collateralDelta - flashFee, 0);
                 return;
             }
 
@@ -1410,25 +1435,18 @@ contract LiquidationExecutor is
     function _validateV4Leg(SwapLeg memory leg) internal view {
         if (leg.minAmountOut == 0) revert InvalidPlan();
 
-        address pm = leg.v4PoolManager;
-        if (pm == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pm]) revert TargetNotAllowed();
+        // pm == address(0) caught by `!allowedTargets[pm]` since
+        // mapping default is false — saves an explicit ZeroAddress
+        // revert for the EIP-170 budget. Tests expect TargetNotAllowed.
+        if (!allowedTargets[leg.v4PoolManager]) revert TargetNotAllowed();
 
         uint256 dataLen = leg.v4SwapData.length;
         if (dataLen == V4_SWAP_DATA_LENGTH) {
-            // Single-hop: legacy 5-tuple layout.
-            (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
-                abi.decode(leg.v4SwapData, (address, address, uint24, int24, address));
-
-            if (tokenIn == address(0) || tokenOut == address(0)) revert InvalidV4NativeToken();
-            if (tokenIn != leg.srcToken) revert InvalidV4Data();
-            if (tokenOut != leg.repayToken) revert InvalidV4TokenOut(leg.repayToken, tokenOut);
-            if (tokenIn == tokenOut) revert InvalidV4Data();
-
-            if (fee == 0 || tickSpacing <= 0) revert InvalidV4FeeOrSpacing();
-            if (fee & 0x800000 != 0) revert InvalidV4Fee();
-
-            if (hook != address(0) && !allowedV4Hooks[hook]) revert V4HookNotAllowed(hook);
+            // Single-hop: structural validation lives in UniswapLib.
+            // Returns the decoded hook address; main keeps the
+            // storage-bound allowlist re-check.
+            address hook = UniswapLib.decodeAndValidateV4SingleHopShape(leg.v4SwapData, leg.srcToken, leg.repayToken);
+            if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidPlan();
         } else if (dataLen > V4_SWAP_DATA_LENGTH) {
             // Multihop: full validation lives in UniswapLib. The lib
             // walks every hop (structural checks + per-hop hook
@@ -1439,7 +1457,8 @@ contract LiquidationExecutor is
                 leg.v4SwapData, leg.srcToken, leg.repayToken, this.isV4HookAllowed
             );
         } else {
-            revert InvalidV4Data();
+            // dataLen < V4_SWAP_DATA_LENGTH (malformed: short payload).
+            revert InvalidPlan();
         }
     }
 
@@ -1479,8 +1498,12 @@ contract LiquidationExecutor is
         // is `tokenInDelta < 0 && tokenOutDelta > 0`, which holds for
         // either direction of `amountSpecified` AND for every multihop
         // sub-swap.
-        bool isBuy = leg.mode == SwapMode.UNI_V4_BUY;
-        int256 amountSpec = isBuy ? int256(leg.minAmountOut) : -int256(amountIn);
+        // Sign of amountSpec discriminates the V4 swap direction:
+        //   negative = exact-input  (SELL, UNI_V4)
+        //   positive = exact-output (BUY,  UNI_V4_BUY)
+        // The unlock callback derives isBuy = amountSpec > 0 — no need
+        // to pass a separate bool through the wire.
+        int256 amountSpec = leg.mode == SwapMode.UNI_V4_BUY ? int256(leg.minAmountOut) : -int256(amountIn);
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
 
@@ -1502,20 +1525,28 @@ contract LiquidationExecutor is
         // abi.decode entry point. The single-hop callback re-decodes
         // the 160 inner bytes as a 5-tuple; multihop re-decodes them as
         // V4Hop[]. Main never has to crack the inner shape.
-        IPoolManager(pm).unlock(abi.encode(leg.v4SwapData, amountSpec, isBuy));
+        IPoolManager(pm).unlock(abi.encode(leg.v4SwapData, amountSpec));
         _activeV4PoolManager = address(0);
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
-        // BUY: enforce `consumed <= amountInMax` post-unlock. The V4
-        // PoolManager has no client-side input ceiling so the executor
-        // must police it — otherwise an honest-but-thin pool could pull
-        // more srcToken than the operator approved (subject to whatever
-        // pre-existing balance the executor happened to hold). amountIn
-        // here is the on-wire `amountInMaximum` field.
-        uint256 consumed = isBuy ? srcBal - IERC20(tokenIn).balanceOf(address(this)) : amountIn;
-        if (isBuy && consumed > amountIn) revert InsufficientSrcBalance(consumed, amountIn);
+        // Enforce `consumed <= amountIn` post-unlock for BOTH SELL and
+        // BUY. The V4 PoolManager has no client-side input ceiling so
+        // the executor must police it — otherwise an honest-but-thin
+        // pool (or hostile hook in a multihop) could pull more srcToken
+        // than the operator approved (bounded only by whatever pre-
+        // existing balance the executor happened to hold).
+        //   * BUY:  amountIn is the on-wire `amountInMaximum` field.
+        //   * SELL: amountIn is the exact-input target. An honest PM
+        //           returns owedIn == amountIn; the check fires if
+        //           the PM (or any hop in a multihop chain) pulled
+        //           more, regardless of the cause.
+        // Audit fix (lead): symmetrize with BUY — the pre-fix code
+        // gated the check on `isBuy`, leaving SELL silently exposed
+        // to over-pulls.
+        uint256 consumed = srcBal - IERC20(tokenIn).balanceOf(address(this));
+        if (consumed > amountIn) revert InsufficientSrcBalance(consumed, amountIn);
 
         // emittedFee = 0: the per-hop / single-hop fee lives inside
         // leg.v4SwapData and the call trace; off-chain consumers
@@ -1550,11 +1581,14 @@ contract LiquidationExecutor is
         _activeV4TokenIn = address(0); // CLAIM
 
         // Uniform unlock-data shape for single-hop AND multihop:
-        //   abi.encode(bytes inner, int256 amountSpec, bool isBuy)
+        //   abi.encode(bytes inner, int256 amountSpec)
         // where `inner` is the leg's `v4SwapData` passed verbatim by
         // `_executeUniV4Leg`. inner.length distinguishes the modes:
         //   == V4_SWAP_DATA_LENGTH (160) → single-hop 5-tuple inside
         //   >  V4_SWAP_DATA_LENGTH       → multihop V4Hop[] inside
+        // Sign of `amountSpec` discriminates SELL (negative=exact-in)
+        // vs BUY (positive=exact-out) — the multihop lib derives this
+        // from `amountSpec > 0` instead of taking a separate flag.
         // Multihop hook allowlist re-check is intentionally NOT run
         // here: the pre-flashloan validator (_validateV4Leg) already
         // walked every hop and asserted `allowedV4Hooks[hook]`. The
@@ -1562,7 +1596,7 @@ contract LiquidationExecutor is
         // verbatim — there is no substitution surface inside one
         // transaction. The single-hop branch keeps its callback-time
         // re-check for parity with the pre-multihop production scope.
-        (bytes memory inner, int256 amountSpec,) = abi.decode(data, (bytes, int256, bool));
+        (bytes memory inner, int256 amountSpec) = abi.decode(data, (bytes, int256));
         if (inner.length == V4_SWAP_DATA_LENGTH) {
             (, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
                 abi.decode(inner, (address, address, uint24, int24, address));
