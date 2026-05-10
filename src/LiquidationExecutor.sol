@@ -1194,7 +1194,8 @@ contract LiquidationExecutor is
         //   * NO_SWAP + hasMixedSplit (e.g. USDC/USDC with WETH bribe):
         //     leg2 still has to run on the residual collateral. Fall
         //     through to the hasMixedSplit branch below, where the
-        //     leg2.amountIn is computed as `collateralDelta - flashRepayAmount`.
+        //     leg2.amountIn is computed as `collateralDelta - flashFee`
+        //     (audit-fix #1 — was `leg1RepayBefore - flashRepayAmount`).
         if (leg1.mode == SwapMode.NO_SWAP && !plan.hasMixedSplit) return;
 
         address finalRepayToken = (plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken);

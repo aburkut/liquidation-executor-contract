@@ -6017,6 +6017,43 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
+    /// @dev Positive test for the leg1.amountIn ≤ collateralDelta cap.
+    /// Submitting `leg1.amountIn = collateralDelta + 1` for a leg whose
+    /// srcToken IS the collateralAsset must revert InvalidPlan — the cap
+    /// closes the operator-coinbase dipping vector. Skip-unwrap legs
+    /// (srcToken = aToken) are exempt and tested separately by the
+    /// existing `test_skipUnwrap_aTokenSrc_skipsPoolWithdraw` flow.
+    function test_leg1AmountIn_exceedsCollateralDelta_reverts() public {
+        // collateralDelta = COLLATERAL_REWARD by default.
+        uint256 oversized = COLLATERAL_REWARD + 1;
+        collateralToken.mint(address(executor), oversized); // dust the cap is supposed to reject
+
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildUniV2SwapPlan(address(collateralToken), address(loanToken), oversized, 1, 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// @dev Boundary test for the cap — `leg1.amountIn == collateralDelta`
+    /// must succeed. Pins the inequality at strict greater-than and
+    /// guards against accidental tightening to >=.
+    function test_leg1AmountIn_equalsCollateralDelta_succeeds() public {
+        // COLLATERAL_REWARD covers flash repay at SWAP_RATE 1.1x.
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildUniV2SwapPlan(address(collateralToken), address(loanToken), COLLATERAL_REWARD, 1, 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan); // no revert
+    }
+
     function test_UniV3_minAmountOut_enforced() public {
         // Router returns below minAmountOut → mock reverts internally.
         uniV3Mock.setRate(0.5e18); // well under any reasonable min
@@ -8345,6 +8382,31 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         // No revert on validation (no InvalidPlan / InvalidLegLink).
         vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    /// @dev Positive test for the harden — assertNoSwapLegZeroed must reject
+    /// NO_SWAP legs whose srcToken != repayToken. To exercise the new
+    /// helper assertion (vs the upstream finalRepayToken==loanToken /
+    /// SrcTokenNotCollateral checks that ALSO revert InvalidPlan) we
+    /// shape the plan so those upstream checks all pass:
+    ///   * action.collateralAsset = loanToken (so srcToken==loanToken
+    ///     satisfies SrcTokenNotCollateral)
+    ///   * leg1.srcToken = loanToken
+    ///   * leg1.repayToken = loanToken (== plan.loanToken — passes
+    ///     finalRepayToken check)
+    /// then we corrupt one of the supposedly-zeroed fields so
+    /// `assertNoSwapLegZeroed` is the FIRST thing to revert.
+    function test_noSwap_validateLeg_rejectsNonZeroDexField() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildNoSwapPlan(address(loanToken), 0);
+        swapPlan.leg1.v3Fee = 3000; // NO_SWAP must not carry DEX fields
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
