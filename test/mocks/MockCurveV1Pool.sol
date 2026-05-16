@@ -21,6 +21,19 @@ contract MockCurveV1Pool {
     uint256 public rate; // 1e18 == 1:1
     bool public revertNext;
 
+    // Per-selector hit counters — let tests assert that the lib routed
+    // to the exact selector requested by `useUnderlying`. Without these
+    // a useUnderlying=true test would silently pass even if the lib
+    // dispatched to `exchange` (since the mock executes both identically).
+    uint256 public exchangeCalls;
+    uint256 public exchangeUnderlyingCalls;
+
+    // When true, return zero bytes from the call (mimics older Curve
+    // pools whose `exchange` signature was `void`). The library MUST
+    // tolerate a void return — it relies on the balance delta, not the
+    // declared return value.
+    bool public voidReturn;
+
     constructor(address coin0, address coin1, uint256 _rate) {
         coins.push(coin0);
         coins.push(coin1);
@@ -35,12 +48,35 @@ contract MockCurveV1Pool {
         revertNext = _r;
     }
 
+    function setVoidReturn(bool _v) external {
+        voidReturn = _v;
+    }
+
     function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) external returns (uint256 dy) {
-        return _exchange(i, j, dx, min_dy);
+        exchangeCalls += 1;
+        dy = _exchange(i, j, dx, min_dy);
+        // Older 3pool/USDC contracts declared `exchange` as `void`
+        // (no return). Solidity-generated wrappers happily ignore the
+        // declared uint256 return type when zero bytes come back. We
+        // truncate the return frame by reverting cleanly via assembly
+        // only when `voidReturn` is armed.
+        if (voidReturn) {
+            assembly {
+                return(0, 0)
+            }
+        }
+        return dy;
     }
 
     function exchange_underlying(int128 i, int128 j, uint256 dx, uint256 min_dy) external returns (uint256 dy) {
-        return _exchange(i, j, dx, min_dy);
+        exchangeUnderlyingCalls += 1;
+        dy = _exchange(i, j, dx, min_dy);
+        if (voidReturn) {
+            assembly {
+                return(0, 0)
+            }
+        }
+        return dy;
     }
 
     function _exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) internal returns (uint256 dy) {
