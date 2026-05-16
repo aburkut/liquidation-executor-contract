@@ -57,7 +57,11 @@ library UniswapLib {
         NO_SWAP,
         UNI_V3_BUY,
         UNI_V2_BUY,
-        UNI_V4_BUY
+        UNI_V4_BUY,
+        CURVE_V1,
+        CURVE_V1_BUY,
+        BAL_V2,
+        BAL_V2_BUY
     }
 
     struct SwapLeg {

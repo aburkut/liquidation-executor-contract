@@ -49,9 +49,16 @@ library SwapLegExecutorLib {
     error ParaswapSrcTokenMismatch(address expected, address actual);
     error ParaswapAmountInMismatch(uint256 expected, uint256 actual);
     error ParaswapDstTokenUnexpected(address dstToken);
+    // Bebop
+    error BebopTargetNotContract();
+    error BebopSwapFailed();
+    error TargetNotAllowed();
 
     // ─── Events (match LiquidationExecutor signatures; emitted under DELEGATECALL) ──
     event ParaswapSwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
+    event BebopSwapExecuted(
+        address indexed target, address indexed srcToken, uint256 amountIn, uint256 repayDelta, uint256 profitDelta
+    );
 
     // ─── Paraswap single leg ─────────────────────────────────────────
     /// @dev Orchestrates decode → approve → call → reset → delta check.
@@ -95,5 +102,38 @@ library SwapLegExecutorLib {
         if (amountOut < minAmountOut) revert InsufficientRepayOutput(amountOut, minAmountOut);
 
         emit ParaswapSwapExecuted(srcToken, dstToken, actualIn, amountOut);
+    }
+
+    // ─── Bebop multi leg ─────────────────────────────────────────────
+    /// @dev Executes opaque Bebop settlement call.
+    ///
+    /// Moved from `LiquidationExecutor._executeBebopLeg` (inline) to free
+    /// ~150 bytes of main runtime bytecode for Curve V1 + Balancer V2
+    /// dispatch branches. Identical control flow; the caller now passes
+    /// `allowedTargets[leg.bebopTarget]` as a bool argument since the
+    /// storage mapping isn't directly visible from the library (would
+    /// require slot-pinning assembly — the bool plumbing is cheaper).
+    ///
+    /// Security model unchanged: allowlist re-check + exact-approval pair
+    /// + output delta floor.
+    function executeBebopLeg(UniswapLib.SwapLeg memory leg, uint256 repayBefore, bool isTargetAllowed) external {
+        address target = leg.bebopTarget;
+        if (target.code.length == 0) revert BebopTargetNotContract();
+        if (!isTargetAllowed) revert TargetNotAllowed();
+
+        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
+        if (srcBal < leg.amountIn) revert InsufficientSrcBalance(leg.amountIn, srcBal);
+
+        IERC20(leg.srcToken).forceApprove(target, leg.amountIn);
+        (bool ok,) = target.call(leg.bebopCalldata);
+        IERC20(leg.srcToken).forceApprove(target, 0);
+
+        if (!ok) revert BebopSwapFailed();
+
+        uint256 repayAfter = IERC20(leg.repayToken).balanceOf(address(this));
+        uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
+        if (repayDelta < leg.minAmountOut) revert InsufficientRepayOutput(repayDelta, leg.minAmountOut);
+
+        emit BebopSwapExecuted(target, leg.srcToken, leg.amountIn, repayDelta, 0);
     }
 }

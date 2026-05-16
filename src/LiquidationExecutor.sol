@@ -17,6 +17,8 @@ import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
 import {ParaswapDecoderLib} from "./libraries/ParaswapDecoderLib.sol";
 import {SwapLegExecutorLib} from "./libraries/SwapLegExecutorLib.sol";
 import {UniswapLib} from "./libraries/UniswapLib.sol";
+import {CurveV1Lib} from "./libraries/CurveV1Lib.sol";
+import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -264,6 +266,22 @@ contract LiquidationExecutor is
     event UniV4SwapExecuted(
         address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
     );
+    /// @dev Emitted by `CurveV1Lib.executeLeg` under DELEGATECALL.
+    /// `pool` is the StableSwap V1 pool address (or its lending wrapper);
+    /// declared here so the contract's external ABI surfaces the event.
+    event CurveV1SwapExecuted(
+        address indexed pool, address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut
+    );
+    /// @dev Emitted by `BalancerV2Lib.executeLeg` under DELEGATECALL.
+    /// `kind` is the SwapKind enum (0=GIVEN_IN/SELL, 1=GIVEN_OUT/BUY).
+    event BalancerV2SwapExecuted(
+        bytes32 indexed poolId,
+        address indexed srcToken,
+        address indexed dstToken,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint8 kind
+    );
     event TwoLegSwapExecuted(
         address indexed intermediateToken,
         uint256 leg1AmountIn,
@@ -301,7 +319,31 @@ contract LiquidationExecutor is
         // contract additionally enforces `consumed <= amountInMax` —
         // the V4 PM has no client-side input ceiling, so the executor
         // must police it. leg1-only (mirrors UNI_V3_BUY scope).
-        UNI_V4_BUY
+        UNI_V4_BUY,
+        // Curve StableSwap V1 SELL — calls pool.exchange(int128 i,
+        // int128 j, uint256 dx, uint256 min_dy) (or exchange_underlying
+        // for lending pools). Pool address comes from `bebopTarget`;
+        // (i, j, useUnderlying) packed into `bebopCalldata` as
+        // abi.encode(int128, int128, bool). The Curve quoter on the
+        // bot side precomputes the indices and pool address.
+        // Implementation: CurveV1Lib.executeLeg.
+        CURVE_V1,
+        // Curve V1 BUY — Curve has no native exact-out. Bot precomputes
+        // `dx` such that get_dy(dx) >= targetOut, packs `dx` as
+        // `amountIn` and `targetOut` as `minAmountOut`. The on-chain
+        // swap is identical to CURVE_V1; only the event label flips.
+        // Excess output (rounding overage) stays on the executor.
+        CURVE_V1_BUY,
+        // Balancer V2 SELL — Vault.swap with SwapKind.GIVEN_IN. Vault
+        // address from `bebopTarget`; poolId + userData packed into
+        // `bebopCalldata` as abi.encode(bytes32, bytes).
+        // Implementation: BalancerV2Lib.executeLeg.
+        BAL_V2,
+        // Balancer V2 BUY — Vault.swap with SwapKind.GIVEN_OUT. Native
+        // exact-out support: amount = targetOut, limit = maxIn (=
+        // leg.amountIn). The Vault consumes ≤ limit and credits
+        // exact targetOut. Same lib as BAL_V2.
+        BAL_V2_BUY
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
@@ -693,6 +735,8 @@ contract LiquidationExecutor is
         if (m == SwapMode.UNI_V3_BUY) m = SwapMode.UNI_V3;
         if (m == SwapMode.UNI_V2_BUY) m = SwapMode.UNI_V2;
         if (m == SwapMode.UNI_V4_BUY) m = SwapMode.UNI_V4;
+        if (m == SwapMode.CURVE_V1_BUY) m = SwapMode.CURVE_V1;
+        if (m == SwapMode.BAL_V2_BUY) m = SwapMode.BAL_V2;
 
         // NO_SWAP: same-token path (e.g. WETH/WETH). No DEX is
         // consulted, so every DEX-related field MUST be zero/empty —
@@ -754,6 +798,34 @@ contract LiquidationExecutor is
             if (leg.minAmountOut == 0) revert InvalidPlan();
         } else if (m == SwapMode.UNI_V4) {
             _validateV4Leg(leg);
+        } else if (m == SwapMode.CURVE_V1) {
+            // Curve V1 SELL/BUY. Pool address comes from `bebopTarget`
+            // (re-used as the generic "external swap target"); allowlist
+            // re-check happens inside CurveV1Lib at dispatch. Encoded
+            // ext-data carries (int128 i, int128 j, bool useUnderlying)
+            // — abi.encode minimum size = 3 * 32 = 96 bytes.
+            //
+            // amountIn is intentionally NOT validated here — leg2 with
+            // useFullBalance=true (sequential + split plans) carries a
+            // zero amountIn that's filled in at runtime from the
+            // measured leg1 leftover. The library re-asserts
+            // amountIn > 0 at dispatch (`ZeroSwapInput`).
+            if (leg.bebopTarget == address(0)) revert InvalidPlan();
+            if (leg.bebopCalldata.length < 96) revert InvalidPlan();
+            if (leg.minAmountOut == 0) revert InvalidPlan();
+        } else if (m == SwapMode.BAL_V2) {
+            // Balancer V2 SELL/BUY. Vault address from `bebopTarget`;
+            // poolId + userData packed in `bebopCalldata` as
+            // abi.encode(bytes32, bytes) — minimum encoding includes
+            // the 32-byte poolId plus a 64-byte dynamic-bytes tail
+            // (offset + length, even when userData is empty) = 96 bytes.
+            //
+            // amountIn validation: same reasoning as CURVE_V1 — deferred
+            // to lib's runtime `ZeroSwapInput` check so useFullBalance=true
+            // leg2 plans (where amountIn = 0 on-wire) are accepted.
+            if (leg.bebopTarget == address(0)) revert InvalidPlan();
+            if (leg.bebopCalldata.length < 96) revert InvalidPlan();
+            if (leg.minAmountOut == 0) revert InvalidPlan();
         } else {
             revert InvalidSwapMode();
         }
@@ -827,8 +899,19 @@ contract LiquidationExecutor is
             // break skip-unwrap sequential plans (receiveAToken=true →
             // leg1 NO_SWAP → leg2 peg-pool swap). Reject at validation.
             if (plan.swapPlan.leg1.mode == SwapMode.NO_SWAP) revert PlanShapeConflict();
+            // Leg2 (the repay/profit-leg in sequential plans) MUST be a
+            // SELL-side mode that accepts a runtime amountIn — leg1's
+            // output is measured at runtime and fed to leg2's input
+            // selector. Curve V1 SELL and Balancer V2 SELL qualify
+            // alongside the Uni-V2/V3/V4 SELL modes. BUY variants are
+            // structurally invalid here: their `amountIn` is a maximum,
+            // not the actual input, which would desync the leg-link
+            // balance accounting.
             SwapMode m2 = plan.swapPlan.leg2.mode;
-            if (m2 != SwapMode.UNI_V2 && m2 != SwapMode.UNI_V3 && m2 != SwapMode.UNI_V4) {
+            if (
+                m2 != SwapMode.UNI_V2 && m2 != SwapMode.UNI_V3 && m2 != SwapMode.UNI_V4 && m2 != SwapMode.CURVE_V1
+                    && m2 != SwapMode.BAL_V2
+            ) {
                 revert Leg2ModeNotAllowed(uint8(m2));
             }
             if (plan.swapPlan.leg1.repayToken != plan.swapPlan.leg2.srcToken) {
@@ -845,10 +928,20 @@ contract LiquidationExecutor is
         if (plan.swapPlan.hasSplit) {
             uint16 bps = plan.swapPlan.splitBps;
             if (bps == 0 || bps >= 10_000) revert InvalidPlan();
+            // SPLIT mode requires both legs to accept an explicit
+            // amountIn at dispatch (sized at runtime to splitBps of the
+            // collateral delta). Same SELL-side allowlist as hasLeg2 —
+            // Uni V2/V3/V4 plus Curve V1 / Balancer V2.
             SwapMode m1 = plan.swapPlan.leg1.mode;
-            if (m1 != SwapMode.UNI_V2 && m1 != SwapMode.UNI_V3 && m1 != SwapMode.UNI_V4) revert InvalidPlan();
+            if (
+                m1 != SwapMode.UNI_V2 && m1 != SwapMode.UNI_V3 && m1 != SwapMode.UNI_V4 && m1 != SwapMode.CURVE_V1
+                    && m1 != SwapMode.BAL_V2
+            ) revert InvalidPlan();
             SwapMode mp = plan.swapPlan.leg2.mode;
-            if (mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4) revert InvalidPlan();
+            if (
+                mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4 && mp != SwapMode.CURVE_V1
+                    && mp != SwapMode.BAL_V2
+            ) revert InvalidPlan();
             if (plan.swapPlan.leg2.repayToken != weth) revert InvalidPlan();
             if (collateralAsset != address(0) && plan.swapPlan.leg2.srcToken != collateralAsset) {
                 revert InvalidPlan();
@@ -885,8 +978,15 @@ contract LiquidationExecutor is
             }
             if (plan.swapPlan.leg1.repayToken != plan.loanToken) revert InvalidPlan();
 
+            // MIXED_SPLIT leg2 (profit leg, coll → WETH) — same SELL-side
+            // allowlist. Balancer 80/20 BAL/WETH and similar weighted
+            // pools are the realistic Curve/Balancer leg2 candidates;
+            // Curve's WETH coverage is thin but legal.
             SwapMode mp = plan.swapPlan.leg2.mode;
-            if (mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4) {
+            if (
+                mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4 && mp != SwapMode.CURVE_V1
+                    && mp != SwapMode.BAL_V2
+            ) {
                 revert InvalidPlan();
             }
             if (plan.swapPlan.leg2.repayToken != weth) revert InvalidPlan();
@@ -898,11 +998,12 @@ contract LiquidationExecutor is
             }
             // PARASWAP_SINGLE / BEBOP_MULTI embed `amountIn` in calldata
             // — that's fine here (leg1 runs first, we measure what it
-            // consumed). For Uni leg1 modes we still require an explicit
-            // amountIn inside the leg struct because Uni executors read
-            // it at dispatch time.
+            // consumed). All other dispatch-time leg1 modes (Uni V2/V3/V4
+            // + Curve V1 + Balancer V2, both SELL and BUY) read amountIn
+            // from the struct, so a zero here would silently emit a
+            // zero-input swap call.
             if (
-                (m1 == SwapMode.UNI_V2 || m1 == SwapMode.UNI_V3 || m1 == SwapMode.UNI_V4)
+                m1 != SwapMode.PARASWAP_SINGLE && m1 != SwapMode.BEBOP_MULTI && m1 != SwapMode.NO_SWAP
                     && plan.swapPlan.leg1.amountIn == 0
             ) {
                 revert ZeroAmountIn();
@@ -1364,7 +1465,7 @@ contract LiquidationExecutor is
         if (m == SwapMode.PARASWAP_SINGLE) {
             SwapLegExecutorLib.executeParaswapLeg(libLeg, paraswapAugustusV6);
         } else if (m == SwapMode.BEBOP_MULTI) {
-            _executeBebopLeg(leg, outBefore);
+            SwapLegExecutorLib.executeBebopLeg(libLeg, outBefore, allowedTargets[leg.bebopTarget]);
         } else if (m == SwapMode.UNI_V2 || m == SwapMode.UNI_V2_BUY) {
             UniswapLib.executeUniV2Leg(libLeg, amountIn, uniV2Router);
         } else if (m == SwapMode.UNI_V3 || m == SwapMode.UNI_V3_BUY) {
@@ -1377,6 +1478,16 @@ contract LiquidationExecutor is
             //   == V4_SWAP_DATA_LENGTH (160) → single-hop
             //   >  V4_SWAP_DATA_LENGTH       → multihop (V4Hop[] payload)
             _executeUniV4Leg(leg, amountIn);
+        } else if (m == SwapMode.CURVE_V1 || m == SwapMode.CURVE_V1_BUY) {
+            // Curve StableSwap V1. SELL and BUY produce identical
+            // on-chain swaps; the bot precomputes `dx` for BUY so that
+            // get_dy(dx) >= targetOut (Curve has no native exact-out).
+            CurveV1Lib.executeLeg(libLeg, amountIn, allowedTargets[leg.bebopTarget]);
+        } else if (m == SwapMode.BAL_V2 || m == SwapMode.BAL_V2_BUY) {
+            // Balancer V2. SwapKind flips inside the library based on
+            // `leg.mode` (GIVEN_IN for SELL, GIVEN_OUT for BUY — native
+            // exact-out support).
+            BalancerV2Lib.executeLeg(libLeg, amountIn, allowedTargets[leg.bebopTarget]);
         } else {
             revert InvalidSwapMode();
         }
@@ -1399,28 +1510,10 @@ contract LiquidationExecutor is
     // Paraswap single leg moved to SwapLegExecutorLib (external library,
     // DELEGATECALL). See `_dispatchLeg` for the call site.
 
-    // ─── Internal: Bebop Multi ───────────────────────────────────────
-    /// @dev Executes opaque Bebop settlement call. Security: allowlist + exact approval + output delta checks.
-    function _executeBebopLeg(SwapLeg memory leg, uint256 repayBefore) internal {
-        address target = leg.bebopTarget;
-        if (target.code.length == 0) revert BebopTargetNotContract();
-        if (!allowedTargets[target]) revert TargetNotAllowed();
-
-        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
-        if (srcBal < leg.amountIn) revert InsufficientSrcBalance(leg.amountIn, srcBal);
-
-        IERC20(leg.srcToken).forceApprove(target, leg.amountIn);
-        (bool ok,) = target.call(leg.bebopCalldata);
-        IERC20(leg.srcToken).forceApprove(target, 0);
-
-        if (!ok) revert BebopSwapFailed();
-
-        uint256 repayAfter = IERC20(leg.repayToken).balanceOf(address(this));
-        uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
-        if (repayDelta < leg.minAmountOut) revert InsufficientRepayOutput(repayDelta, leg.minAmountOut);
-
-        emit BebopSwapExecuted(target, leg.srcToken, leg.amountIn, repayDelta, 0);
-    }
+    // Bebop multi leg moved to SwapLegExecutorLib (external library,
+    // DELEGATECALL) — frees ~150 bytes of main runtime bytecode needed
+    // for Curve V1 + Balancer V2 dispatch branches. See `_dispatchLeg`
+    // for the call site.
 
     // Uniswap V2 + V3 + V4 leg execution moved to UniswapLib (external
     // library, DELEGATECALL). See `_dispatchLeg` and `unlockCallback`
