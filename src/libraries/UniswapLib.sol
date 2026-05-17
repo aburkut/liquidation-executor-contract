@@ -263,7 +263,14 @@ library UniswapLib {
     /// so the endpoint addresses sit at fixed offsets regardless of
     /// the number of intermediate hops.
     function _v3PathEndpoints(bytes memory path) private pure returns (address first, address last) {
-        require(path.length >= 40, "V3Path: too short");
+        // A valid Uniswap V3 path is (token 20 + fee 3 + token 20) = 43 bytes
+        // minimum (single hop). The prior `>= 40` cutoff allowed degenerate
+        // lengths 40-42 where the first-20-byte and last-20-byte loads sit
+        // adjacent or overlap. Tightened to 43 so the lib's precondition
+        // matches the actual V3-path invariant — defense-in-depth even
+        // though the only existing caller is pre-gated by `_validateLeg`'s
+        // `length < 66` check.
+        require(path.length >= 43, "V3Path: too short");
         uint256 len = path.length;
         assembly {
             // Memory layout: path[0..32]=length prefix, path[32..32+len]=data.
@@ -394,11 +401,25 @@ library UniswapLib {
         V4Hop[] memory hopArr = abi.decode(data, (V4Hop[]));
         uint256 nHops = hopArr.length;
         if (nHops < 2) revert InvalidPlan();
+        // Reject non-simple paths: every hop's tokenOut must be unique
+        // and must NOT equal srcToken. The prior validator only blocked
+        // immediate self-loops (curIn == h.tokenOut). Multi-hop paths
+        // that revisit srcToken mid-route (e.g. A→B→A→C) or revisit any
+        // earlier hop's output (A→B→C→B→D) passed the old check but
+        // create implicit aliasing in PoolManager's credit ledger that
+        // downstream `consumed > amountIn` reverts catch only for the
+        // BUY direction. Defense-in-depth: surface non-simple paths at
+        // validation time so SELL has a symmetric reject path too.
         address curIn = srcToken;
         for (uint256 i = 0; i < nHops; i++) {
             V4Hop memory h = hopArr[i];
             if (h.tokenOut == address(0)) revert V4UnexpectedDelta();
             if (curIn == h.tokenOut) revert InvalidPlan();
+            if (h.tokenOut == srcToken) revert InvalidPlan();
+            // Ensure no earlier hop already produced this tokenOut.
+            for (uint256 j = 0; j < i; j++) {
+                if (hopArr[j].tokenOut == h.tokenOut) revert InvalidPlan();
+            }
             if (h.fee == 0 || h.tickSpacing <= 0) revert InvalidPlan();
             if (h.fee & 0x800000 != 0) revert InvalidPlan();
             if (h.hook != address(0) && !hookAllowed(h.hook)) revert InvalidPlan();

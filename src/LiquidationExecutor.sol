@@ -210,6 +210,18 @@ contract LiquidationExecutor is
     /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
+    /// @dev Dedicated narrow allowlist for Curve V1 / Balancer V2 pool
+    /// targets used by the CURVE_V1 and BAL_V2 swap modes. Separating
+    /// this from the generic `allowedTargets` set closes a selector-
+    /// collision surface: if any contract in `allowedTargets` (Aave
+    /// pool, Paraswap Augustus, Bebop, Uni routers, etc.) happens to
+    /// implement Curve's `exchange(int128,int128,uint256,uint256)`
+    /// selector (0x3df02124) or `exchange_underlying` (0xa6417ed6) —
+    /// or Balancer's `swap(SingleSwap, FundManagement, ...)` selector —
+    /// with side-effects, the operator could otherwise route a swap to
+    /// it. Pool addresses MUST be added to BOTH mappings (the broader
+    /// `allowedTargets` gate is preserved as a sanity floor).
+    mapping(address => bool) public allowedExtSwapTargets;
 
     bytes32 private _activePlanHash;
 
@@ -290,6 +302,7 @@ contract LiquidationExecutor is
         uint256 finalRepayDelta
     );
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
+    event ExtSwapTargetUpdated(address indexed target, bool allowed);
 
     // ─── Enums ────────────────────────────────────────────────────────
     enum SwapMode {
@@ -537,13 +550,14 @@ contract LiquidationExecutor is
     }
 
     // ─── Owner Config Functions ──────────────────────────────────────
-    function setMorphoBlue(address morpho) external onlyOwner {
-        if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert TargetNotAllowed();
-        address old = morphoBlue;
-        morphoBlue = morpho;
-        emit ConfigUpdated("morphoBlue", old, morpho);
-    }
+    // setMorphoBlue removed — the Morpho role is two independent storage
+    // slots (`morphoBlue` + `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`)
+    // whose desync produces an exploitable mismatch (callback authority
+    // pinned to old Morpho while liquidation routes through new Morpho).
+    // The atomic helper `configureMorpho` writes both slots in one call;
+    // removing the single-slot setter eliminates the desync window
+    // entirely and forces all Morpho re-configuration through the
+    // atomic path.
 
     function setAaveV2LendingPool(address pool) external onlyOwner {
         if (pool == address(0)) revert ZeroAddress();
@@ -553,7 +567,14 @@ contract LiquidationExecutor is
         emit ConfigUpdated("aaveV2Pool", old, pool);
     }
 
+    /// @notice Update a flashloan provider slot. Restricted to
+    /// `FLASH_PROVIDER_BALANCER` only — Morpho re-configuration MUST go
+    /// through `configureMorpho` to keep the liquidation-target and
+    /// callback-authority slots synced. Unknown providerIds were
+    /// inert dispatch-side but used to pollute the mapping namespace;
+    /// pinning to BALANCER closes both concerns.
     function setFlashProvider(uint8 providerId, address provider) external onlyOwner {
+        if (providerId != FLASH_PROVIDER_BALANCER) revert InvalidPlan();
         if (provider == address(0)) revert ZeroAddress();
         if (!allowedTargets[provider]) revert TargetNotAllowed();
         address old = allowedFlashProviders[providerId];
@@ -594,6 +615,23 @@ contract LiquidationExecutor is
         if (hook == address(0)) revert ZeroAddress();
         allowedV4Hooks[hook] = allowed;
         emit V4HookAllowedUpdated(hook, allowed);
+    }
+
+    /// @notice Add/remove a Curve V1 pool or Balancer V2 Vault from the
+    /// dedicated ext-swap allowlist consulted by CURVE_V1 and BAL_V2
+    /// dispatch paths.
+    /// @dev Decoupled from `allowedTargets` to close the selector-
+    /// collision surface — if any contract in `allowedTargets` (Aave
+    /// pool, Paraswap Augustus, Bebop, Uni routers) happened to expose
+    /// Curve's `exchange(int128,int128,uint256,uint256)` (selector
+    /// 0x3df02124) or Balancer's `swap(...)` selector with side-effects,
+    /// operator could route a swap to it. Curve and Balancer regularly
+    /// deploy new pools, so unlike `allowedTargets` (constructor-only)
+    /// this allowlist is post-deploy curatable.
+    function setExtSwapTarget(address target, bool allowed) external onlyOwner {
+        if (target == address(0)) revert ZeroAddress();
+        allowedExtSwapTargets[target] = allowed;
+        emit ExtSwapTargetUpdated(target, allowed);
     }
 
     function pause() external onlyOwner {
@@ -1165,6 +1203,18 @@ contract LiquidationExecutor is
                 uint256 underlyingBefore = IERC20(collateralAsset).balanceOf(address(this));
                 _unwrapATokens(collateralAsset, aTokenDelta);
                 if (IERC20(collateralAsset).balanceOf(address(this)) <= underlyingBefore) revert UnwrapFailed();
+            } else if (trackingToken != collateralAsset && plan.swapPlan.leg1.srcToken == trackingToken) {
+                // Skip-unwrap branch: leg1 swaps the aToken directly via
+                // an aToken/underlying peg pool. The single-leg path's
+                // collateralDelta-cap at line 1445 below is gated on
+                // `srcToken == collateralAsset` and so does not bind
+                // here. Apply the symmetric cap against the aToken
+                // delta so a compromised operator cannot oversize
+                // `leg1.amountIn` to dip into any pre-existing aToken
+                // balance the executor happens to hold (donations,
+                // residue from earlier receive-aToken liquidations).
+                uint256 aTokenDelta = trackingAfter - collateralBefore;
+                if (plan.swapPlan.leg1.amountIn > aTokenDelta) revert InvalidPlan();
             }
         }
 
@@ -1381,6 +1431,16 @@ contract LiquidationExecutor is
                 return;
             }
 
+            // Pre-cap intentionally omitted: the post-execution
+            // `MixedSplitLeg1Overspent` check at line 1413 below catches
+            // any leg1 that consumes ≥ collateralDelta. Adding a
+            // pre-flashloan symmetric cap on `leg1.amountIn` is a
+            // ~70-byte defense-in-depth gesture that the EIP-170 budget
+            // does not have headroom for. The reactive guard remains
+            // fail-closed; the only operational difference is a slightly
+            // later revert that still aborts the tx before any state
+            // would leak.
+
             uint256 collBeforeLeg1 = IERC20(collateralAsset).balanceOf(address(this));
 
             // leg1 executes with its own amountIn. The leg1RepayBefore
@@ -1482,12 +1542,12 @@ contract LiquidationExecutor is
             // Curve StableSwap V1. SELL and BUY produce identical
             // on-chain swaps; the bot precomputes `dx` for BUY so that
             // get_dy(dx) >= targetOut (Curve has no native exact-out).
-            CurveV1Lib.executeLeg(libLeg, amountIn, allowedTargets[leg.bebopTarget]);
+            CurveV1Lib.executeLeg(libLeg, amountIn, allowedExtSwapTargets[leg.bebopTarget]);
         } else if (m == SwapMode.BAL_V2 || m == SwapMode.BAL_V2_BUY) {
             // Balancer V2. SwapKind flips inside the library based on
             // `leg.mode` (GIVEN_IN for SELL, GIVEN_OUT for BUY — native
             // exact-out support).
-            BalancerV2Lib.executeLeg(libLeg, amountIn, allowedTargets[leg.bebopTarget]);
+            BalancerV2Lib.executeLeg(libLeg, amountIn, allowedExtSwapTargets[leg.bebopTarget]);
         } else {
             revert InvalidSwapMode();
         }
@@ -1811,6 +1871,13 @@ contract LiquidationExecutor is
                     mstore(add(ptr, 4), collateralAsset)
                     let ok := staticcall(gas(), pool, ptr, 36, ptr, 480)
                     if iszero(ok) { revert(0, 0) }
+                    // EVM staticcall writes only `min(returndatasize, outsize)`
+                    // bytes — the remaining buffer is uninitialized scratch.
+                    // Verify at least 9 * 32 = 288 bytes came back so the
+                    // slot-9 read targets returned data, not scratch.
+                    // Defends against an Aave-pool downgrade / proxy bug
+                    // returning a truncated ReserveData struct.
+                    if lt(returndatasize(), 288) { revert(0, 0) }
                     canonical := mload(add(ptr, 256)) // 9th slot
                 }
                 if (suppliedAToken != canonical) revert InvalidATokenAddress(suppliedAToken, canonical);

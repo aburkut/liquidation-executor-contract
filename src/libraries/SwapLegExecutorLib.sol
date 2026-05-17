@@ -99,7 +99,16 @@ library SwapLegExecutorLib {
         }
 
         if (amountOut == 0) revert ZeroSwapOutput();
+        // Two floors: the calldata-embedded `minAmountOut` (Augustus's
+        // own slippage check) AND the struct-level `leg.minAmountOut`.
+        // Other DEX libraries (Uniswap V2/V3/V4, Curve V1, Balancer V2)
+        // enforce `leg.minAmountOut` as the source of truth. Paraswap
+        // used to defer entirely to the calldata value, leaving per-leg
+        // slippage discipline asymmetric — a permissively-built quote
+        // could land with calldata-min = 0 even when the operator
+        // intended `leg.minAmountOut` as a hard floor. Now both bind.
         if (amountOut < minAmountOut) revert InsufficientRepayOutput(amountOut, minAmountOut);
+        if (amountOut < leg.minAmountOut) revert InsufficientRepayOutput(amountOut, leg.minAmountOut);
 
         emit ParaswapSwapExecuted(srcToken, dstToken, actualIn, amountOut);
     }

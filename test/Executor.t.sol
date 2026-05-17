@@ -226,7 +226,13 @@ contract ExecutorTest is Test {
 
         vm.startPrank(owner);
         executor.setAaveV2LendingPool(address(aaveV2Pool));
-        executor.setMorphoBlue(address(morphoBlue));
+        executor.configureMorpho(address(morphoBlue));
+        // Audit-fix #3: dedicated ext-swap allowlist. Curve V1 pool and
+        // Balancer V2 Vault targets must be flagged separately; the
+        // broader allowedTargets gate is preserved as a sanity floor
+        // but is no longer the CURVE_V1 / BAL_V2 dispatch gate.
+        executor.setExtSwapTarget(address(curveV1Mock), true);
+        executor.setExtSwapTarget(address(balancerSwapMock), true);
         vm.stopPrank();
 
         // Configure liquidation reward so the delta-based collateral check passes
@@ -1384,7 +1390,7 @@ contract ExecutorTest is Test {
     function test_morphoFlash_paraswap_morphoRepay() public {
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
         vm.prank(owner);
-        executor.setFlashProvider(morphoFlashId, address(morphoBlue));
+        executor.configureMorpho(address(morphoBlue));
 
         uint256 seizedAssets = 500e18;
         LiquidationExecutor.SwapPlan memory swapPlan =
@@ -1428,7 +1434,7 @@ contract ExecutorTest is Test {
         // address to compare against.
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
         vm.prank(owner);
-        executor.setFlashProvider(morphoFlashId, address(morphoBlue));
+        executor.configureMorpho(address(morphoBlue));
 
         // Build a real plan and abi-encode it; the plan hash must match what we
         // plant into _activePlanHash for the hash check to pass.
@@ -1442,13 +1448,15 @@ contract ExecutorTest is Test {
         bytes32 planHash = keccak256(planBytes);
 
         // Storage layout (forge inspect LiquidationExecutor storage):
-        //   slot 10 = _activePlanHash       (bytes32)
-        //   slot 11 = _activeV4PoolManager  (address, offset 0)
+        //   slot 11 = _activePlanHash       (bytes32)
+        //   slot 12 = _activeV4PoolManager  (address, offset 0)
         //            _executionPhase        (uint8 enum, offset 20)
-        // Force both into the "during flashloan" state so neither guard short-circuits.
+        // (Slot numbers shifted by +1 after audit-fix #3 added the
+        // `allowedExtSwapTargets` mapping above this group.) Force both
+        // into the "during flashloan" state so neither guard short-circuits.
         // Byte at offset 20 (Solidity) corresponds to bit 160 of the uint256 slot.
-        vm.store(address(executor), bytes32(uint256(10)), planHash);
-        vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive
+        vm.store(address(executor), bytes32(uint256(11)), planHash);
+        vm.store(address(executor), bytes32(uint256(12)), bytes32(uint256(1) << 160)); // FlashLoanActive
 
         // Attacker (not the registered Morpho provider) hits the callback. The phase
         // and hash gates pass; only the caller check should reject.
@@ -1465,17 +1473,41 @@ contract ExecutorTest is Test {
     function test_configureMorphoAtomicallyPinsBothSlots() public {
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
 
-        // Sanity: setUp() previously called only setMorphoBlue, leaving the flash
-        // provider entry empty.
+        // setUp now seeds both slots via configureMorpho already, so the
+        // initial state already pins them. Verify both, then deploy a
+        // fresh executor where neither slot has been touched and assert
+        // that `configureMorpho` atomically populates both.
         assertEq(executor.morphoBlue(), address(morphoBlue));
-        assertEq(executor.allowedFlashProviders(morphoFlashId), address(0));
+        assertEq(executor.allowedFlashProviders(morphoFlashId), address(morphoBlue));
+
+        // Fresh executor: same constructor allowlist but no post-deploy config.
+        address[] memory targets = new address[](6);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        targets[2] = address(aaveV2Pool);
+        targets[3] = address(bebop);
+        targets[4] = address(morphoBlue);
+        targets[5] = address(uniV4Mock);
+        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+        assertEq(freshExecutor.morphoBlue(), address(0));
+        assertEq(freshExecutor.allowedFlashProviders(morphoFlashId), address(0));
 
         vm.prank(owner);
-        executor.configureMorpho(address(morphoBlue));
+        freshExecutor.configureMorpho(address(morphoBlue));
 
-        assertEq(executor.morphoBlue(), address(morphoBlue), "morphoBlue must be set");
+        assertEq(freshExecutor.morphoBlue(), address(morphoBlue), "morphoBlue must be set");
         assertEq(
-            executor.allowedFlashProviders(morphoFlashId),
+            freshExecutor.allowedFlashProviders(morphoFlashId),
             address(morphoBlue),
             "FLASH_PROVIDER_MORPHO entry must be set to the same address"
         );
@@ -1516,8 +1548,8 @@ contract ExecutorTest is Test {
 
         uint8 morphoFlashId = freshExecutor.FLASH_PROVIDER_MORPHO();
         vm.startPrank(owner);
-        freshExecutor.setMorphoBlue(address(morphoBlue));
-        freshExecutor.setFlashProvider(morphoFlashId, address(morphoBlue));
+        freshExecutor.configureMorpho(address(morphoBlue));
+        freshExecutor.configureMorpho(address(morphoBlue));
         vm.stopPrank();
 
         uint256 seizedAssets = 500e18;
@@ -2118,23 +2150,39 @@ contract ExecutorTest is Test {
     }
 
     function test_setFlashProviderZeroReverts() public {
+        // setFlashProvider is now Balancer-pinned (FLASH_PROVIDER_BALANCER = 2).
         vm.prank(owner);
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
-        executor.setFlashProvider(1, address(0));
+        executor.setFlashProvider(2, address(0));
     }
 
     function test_setFlashProviderRejectsNonWhitelisted() public {
         address notWhitelisted = address(0xDEAD3);
         vm.prank(owner);
         vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
-        executor.setFlashProvider(1, notWhitelisted);
+        executor.setFlashProvider(2, notWhitelisted);
     }
 
     function test_setFlashProviderAcceptsWhitelisted() public {
-        // aavePool is in allowedTargets (set in constructor)
+        // aavePool is in allowedTargets (set in constructor). Re-uses
+        // the BALANCER slot — purely a setter parity check, doesn't
+        // affect dispatch.
         vm.prank(owner);
-        executor.setFlashProvider(1, address(aavePool));
-        assertEq(executor.allowedFlashProviders(1), address(aavePool));
+        executor.setFlashProvider(2, address(aavePool));
+        assertEq(executor.allowedFlashProviders(2), address(aavePool));
+    }
+
+    /// @dev Audit-fix #5/#10: providerIds other than BALANCER revert
+    /// at the validation gate (Morpho re-config must go through
+    /// `configureMorpho`; unknown ids would pollute the mapping
+    /// namespace and silently couple to future dispatcher branches).
+    function test_setFlashProviderRejectsNonBalancerId() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.setFlashProvider(3, address(morphoBlue)); // FLASH_PROVIDER_MORPHO
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.setFlashProvider(5, address(aavePool)); // arbitrary unknown id
     }
 
     function test_setAaveV2LendingPoolRejectsNonWhitelisted() public {
@@ -4627,7 +4675,7 @@ contract ExecutorTest is Test {
         );
 
         vm.prank(owner);
-        freshExecutor.setMorphoBlue(address(morphoBlue));
+        freshExecutor.configureMorpho(address(morphoBlue));
 
         uint256 seizedAssets = 500e18;
         uint256 collateralReward = COLLATERAL_REWARD;
@@ -4787,7 +4835,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
@@ -4957,7 +5005,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
@@ -5006,7 +5054,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
@@ -5058,7 +5106,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
@@ -5128,7 +5176,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
@@ -9272,8 +9320,10 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
+        vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(curveLeg2), true);
+        vm.stopPrank();
 
         // Pre-fund the new executor so it can repay flashloans
         loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
@@ -9388,8 +9438,10 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
+        vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(balLeg2), true);
+        vm.stopPrank();
         loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
         LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
@@ -10198,8 +10250,10 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
+        vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(curvePool), true);
+        vm.stopPrank();
         loanToken.mint(address(execLocal), 2 * (LOAN_AMOUNT + FLASH_FEE) + 200e18);
 
         // Pre-fund the executor with enough USDT for both runs and
@@ -10273,8 +10327,10 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
+        vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(balPool), true);
+        vm.stopPrank();
         loanToken.mint(address(execLocal), 2 * (LOAN_AMOUNT + FLASH_FEE) + 200e18);
 
         aavePool.setReserveAToken(address(usdt), address(aToken));
@@ -10483,8 +10539,11 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
+        vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(curveV1Mock), true);
+        execLocal.setExtSwapTarget(address(balWeth), true);
+        vm.stopPrank();
         loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
         // hasSplit semantics (see _executeSwapPlan): `splitBps` is the
@@ -10618,8 +10677,11 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
+        vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(curveLeg1), true);
+        execLocal.setExtSwapTarget(address(balLeg2), true);
+        vm.stopPrank();
         loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
         LiquidationExecutor.SwapLeg memory leg1 = _curveV1Leg(
