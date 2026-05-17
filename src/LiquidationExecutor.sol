@@ -189,7 +189,6 @@ contract LiquidationExecutor is
     address public immutable weth;
     address public aavePool;
     address public morphoBlue;
-    address public balancerVault;
     address public paraswapAugustusV6;
     address public aaveV2LendingPool;
     /// @dev Immutable — canonical Uniswap V2 Router02 (mainnet
@@ -526,7 +525,6 @@ contract LiquidationExecutor is
         uniV2Router = uniV2Router_;
         uniV3Router = uniV3Router_;
         aavePool = aavePool_;
-        balancerVault = balancerVault_;
         paraswapAugustusV6 = paraswapAugustus_;
 
         allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;

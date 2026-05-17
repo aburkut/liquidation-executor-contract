@@ -1448,15 +1448,15 @@ contract ExecutorTest is Test {
         bytes32 planHash = keccak256(planBytes);
 
         // Storage layout (forge inspect LiquidationExecutor storage):
-        //   slot 11 = _activePlanHash       (bytes32)
-        //   slot 12 = _activeV4PoolManager  (address, offset 0)
+        //   slot 10 = _activePlanHash       (bytes32)
+        //   slot 11 = _activeV4PoolManager  (address, offset 0)
         //            _executionPhase        (uint8 enum, offset 20)
-        // (Slot numbers shifted by +1 after audit-fix #3 added the
-        // `allowedExtSwapTargets` mapping above this group.) Force both
-        // into the "during flashloan" state so neither guard short-circuits.
+        // (Slots shifted -1 after removing the unused `balancerVault`
+        // storage var per re-audit informational LEAD.) Force both into
+        // the "during flashloan" state so neither guard short-circuits.
         // Byte at offset 20 (Solidity) corresponds to bit 160 of the uint256 slot.
-        vm.store(address(executor), bytes32(uint256(11)), planHash);
-        vm.store(address(executor), bytes32(uint256(12)), bytes32(uint256(1) << 160)); // FlashLoanActive
+        vm.store(address(executor), bytes32(uint256(10)), planHash);
+        vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive
 
         // Attacker (not the registered Morpho provider) hits the callback. The phase
         // and hash gates pass; only the caller check should reject.
