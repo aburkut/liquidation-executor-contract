@@ -4,19 +4,25 @@
 
 | Parameter | Value |
 |---|---|
-| **Contract (V8)** | `0xB48378b1035dDA425bB9AA76F81c7f1695B0aeE0` |
-| **Deploy tx** | `0xe011e1029adb704e0f64a37b072bc17a82d9ddd1a403a6d06ad5370f63cc6827` |
-| **SwapLegExecutorLib** | `0x0846BE913D89B91B92276AEAf546205529b94979` (reused from V5/V6/V7 — source unchanged; linked via `--libraries`) |
-| **SwapLegExecutorLib deploy tx** | `0x903045a07f29f90f208875cbdb68af511e442dcfa1225b6d804d48e5861c056b` |
-| **ParaswapDecoderLib** | `0x01E0B8e5B4A2A055F6a18B6442d7ecC7BC519a16` (reused from V4/V5/V6/V7 — source unchanged; linked via `--libraries`) |
-| **ParaswapDecoderLib deploy tx** | `0x1446d0fc56087032a8872d3bf09083cf341bfb91cc3924e3baa0cb6cfca17dac` |
-| **Runtime bytecode size** | 24 537 bytes (39 bytes margin under EIP-170) — V8 unlocks NO_SWAP + hasMixedSplit for same-asset bribe path; arg-bearing reverts in MIXED_SPLIT validation collapsed to `InvalidPlan()` to fit the limit |
+| **Contract (V9)** | `0x5b1E7FCf175Aac717F4841321bA2C8D17558a6Fd` |
+| **Deploy tx** | `0x460acabd932c1e7e8a5738ce9b9fbe863602c90c0f848c954b7aab277a9669f8` (block 25117625) |
+| **UniswapLib** | `0x2de78cea514e35c387951903a6fa2170ecba8ce4` |
+| **UniswapLib deploy tx** | `0xadd4cdb135771c29a78dc55097cddbd2be481dff0bb16b4013c60527d49dabc5` |
+| **SwapLegExecutorLib** | `0x60a3eef08b5014d1940b9fe96433642f7e3fda58` (re-deployed — now hosts `executeBebopLeg` moved from main contract for size budget) |
+| **SwapLegExecutorLib deploy tx** | `0x6928cf7862f46a9d3d6e2c04a7ab44832dcbcfdf520602299e9140410147b69f` |
+| **ParaswapDecoderLib** | `0x498e1dc8e2d7d221da9afc8d1a1aaa82b3b2ee08` (re-deployed) |
+| **ParaswapDecoderLib deploy tx** | `0x27e3efe2b8641712f8bef4d21cf9f0f348774fbdddab88a77c245e4e4518bbb7` |
+| **CurveV1Lib** | `0x6f84083a9c5f2e155d93b90de28c9081402d1c32` (new in V9 — `exchange` / `exchange_underlying` dispatchers, SELL + BUY) |
+| **CurveV1Lib deploy tx** | `0x2b0b61694bd31f057a6b52f568b3c5816537fdb91b0e1a49a116788b5c7a1788` |
+| **BalancerV2Lib** | `0xd60d1afd06575532aa6048068ec9db2616bb056c` (new in V9 — `swap(...)` GIVEN_IN/GIVEN_OUT dispatchers) |
+| **BalancerV2Lib deploy tx** | `0xe8f805c1df18ec47d1acb3392fa3e2db8931f4d478f5befa18ca7a04e46fde63` |
+| **Runtime bytecode size** | 24 508 bytes (68 bytes margin under EIP-170) — V9 absorbs +4 SwapMode variants (Curve V1, Balancer V2 × SELL/BUY) + 10 audit hardenings while freeing space via Bebop-leg extraction to `SwapLegExecutorLib` and `balancerVault` slot removal (re-audit cleanup) |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
 | **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
 | **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
 | **Deployer** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` |
 | **Aave V3 Pool** | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` (liquidation target; V3 flashloan path removed) |
-| **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` (auto-registered as flash provider id=2) |
+| **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` (registered as flash provider id=2 in constructor; no longer a public storage var — re-audit cleanup) |
 | **ParaSwap AugustusV6** | `0x6A000F20005980200259B80c5102003040001068` |
 | **Uniswap V2 Router02** | `0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D` (immutable) |
 | **Uniswap V3 SwapRouter02** | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` (immutable) |
@@ -26,22 +32,25 @@
 | **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (allowlisted — set via `setAaveV2LendingPool` when V2 liquidations are wired) |
 | **Solidity** | 0.8.24, Shanghai, optimizer 1 run, `via_ir=true`, `bytecode_hash=none` |
 
-V8 unlocks **same-asset NO_SWAP + hasMixedSplit** so the bot can serve `col == debt != WETH` opportunities (e.g. USDC/USDC) with a coinbase-capable WETH bribe leg:
+V9 adds **Curve V1 + Balancer V2 dispatchers** (SELL + BUY, leg1 + leg2) and closes 9/10 LEAD-level findings from a fresh `/solidity-auditor` sweep:
 
-1. **NO_SWAP + hasMixedSplit allowed for same-asset path** — when `leg1.mode == NO_SWAP`, validation now requires `leg1.srcToken == leg1.repayToken == loanToken` (i.e. `col == loanToken`), and `_executeSwapPlan` dispatches leg2 with `amountIn = leg1RepayBefore - flashRepayAmount` so the residual loanToken is converted to WETH for the bribe + profit. `NO_SWAP + hasLeg2` (sequential) remains rejected as before.
-2. **Diff-asset NO_SWAP + hasMixedSplit rejected at validation** — explicit `srcToken == loanToken` guard ensures cross-asset misconfigurations revert `InvalidPlan()` pre-flashloan instead of underflowing inside the callback.
-3. **Custom-error consolidation** — arg-bearing reverts in the MIXED_SPLIT validation block (`RepayTokenMismatch`, `SrcTokenNotCollateral`, `Leg2ModeNotAllowed`) collapsed to `InvalidPlan()` to keep the contract at 24 537 / +39 bytes under EIP-170. No semantic change for valid plans; failure diagnostics are slightly less specific.
+1. **Curve V1 / Balancer V2 SwapModes** — `CURVE_V1`, `CURVE_V1_BUY`, `BAL_V2`, `BAL_V2_BUY` join the swap-leg dispatcher. Curve uses `exchange(int128,int128,uint256,uint256)` (selector `0x3df02124`) or `exchange_underlying` for metapools; Balancer uses the Vault's `swap(...)` with native `SwapKind.GIVEN_IN` / `GIVEN_OUT` for exact-out. Each path is gated by a new `allowedExtSwapTargets` allowlist (owner-curatable via `setExtSwapTarget`) so a non-Curve contract in the broad `allowedTargets` set cannot be invoked through the ext-swap dispatcher.
+2. **Skip-unwrap leg1.amountIn cap** — `_runFlashloanPipeline` now caps `leg1.amountIn ≤ aTokenDelta` in the `receiveAToken=true` branch, symmetric to the existing collateral cap. Closes the dipping vector where a compromised operator could oversize the input through an allowlisted swap target.
+3. **`_verifyATokenAddress` returndatasize guard** — assembly read of slot 9 from `getReserveData` is now gated by `returndatasize() ≥ 288`. If the pool ever downgraded to a smaller struct, the read would target uninitialized scratch memory and the canonical aToken value could become attacker-influenceable; now reverts deterministically.
+4. **`setMorphoBlue` removed; `setFlashProvider` BALANCER-only** — Morpho config must go through `configureMorpho` (atomic pin of both the liquidation-target slot and the callback-authority slot). `setFlashProvider` rejects any providerId other than `FLASH_PROVIDER_BALANCER (=2)`, eliminating the desync window and the namespace-pollution surface on unused providerIds.
+5. **Paraswap leg.minAmountOut floor** — `SwapLegExecutorLib.executeParaswapLeg` now enforces BOTH the calldata-embedded `minAmountOut` AND `leg.minAmountOut` as floors, restoring per-leg slippage parity with Uniswap V2/V3/V4, Curve V1, and Balancer V2.
+6. **V4 multihop non-simple-path rejection** — `UniswapLib.decodeAndValidateV4MultihopShape` rejects any hop whose `tokenOut` equals `srcToken` or any earlier hop's `tokenOut`, closing the implicit-aliasing surface where paths like A→B→A→C passed shape validation (SELL was safe via PoolManager credit-ledger netting; BUY relied on the post-unlock `consumed > amountIn` check).
+7. **`_v3PathEndpoints` precondition tightened** to `>= 43` bytes (was `>= 40`) — matches the real Uniswap V3 path minimum (token + fee + token) and forbids degenerate lengths where the first-20 / last-20 byte loads could overlap.
+8. **Re-audit cleanup**: unused `balancerVault` public storage slot removed (the slot was written in the constructor but never read on-chain — the public auto-getter served no on-chain purpose; storage authority for the Balancer-flashloan path lives in `allowedFlashProviders[FLASH_PROVIDER_BALANCER]`). Frees 56 B of bytecode and one storage slot.
 
-V7 added three security hardenings (carried forward in V8):
+The one remaining LEAD (Bebop arbitrary calldata) is a design constraint: `target.call(leg.bebopCalldata)` is structurally an arbitrary-call primitive against allowlisted contracts. The output-delta floor blocks pure value-extraction; closing the state-only side-effect surface would require either removing Bebop or porting it to a typed-interface dispatcher with selector whitelisting.
 
-- **V4 unlock-callback re-entry + tokenIn pin** — `_activeV4TokenIn` storage slot pinned at unlock time, read back inside `unlockCallback` instead of trusting decoded calldata. Prevents a malicious / mis-allowlisted V4 hook from substituting `tokenIn` mid-callback. Clear-on-entry doubles as a re-entry guard.
-- **`NO_SWAP + hasLeg2` revert** (`PlanShapeConflict`) — explicit pre-flashloan guard closing a validator/executor mismatch where the two-leg branch silently dropped leg1 if `mode = NO_SWAP`.
-- **`NO_SWAP + hasMixedSplit` revert** (V7 only — V8 replaces this rejection with the same-asset allowance described above).
-
-V6 introduced `hasMixedSplit` plan shape: leg1 any mode (Paraswap / Bebop for deep repay routing) + leg2 Uni-only (`coll → WETH`) on the residual collateral, giving coinbase-capable WETH profit on non-WETH / non-WETH pairs even when no direct Uni `coll → debt` pool exists. All three of {`hasLeg2`, `hasSplit`, `hasMixedSplit`} are mutually exclusive — enforced pre-flashloan with `PlanShapeConflict`. Carried forward in V7/V8 unchanged.
+Carried forward from V8: same-asset NO_SWAP + hasMixedSplit (`col == debt != WETH` opportunities with a coinbase-capable WETH bribe leg). Carried forward from V7: V4 unlock-callback re-entry + tokenIn pin, explicit NO_SWAP + hasLeg2 / hasMixedSplit guards (the latter relaxed in V8 for the same-asset case). Carried forward from V6: `hasMixedSplit` plan shape; all three of {`hasLeg2`, `hasSplit`, `hasMixedSplit`} remain mutually exclusive — enforced pre-flashloan with `PlanShapeConflict`.
 
 | Previous deployments | |
 |---|---|
+| **V8 Contract** | `0xB48378b1035dDA425bB9AA76F81c7f1695B0aeE0` (deprecated — superseded by V9 Curve V1 + Balancer V2 dispatchers + 9 audit-LEAD hardenings) |
+| **V8 deploy tx** | `0xe011e1029adb704e0f64a37b072bc17a82d9ddd1a403a6d06ad5370f63cc6827` |
 | **V7 Contract** | `0xb18e3A861961BF399b08Bdd8500019319Be58779` (deprecated — superseded by V8 same-asset NO_SWAP + hasMixedSplit support; V7 rejected the combination outright) |
 | **V7 deploy tx** | `0x1a48be1e2fffecb1486542d23a40eec6747fc6a1b711c62b13846f012e2ddfd3` |
 | **V6 Contract** | `0x4AEdDDF5E0D18D454E5F0Cc5E37E86B061fC0D1c` (deprecated — superseded by V7 security hardening: V4 callback re-entry + tokenIn pin, explicit NO_SWAP + hasLeg2 / hasMixedSplit guards) |
