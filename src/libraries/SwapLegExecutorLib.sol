@@ -4,86 +4,60 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import {IUniV2Router} from "../interfaces/IUniV2Router.sol";
-import {IUniV3SwapRouter} from "../interfaces/IUniV3SwapRouter.sol";
 import {ParaswapDecoderLib} from "./ParaswapDecoderLib.sol";
+import {UniswapLib} from "./UniswapLib.sol";
 
 /// @title SwapLegExecutorLib
-/// @notice External library housing the per-leg swap executors for
-/// Paraswap (single), Uniswap V2 (`swapExactTokensForTokens`), and
-/// Uniswap V3 (`exactInputSingle`). Called via DELEGATECALL from
-/// `LiquidationExecutor` — execution runs in the caller's storage /
-/// balance / msg.sender context, which is necessary because these
-/// functions transfer tokens, set approvals, and emit events against
-/// the executor's account.
+/// @notice External library housing the Paraswap leg orchestrator.
+/// Called via DELEGATECALL from `LiquidationExecutor` — execution runs
+/// in the caller's storage / balance / msg.sender context, which is
+/// necessary because this function transfers tokens, sets approvals,
+/// and emits events against the executor's account.
 ///
-/// Moving the bodies out of the main contract recovers ~1KB+ of runtime
-/// bytecode versus inlining, the same pattern already used for
-/// `ParaswapDecoderLib`. V4 and Bebop stay in the main contract: V4
-/// depends on the `_activeV4PoolManager` storage slot + the
-/// `IUnlockCallback` entrypoint; Bebop needs `allowedTargets[...]`
-/// (operator-supplied target, runtime allowlist check).
+/// SCOPE: Paraswap (single-leg via Augustus V6.2). All Uniswap V2/V3/V4
+/// leg execution lives in `UniswapLib` (sister library); Bebop stays
+/// in the main contract because it needs runtime `allowedTargets[...]`
+/// allowlist re-checks against an operator-supplied target.
 ///
 /// STRUCT DISCIPLINE: `SwapLeg` here MUST stay byte-for-byte identical
 /// to the `SwapLeg` declared in `LiquidationExecutor`. Divergence
 /// silently corrupts ABI decoding under DELEGATECALL.
 ///
-/// SECURITY NOTE — removed checks: the main contract's pre-library
-/// `_executeParaswapCall` used to re-assert `allowedTargets[augustus]`
-/// before the external call. `paraswapAugustusV6` is pinned in the
-/// constructor and has no setter, and the constructor seeds
-/// `allowedTargets[paraswapAugustusV6] = true` with no flip path, so
-/// the check is a constant-true at every reachable callsite. The
-/// library omits it to shave bytecode without changing behavior. Same
-/// rationale holds for `uniV2Router` / `uniV3Router` (both immutable,
-/// both auto-allowlisted).
+/// SECURITY NOTE — removed allowlist check: the main contract's pre-
+/// library `_executeParaswapCall` used to re-assert
+/// `allowedTargets[augustus]` before the external call.
+/// `paraswapAugustusV6` is pinned in the constructor and has no setter,
+/// and the constructor seeds `allowedTargets[paraswapAugustusV6] = true`
+/// with no flip path, so the check is a constant-true at every reachable
+/// callsite. The library omits it to shave bytecode without changing
+/// behavior.
 library SwapLegExecutorLib {
     using SafeERC20 for IERC20;
 
-    // ─── SwapLeg struct (MUST match LiquidationExecutor.SwapLeg) ─────
-    enum SwapMode {
-        PARASWAP_SINGLE,
-        BEBOP_MULTI,
-        UNI_V2,
-        UNI_V3,
-        UNI_V4
-    }
-
-    struct SwapLeg {
-        SwapMode mode;
-        address srcToken;
-        uint256 amountIn;
-        bool useFullBalance;
-        uint256 deadline;
-        bytes paraswapCalldata;
-        address bebopTarget;
-        bytes bebopCalldata;
-        address[] v2Path;
-        uint24 v3Fee;
-        address v4PoolManager;
-        bytes v4SwapData;
-        address repayToken;
-        uint256 minAmountOut;
-    }
+    // ─── SwapLeg struct + SwapMode enum imported from UniswapLib ─────
+    // Single source of truth for the struct shape — both the Uniswap
+    // and the Paraswap libs accept the SAME `UniswapLib.SwapLeg memory`
+    // pointer and the main contract uses ONE cast helper for both.
+    // STRUCT DISCIPLINE: the struct in UniswapLib MUST stay byte-for-
+    // byte identical to `LiquidationExecutor.SwapLeg`.
 
     // ─── Errors (must match LiquidationExecutor signatures by name) ──
     error InsufficientSrcBalance(uint256 required, uint256 available);
     error InsufficientRepayOutput(uint256 actual, uint256 required);
-    error ZeroSwapInput();
     error ZeroSwapOutput();
-    error InvalidV2Path();
-    error InvalidV3Fee(uint24 fee);
-    error InvalidPlan();
     error ParaswapSwapFailed();
     error ParaswapSrcTokenMismatch(address expected, address actual);
     error ParaswapAmountInMismatch(uint256 expected, uint256 actual);
     error ParaswapDstTokenUnexpected(address dstToken);
+    // Bebop
+    error BebopTargetNotContract();
+    error BebopSwapFailed();
+    error TargetNotAllowed();
 
     // ─── Events (match LiquidationExecutor signatures; emitted under DELEGATECALL) ──
     event ParaswapSwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
-    event UniV2SwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
-    event UniV3SwapExecuted(
-        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
+    event BebopSwapExecuted(
+        address indexed target, address indexed srcToken, uint256 amountIn, uint256 repayDelta, uint256 profitDelta
     );
 
     // ─── Paraswap single leg ─────────────────────────────────────────
@@ -91,7 +65,7 @@ library SwapLegExecutorLib {
     /// `augustus` is `paraswapAugustusV6` from the main contract; the
     /// caller is responsible for ensuring it is non-zero (constructor-
     /// pinned, so always non-zero in practice).
-    function executeParaswapLeg(SwapLeg memory leg, address augustus) external {
+    function executeParaswapLeg(UniswapLib.SwapLeg memory leg, address augustus) external {
         (address srcToken, address dstToken, uint256 declaredIn, uint256 minAmountOut, bool isExactIn) =
             ParaswapDecoderLib.decodeAndValidate(leg.paraswapCalldata, address(this));
 
@@ -125,58 +99,50 @@ library SwapLegExecutorLib {
         }
 
         if (amountOut == 0) revert ZeroSwapOutput();
+        // Two floors: the calldata-embedded `minAmountOut` (Augustus's
+        // own slippage check) AND the struct-level `leg.minAmountOut`.
+        // Other DEX libraries (Uniswap V2/V3/V4, Curve V1, Balancer V2)
+        // enforce `leg.minAmountOut` as the source of truth. Paraswap
+        // used to defer entirely to the calldata value, leaving per-leg
+        // slippage discipline asymmetric — a permissively-built quote
+        // could land with calldata-min = 0 even when the operator
+        // intended `leg.minAmountOut` as a hard floor. Now both bind.
         if (amountOut < minAmountOut) revert InsufficientRepayOutput(amountOut, minAmountOut);
+        if (amountOut < leg.minAmountOut) revert InsufficientRepayOutput(amountOut, leg.minAmountOut);
 
         emit ParaswapSwapExecuted(srcToken, dstToken, actualIn, amountOut);
     }
 
-    // ─── Uniswap V2 leg ──────────────────────────────────────────────
-    function executeUniV2Leg(SwapLeg memory leg, uint256 amountIn, address router) external {
-        if (amountIn == 0) revert ZeroSwapInput();
+    // ─── Bebop multi leg ─────────────────────────────────────────────
+    /// @dev Executes opaque Bebop settlement call.
+    ///
+    /// Moved from `LiquidationExecutor._executeBebopLeg` (inline) to free
+    /// ~150 bytes of main runtime bytecode for Curve V1 + Balancer V2
+    /// dispatch branches. Identical control flow; the caller now passes
+    /// `allowedTargets[leg.bebopTarget]` as a bool argument since the
+    /// storage mapping isn't directly visible from the library (would
+    /// require slot-pinning assembly — the bool plumbing is cheaper).
+    ///
+    /// Security model unchanged: allowlist re-check + exact-approval pair
+    /// + output delta floor.
+    function executeBebopLeg(UniswapLib.SwapLeg memory leg, uint256 repayBefore, bool isTargetAllowed) external {
+        address target = leg.bebopTarget;
+        if (target.code.length == 0) revert BebopTargetNotContract();
+        if (!isTargetAllowed) revert TargetNotAllowed();
 
         uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
-        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
+        if (srcBal < leg.amountIn) revert InsufficientSrcBalance(leg.amountIn, srcBal);
 
-        uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
+        IERC20(leg.srcToken).forceApprove(target, leg.amountIn);
+        (bool ok,) = target.call(leg.bebopCalldata);
+        IERC20(leg.srcToken).forceApprove(target, 0);
 
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
-        IUniV2Router(router)
-            .swapExactTokensForTokens(amountIn, leg.minAmountOut, leg.v2Path, address(this), leg.deadline);
-        IERC20(leg.srcToken).forceApprove(router, 0);
+        if (!ok) revert BebopSwapFailed();
 
-        uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
-        if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
+        uint256 repayAfter = IERC20(leg.repayToken).balanceOf(address(this));
+        uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
+        if (repayDelta < leg.minAmountOut) revert InsufficientRepayOutput(repayDelta, leg.minAmountOut);
 
-        emit UniV2SwapExecuted(leg.srcToken, leg.repayToken, amountIn, received);
-    }
-
-    // ─── Uniswap V3 leg ──────────────────────────────────────────────
-    function executeUniV3Leg(SwapLeg memory leg, uint256 amountIn, address router) external {
-        if (amountIn == 0) revert ZeroSwapInput();
-
-        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
-        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
-
-        uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
-
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
-        IUniV3SwapRouter(router)
-            .exactInputSingle(
-                IUniV3SwapRouter.ExactInputSingleParams({
-                tokenIn: leg.srcToken,
-                tokenOut: leg.repayToken,
-                fee: leg.v3Fee,
-                recipient: address(this),
-                amountIn: amountIn,
-                amountOutMinimum: leg.minAmountOut,
-                sqrtPriceLimitX96: 0
-            })
-            );
-        IERC20(leg.srcToken).forceApprove(router, 0);
-
-        uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
-        if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, leg.v3Fee, amountIn, received);
+        emit BebopSwapExecuted(target, leg.srcToken, leg.amountIn, repayDelta, 0);
     }
 }

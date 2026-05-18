@@ -13,9 +13,12 @@ import {IAaveV2LendingPool} from "./interfaces/IAaveV2LendingPool.sol";
 import {IMorphoBlue, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/IMorphoBlue.sol";
 import {IUniV2Router} from "./interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "./interfaces/IUniV3SwapRouter.sol";
-import {IPoolManager, IUnlockCallback, PoolKey, SwapParams} from "./interfaces/IPoolManager.sol";
+import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
 import {ParaswapDecoderLib} from "./libraries/ParaswapDecoderLib.sol";
 import {SwapLegExecutorLib} from "./libraries/SwapLegExecutorLib.sol";
+import {UniswapLib} from "./libraries/UniswapLib.sol";
+import {CurveV1Lib} from "./libraries/CurveV1Lib.sol";
+import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -131,13 +134,12 @@ contract LiquidationExecutor is
     error ZeroRepayOutput();
     error InvalidV2Path();
     error InvalidV3Fee(uint24 fee);
-    error InvalidV4Data();
-    error InvalidV4Fee();
-    error InvalidV4TokenOut(address expected, address actual);
-    error InvalidV4NativeToken();
-    error InvalidV4FeeOrSpacing();
-    error V4HookNotAllowed(address hook);
-    error V4UnexpectedDelta();
+    // V4-specific granular errors (InvalidV4Data, InvalidV4Fee,
+    // InvalidV4TokenOut, InvalidV4NativeToken, InvalidV4FeeOrSpacing,
+    // V4HookNotAllowed) were removed in the audit-fix pass — single-hop /
+    // multihop validation is hosted in `UniswapLib`, which reverts with
+    // `InvalidPlan` (or `V4UnexpectedDelta` for native-zero token).
+    // Tests target those selectors instead.
     error InvalidV4CallbackHook();
 
     // Profit / payment errors
@@ -147,7 +149,11 @@ contract LiquidationExecutor is
     error InvalidCoinbaseBps();
     error InsufficientRepayBalance(uint256 required, uint256 available);
     error InsufficientSrcBalance(uint256 required, uint256 available);
-    error TargetNotAllowed(address target);
+    /// @dev Was `TargetNotAllowed(address target)`; arg dropped to free
+    /// EIP-170 budget for the BUY-side V3 dispatch. The address is
+    /// always reconstructible by the caller (it's the address they
+    /// just passed in), and no on-chain consumer parses the arg.
+    error TargetNotAllowed();
 
     // ─── Constants ───────────────────────────────────────────────────
     // FLASH_PROVIDER_AAVE_V3 (1) removed — Aave V3 flashloan path deleted.
@@ -166,15 +172,9 @@ contract LiquidationExecutor is
     /// malicious block.coinbase from grinding gas in the callback.
     uint256 private constant COINBASE_CALL_GAS = 10_000;
 
-    /// @dev Uniswap V4 sqrt price limits, set one tick inside the allowed
-    /// range so the swap is unconstrained by price (slippage is enforced
-    /// by the output delta check against the per-leg `leg.minAmountOut`
-    /// field on `SwapLeg`).
-    /// Reference: v4-core TickMath.MIN_SQRT_PRICE / MAX_SQRT_PRICE.
-    uint160 private constant V4_MIN_SQRT_PRICE_LIMIT = 4_295_128_740;
-    uint160 private constant V4_MAX_SQRT_PRICE_LIMIT =
-        1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261;
-
+    /// @dev V4 sqrt-price-limit constants moved to UniswapLib (used only
+    /// inside the unlock callback now). Slippage enforcement remains the
+    /// per-leg `leg.minAmountOut` delta check at the main-contract level.
     /// @dev Strict size of encoded v4SwapData: 5 × 32-byte words
     /// (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook).
     uint256 private constant V4_SWAP_DATA_LENGTH = 160;
@@ -189,7 +189,6 @@ contract LiquidationExecutor is
     address public immutable weth;
     address public aavePool;
     address public morphoBlue;
-    address public balancerVault;
     address public paraswapAugustusV6;
     address public aaveV2LendingPool;
     /// @dev Immutable — canonical Uniswap V2 Router02 (mainnet
@@ -206,10 +205,22 @@ contract LiquidationExecutor is
     mapping(address => bool) public allowedTargets;
     /// @dev Owner-curated whitelist of V4 hook contracts. A V4 swap whose
     /// PoolKey references a hook that is neither address(0) nor allow-listed
-    /// reverts with `V4HookNotAllowed`. Hooks run arbitrary code inside
+    /// reverts with `InvalidPlan`. Hooks run arbitrary code inside
     /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
+    /// @dev Dedicated narrow allowlist for Curve V1 / Balancer V2 pool
+    /// targets used by the CURVE_V1 and BAL_V2 swap modes. Separating
+    /// this from the generic `allowedTargets` set closes a selector-
+    /// collision surface: if any contract in `allowedTargets` (Aave
+    /// pool, Paraswap Augustus, Bebop, Uni routers, etc.) happens to
+    /// implement Curve's `exchange(int128,int128,uint256,uint256)`
+    /// selector (0x3df02124) or `exchange_underlying` (0xa6417ed6) —
+    /// or Balancer's `swap(SingleSwap, FundManagement, ...)` selector —
+    /// with side-effects, the operator could otherwise route a swap to
+    /// it. Pool addresses MUST be added to BOTH mappings (the broader
+    /// `allowedTargets` gate is preserved as a sanity floor).
+    mapping(address => bool) public allowedExtSwapTargets;
 
     bytes32 private _activePlanHash;
 
@@ -266,6 +277,22 @@ contract LiquidationExecutor is
     event UniV4SwapExecuted(
         address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
     );
+    /// @dev Emitted by `CurveV1Lib.executeLeg` under DELEGATECALL.
+    /// `pool` is the StableSwap V1 pool address (or its lending wrapper);
+    /// declared here so the contract's external ABI surfaces the event.
+    event CurveV1SwapExecuted(
+        address indexed pool, address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut
+    );
+    /// @dev Emitted by `BalancerV2Lib.executeLeg` under DELEGATECALL.
+    /// `kind` is the SwapKind enum (0=GIVEN_IN/SELL, 1=GIVEN_OUT/BUY).
+    event BalancerV2SwapExecuted(
+        bytes32 indexed poolId,
+        address indexed srcToken,
+        address indexed dstToken,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint8 kind
+    );
     event TwoLegSwapExecuted(
         address indexed intermediateToken,
         uint256 leg1AmountIn,
@@ -274,6 +301,7 @@ contract LiquidationExecutor is
         uint256 finalRepayDelta
     );
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
+    event ExtSwapTargetUpdated(address indexed target, bool allowed);
 
     // ─── Enums ────────────────────────────────────────────────────────
     enum SwapMode {
@@ -282,7 +310,52 @@ contract LiquidationExecutor is
         UNI_V2,
         UNI_V3,
         UNI_V4,
-        NO_SWAP // Same-token liquidation: srcToken == repayToken, no DEX call.
+        NO_SWAP, // Same-token liquidation: srcToken == repayToken, no DEX call.
+        // BUY-side V3 — caller specifies EXACT `amountOut` (in
+        // `minAmountOut`) and MAX input (in `amountIn`, semantically
+        // `amountInMaximum`). Router refunds unused source. Library
+        // dispatches to `exactOutputSingle`. leg1-only; leg2 / split /
+        // sequential paths reject this mode.
+        UNI_V3_BUY,
+        // BUY-side V2 — same field remap as UNI_V3_BUY (`minAmountOut`
+        // is the EXACT amountOut, `amountIn` is amountInMax). Library
+        // dispatches to V2 router's `swapTokensForExactTokens`. Router
+        // consumes only the required input, the rest stays on the
+        // caller. leg1-only.
+        UNI_V2_BUY,
+        // BUY-side V4 — same field remap as the other *_BUY modes
+        // (`minAmountOut` = EXACT amountOut, `amountIn` = amountInMax).
+        // The unlock callback feeds the V4 PoolManager a positive
+        // `amountSpecified` (= EXACT amountOut) so the pool returns a
+        // variable-input / fixed-output delta. Post-unlock the main
+        // contract additionally enforces `consumed <= amountInMax` —
+        // the V4 PM has no client-side input ceiling, so the executor
+        // must police it. leg1-only (mirrors UNI_V3_BUY scope).
+        UNI_V4_BUY,
+        // Curve StableSwap V1 SELL — calls pool.exchange(int128 i,
+        // int128 j, uint256 dx, uint256 min_dy) (or exchange_underlying
+        // for lending pools). Pool address comes from `bebopTarget`;
+        // (i, j, useUnderlying) packed into `bebopCalldata` as
+        // abi.encode(int128, int128, bool). The Curve quoter on the
+        // bot side precomputes the indices and pool address.
+        // Implementation: CurveV1Lib.executeLeg.
+        CURVE_V1,
+        // Curve V1 BUY — Curve has no native exact-out. Bot precomputes
+        // `dx` such that get_dy(dx) >= targetOut, packs `dx` as
+        // `amountIn` and `targetOut` as `minAmountOut`. The on-chain
+        // swap is identical to CURVE_V1; only the event label flips.
+        // Excess output (rounding overage) stays on the executor.
+        CURVE_V1_BUY,
+        // Balancer V2 SELL — Vault.swap with SwapKind.GIVEN_IN. Vault
+        // address from `bebopTarget`; poolId + userData packed into
+        // `bebopCalldata` as abi.encode(bytes32, bytes).
+        // Implementation: BalancerV2Lib.executeLeg.
+        BAL_V2,
+        // Balancer V2 BUY — Vault.swap with SwapKind.GIVEN_OUT. Native
+        // exact-out support: amount = targetOut, limit = maxIn (=
+        // leg.amountIn). The Vault consumes ≤ limit and credits
+        // exact targetOut. Same lib as BAL_V2.
+        BAL_V2_BUY
     }
 
     // ─── Plan Structs ─────────────────────────────────────────────────
@@ -452,7 +525,6 @@ contract LiquidationExecutor is
         uniV2Router = uniV2Router_;
         uniV3Router = uniV3Router_;
         aavePool = aavePool_;
-        balancerVault = balancerVault_;
         paraswapAugustusV6 = paraswapAugustus_;
 
         allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
@@ -476,25 +548,33 @@ contract LiquidationExecutor is
     }
 
     // ─── Owner Config Functions ──────────────────────────────────────
-    function setMorphoBlue(address morpho) external onlyOwner {
-        if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
-        address old = morphoBlue;
-        morphoBlue = morpho;
-        emit ConfigUpdated("morphoBlue", old, morpho);
-    }
+    // setMorphoBlue removed — the Morpho role is two independent storage
+    // slots (`morphoBlue` + `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`)
+    // whose desync produces an exploitable mismatch (callback authority
+    // pinned to old Morpho while liquidation routes through new Morpho).
+    // The atomic helper `configureMorpho` writes both slots in one call;
+    // removing the single-slot setter eliminates the desync window
+    // entirely and forces all Morpho re-configuration through the
+    // atomic path.
 
     function setAaveV2LendingPool(address pool) external onlyOwner {
         if (pool == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
+        if (!allowedTargets[pool]) revert TargetNotAllowed();
         address old = aaveV2LendingPool;
         aaveV2LendingPool = pool;
         emit ConfigUpdated("aaveV2Pool", old, pool);
     }
 
+    /// @notice Update a flashloan provider slot. Restricted to
+    /// `FLASH_PROVIDER_BALANCER` only — Morpho re-configuration MUST go
+    /// through `configureMorpho` to keep the liquidation-target and
+    /// callback-authority slots synced. Unknown providerIds were
+    /// inert dispatch-side but used to pollute the mapping namespace;
+    /// pinning to BALANCER closes both concerns.
     function setFlashProvider(uint8 providerId, address provider) external onlyOwner {
+        if (providerId != FLASH_PROVIDER_BALANCER) revert InvalidPlan();
         if (provider == address(0)) revert ZeroAddress();
-        if (!allowedTargets[provider]) revert TargetNotAllowed(provider);
+        if (!allowedTargets[provider]) revert TargetNotAllowed();
         address old = allowedFlashProviders[providerId];
         allowedFlashProviders[providerId] = provider;
         emit FlashProviderUpdated(providerId, old, provider);
@@ -512,7 +592,7 @@ contract LiquidationExecutor is
     /// the rare case the two roles intentionally diverge (testnets, migrations).
     function configureMorpho(address morpho) external onlyOwner {
         if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
+        if (!allowedTargets[morpho]) revert TargetNotAllowed();
 
         address oldMorpho = morphoBlue;
         morphoBlue = morpho;
@@ -526,13 +606,30 @@ contract LiquidationExecutor is
     /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.
     /// @dev Hooks execute arbitrary logic during `beforeSwap`/`afterSwap` on the
     /// PoolManager; any non-zero hook that is NOT in this whitelist causes the
-    /// V4 path to revert with `V4HookNotAllowed`. Default is empty — operator
+    /// V4 path to revert with `InvalidPlan`. Default is empty — operator
     /// routes MUST stay on hook-less pools unless the owner explicitly enables
     /// a hook after review.
     function setV4HookAllowed(address hook, bool allowed) external onlyOwner {
         if (hook == address(0)) revert ZeroAddress();
         allowedV4Hooks[hook] = allowed;
         emit V4HookAllowedUpdated(hook, allowed);
+    }
+
+    /// @notice Add/remove a Curve V1 pool or Balancer V2 Vault from the
+    /// dedicated ext-swap allowlist consulted by CURVE_V1 and BAL_V2
+    /// dispatch paths.
+    /// @dev Decoupled from `allowedTargets` to close the selector-
+    /// collision surface — if any contract in `allowedTargets` (Aave
+    /// pool, Paraswap Augustus, Bebop, Uni routers) happened to expose
+    /// Curve's `exchange(int128,int128,uint256,uint256)` (selector
+    /// 0x3df02124) or Balancer's `swap(...)` selector with side-effects,
+    /// operator could route a swap to it. Curve and Balancer regularly
+    /// deploy new pools, so unlike `allowedTargets` (constructor-only)
+    /// this allowlist is post-deploy curatable.
+    function setExtSwapTarget(address target, bool allowed) external onlyOwner {
+        if (target == address(0)) revert ZeroAddress();
+        allowedExtSwapTargets[target] = allowed;
+        emit ExtSwapTargetUpdated(target, allowed);
     }
 
     function pause() external onlyOwner {
@@ -666,13 +763,28 @@ contract LiquidationExecutor is
         if (leg.repayToken == address(0)) revert ZeroAddress();
 
         SwapMode m = leg.mode;
+        // BUY-side variants share their validation + dispatch branch
+        // with the corresponding SELL mode — the library reads the
+        // ORIGINAL `leg.mode` to pick exactInput vs exactOutput.
+        // Normalising once here saves bytecode vs duplicating
+        // selectors with `||` at every branch (EIP-170 budget).
+        if (m == SwapMode.UNI_V3_BUY) m = SwapMode.UNI_V3;
+        if (m == SwapMode.UNI_V2_BUY) m = SwapMode.UNI_V2;
+        if (m == SwapMode.UNI_V4_BUY) m = SwapMode.UNI_V4;
+        if (m == SwapMode.CURVE_V1_BUY) m = SwapMode.CURVE_V1;
+        if (m == SwapMode.BAL_V2_BUY) m = SwapMode.BAL_V2;
 
-        // NO_SWAP: same-token path (e.g. WETH/WETH). Leg-level checks are
-        // skipped; a mismatched src/repay silently early-returns in
-        // _executeSwapPlan and the final flash-repay balance check
-        // reverts if the plan didn't actually produce enough loanToken.
-        if (m == SwapMode.NO_SWAP) return;
+        // NO_SWAP: same-token path (e.g. WETH/WETH). No DEX is
+        // consulted, so every DEX-related field MUST be zero/empty —
+        // defense-in-depth against future consumers reading these
+        // fields without re-checking the mode. The OR-chain is hosted
+        // in UniswapLib to fit the main contract's EIP-170 budget.
+        if (m == SwapMode.NO_SWAP) {
+            UniswapLib.assertNoSwapLegZeroed(_asLibLeg(leg));
+            return;
+        }
 
+        if (block.timestamp > leg.deadline) revert SwapDeadlineExpired(leg.deadline, block.timestamp);
         if (leg.srcToken == leg.repayToken) revert InvalidPlan();
 
         // Paraswap/Bebop: reject useFullBalance (amountIn is inside calldata).
@@ -695,11 +807,61 @@ contract LiquidationExecutor is
             if (leg.v2Path[pLen - 1] != leg.repayToken) revert InvalidV2Path();
             if (leg.minAmountOut == 0) revert InvalidPlan();
         } else if (m == SwapMode.UNI_V3) {
-            uint24 f = leg.v3Fee;
-            if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
+            // Both UNI_V3 (SELL) and UNI_V3_BUY (mode normalised above)
+            // land here. Single-hop vs multihop is signalled by
+            // `leg.v4SwapData.length`:
+            //   * empty  → single-hop, validate `v3Fee` against the
+            //              canonical Uniswap V3 fee tier set
+            //   * non-empty → multihop, fees are inside the path bytes;
+            //              skip v3Fee here. Path-shape sanity (length,
+            //              endpoint tokens) is enforced by the lib at
+            //              dispatch — bad fees inside the path get
+            //              naturally caught when the router fails to
+            //              find a pool. BUY-specific invariants
+            //              (amountInMax > 0, amountOut > 0) are
+            //              re-checked by the library at dispatch.
+            if (leg.v4SwapData.length == 0) {
+                uint24 f = leg.v3Fee;
+                if (f != 100 && f != 500 && f != 3000 && f != 10000) revert InvalidV3Fee(f);
+            } else {
+                // Multihop: cheap length sanity (>= 66, (len - 20) % 23 == 0).
+                // Lib re-checks endpoints; we keep this here so a malformed
+                // length fails fast pre-flashloan.
+                if (leg.v4SwapData.length < 66 || (leg.v4SwapData.length - 20) % 23 != 0) {
+                    revert InvalidPlan();
+                }
+            }
             if (leg.minAmountOut == 0) revert InvalidPlan();
         } else if (m == SwapMode.UNI_V4) {
             _validateV4Leg(leg);
+        } else if (m == SwapMode.CURVE_V1) {
+            // Curve V1 SELL/BUY. Pool address comes from `bebopTarget`
+            // (re-used as the generic "external swap target"); allowlist
+            // re-check happens inside CurveV1Lib at dispatch. Encoded
+            // ext-data carries (int128 i, int128 j, bool useUnderlying)
+            // — abi.encode minimum size = 3 * 32 = 96 bytes.
+            //
+            // amountIn is intentionally NOT validated here — leg2 with
+            // useFullBalance=true (sequential + split plans) carries a
+            // zero amountIn that's filled in at runtime from the
+            // measured leg1 leftover. The library re-asserts
+            // amountIn > 0 at dispatch (`ZeroSwapInput`).
+            if (leg.bebopTarget == address(0)) revert InvalidPlan();
+            if (leg.bebopCalldata.length < 96) revert InvalidPlan();
+            if (leg.minAmountOut == 0) revert InvalidPlan();
+        } else if (m == SwapMode.BAL_V2) {
+            // Balancer V2 SELL/BUY. Vault address from `bebopTarget`;
+            // poolId + userData packed in `bebopCalldata` as
+            // abi.encode(bytes32, bytes) — minimum encoding includes
+            // the 32-byte poolId plus a 64-byte dynamic-bytes tail
+            // (offset + length, even when userData is empty) = 96 bytes.
+            //
+            // amountIn validation: same reasoning as CURVE_V1 — deferred
+            // to lib's runtime `ZeroSwapInput` check so useFullBalance=true
+            // leg2 plans (where amountIn = 0 on-wire) are accepted.
+            if (leg.bebopTarget == address(0)) revert InvalidPlan();
+            if (leg.bebopCalldata.length < 96) revert InvalidPlan();
+            if (leg.minAmountOut == 0) revert InvalidPlan();
         } else {
             revert InvalidSwapMode();
         }
@@ -709,14 +871,10 @@ contract LiquidationExecutor is
     function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
         Plan memory plan = abi.decode(planData, (Plan));
 
-        // Deadline: check leg1 and leg2 pre-flashloan. block.timestamp is
-        // monotonic within a transaction, so no in-pipeline re-check needed.
-        if (block.timestamp > plan.swapPlan.leg1.deadline) {
-            revert SwapDeadlineExpired(plan.swapPlan.leg1.deadline, block.timestamp);
-        }
-        if (plan.swapPlan.hasLeg2 && block.timestamp > plan.swapPlan.leg2.deadline) {
-            revert SwapDeadlineExpired(plan.swapPlan.leg2.deadline, block.timestamp);
-        }
+        // Deadline check is hoisted into `_validateLeg` (after the NO_SWAP
+        // early-return) so NO_SWAP legs with deadline=0 are exempt and the
+        // selector lives at one revert site. block.timestamp is monotonic
+        // within a transaction, so no in-pipeline re-check needed.
 
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
@@ -777,8 +935,19 @@ contract LiquidationExecutor is
             // break skip-unwrap sequential plans (receiveAToken=true →
             // leg1 NO_SWAP → leg2 peg-pool swap). Reject at validation.
             if (plan.swapPlan.leg1.mode == SwapMode.NO_SWAP) revert PlanShapeConflict();
+            // Leg2 (the repay/profit-leg in sequential plans) MUST be a
+            // SELL-side mode that accepts a runtime amountIn — leg1's
+            // output is measured at runtime and fed to leg2's input
+            // selector. Curve V1 SELL and Balancer V2 SELL qualify
+            // alongside the Uni-V2/V3/V4 SELL modes. BUY variants are
+            // structurally invalid here: their `amountIn` is a maximum,
+            // not the actual input, which would desync the leg-link
+            // balance accounting.
             SwapMode m2 = plan.swapPlan.leg2.mode;
-            if (m2 != SwapMode.UNI_V2 && m2 != SwapMode.UNI_V3 && m2 != SwapMode.UNI_V4) {
+            if (
+                m2 != SwapMode.UNI_V2 && m2 != SwapMode.UNI_V3 && m2 != SwapMode.UNI_V4 && m2 != SwapMode.CURVE_V1
+                    && m2 != SwapMode.BAL_V2
+            ) {
                 revert Leg2ModeNotAllowed(uint8(m2));
             }
             if (plan.swapPlan.leg1.repayToken != plan.swapPlan.leg2.srcToken) {
@@ -795,10 +964,20 @@ contract LiquidationExecutor is
         if (plan.swapPlan.hasSplit) {
             uint16 bps = plan.swapPlan.splitBps;
             if (bps == 0 || bps >= 10_000) revert InvalidPlan();
+            // SPLIT mode requires both legs to accept an explicit
+            // amountIn at dispatch (sized at runtime to splitBps of the
+            // collateral delta). Same SELL-side allowlist as hasLeg2 —
+            // Uni V2/V3/V4 plus Curve V1 / Balancer V2.
             SwapMode m1 = plan.swapPlan.leg1.mode;
-            if (m1 != SwapMode.UNI_V2 && m1 != SwapMode.UNI_V3 && m1 != SwapMode.UNI_V4) revert InvalidPlan();
+            if (
+                m1 != SwapMode.UNI_V2 && m1 != SwapMode.UNI_V3 && m1 != SwapMode.UNI_V4 && m1 != SwapMode.CURVE_V1
+                    && m1 != SwapMode.BAL_V2
+            ) revert InvalidPlan();
             SwapMode mp = plan.swapPlan.leg2.mode;
-            if (mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4) revert InvalidPlan();
+            if (
+                mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4 && mp != SwapMode.CURVE_V1
+                    && mp != SwapMode.BAL_V2
+            ) revert InvalidPlan();
             if (plan.swapPlan.leg2.repayToken != weth) revert InvalidPlan();
             if (collateralAsset != address(0) && plan.swapPlan.leg2.srcToken != collateralAsset) {
                 revert InvalidPlan();
@@ -835,8 +1014,15 @@ contract LiquidationExecutor is
             }
             if (plan.swapPlan.leg1.repayToken != plan.loanToken) revert InvalidPlan();
 
+            // MIXED_SPLIT leg2 (profit leg, coll → WETH) — same SELL-side
+            // allowlist. Balancer 80/20 BAL/WETH and similar weighted
+            // pools are the realistic Curve/Balancer leg2 candidates;
+            // Curve's WETH coverage is thin but legal.
             SwapMode mp = plan.swapPlan.leg2.mode;
-            if (mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4) {
+            if (
+                mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4 && mp != SwapMode.CURVE_V1
+                    && mp != SwapMode.BAL_V2
+            ) {
                 revert InvalidPlan();
             }
             if (plan.swapPlan.leg2.repayToken != weth) revert InvalidPlan();
@@ -848,11 +1034,12 @@ contract LiquidationExecutor is
             }
             // PARASWAP_SINGLE / BEBOP_MULTI embed `amountIn` in calldata
             // — that's fine here (leg1 runs first, we measure what it
-            // consumed). For Uni leg1 modes we still require an explicit
-            // amountIn inside the leg struct because Uni executors read
-            // it at dispatch time.
+            // consumed). All other dispatch-time leg1 modes (Uni V2/V3/V4
+            // + Curve V1 + Balancer V2, both SELL and BUY) read amountIn
+            // from the struct, so a zero here would silently emit a
+            // zero-input swap call.
             if (
-                (m1 == SwapMode.UNI_V2 || m1 == SwapMode.UNI_V3 || m1 == SwapMode.UNI_V4)
+                m1 != SwapMode.PARASWAP_SINGLE && m1 != SwapMode.BEBOP_MULTI && m1 != SwapMode.NO_SWAP
                     && plan.swapPlan.leg1.amountIn == 0
             ) {
                 revert ZeroAmountIn();
@@ -1014,6 +1201,18 @@ contract LiquidationExecutor is
                 uint256 underlyingBefore = IERC20(collateralAsset).balanceOf(address(this));
                 _unwrapATokens(collateralAsset, aTokenDelta);
                 if (IERC20(collateralAsset).balanceOf(address(this)) <= underlyingBefore) revert UnwrapFailed();
+            } else if (trackingToken != collateralAsset && plan.swapPlan.leg1.srcToken == trackingToken) {
+                // Skip-unwrap branch: leg1 swaps the aToken directly via
+                // an aToken/underlying peg pool. The single-leg path's
+                // collateralDelta-cap at line 1445 below is gated on
+                // `srcToken == collateralAsset` and so does not bind
+                // here. Apply the symmetric cap against the aToken
+                // delta so a compromised operator cannot oversize
+                // `leg1.amountIn` to dip into any pre-existing aToken
+                // balance the executor happens to hold (donations,
+                // residue from earlier receive-aToken liquidations).
+                uint256 aTokenDelta = trackingAfter - collateralBefore;
+                if (plan.swapPlan.leg1.amountIn > aTokenDelta) revert InvalidPlan();
             }
         }
 
@@ -1028,7 +1227,14 @@ contract LiquidationExecutor is
                 collateralAssetAfter > collateralAssetBefore ? collateralAssetAfter - collateralAssetBefore : 0;
         }
 
-        _executeSwapPlan(plan.swapPlan, flashRepayAmount, collateralAsset, collateralDelta);
+        // flashFee is the flashloan provider's fee for this advance.
+        // Subtracted from `collateralDelta` (the bonus collateral) when
+        // computing surplus for parallel-split branches — keeps pre-
+        // existing executor balance OUT of the swap-plan accounting.
+        // Underflow → loss-making opp; native Panic(0x11) is a fail-
+        // closed signal the operator should never have submitted.
+        uint256 flashFee = flashRepayAmount - plan.loanAmount;
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount, flashFee, collateralAsset, collateralDelta);
 
         // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
         // BEFORE flash repay. This is the authoritative base that ACTION_PAY_COINBASE
@@ -1124,6 +1330,7 @@ contract LiquidationExecutor is
     function _executeSwapPlan(
         SwapPlan memory plan,
         uint256 flashRepayAmount,
+        uint256 flashFee,
         address collateralAsset,
         uint256 collateralDelta
     ) internal {
@@ -1136,7 +1343,8 @@ contract LiquidationExecutor is
         //   * NO_SWAP + hasMixedSplit (e.g. USDC/USDC with WETH bribe):
         //     leg2 still has to run on the residual collateral. Fall
         //     through to the hasMixedSplit branch below, where the
-        //     leg2.amountIn is computed as `collateralDelta - flashRepayAmount`.
+        //     leg2.amountIn is computed as `collateralDelta - flashFee`
+        //     (audit-fix #1 — was `leg1RepayBefore - flashRepayAmount`).
         if (leg1.mode == SwapMode.NO_SWAP && !plan.hasMixedSplit) return;
 
         address finalRepayToken = (plan.hasLeg2 ? plan.leg2.repayToken : leg1.repayToken);
@@ -1197,13 +1405,39 @@ contract LiquidationExecutor is
             // mode silently degrade into a no-op profit leg.
             if (collateralAsset == address(0)) revert InvalidPlan();
 
-            // NO_SWAP + hasMixedSplit (same-asset path): sweep
-            // `loanBalance - flashRepayAmount` through leg2; residual
-            // settles the flashloan. Underflow → native Panic(0x11).
+            // NO_SWAP + hasMixedSplit (same-asset path): sweep ONLY
+            // the new value added by THIS opp through leg2 — i.e.
+            // `collateralDelta - flashFee` (bonus collateral minus
+            // the cost of borrowing). Pre-existing balance and the
+            // flashloan principal stay reserved for repay.
+            //
+            // Audit fix (5-agent convergence): the prior formula
+            // `leg1RepayBefore - flashRepayAmount` measured ABSOLUTE
+            // post-liquidation balance, which includes any pre-existing
+            // executor balance of loanToken (== collateralAsset for
+            // this same-asset branch). That delta-vs-absolute asymmetry
+            // contradicted the design used by every other multi-leg
+            // branch (SPLIT, MIXED_SPLIT non-NO_SWAP) where leg2 is
+            // sized strictly off `collateralDelta`. The fixed formula
+            // restores that invariant.
+            //
+            // Underflow (collateralDelta < flashFee) means the opp is
+            // loss-making; native Panic(0x11) is a fail-closed signal
+            // — operator should never have submitted it.
             if (leg1.mode == SwapMode.NO_SWAP) {
-                _dispatchLeg(plan.leg2, leg1RepayBefore - flashRepayAmount, 0);
+                _dispatchLeg(plan.leg2, collateralDelta - flashFee, 0);
                 return;
             }
+
+            // Pre-cap intentionally omitted: the post-execution
+            // `MixedSplitLeg1Overspent` check at line 1413 below catches
+            // any leg1 that consumes ≥ collateralDelta. Adding a
+            // pre-flashloan symmetric cap on `leg1.amountIn` is a
+            // ~70-byte defense-in-depth gesture that the EIP-170 budget
+            // does not have headroom for. The reactive guard remains
+            // fail-closed; the only operational difference is a slightly
+            // later revert that still aborts the tx before any state
+            // would leak.
 
             uint256 collBeforeLeg1 = IERC20(collateralAsset).balanceOf(address(this));
 
@@ -1250,6 +1484,15 @@ contract LiquidationExecutor is
         }
 
         uint256 leg1AmountIn = leg1.useFullBalance ? collateralDelta : leg1.amountIn;
+        // Cap leg1AmountIn at collateralDelta when leg1 swaps the underlying
+        // collateral directly — same delta-vs-absolute invariant SPLIT and
+        // MIXED_SPLIT already enforce. Skip-unwrap (leg1.srcToken == aToken)
+        // is exempted because the aToken has its own delta semantics and
+        // collateralAsset's balance hasn't changed.
+        // Closes the operator-coinbase dipping vector surfaced by re-audit;
+        // production bot already keeps amountIn ≤ 0.99 * collateral_to_receive
+        // (worker.rs:2153), so the cap has no operational impact.
+        if (leg1.srcToken == collateralAsset && leg1AmountIn > collateralDelta) revert InvalidPlan();
 
         _dispatchLeg(leg1, leg1AmountIn, leg1RepayBefore);
 
@@ -1276,28 +1519,47 @@ contract LiquidationExecutor is
 
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
         SwapMode m = leg.mode;
+        UniswapLib.SwapLeg memory libLeg = _asLibLeg(leg);
         if (m == SwapMode.PARASWAP_SINGLE) {
-            SwapLegExecutorLib.executeParaswapLeg(_asLibLeg(leg), paraswapAugustusV6);
+            SwapLegExecutorLib.executeParaswapLeg(libLeg, paraswapAugustusV6);
         } else if (m == SwapMode.BEBOP_MULTI) {
-            _executeBebopLeg(leg, outBefore);
-        } else if (m == SwapMode.UNI_V2) {
-            SwapLegExecutorLib.executeUniV2Leg(_asLibLeg(leg), amountIn, uniV2Router);
-        } else if (m == SwapMode.UNI_V3) {
-            SwapLegExecutorLib.executeUniV3Leg(_asLibLeg(leg), amountIn, uniV3Router);
-        } else if (m == SwapMode.UNI_V4) {
+            SwapLegExecutorLib.executeBebopLeg(libLeg, outBefore, allowedTargets[leg.bebopTarget]);
+        } else if (m == SwapMode.UNI_V2 || m == SwapMode.UNI_V2_BUY) {
+            UniswapLib.executeUniV2Leg(libLeg, amountIn, uniV2Router);
+        } else if (m == SwapMode.UNI_V3 || m == SwapMode.UNI_V3_BUY) {
+            UniswapLib.executeUniV3Leg(libLeg, amountIn, uniV3Router);
+        } else if (m == SwapMode.UNI_V4 || m == SwapMode.UNI_V4_BUY) {
+            // _executeUniV4Leg reads `leg.mode` to flip the V4
+            // amountSpecified sign (BUY → positive = exact-output)
+            // and to enforce the post-unlock consumed-input ceiling.
+            // Single-hop vs multihop is dispatched by v4SwapData.length:
+            //   == V4_SWAP_DATA_LENGTH (160) → single-hop
+            //   >  V4_SWAP_DATA_LENGTH       → multihop (V4Hop[] payload)
             _executeUniV4Leg(leg, amountIn);
+        } else if (m == SwapMode.CURVE_V1 || m == SwapMode.CURVE_V1_BUY) {
+            // Curve StableSwap V1. SELL and BUY produce identical
+            // on-chain swaps; the bot precomputes `dx` for BUY so that
+            // get_dy(dx) >= targetOut (Curve has no native exact-out).
+            CurveV1Lib.executeLeg(libLeg, amountIn, allowedExtSwapTargets[leg.bebopTarget]);
+        } else if (m == SwapMode.BAL_V2 || m == SwapMode.BAL_V2_BUY) {
+            // Balancer V2. SwapKind flips inside the library based on
+            // `leg.mode` (GIVEN_IN for SELL, GIVEN_OUT for BUY — native
+            // exact-out support).
+            BalancerV2Lib.executeLeg(libLeg, amountIn, allowedExtSwapTargets[leg.bebopTarget]);
         } else {
             revert InvalidSwapMode();
         }
     }
 
     /// @dev Reinterprets a main-contract `SwapLeg memory` pointer as a
-    /// `SwapLegExecutorLib.SwapLeg memory` pointer. The two struct
-    /// declarations are byte-for-byte identical (field order + types);
-    /// memory layout is identical by ABI rules. Pure pointer retype, no
-    /// memory copy. Keeping both declarations in sync is enforced by the
-    /// STRUCT DISCIPLINE comment in the library file.
-    function _asLibLeg(SwapLeg memory leg) internal pure returns (SwapLegExecutorLib.SwapLeg memory libLeg) {
+    /// `UniswapLib.SwapLeg memory` pointer. The two struct declarations
+    /// are byte-for-byte identical (field order + types); memory layout
+    /// is identical by ABI rules. Pure pointer retype, no memory copy.
+    /// Both UniswapLib and SwapLegExecutorLib's executeParaswapLeg take
+    /// `UniswapLib.SwapLeg memory` so a single cast helper covers both
+    /// dispatch paths. Keeping the two struct declarations in sync is
+    /// enforced by the STRUCT DISCIPLINE comments in UniswapLib.
+    function _asLibLeg(SwapLeg memory leg) internal pure returns (UniswapLib.SwapLeg memory libLeg) {
         assembly {
             libLeg := leg
         }
@@ -1306,31 +1568,14 @@ contract LiquidationExecutor is
     // Paraswap single leg moved to SwapLegExecutorLib (external library,
     // DELEGATECALL). See `_dispatchLeg` for the call site.
 
-    // ─── Internal: Bebop Multi ───────────────────────────────────────
-    /// @dev Executes opaque Bebop settlement call. Security: allowlist + exact approval + output delta checks.
-    function _executeBebopLeg(SwapLeg memory leg, uint256 repayBefore) internal {
-        address target = leg.bebopTarget;
-        if (target.code.length == 0) revert BebopTargetNotContract();
-        if (!allowedTargets[target]) revert TargetNotAllowed(target);
+    // Bebop multi leg moved to SwapLegExecutorLib (external library,
+    // DELEGATECALL) — frees ~150 bytes of main runtime bytecode needed
+    // for Curve V1 + Balancer V2 dispatch branches. See `_dispatchLeg`
+    // for the call site.
 
-        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
-        if (srcBal < leg.amountIn) revert InsufficientSrcBalance(leg.amountIn, srcBal);
-
-        IERC20(leg.srcToken).forceApprove(target, leg.amountIn);
-        (bool ok,) = target.call(leg.bebopCalldata);
-        IERC20(leg.srcToken).forceApprove(target, 0);
-
-        if (!ok) revert BebopSwapFailed();
-
-        uint256 repayAfter = IERC20(leg.repayToken).balanceOf(address(this));
-        uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
-        if (repayDelta < leg.minAmountOut) revert InsufficientRepayOutput(repayDelta, leg.minAmountOut);
-
-        emit BebopSwapExecuted(target, leg.srcToken, leg.amountIn, repayDelta, 0);
-    }
-
-    // Uniswap V2 + V3 legs moved to SwapLegExecutorLib (external library,
-    // DELEGATECALL). See `_dispatchLeg` for the call sites.
+    // Uniswap V2 + V3 + V4 leg execution moved to UniswapLib (external
+    // library, DELEGATECALL). See `_dispatchLeg` and `unlockCallback`
+    // for the call sites.
 
     // ─── Internal: V4 leg validation (centralized fail-closed checks) ─
     /// @dev Single source of truth for V4 preconditions. Called from
@@ -1348,30 +1593,44 @@ contract LiquidationExecutor is
     ///     intermediate token (== leg2.srcToken) for leg1 of a two-leg plan
     ///   * hook MUST be address(0) or in `allowedV4Hooks`
     /// Any widening of this scope requires new tests and a fresh review.
-    function _validateV4Leg(SwapLeg memory leg)
-        internal
-        view
-        returns (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook)
-    {
+    function _validateV4Leg(SwapLeg memory leg) internal view {
         if (leg.minAmountOut == 0) revert InvalidPlan();
 
-        address pm = leg.v4PoolManager;
-        if (pm == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pm]) revert TargetNotAllowed(pm);
-        if (leg.v4SwapData.length != V4_SWAP_DATA_LENGTH) revert InvalidV4Data();
+        // pm == address(0) caught by `!allowedTargets[pm]` since
+        // mapping default is false — saves an explicit ZeroAddress
+        // revert for the EIP-170 budget. Tests expect TargetNotAllowed.
+        if (!allowedTargets[leg.v4PoolManager]) revert TargetNotAllowed();
 
-        (tokenIn, tokenOut, fee, tickSpacing, hook) =
-            abi.decode(leg.v4SwapData, (address, address, uint24, int24, address));
+        uint256 dataLen = leg.v4SwapData.length;
+        if (dataLen == V4_SWAP_DATA_LENGTH) {
+            // Single-hop: structural validation lives in UniswapLib.
+            // Returns the decoded hook address; main keeps the
+            // storage-bound allowlist re-check.
+            address hook = UniswapLib.decodeAndValidateV4SingleHopShape(leg.v4SwapData, leg.srcToken, leg.repayToken);
+            if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidPlan();
+        } else if (dataLen > V4_SWAP_DATA_LENGTH) {
+            // Multihop: full validation lives in UniswapLib. The lib
+            // walks every hop (structural checks + per-hop hook
+            // allowlist via a CALL back into `this.isV4HookAllowed`).
+            // Keeps the heavy V4Hop[] codec and the per-hop loop off
+            // the main-contract bytecode budget.
+            UniswapLib.decodeAndValidateV4MultihopShape(
+                leg.v4SwapData, leg.srcToken, leg.repayToken, this.isV4HookAllowed
+            );
+        } else {
+            // dataLen < V4_SWAP_DATA_LENGTH (malformed: short payload).
+            revert InvalidPlan();
+        }
+    }
 
-        if (tokenIn == address(0) || tokenOut == address(0)) revert InvalidV4NativeToken();
-        if (tokenIn != leg.srcToken) revert InvalidV4Data();
-        if (tokenOut != leg.repayToken) revert InvalidV4TokenOut(leg.repayToken, tokenOut);
-        if (tokenIn == tokenOut) revert InvalidV4Data();
-
-        if (fee == 0 || tickSpacing <= 0) revert InvalidV4FeeOrSpacing();
-        if (fee & 0x800000 != 0) revert InvalidV4Fee();
-
-        if (hook != address(0) && !allowedV4Hooks[hook]) revert V4HookNotAllowed(hook);
+    /// @notice Public allowlist getter — used by `UniswapLib.
+    /// decodeAndValidateV4MultihopShape` to enforce per-hop hook
+    /// allowlist during multihop validation. Function-pointer call
+    /// from the lib lands here as a regular CALL (not DELEGATECALL)
+    /// because `this.fn` is external. Cheap and keeps the per-hop
+    /// loop bytecode in the lib instead of the main contract.
+    function isV4HookAllowed(address hook) external view returns (bool) {
+        return allowedV4Hooks[hook];
     }
 
     // ─── Internal: Uniswap V4 single-hop exact-input swap ────────────
@@ -1385,13 +1644,27 @@ contract LiquidationExecutor is
     /// via `_validateV4Leg`; this function re-decodes inline to keep the
     /// runtime size down.
     function _executeUniV4Leg(SwapLeg memory leg, uint256 amountIn) internal {
-        (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
-            abi.decode(leg.v4SwapData, (address, address, uint24, int24, address));
-
         if (amountIn == 0) revert ZeroSwapInput();
+
+        address tokenIn = leg.srcToken;
+        address tokenOut = leg.repayToken;
 
         uint256 srcBal = IERC20(tokenIn).balanceOf(address(this));
         if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
+
+        // Mode-dependent amountSpecified for V4:
+        //   * SELL (UNI_V4):     -int256(amountIn)         exact-input
+        //   * BUY  (UNI_V4_BUY): +int256(leg.minAmountOut) exact-output
+        // The lib treats both uniformly — the only invariant it enforces
+        // is `tokenInDelta < 0 && tokenOutDelta > 0`, which holds for
+        // either direction of `amountSpecified` AND for every multihop
+        // sub-swap.
+        // Sign of amountSpec discriminates the V4 swap direction:
+        //   negative = exact-input  (SELL, UNI_V4)
+        //   positive = exact-output (BUY,  UNI_V4_BUY)
+        // The unlock callback derives isBuy = amountSpec > 0 — no need
+        // to pass a separate bool through the wire.
+        int256 amountSpec = leg.mode == SwapMode.UNI_V4_BUY ? int256(leg.minAmountOut) : -int256(amountIn);
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
 
@@ -1399,17 +1672,48 @@ contract LiquidationExecutor is
         _activeV4PoolManager = pm;
         _activeV4TokenIn = tokenIn;
         // tokenIn is NOT included in the unlock payload — the callback
-        // reads it from storage so the PM cannot substitute it. Encode
-        // the remaining five fields only.
-        IPoolManager(pm).unlock(abi.encode(tokenOut, fee, tickSpacing, hook, amountIn));
-        // _activeV4TokenIn cleared by callback on entry. _activeV4PoolManager
-        // cleared so the existing pm-pin guard re-arms for the next leg.
+        // reads it from storage so the PM cannot substitute it.
+        // Single-hop vs multihop is dispatched by v4SwapData length:
+        //   == V4_SWAP_DATA_LENGTH (160) → single-hop 5-tuple,
+        //                                  passed verbatim to callback
+        //                                  along with the amountSpec
+        //                                  + the leg's repayToken.
+        //   >  V4_SWAP_DATA_LENGTH       → multihop V4Hop[] (validated),
+        //                                  passed verbatim with amountSpec
+        //                                  + isBuy flag.
+        // Encoding both modes as `(bytes, int256, bool)` keeps the
+        // unlock-callback dispatch uniform and lets it re-use a single
+        // abi.decode entry point. The single-hop callback re-decodes
+        // the 160 inner bytes as a 5-tuple; multihop re-decodes them as
+        // V4Hop[]. Main never has to crack the inner shape.
+        IPoolManager(pm).unlock(abi.encode(leg.v4SwapData, amountSpec));
         _activeV4PoolManager = address(0);
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
-        emit UniV4SwapExecuted(tokenIn, tokenOut, fee, amountIn, received);
+        // Enforce `consumed <= amountIn` post-unlock for BOTH SELL and
+        // BUY. The V4 PoolManager has no client-side input ceiling so
+        // the executor must police it — otherwise an honest-but-thin
+        // pool (or hostile hook in a multihop) could pull more srcToken
+        // than the operator approved (bounded only by whatever pre-
+        // existing balance the executor happened to hold).
+        //   * BUY:  amountIn is the on-wire `amountInMaximum` field.
+        //   * SELL: amountIn is the exact-input target. An honest PM
+        //           returns owedIn == amountIn; the check fires if
+        //           the PM (or any hop in a multihop chain) pulled
+        //           more, regardless of the cause.
+        // Audit fix (lead): symmetrize with BUY — the pre-fix code
+        // gated the check on `isBuy`, leaving SELL silently exposed
+        // to over-pulls.
+        uint256 consumed = srcBal - IERC20(tokenIn).balanceOf(address(this));
+        if (consumed > amountIn) revert InsufficientSrcBalance(consumed, amountIn);
+
+        // emittedFee = 0: the per-hop / single-hop fee lives inside
+        // leg.v4SwapData and the call trace; off-chain consumers
+        // recover it from there. Not emitting it here saves a
+        // single-hop abi.decode in main (EIP-170 budget).
+        emit UniV4SwapExecuted(tokenIn, tokenOut, 0, consumed, received);
     }
 
     /// @inheritdoc IUnlockCallback
@@ -1437,52 +1741,31 @@ contract LiquidationExecutor is
         if (tokenIn == address(0) || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
         _activeV4TokenIn = address(0); // CLAIM
 
-        (address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint256 amountIn) =
-            abi.decode(data, (address, uint24, int24, address, uint256));
-
-        // Hook whitelist re-check defends against a malicious/
-        // misconfigured PoolManager substituting the hook field.
-        // tokenOut substitution remains caught by the post-unlock
-        // `received` delta (computed against `leg.repayToken`) and
-        // the pipeline-level `repayDelta >= flashRepayAmount` gate.
-        if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
-
-        bool zeroForOne = tokenIn < tokenOut;
-        PoolKey memory key = PoolKey({
-            currency0: zeroForOne ? tokenIn : tokenOut,
-            currency1: zeroForOne ? tokenOut : tokenIn,
-            fee: fee,
-            tickSpacing: tickSpacing,
-            hooks: hook
-        });
-
-        SwapParams memory params = SwapParams({
-            zeroForOne: zeroForOne,
-            amountSpecified: -int256(amountIn),
-            sqrtPriceLimitX96: zeroForOne ? V4_MIN_SQRT_PRICE_LIMIT : V4_MAX_SQRT_PRICE_LIMIT
-        });
-
-        int256 swapDelta = IPoolManager(msg.sender).swap(key, params, "");
-        int128 amount0 = int128(swapDelta >> 128);
-        int128 amount1 = int128(swapDelta);
-
-        int128 tokenInDelta = zeroForOne ? amount0 : amount1;
-        int128 tokenOutDelta = zeroForOne ? amount1 : amount0;
-
-        // Exact-input single-hop invariant: owe strictly positive tokenIn
-        // (tokenInDelta < 0), gain strictly positive tokenOut (tokenOutDelta > 0).
-        // Any other shape — including zero-output, positive-input, or partial
-        // settlement — fails closed. Strict `< 0` / `> 0` makes owedIn > 0
-        // and gainedOut > 0 by construction (no extra zero-guards needed).
-        if (tokenInDelta >= 0 || tokenOutDelta <= 0) revert V4UnexpectedDelta();
-
-        uint256 owedIn = uint256(int256(-tokenInDelta));
-        uint256 gainedOut = uint256(int256(tokenOutDelta));
-
-        IPoolManager(msg.sender).sync(tokenIn);
-        IERC20(tokenIn).safeTransfer(msg.sender, owedIn);
-        IPoolManager(msg.sender).settle();
-        IPoolManager(msg.sender).take(tokenOut, address(this), gainedOut);
+        // Uniform unlock-data shape for single-hop AND multihop:
+        //   abi.encode(bytes inner, int256 amountSpec)
+        // where `inner` is the leg's `v4SwapData` passed verbatim by
+        // `_executeUniV4Leg`. inner.length distinguishes the modes:
+        //   == V4_SWAP_DATA_LENGTH (160) → single-hop 5-tuple inside
+        //   >  V4_SWAP_DATA_LENGTH       → multihop V4Hop[] inside
+        // Sign of `amountSpec` discriminates SELL (negative=exact-in)
+        // vs BUY (positive=exact-out) — the multihop lib derives this
+        // from `amountSpec > 0` instead of taking a separate flag.
+        // Multihop hook allowlist re-check is intentionally NOT run
+        // here: the pre-flashloan validator (_validateV4Leg) already
+        // walked every hop and asserted `allowedV4Hooks[hook]`. The
+        // PoolManager forwards the bytes we passed to `unlock()`
+        // verbatim — there is no substitution surface inside one
+        // transaction. The single-hop branch keeps its callback-time
+        // re-check for parity with the pre-multihop production scope.
+        (bytes memory inner, int256 amountSpec) = abi.decode(data, (bytes, int256));
+        if (inner.length == V4_SWAP_DATA_LENGTH) {
+            (, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
+                abi.decode(inner, (address, address, uint24, int24, address));
+            if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
+            UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec);
+        } else {
+            UniswapLib.runV4UnlockMultihop(IPoolManager(msg.sender), tokenIn, data);
+        }
         return "";
     }
 
@@ -1509,7 +1792,7 @@ contract LiquidationExecutor is
 
         address pool = aavePool;
         if (pool == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
+        if (!allowedTargets[pool]) revert TargetNotAllowed();
         if (action.actionType != 4) revert UnsupportedActionType(action.actionType);
         if (action.user == address(0)) revert ZeroAddress();
         if (action.debtToCover == 0) revert InvalidPlan();
@@ -1529,7 +1812,7 @@ contract LiquidationExecutor is
 
         address pool = aaveV2LendingPool;
         if (pool == address(0)) revert ZeroAddress();
-        if (!allowedTargets[pool]) revert TargetNotAllowed(pool);
+        if (!allowedTargets[pool]) revert TargetNotAllowed();
 
         IERC20(liq.debtAsset).forceApprove(pool, liq.debtToCover);
         IAaveV2LendingPool(pool)
@@ -1544,7 +1827,7 @@ contract LiquidationExecutor is
 
         address morpho = morphoBlue;
         if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert TargetNotAllowed(morpho);
+        if (!allowedTargets[morpho]) revert TargetNotAllowed();
         if (liq.borrower == address(0)) revert ZeroAddress();
         if (liq.seizedAssets == 0) revert MorphoShareModeUnsupported();
         if (liq.repaidShares != 0) revert MorphoMixedModeUnsupported();
@@ -1586,6 +1869,13 @@ contract LiquidationExecutor is
                     mstore(add(ptr, 4), collateralAsset)
                     let ok := staticcall(gas(), pool, ptr, 36, ptr, 480)
                     if iszero(ok) { revert(0, 0) }
+                    // EVM staticcall writes only `min(returndatasize, outsize)`
+                    // bytes — the remaining buffer is uninitialized scratch.
+                    // Verify at least 9 * 32 = 288 bytes came back so the
+                    // slot-9 read targets returned data, not scratch.
+                    // Defends against an Aave-pool downgrade / proxy bug
+                    // returning a truncated ReserveData struct.
+                    if lt(returndatasize(), 288) { revert(0, 0) }
                     canonical := mload(add(ptr, 256)) // 9th slot
                 }
                 if (suppliedAToken != canonical) revert InvalidATokenAddress(suppliedAToken, canonical);

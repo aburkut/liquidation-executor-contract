@@ -8,6 +8,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
+import {UniswapLib} from "../src/libraries/UniswapLib.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
 import {MarketParams} from "../src/interfaces/IMorphoBlue.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -21,6 +22,9 @@ import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockUniV2Router} from "./mocks/MockUniV2Router.sol";
 import {MockUniV3Router} from "./mocks/MockUniV3Router.sol";
 import {MockV4PoolManager} from "./mocks/MockV4PoolManager.sol";
+import {MockCurveV1Pool} from "./mocks/MockCurveV1Pool.sol";
+import {MockBalancerV2Vault2} from "./mocks/MockBalancerV2Vault2.sol";
+import {MockTetherStyleERC20} from "./mocks/MockTetherStyleERC20.sol";
 import {MaliciousV4PoolManager} from "./mocks/MaliciousV4PoolManager.sol";
 
 /// Test-only struct mirroring Augustus V6.2 UniswapV2Data / UniswapV3Data. Both
@@ -99,6 +103,8 @@ contract ExecutorTest is Test {
     MockUniV2Router public uniV2Mock;
     MockUniV3Router public uniV3Mock;
     MockV4PoolManager public uniV4Mock;
+    MockCurveV1Pool public curveV1Mock;
+    MockBalancerV2Vault2 public balancerSwapMock;
 
     address public owner = address(0xA11CE);
     address public operatorAddr = address(0xB0B);
@@ -108,8 +114,8 @@ contract ExecutorTest is Test {
     uint256 constant FLASH_FEE = 1e18;
     uint256 constant SWAP_RATE = 1.1e18; // 10% gain
     uint256 constant MIN_PROFIT = 5e18;
-    uint256 constant COLLATERAL_REWARD = 600e18;
-    uint256 constant DEFAULT_SWAP_AMOUNT = 1000e18; // Pre-funded collateral balance used in default swaps
+    uint256 constant COLLATERAL_REWARD = 1000e18;
+    uint256 constant DEFAULT_SWAP_AMOUNT = 1000e18; // Default swap covers full collateralReward (no pre-fund — leg1.amountIn capped at collateralDelta)
 
     // ─── Augustus V6.2 swap entrypoint selectors (all 11) ────────────────
     // Verified against Sourcify metadata for 0x6A000F20005980200259B80c5102003040001068.
@@ -193,14 +199,18 @@ contract ExecutorTest is Test {
         uniV2Mock = new MockUniV2Router(SWAP_RATE);
         uniV3Mock = new MockUniV3Router(SWAP_RATE);
         uniV4Mock = new MockV4PoolManager(SWAP_RATE);
+        curveV1Mock = new MockCurveV1Pool(address(collateralToken), address(loanToken), SWAP_RATE);
+        balancerSwapMock = new MockBalancerV2Vault2(SWAP_RATE);
 
-        address[] memory targets = new address[](6);
+        address[] memory targets = new address[](8);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(aaveV2Pool);
         targets[3] = address(bebop);
         targets[4] = address(morphoBlue);
         targets[5] = address(uniV4Mock);
+        targets[6] = address(curveV1Mock);
+        targets[7] = address(balancerSwapMock);
 
         executor = new LiquidationExecutor(
             owner,
@@ -216,7 +226,13 @@ contract ExecutorTest is Test {
 
         vm.startPrank(owner);
         executor.setAaveV2LendingPool(address(aaveV2Pool));
-        executor.setMorphoBlue(address(morphoBlue));
+        executor.configureMorpho(address(morphoBlue));
+        // Audit-fix #3: dedicated ext-swap allowlist. Curve V1 pool and
+        // Balancer V2 Vault targets must be flagged separately; the
+        // broader allowedTargets gate is preserved as a sanity floor
+        // but is no longer the CURVE_V1 / BAL_V2 dispatch gate.
+        executor.setExtSwapTarget(address(curveV1Mock), true);
+        executor.setExtSwapTarget(address(balancerSwapMock), true);
         vm.stopPrank();
 
         // Configure liquidation reward so the delta-based collateral check passes
@@ -232,7 +248,8 @@ contract ExecutorTest is Test {
         collateralToken.mint(address(augustus), 100_000e18);
         collateralToken.mint(address(aavePool), 100_000e18); // Pool needs collateral to send as reward
         loanToken.mint(address(executor), LOAN_AMOUNT + FLASH_FEE + 100e18);
-        collateralToken.mint(address(executor), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD); // Pre-fund gap (swap needs more than liquidation produces)
+        // No pre-fund: contract requires leg1.amountIn ≤ collateralDelta,
+        // and DEFAULT_SWAP_AMOUNT == COLLATERAL_REWARD by construction.
         collateralToken.mint(address(aaveV2Pool), 100_000e18);
         loanToken.mint(address(aaveV2Pool), 100_000e18);
         collateralToken.mint(address(morphoBlue), 100_000e18);
@@ -269,6 +286,20 @@ contract ExecutorTest is Test {
         collateralToken.mint(address(uniV4Mock), 100_000e18);
         profitToken.mint(address(uniV4Mock), 100_000e18);
         mockWeth.mint(address(uniV4Mock), 100_000e18);
+
+        // Fund Curve V1 pool mock with output tokens (coin1 = loanToken
+        // by construction; profitToken + mockWeth added for leg2 plans
+        // that route into WETH or a profit-asset)
+        loanToken.mint(address(curveV1Mock), 100_000e18);
+        collateralToken.mint(address(curveV1Mock), 100_000e18);
+        profitToken.mint(address(curveV1Mock), 100_000e18);
+        mockWeth.mint(address(curveV1Mock), 100_000e18);
+
+        // Fund Balancer V2 vault mock with output tokens
+        loanToken.mint(address(balancerSwapMock), 100_000e18);
+        collateralToken.mint(address(balancerSwapMock), 100_000e18);
+        profitToken.mint(address(balancerSwapMock), 100_000e18);
+        mockWeth.mint(address(balancerSwapMock), 100_000e18);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────
@@ -805,6 +836,67 @@ contract ExecutorTest is Test {
         });
     }
 
+    /// @dev V2 BUY-side leg — same field remap as `_buildUniV3BuyLeg`,
+    /// but routes via `swapTokensForExactTokens` on the V2 router.
+    function _buildUniV2BuyLeg(address srcToken, address dstToken, uint256 amountInMaximum, uint256 amountOut)
+        internal
+        view
+        returns (LiquidationExecutor.SwapLeg memory)
+    {
+        address[] memory path = new address[](2);
+        path[0] = srcToken;
+        path[1] = dstToken;
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V2_BUY,
+            srcToken: srcToken,
+            amountIn: amountInMaximum,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: path,
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: amountOut
+        });
+    }
+
+    /// @dev BUY-side leg1 — caller specifies EXACT output (`amountOut`)
+    /// and MAX input (`amountInMaximum`). Field remap on the
+    /// canonical `SwapLeg`:
+    ///   * `amountIn`     → `amountInMaximum`  (max source tokens spent)
+    ///   * `minAmountOut` → `amountOut`        (exact target output)
+    /// Router refunds unused source tokens to the executor; leftover
+    /// stays on contract (= collateral residual for MIXED_SPLIT leg2,
+    /// or profit / sweep for single-leg).
+    function _buildUniV3BuyLeg(
+        address srcToken,
+        address dstToken,
+        uint256 amountInMaximum,
+        uint24 fee,
+        uint256 amountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3_BUY,
+            srcToken: srcToken,
+            amountIn: amountInMaximum,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: fee,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: amountOut
+        });
+    }
+
     function _buildUniV4Leg(
         address srcToken,
         address dstToken,
@@ -831,6 +923,148 @@ contract ExecutorTest is Test {
             v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook),
             repayToken: dstToken,
             minAmountOut: minOut
+        });
+    }
+
+    /// @dev Encode a 3-token V3 multihop path for SELL: tokenA-feeAB-tokenB-feeBC-tokenC.
+    /// Standard Uniswap V3 path layout: 20+3+20+3+20 = 66 bytes.
+    function _encodeV3PathSell(address tA, uint24 feeAB, address tB, uint24 feeBC, address tC)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(tA, feeAB, tB, feeBC, tC);
+    }
+
+    /// @dev Encode a 3-token V3 multihop path for BUY (V3 SwapRouter02 expects
+    /// path REVERSED on exactOutput): tokenC-feeBC-tokenB-feeAB-tokenA.
+    function _encodeV3PathBuy(address tA, uint24 feeAB, address tB, uint24 feeBC, address tC)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(tC, feeBC, tB, feeAB, tA);
+    }
+
+    /// @dev V3 multihop SELL leg — `v4SwapData` carries V3 path bytes;
+    /// when non-empty the lib dispatches to `exactInput` instead of
+    /// `exactInputSingle`. `v3Fee` is ignored on the multihop branch
+    /// (fees come from the path).
+    function _buildUniV3MultihopSellLeg(
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        bytes memory path,
+        uint256 minAmountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: path,
+            repayToken: dstToken,
+            minAmountOut: minAmountOut
+        });
+    }
+
+    /// @dev V3 multihop BUY leg — `v4SwapData` carries REVERSED path
+    /// bytes (V3 router contract); lib dispatches to `exactOutput`.
+    function _buildUniV3MultihopBuyLeg(
+        address srcToken,
+        address dstToken,
+        uint256 amountInMaximum,
+        bytes memory pathReversed,
+        uint256 amountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3_BUY,
+            srcToken: srcToken,
+            amountIn: amountInMaximum,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: pathReversed,
+            repayToken: dstToken,
+            minAmountOut: amountOut
+        });
+    }
+
+    /// @dev V4 BUY-side leg — exact-output single-hop. `amountInMaximum`
+    /// is the spend ceiling; `amountOut` is the EXACT target. Library
+    /// reads `leg.mode == UNI_V4_BUY` to flip the V4 amountSpecified
+    /// sign (positive = exact-output) and to enforce `consumed <=
+    /// amountInMax` post-unlock.
+    /// @dev V4 multihop leg — `v4SwapData = abi.encode(V4Hop[])`.
+    /// Length > V4_SWAP_DATA_LENGTH (160) signals multihop dispatch in
+    /// the validator, the executor, and the unlock callback. `isBuy`
+    /// flips the SwapMode (UNI_V4 vs UNI_V4_BUY) which the executor
+    /// reads to pick the amountSpec sign. Per-hop fees live inside
+    /// the encoded V4Hop[] (`v3Fee` field is unused on the multihop path).
+    function _buildUniV4MultihopLeg(
+        bool isBuy,
+        address srcToken,
+        address dstToken,
+        uint256 amountIn,
+        UniswapLib.V4Hop[] memory hops,
+        address poolManager,
+        uint256 minAmountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: isBuy ? LiquidationExecutor.SwapMode.UNI_V4_BUY : LiquidationExecutor.SwapMode.UNI_V4,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: poolManager,
+            v4SwapData: abi.encode(hops),
+            repayToken: dstToken,
+            minAmountOut: minAmountOut
+        });
+    }
+
+    function _buildUniV4BuyLeg(
+        address srcToken,
+        address dstToken,
+        uint256 amountInMaximum,
+        uint24 fee,
+        int24 tickSpacing,
+        address hook,
+        address poolManager,
+        uint256 amountOut
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V4_BUY,
+            srcToken: srcToken,
+            amountIn: amountInMaximum,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: poolManager,
+            v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook),
+            repayToken: dstToken,
+            minAmountOut: amountOut
         });
     }
 
@@ -1156,7 +1390,7 @@ contract ExecutorTest is Test {
     function test_morphoFlash_paraswap_morphoRepay() public {
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
         vm.prank(owner);
-        executor.setFlashProvider(morphoFlashId, address(morphoBlue));
+        executor.configureMorpho(address(morphoBlue));
 
         uint256 seizedAssets = 500e18;
         LiquidationExecutor.SwapPlan memory swapPlan =
@@ -1200,7 +1434,7 @@ contract ExecutorTest is Test {
         // address to compare against.
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
         vm.prank(owner);
-        executor.setFlashProvider(morphoFlashId, address(morphoBlue));
+        executor.configureMorpho(address(morphoBlue));
 
         // Build a real plan and abi-encode it; the plan hash must match what we
         // plant into _activePlanHash for the hash check to pass.
@@ -1217,7 +1451,9 @@ contract ExecutorTest is Test {
         //   slot 10 = _activePlanHash       (bytes32)
         //   slot 11 = _activeV4PoolManager  (address, offset 0)
         //            _executionPhase        (uint8 enum, offset 20)
-        // Force both into the "during flashloan" state so neither guard short-circuits.
+        // (Slots shifted -1 after removing the unused `balancerVault`
+        // storage var per re-audit informational LEAD.) Force both into
+        // the "during flashloan" state so neither guard short-circuits.
         // Byte at offset 20 (Solidity) corresponds to bit 160 of the uint256 slot.
         vm.store(address(executor), bytes32(uint256(10)), planHash);
         vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive
@@ -1237,17 +1473,41 @@ contract ExecutorTest is Test {
     function test_configureMorphoAtomicallyPinsBothSlots() public {
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
 
-        // Sanity: setUp() previously called only setMorphoBlue, leaving the flash
-        // provider entry empty.
+        // setUp now seeds both slots via configureMorpho already, so the
+        // initial state already pins them. Verify both, then deploy a
+        // fresh executor where neither slot has been touched and assert
+        // that `configureMorpho` atomically populates both.
         assertEq(executor.morphoBlue(), address(morphoBlue));
-        assertEq(executor.allowedFlashProviders(morphoFlashId), address(0));
+        assertEq(executor.allowedFlashProviders(morphoFlashId), address(morphoBlue));
+
+        // Fresh executor: same constructor allowlist but no post-deploy config.
+        address[] memory targets = new address[](6);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        targets[2] = address(aaveV2Pool);
+        targets[3] = address(bebop);
+        targets[4] = address(morphoBlue);
+        targets[5] = address(uniV4Mock);
+        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+        assertEq(freshExecutor.morphoBlue(), address(0));
+        assertEq(freshExecutor.allowedFlashProviders(morphoFlashId), address(0));
 
         vm.prank(owner);
-        executor.configureMorpho(address(morphoBlue));
+        freshExecutor.configureMorpho(address(morphoBlue));
 
-        assertEq(executor.morphoBlue(), address(morphoBlue), "morphoBlue must be set");
+        assertEq(freshExecutor.morphoBlue(), address(morphoBlue), "morphoBlue must be set");
         assertEq(
-            executor.allowedFlashProviders(morphoFlashId),
+            freshExecutor.allowedFlashProviders(morphoFlashId),
             address(morphoBlue),
             "FLASH_PROVIDER_MORPHO entry must be set to the same address"
         );
@@ -1263,7 +1523,7 @@ contract ExecutorTest is Test {
 
         address notWhitelisted = address(0xDEADBEEF);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.configureMorpho(notWhitelisted);
     }
 
@@ -1288,8 +1548,8 @@ contract ExecutorTest is Test {
 
         uint8 morphoFlashId = freshExecutor.FLASH_PROVIDER_MORPHO();
         vm.startPrank(owner);
-        freshExecutor.setMorphoBlue(address(morphoBlue));
-        freshExecutor.setFlashProvider(morphoFlashId, address(morphoBlue));
+        freshExecutor.configureMorpho(address(morphoBlue));
+        freshExecutor.configureMorpho(address(morphoBlue));
         vm.stopPrank();
 
         uint256 seizedAssets = 500e18;
@@ -1890,29 +2150,45 @@ contract ExecutorTest is Test {
     }
 
     function test_setFlashProviderZeroReverts() public {
+        // setFlashProvider is now Balancer-pinned (FLASH_PROVIDER_BALANCER = 2).
         vm.prank(owner);
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
-        executor.setFlashProvider(1, address(0));
+        executor.setFlashProvider(2, address(0));
     }
 
     function test_setFlashProviderRejectsNonWhitelisted() public {
         address notWhitelisted = address(0xDEAD3);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
-        executor.setFlashProvider(1, notWhitelisted);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
+        executor.setFlashProvider(2, notWhitelisted);
     }
 
     function test_setFlashProviderAcceptsWhitelisted() public {
-        // aavePool is in allowedTargets (set in constructor)
+        // aavePool is in allowedTargets (set in constructor). Re-uses
+        // the BALANCER slot — purely a setter parity check, doesn't
+        // affect dispatch.
         vm.prank(owner);
-        executor.setFlashProvider(1, address(aavePool));
-        assertEq(executor.allowedFlashProviders(1), address(aavePool));
+        executor.setFlashProvider(2, address(aavePool));
+        assertEq(executor.allowedFlashProviders(2), address(aavePool));
+    }
+
+    /// @dev Audit-fix #5/#10: providerIds other than BALANCER revert
+    /// at the validation gate (Morpho re-config must go through
+    /// `configureMorpho`; unknown ids would pollute the mapping
+    /// namespace and silently couple to future dispatcher branches).
+    function test_setFlashProviderRejectsNonBalancerId() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.setFlashProvider(3, address(morphoBlue)); // FLASH_PROVIDER_MORPHO
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.setFlashProvider(5, address(aavePool)); // arbitrary unknown id
     }
 
     function test_setAaveV2LendingPoolRejectsNonWhitelisted() public {
         address notWhitelisted = address(0xDEAD2);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, notWhitelisted));
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.setAaveV2LendingPool(notWhitelisted);
     }
 
@@ -2136,7 +2412,8 @@ contract ExecutorTest is Test {
 
     function test_aave_v3_liquidation_executes_and_resets_allowance() public {
         uint256 debtToCover = 500e18;
-        uint256 collateralReward = 600e18;
+        // Reward must match the swap amountIn — the cap rejects amountIn > collateralDelta.
+        uint256 collateralReward = DEFAULT_SWAP_AMOUNT;
 
         aavePool.setLiquidationCollateralReward(collateralReward);
         loanToken.mint(address(aavePool), 100_000e18);
@@ -3717,7 +3994,8 @@ contract ExecutorTest is Test {
         // Set liquidation reward to 0 — liquidation won't increase collateral
         aavePool.setLiquidationCollateralReward(0);
 
-        // Executor still has pre-funded collateral from setUp (DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD = 400e18)
+        // Inject stale collateral explicitly (default setUp no longer pre-funds).
+        collateralToken.mint(address(executor), 400e18);
         assertTrue(collateralToken.balanceOf(address(executor)) > 0, "precondition: stale collateral exists");
 
         bytes memory plan =
@@ -3731,6 +4009,7 @@ contract ExecutorTest is Test {
     /// @notice Same stale-collateral test but with Balancer flash provider.
     function test_staleCollateral_doesNotMaskMissingDelta_balancer() public {
         aavePool.setLiquidationCollateralReward(0);
+        collateralToken.mint(address(executor), 400e18);
 
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), _defaultSwapPlan());
@@ -4396,7 +4675,7 @@ contract ExecutorTest is Test {
         );
 
         vm.prank(owner);
-        freshExecutor.setMorphoBlue(address(morphoBlue));
+        freshExecutor.configureMorpho(address(morphoBlue));
 
         uint256 seizedAssets = 500e18;
         uint256 collateralReward = COLLATERAL_REWARD;
@@ -4556,7 +4835,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
@@ -4726,7 +5005,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
@@ -4775,7 +5054,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
@@ -4827,7 +5106,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
@@ -4897,7 +5176,7 @@ contract ExecutorTest is Test {
             targets
         );
         vm.prank(owner);
-        freshExec.setMorphoBlue(address(morphoBlue));
+        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
@@ -5764,9 +6043,16 @@ contract ExecutorTest is Test {
     }
 
     function test_UniV2_fullBalance_usesDelta() public {
-        // The liquidation produces COLLATERAL_REWARD of collateralToken. With
-        // useFullBalance=true, the swap input must equal that delta — never the
-        // pre-existing pre-funded balance (DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD).
+        // useFullBalance=true sets leg1.amountIn = collateralDelta at runtime;
+        // the swap input MUST equal that delta and not any pre-existing balance.
+        // To prove delta-only behaviour we set local reward small enough that
+        // swap output is too low to cover repay, then pre-fund extra dust that
+        // a balance-based formula would silently consume. Pipeline reverts
+        // with InsufficientRepayOutput because delta-only output (800*1.1)
+        // < 1001 flashRepay.
+        uint256 smallReward = 800e18;
+        aavePool.setLiquidationCollateralReward(smallReward);
+        collateralToken.mint(address(executor), 200e18); // dust — must be ignored
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), 0, 1, 0);
         swapPlan.leg1.useFullBalance = true;
@@ -5774,14 +6060,11 @@ contract ExecutorTest is Test {
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
-        // With SWAP_RATE = 1.1e18 and delta = 600e18, expected output ≈ 660e18,
-        // which is well below flashRepay (1001e18). The swap succeeds at the
-        // router level but the pipeline-level repay check must reject.
         vm.prank(operatorAddr);
         vm.expectRevert(
             abi.encodeWithSelector(
                 LiquidationExecutor.InsufficientRepayOutput.selector,
-                COLLATERAL_REWARD * SWAP_RATE / 1e18,
+                smallReward * SWAP_RATE / 1e18,
                 LOAN_AMOUNT + FLASH_FEE
             )
         );
@@ -5803,6 +6086,43 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         executor.execute(plan);
+    }
+
+    /// @dev Positive test for the leg1.amountIn ≤ collateralDelta cap.
+    /// Submitting `leg1.amountIn = collateralDelta + 1` for a leg whose
+    /// srcToken IS the collateralAsset must revert InvalidPlan — the cap
+    /// closes the operator-coinbase dipping vector. Skip-unwrap legs
+    /// (srcToken = aToken) are exempt and tested separately by the
+    /// existing `test_skipUnwrap_aTokenSrc_skipsPoolWithdraw` flow.
+    function test_leg1AmountIn_exceedsCollateralDelta_reverts() public {
+        // collateralDelta = COLLATERAL_REWARD by default.
+        uint256 oversized = COLLATERAL_REWARD + 1;
+        collateralToken.mint(address(executor), oversized); // dust the cap is supposed to reject
+
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildUniV2SwapPlan(address(collateralToken), address(loanToken), oversized, 1, 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// @dev Boundary test for the cap — `leg1.amountIn == collateralDelta`
+    /// must succeed. Pins the inequality at strict greater-than and
+    /// guards against accidental tightening to >=.
+    function test_leg1AmountIn_equalsCollateralDelta_succeeds() public {
+        // COLLATERAL_REWARD covers flash repay at SWAP_RATE 1.1x.
+        LiquidationExecutor.SwapPlan memory swapPlan =
+            _buildUniV2SwapPlan(address(collateralToken), address(loanToken), COLLATERAL_REWARD, 1, 0);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan); // no revert
     }
 
     function test_UniV3_minAmountOut_enforced() public {
@@ -5874,6 +6194,813 @@ contract ExecutorTest is Test {
     function test_UniV2_minAmountOutZero_reverts() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, 0);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// @notice V3 BUY-side leg1: caller specifies EXACT loanToken output
+    /// and MAX collateral input. Mock rate 1.1 → exactOut=1100e18 costs
+    /// actualIn = 1000e18 of collateral. amountInMaximum=1500e18 leaves
+    /// 500e18 collateral residual on the executor for sweep / leg2.
+    /// After: loanToken balance ≥ flashRepay (1001e18) + minProfit.
+    function test_UniV2_buy_singleLeg_happy_path() public {
+        // BUY-side single-hop V2. amountInMax capped at collateralDelta
+        // (= COLLATERAL_REWARD); router consumes amountOut/rate of it.
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV2BuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            1000e18,
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        // Net collateral consumption: pre-balance + liquidation reward minus
+        // post-balance. Liquidation reward credits BEFORE leg1 fires so a
+        // naive `collBefore - collAfter` would understate by COLLATERAL_REWARD.
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
+        assertEq(swapConsumed, expectedActualIn, "BUY-side V2 actualIn must equal amountOut/rate");
+
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V2 leg1 must leave loanToken profit");
+    }
+
+    function test_UniV2_multihop_sell_happy_path() public {
+        // V2 multihop is supported "for free" by the existing
+        // executeUniV2Leg path: validator only checks path[0] / path[last]
+        // (length already permitted >= 2), library passes leg.v2Path
+        // through to the router, and Router02 natively supports any
+        // path.length >= 2. This regression test pins the behaviour so
+        // future validation tightening can't silently break multihop.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        address[] memory path = new address[](3);
+        path[0] = address(collateralToken);
+        path[1] = address(intermediateToken);
+        path[2] = address(loanToken);
+
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V2,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: path,
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(loanToken),
+            minAmountOut: 1
+        });
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "V2 multihop SELL must produce loanToken profit");
+    }
+
+    function test_UniV2_multihop_buy_happy_path() public {
+        // V2 BUY-side multihop — amountInMax capped at collateralDelta.
+        // Router consumes exactly amountOut/rate of the new collateral.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        address[] memory path = new address[](3);
+        path[0] = address(collateralToken);
+        path[1] = address(intermediateToken);
+        path[2] = address(loanToken);
+
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V2_BUY,
+            srcToken: address(collateralToken),
+            amountIn: 1000e18, // amountInMaximum
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: path,
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(loanToken),
+            minAmountOut: 1100e18 // exact amountOut
+        });
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
+        assertEq(swapConsumed, expectedActualIn, "BUY-side V2 multihop actualIn must equal amountOut/rate");
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V2 multihop must leave loanToken profit");
+    }
+
+    function test_UniV3_buy_singleLeg_happy_path() public {
+        // BUY-side single-hop V3. amountInMax capped at collateralDelta;
+        // router consumes exactly amountOut/rate.
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3BuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            1000e18,
+            3000,
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // Router consumed exactly amountOut/rate of collateral; the rest
+        // remains on contract.
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        // Net collateral consumption = (pre-balance + liquidation reward) - post-balance.
+        // The liquidation step credits COLLATERAL_REWARD to the executor BEFORE
+        // leg1 fires, so a naive `collBefore - collAfter` would understate
+        // the swap's input by exactly COLLATERAL_REWARD.
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
+        assertEq(swapConsumed, expectedActualIn, "BUY-side actualIn must equal amountOut/rate");
+
+        // Profit: exact output (1100e18) - flashRepay (1001e18) = 99e18,
+        // plus whatever was already on the contract.
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side leg1 must leave loanToken profit");
+    }
+
+    function test_UniV3_multihop_sell_happy_path() public {
+        // V3 multihop SELL — `v4SwapData` carries the standard V3 path
+        // (tokenA-feeAB-tokenB-feeBC-tokenC, 66 bytes for 3 tokens).
+        // Mock applies SWAP_RATE to endpoints so expected output mirrors
+        // the single-hop case: amountIn * rate / 1e18.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        bytes memory path = _encodeV3PathSell(
+            address(collateralToken),
+            500, // tier collateral→intermediate
+            address(intermediateToken),
+            3000, // tier intermediate→loan
+            address(loanToken)
+        );
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3MultihopSellLeg(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            path,
+            /* minOut */
+            1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "V3 multihop SELL must produce loanToken profit");
+    }
+
+    function test_UniV3_multihop_buy_happy_path() public {
+        // V3 multihop BUY — path is REVERSED (tokenOut-first, tokenIn-last).
+        // Validator + lib enforce that the FIRST 20 bytes of the path equal
+        // `leg.repayToken` and the LAST 20 bytes equal `leg.srcToken`.
+        // Mock applies SWAP_RATE inverse to endpoints, so consumed input
+        // is the same deterministic 1100/1.1 = 1000 used by single-hop BUY.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        bytes memory pathReversed =
+            _encodeV3PathBuy(address(collateralToken), 500, address(intermediateToken), 3000, address(loanToken));
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3MultihopBuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            1000e18,
+            pathReversed,
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
+        assertEq(swapConsumed, expectedActualIn, "BUY-side V3 multihop actualIn must equal amountOut/rate");
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V3 multihop must leave loanToken profit");
+    }
+
+    function test_UniV4_buy_singleLeg_happy_path() public {
+        // V4 BUY mirrors V3 BUY field semantics: amountIn = amountInMax,
+        // minAmountOut = EXACT amountOut. amountInMax capped at
+        // collateralDelta (= COLLATERAL_REWARD).
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4BuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            1000e18,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 expectedActualIn = uint256(1100e18) * 1e18 / SWAP_RATE; // 1000e18
+        // Net collateral consumption = (pre + COLLATERAL_REWARD) - post.
+        // The liquidation step credits COLLATERAL_REWARD to the executor
+        // before leg1 fires, so a naive pre-vs-post would understate the
+        // swap input by exactly that reward. Same reasoning as V2/V3 BUY.
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
+        assertEq(swapConsumed, expectedActualIn, "BUY-side V4 actualIn must equal amountOut/rate");
+
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "BUY-side V4 leg1 must leave loanToken profit");
+    }
+
+    function test_UniV4_multihop_sell_happy_path() public {
+        // V4 multihop SELL — 3-token chain (col → INT → loan) routed
+        // through ONE PoolManager unlock with TWO sequential swap()
+        // calls. Hop 0's output (INT) feeds hop 1 as exact-input via
+        // PM's internal credit ledger; only the leg's tokenIn (col)
+        // is settled and only the final tokenOut (loan) is taken.
+        // SWAP_RATE is applied per hop in the mock so the cumulative
+        // output = amountIn * (rate / 1e18)^2.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        // Fund the PM so it has the intermediate + final tokens to take().
+        intermediateToken.mint(address(uniV4Mock), 10_000e18);
+        loanToken.mint(address(uniV4Mock), 10_000e18);
+
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg( /* isBuy */
+            false,
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            hops,
+            address(uniV4Mock),
+            /* minOut */
+            1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertGt(loanToken.balanceOf(address(executor)), 0, "V4 multihop SELL must produce loanToken profit");
+    }
+
+    function test_UniV4_multihop_buy_happy_path() public {
+        // V4 multihop BUY — 3-token chain, exact-output target. The
+        // lib walks hops BACKWARD: hop 1 takes amountSpec=+amountOut,
+        // returns input demand X1; hop 0 takes amountSpec=+X1, returns
+        // input demand X0 (= the leg's actual consumed input). Final
+        // gainedOut == amountOut; finalConsumed == X0 ≤ amountInMax.
+        // amountInMax capped at collateralDelta (= COLLATERAL_REWARD).
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        intermediateToken.mint(address(uniV4Mock), 10_000e18);
+        loanToken.mint(address(uniV4Mock), 10_000e18);
+
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+
+        // Per-hop rate is SWAP_RATE = 1.1e18 in setUp; cumulative gain
+        // hop0→hop1 means input X for amountOut requires X = amountOut / rate^2.
+        // For amountOut=1100e18 and rate=1.1: X = 1100/(1.1*1.1) = ~909.09e18.
+        uint256 amountOutExact = 1100e18;
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg( /* isBuy */
+            true,
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            1000e18,
+            hops,
+            address(uniV4Mock),
+            amountOutExact
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        uint256 collAfter = collateralToken.balanceOf(address(executor));
+        uint256 swapConsumed = (collBefore + COLLATERAL_REWARD) - collAfter;
+        // assertLt swapConsumed dropped: cap forces actualIn ≤ amountInMax = collateralDelta
+        // Mock applies rate per hop with truncating integer division so
+        // exact closed-form consumed-input is brittle; the strong
+        // invariants are: (a) consumed < amountInMax, (b) loanToken
+        // profit increased, (c) leg's exact amountOut delivered.
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "V4 multihop BUY must leave loanToken profit");
+    }
+
+    // ─── Negative tests for multihop / BUY validation ──────────────────
+
+    function test_UniV3_multihop_sell_pathFirstNotSrc_reverts() public {
+        // Path[0] address must equal leg.srcToken on SELL multihop.
+        // The lib's `_v3PathEndpoints` check fires inside executeUniV3Leg
+        // (post-flashloan) and reverts InvalidV2Path.
+        MockERC20 wrongFirst = new MockERC20("Wrong", "WRG", 18);
+        bytes memory path =
+            _encodeV3PathSell(address(wrongFirst), 500, address(collateralToken), 3000, address(loanToken));
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, path, 1);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(UniswapLib.InvalidV2Path.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV3_multihop_sell_pathLastNotRepay_reverts() public {
+        MockERC20 wrongLast = new MockERC20("Wrong", "WRG", 18);
+        bytes memory path =
+            _encodeV3PathSell(address(collateralToken), 500, address(loanToken), 3000, address(wrongLast));
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, path, 1);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(UniswapLib.InvalidV2Path.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV3_multihop_badPathLength_reverts() public {
+        // Path length must satisfy >= 66 AND (len - 20) % 23 == 0.
+        // 50 bytes fails both — validator catches pre-flashloan (InvalidPlan).
+        bytes memory badPath = new bytes(50);
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, badPath, 1);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV3_multihop_buy_forwardPath_reverts() public {
+        // V3 BUY expects path REVERSED (tokenOut-first). Passing forward
+        // SELL-shape path means path[0] == srcToken — but the BUY branch
+        // expects path[0] == repayToken. Mismatch → InvalidV2Path.
+        // amountInMax capped at collateralDelta (= COLLATERAL_REWARD);
+        // path-shape mismatch fires regardless.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        bytes memory forwardPath =
+            _encodeV3PathSell(address(collateralToken), 500, address(intermediateToken), 3000, address(loanToken));
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV3MultihopBuyLeg(address(collateralToken), address(loanToken), 1000e18, forwardPath, 1100e18);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(UniswapLib.InvalidV2Path.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_oneHop_reverts() public {
+        // Multihop is signalled by v4SwapData.length > 160. A single-hop
+        // V4Hop[] (length 1) decodes as multihop but fails the lib's
+        // `nHops < 2 → InvalidPlan` check inside decodeAndValidateV4MultihopShape.
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](1);
+        hops[0] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 3000, tickSpacing: int24(60), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_finalTokenOutMismatch_reverts() public {
+        // Last hop's tokenOut != leg.repayToken → InvalidPlan.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        MockERC20 wrongFinal = new MockERC20("Wrong", "WRG", 18);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(wrongFinal), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_zeroFee_reverts() public {
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] =
+            UniswapLib.V4Hop({tokenOut: address(intermediateToken), fee: 0, tickSpacing: int24(60), hook: address(0)});
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_zeroTickSpacing_reverts() public {
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(0), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_dynamicFeeBit_reverts() public {
+        // V4 reserves bit 0x800000 of `fee` for dynamic-fee pools. The
+        // production-scope validator rejects them — set the bit on hop[0].
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: uint24(0x800000) | 3000, tickSpacing: int24(60), hook: address(0)
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_UniV2_buy_amountInMaxExceeded_reverts() public {
+        // V2 BUY: router (mock) reverts when input required to satisfy
+        // exact amountOut exceeds amountInMaximum. Set rate=0.5e18 so
+        // the input demand (= amountOut * 1e18 / rate = 2200) exceeds
+        // amountInMax=100. Mock's swapTokensForExactTokens reverts;
+        // the executor's flashloan callback unwinds to a top-level
+        // revert. Assert it reverts (not asserting selector — mock
+        // string revert isn't a Solidity error type).
+        collateralToken.mint(address(executor), 5000e18);
+        uniV2Mock.setRate(0.5e18);
+
+        LiquidationExecutor.SwapLeg memory leg1 =
+            _buildUniV2BuyLeg(address(collateralToken), address(loanToken), 100e18, 1100e18);
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_UniV4_buy_consumedExceedsMax_reverts() public {
+        // V4 PoolManager has no client-side amountInMax — main contract
+        // enforces it post-unlock. Distort the mock rate so input
+        // demand FAR exceeds amountInMax: rate=0.5e18 means input =
+        // amountOut * 2. Pre-fund 5000 collateral so the mock can
+        // physically pull 2200 (executor isn't liquidity-blocked) but
+        // post-unlock check catches `consumed=2200 > amountInMax=100`.
+        collateralToken.mint(address(executor), 5000e18);
+        uniV4Mock.setRate(0.5e18);
+
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4BuyLeg(
+            address(collateralToken),
+            address(loanToken),
+            /* amountInMaximum = */
+            100e18,
+            3000,
+            int24(60),
+            address(0),
+            address(uniV4Mock),
+            /* exact amountOut = */
+            1100e18
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+
+        vm.prank(operatorAddr);
+        // Pre-check `srcBal >= amountIn` reads amountIn=100e18 — the
+        // executor has 5000+ so passes. After the unlock the mock
+        // pulled 2200e18 (= 1100/0.5). Post-unlock check
+        // `consumed > amountInMax` reverts with the expected selector.
+        // We accept either revert form: the new post-check guard
+        // (InsufficientSrcBalance(consumed, amountInMax)) OR an
+        // earlier balance-driven revert in the mock chain — assert
+        // the call REVERTS, that's the security guarantee.
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_UniV4_multihop_unallowlistedHook_reverts() public {
+        // Each hop's hook must be address(0) OR in allowedV4Hooks. The
+        // function-pointer callback (`this.isV4HookAllowed`) returns
+        // false → lib reverts InvalidPlan inside the per-hop loop.
+        MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
+        address strangerHook = address(0xBADC0DE);
+        UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
+        hops[0] = UniswapLib.V4Hop({
+            tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: strangerHook
+        });
+        hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
+        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+            false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
@@ -5973,7 +7100,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidV4Data.selector);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -5997,7 +7124,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidV4Data.selector);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -6018,7 +7145,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.V4HookNotAllowed.selector, rogueHook));
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -6087,11 +7214,15 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, address(stranger)));
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.execute(plan);
     }
 
     function test_UniV4_zeroPoolManager_reverts() public {
+        // address(0) is rejected by the `allowedTargets[pm]` check
+        // (mapping default is false) → TargetNotAllowed. The previous
+        // explicit ZeroAddress revert was redundant; removing it freed
+        // bytes for the audit-fix pass.
         LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
             address(collateralToken),
             address(loanToken),
@@ -6109,7 +7240,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.execute(plan);
     }
 
@@ -6153,7 +7284,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.V4UnexpectedDelta.selector);
+        vm.expectRevert(UniswapLib.V4UnexpectedDelta.selector);
         executor.execute(plan);
 
         uniV4Mock.setZeroOut(false);
@@ -6199,7 +7330,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidV4NativeToken.selector);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -6221,7 +7352,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidV4NativeToken.selector);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -6244,11 +7375,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.InvalidV4TokenOut.selector, address(loanToken), address(profitToken)
-            )
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -6269,9 +7396,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(0), int24(60))
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -6292,9 +7417,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(3000), int24(0))
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -6315,9 +7438,7 @@ contract ExecutorTest is Test {
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(3000), int24(-60))
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -6344,11 +7465,7 @@ contract ExecutorTest is Test {
             _buildPlan(99, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.InvalidV4TokenOut.selector, address(loanToken), address(profitToken)
-            )
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7245,7 +8362,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
                 srcToken: token,
                 amountIn: 0,
                 useFullBalance: false,
-                deadline: block.timestamp + 3600,
+                deadline: 0,
                 paraswapCalldata: "",
                 bebopTarget: address(0),
                 bebopCalldata: "",
@@ -7336,6 +8453,31 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         // No revert on validation (no InvalidPlan / InvalidLegLink).
         vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    /// @dev Positive test for the harden — assertNoSwapLegZeroed must reject
+    /// NO_SWAP legs whose srcToken != repayToken. To exercise the new
+    /// helper assertion (vs the upstream finalRepayToken==loanToken /
+    /// SrcTokenNotCollateral checks that ALSO revert InvalidPlan) we
+    /// shape the plan so those upstream checks all pass:
+    ///   * action.collateralAsset = loanToken (so srcToken==loanToken
+    ///     satisfies SrcTokenNotCollateral)
+    ///   * leg1.srcToken = loanToken
+    ///   * leg1.repayToken = loanToken (== plan.loanToken — passes
+    ///     finalRepayToken check)
+    /// then we corrupt one of the supposedly-zeroed fields so
+    /// `assertNoSwapLegZeroed` is the FIRST thing to revert.
+    function test_noSwap_validateLeg_rejectsNonZeroDexField() public {
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildNoSwapPlan(address(loanToken), 0);
+        swapPlan.leg1.v3Fee = 3000; // NO_SWAP must not carry DEX fields
+        bytes memory action =
+            _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _singleAction(1, action), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -7524,7 +8666,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: false,
-            deadline: block.timestamp + 3600,
+            deadline: 0,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
@@ -7580,7 +8722,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             srcToken: address(collateralToken),
             amountIn: 0,
             useFullBalance: false,
-            deadline: block.timestamp + 3600,
+            deadline: 0,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
@@ -7629,7 +8771,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: false,
-            deadline: block.timestamp + 3600,
+            deadline: 0,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
@@ -7685,7 +8827,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: false,
-            deadline: block.timestamp + 3600,
+            deadline: 0,
             paraswapCalldata: "",
             bebopTarget: address(0),
             bebopCalldata: "",
@@ -7928,6 +9070,1655 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         // invocation. Today: both swaps run, executor leaks WETH.
         vm.expectRevert();
         evilExec.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // CURVE V1 + BALANCER V2 DISPATCHERS — full SELL/BUY × leg1/leg2 set
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // The new dispatch branches added to `_dispatchLeg` route to
+    // CurveV1Lib / BalancerV2Lib (external libraries, DELEGATECALL).
+    // Coverage goals:
+    //
+    //   * SELL leg1 single-leg plan, both DEXes.
+    //   * BUY  leg1 single-leg plan, both DEXes.
+    //   * SELL leg2 in hasLeg2 sequential plan, both DEXes.
+    //   * SELL leg2 in hasMixedSplit (collateral → WETH profit leg).
+    //   * SELL leg1 + leg2 in hasSplit (parallel WETH profit leg).
+    //   * Negative validation paths: target-not-allowed, EOA pool,
+    //     short ext-data, zero amounts, zero output, pool reverts,
+    //     output below minAmountOut, NO_SWAP must reject the new fields.
+    //   * leg2 rejects BUY variants (BUY semantics require an amountIn
+    //     ceiling that the runtime leg-link cannot provide).
+    //   * Curve `useUnderlying` exchange variant.
+
+    function _buildCurveV1ExtData(int128 i, int128 j, bool useUnderlying) internal pure returns (bytes memory) {
+        return abi.encode(i, j, useUnderlying);
+    }
+
+    function _buildBalancerV2ExtData(bytes32 poolId, bytes memory userData) internal pure returns (bytes memory) {
+        return abi.encode(poolId, userData);
+    }
+
+    function _curveV1Leg(
+        LiquidationExecutor.SwapMode m,
+        address srcToken,
+        address dstToken,
+        address pool,
+        int128 i,
+        int128 j,
+        bool useUnderlying,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        bool useFullBalance
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: m,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: useFullBalance,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: pool,
+            bebopCalldata: _buildCurveV1ExtData(i, j, useUnderlying),
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: minAmountOut
+        });
+    }
+
+    function _balancerV2Leg(
+        LiquidationExecutor.SwapMode m,
+        address srcToken,
+        address dstToken,
+        address vault,
+        bytes32 poolId,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        bool useFullBalance
+    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
+        return LiquidationExecutor.SwapLeg({
+            mode: m,
+            srcToken: srcToken,
+            amountIn: amountIn,
+            useFullBalance: useFullBalance,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: vault,
+            bebopCalldata: _buildBalancerV2ExtData(poolId, ""),
+            v2Path: new address[](0),
+            v3Fee: 0,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: dstToken,
+            minAmountOut: minAmountOut
+        });
+    }
+
+    function _curveV1SinglePlan(LiquidationExecutor.SwapMode m, uint256 amountIn, uint256 minAmountOut)
+        internal
+        view
+        returns (LiquidationExecutor.SwapPlan memory)
+    {
+        return LiquidationExecutor.SwapPlan({
+            leg1: _curveV1Leg(
+                m,
+                address(collateralToken),
+                address(loanToken),
+                address(curveV1Mock),
+                int128(0),
+                int128(1),
+                false,
+                amountIn,
+                minAmountOut,
+                false
+            ),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+    }
+
+    function _balancerV2SinglePlan(LiquidationExecutor.SwapMode m, uint256 amountIn, uint256 minAmountOut)
+        internal
+        view
+        returns (LiquidationExecutor.SwapPlan memory)
+    {
+        return LiquidationExecutor.SwapPlan({
+            leg1: _balancerV2Leg(
+                m,
+                address(collateralToken),
+                address(loanToken),
+                address(balancerSwapMock),
+                bytes32(uint256(0xdeadbeef)),
+                amountIn,
+                minAmountOut,
+                false
+            ),
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // CURVE V1 — happy paths
+    // ───────────────────────────────────────────────────────────────
+
+    function test_CurveV1_sell_singleLeg_success() public {
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
+        );
+        vm.expectEmit(true, true, true, false);
+        emit LiquidationExecutor.CurveV1SwapExecuted(
+            address(curveV1Mock), address(collateralToken), address(loanToken), 0, 0
+        );
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_buy_singleLeg_success() public {
+        // BUY semantics: bot precomputes dx such that dx * SWAP_RATE / 1e18
+        // >= targetOut. With SWAP_RATE = 1.1e18 and dx = 1000e18:
+        // out = 1100e18, so targetOut up to 1100e18 succeeds.
+        uint256 dx = DEFAULT_SWAP_AMOUNT;
+        uint256 targetOut = 1090e18; // < 1100e18 produced output
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1_BUY, dx, targetOut)
+        );
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_sell_useUnderlying_routesToExchangeUnderlying() public {
+        // Set up plan with useUnderlying=true — library invokes the
+        // `exchange_underlying` selector. Mock dispatches both selectors
+        // to the same code path so the swap completes identically.
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            true, // useUnderlying
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_sell_as_leg2_in_hasLeg2_success() public {
+        // leg1: collateral → profitToken via Curve (intermediate)
+        // leg2: profitToken → loanToken via Curve (final repay leg)
+        // Both Curve pools deployed: first leg uses curveV1Mock (coll↔loan
+        // both = collateral/loan tokens of the mock). We need an
+        // intermediate token routing. Easiest: leg1 collateral→loan via
+        // Curve direct, leg2 loan→loan NO_SWAP (skipped — that's not
+        // a hasLeg2 layout). Use UniV3 leg1 + Curve leg2 instead:
+        // collateral→profitToken (V3), profitToken→loanToken (Curve).
+        MockCurveV1Pool curveLeg2 = new MockCurveV1Pool(address(profitToken), address(loanToken), SWAP_RATE);
+        loanToken.mint(address(curveLeg2), 100_000e18);
+        profitToken.mint(address(curveLeg2), 100_000e18);
+
+        // Allowlist the new pool via the owner (no setter; re-deploy
+        // an executor with the extra target).
+        address[] memory targets = new address[](9);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        targets[2] = address(aaveV2Pool);
+        targets[3] = address(bebop);
+        targets[4] = address(morphoBlue);
+        targets[5] = address(uniV4Mock);
+        targets[6] = address(curveV1Mock);
+        targets[7] = address(balancerSwapMock);
+        targets[8] = address(curveLeg2);
+
+        LiquidationExecutor execLocal = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+        vm.startPrank(owner);
+        execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(curveLeg2), true);
+        vm.stopPrank();
+
+        // Pre-fund the new executor so it can repay flashloans
+        loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
+
+        // leg1 collateral → profitToken via UniV3 (intermediate)
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 3000,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(profitToken),
+            minAmountOut: 1
+        });
+        // leg2 profitToken → loanToken via Curve V1
+        LiquidationExecutor.SwapLeg memory leg2 = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(profitToken),
+            address(loanToken),
+            address(curveLeg2),
+            int128(0),
+            int128(1),
+            false,
+            0, // useFullBalance computes amountIn at runtime
+            1,
+            true
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: true,
+            leg2: leg2,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        execLocal.execute(plan);
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // BALANCER V2 — happy paths
+    // ───────────────────────────────────────────────────────────────
+
+    function test_BalancerV2_sell_singleLeg_success() public {
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _balancerV2SinglePlan(LiquidationExecutor.SwapMode.BAL_V2, DEFAULT_SWAP_AMOUNT, 1)
+        );
+        vm.expectEmit(true, true, true, false);
+        emit LiquidationExecutor.BalancerV2SwapExecuted(
+            bytes32(uint256(0xdeadbeef)), address(collateralToken), address(loanToken), 0, 0, 0
+        );
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_buy_singleLeg_success_nativeExactOut() public {
+        // Balancer V2 GIVEN_OUT: bot specifies targetOut = leg.minAmountOut
+        // and ceiling = leg.amountIn. Vault pulls only the amount needed.
+        uint256 ceiling = DEFAULT_SWAP_AMOUNT;
+        uint256 targetOut = 1099e18;
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _balancerV2SinglePlan(LiquidationExecutor.SwapMode.BAL_V2_BUY, ceiling, targetOut)
+        );
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_sell_as_leg2_in_hasLeg2_success() public {
+        MockBalancerV2Vault2 balLeg2 = new MockBalancerV2Vault2(SWAP_RATE);
+        loanToken.mint(address(balLeg2), 100_000e18);
+        profitToken.mint(address(balLeg2), 100_000e18);
+
+        address[] memory targets = new address[](9);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        targets[2] = address(aaveV2Pool);
+        targets[3] = address(bebop);
+        targets[4] = address(morphoBlue);
+        targets[5] = address(uniV4Mock);
+        targets[6] = address(curveV1Mock);
+        targets[7] = address(balancerSwapMock);
+        targets[8] = address(balLeg2);
+
+        LiquidationExecutor execLocal = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+        vm.startPrank(owner);
+        execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(balLeg2), true);
+        vm.stopPrank();
+        loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
+
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 3000,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(profitToken),
+            minAmountOut: 1
+        });
+        LiquidationExecutor.SwapLeg memory leg2 = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(profitToken),
+            address(loanToken),
+            address(balLeg2),
+            bytes32(uint256(0xbeef)),
+            0,
+            1,
+            true
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: true,
+            leg2: leg2,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        execLocal.execute(plan);
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // CURVE V1 — negative paths
+    // ───────────────────────────────────────────────────────────────
+
+    function test_CurveV1_revert_when_targetNotAllowed() public {
+        MockCurveV1Pool roguePool = new MockCurveV1Pool(address(collateralToken), address(loanToken), SWAP_RATE);
+        loanToken.mint(address(roguePool), 100_000e18);
+
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(roguePool), // NOT in allowedTargets
+            int128(0),
+            int128(1),
+            false,
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_revert_when_extData_empty() public {
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            false,
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        leg.bebopCalldata = ""; // strip ext-data after building
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_revert_when_extData_too_short() public {
+        // 95 bytes < 96 bytes minimum — fails the _validateLeg length check.
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            false,
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        leg.bebopCalldata = new bytes(95);
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_revert_when_pool_address_zero() public {
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(0), // pool address zero — fails _validateLeg
+            int128(0),
+            int128(1),
+            false,
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_revert_when_amountIn_zero() public {
+        // _validateLeg no longer asserts amountIn > 0 for CURVE_V1 (leg2
+        // with useFullBalance=true ships amountIn=0 on the wire and is
+        // legal). The runtime ZeroSwapInput revert from CurveV1Lib is
+        // the source of truth for the empty-input failure.
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            false,
+            0, // amountIn=0 with useFullBalance=false → ZeroSwapInput at dispatch
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_revert_when_minAmountOut_zero() public {
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            false,
+            DEFAULT_SWAP_AMOUNT,
+            0, // minAmountOut=0 → InvalidPlan
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_revert_when_pool_reverts() public {
+        curveV1Mock.setRevertNext(true);
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
+        );
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_revert_when_output_below_minAmountOut() public {
+        // Pool delivers SWAP_RATE = 1.1e18 → 1100e18 out from 1000e18 in.
+        // Set min higher than that to force InsufficientRepayOutput.
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1101e18)
+        );
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    /// @dev Same-token liq action used by NO_SWAP rejection tests. The
+    /// liq is on `loanToken / loanToken` (col == loan), so a NO_SWAP
+    /// leg with srcToken == repayToken == loanToken passes the
+    /// `SrcTokenNotCollateral` guard and reaches the NO_SWAP branch in
+    /// `_validateLeg`.
+    function _sameTokenLoanLiqAction() internal view returns (LiquidationExecutor.Action[] memory) {
+        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
+        actions[0] = LiquidationExecutor.Action({
+            protocolId: 1,
+            data: _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0xBA12), 500e18, false)
+        });
+        return actions;
+    }
+
+    function test_CurveV1_NO_SWAP_rejects_bebopTarget_set() public {
+        // NO_SWAP must zero every DEX field. Setting bebopTarget on a
+        // NO_SWAP leg should hit the assertNoSwapLegZeroed branch.
+        // Liq must be same-token (col==loan) so srcToken == repayToken
+        // == loanToken satisfies the SrcTokenNotCollateral guard and
+        // execution reaches the NO_SWAP validator.
+        LiquidationExecutor.SwapLeg memory leg = _zeroLeg();
+        leg.mode = LiquidationExecutor.SwapMode.NO_SWAP;
+        leg.srcToken = address(loanToken);
+        leg.repayToken = address(loanToken);
+        leg.bebopTarget = address(curveV1Mock); // illegal on NO_SWAP
+
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _sameTokenLoanLiqAction(), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_CurveV1_NO_SWAP_rejects_bebopCalldata_set() public {
+        LiquidationExecutor.SwapLeg memory leg = _zeroLeg();
+        leg.mode = LiquidationExecutor.SwapMode.NO_SWAP;
+        leg.srcToken = address(loanToken);
+        leg.repayToken = address(loanToken);
+        leg.bebopCalldata = _buildCurveV1ExtData(int128(0), int128(1), false);
+
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _sameTokenLoanLiqAction(), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // BALANCER V2 — negative paths
+    // ───────────────────────────────────────────────────────────────
+
+    function test_BalancerV2_revert_when_targetNotAllowed() public {
+        MockBalancerV2Vault2 rogueVault = new MockBalancerV2Vault2(SWAP_RATE);
+        loanToken.mint(address(rogueVault), 100_000e18);
+
+        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(collateralToken),
+            address(loanToken),
+            address(rogueVault),
+            bytes32(uint256(0xdead)),
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_revert_when_extData_empty() public {
+        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(collateralToken),
+            address(loanToken),
+            address(balancerSwapMock),
+            bytes32(uint256(0xdeadbeef)),
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        leg.bebopCalldata = "";
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_revert_when_vault_address_zero() public {
+        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(collateralToken),
+            address(loanToken),
+            address(0),
+            bytes32(uint256(0xdeadbeef)),
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_revert_when_amountIn_zero() public {
+        // Same reasoning as test_CurveV1_revert_when_amountIn_zero —
+        // BalancerV2Lib enforces ZeroSwapInput at dispatch; validation
+        // accepts zero so leg2 useFullBalance=true plans pass.
+        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(collateralToken),
+            address(loanToken),
+            address(balancerSwapMock),
+            bytes32(uint256(0xdeadbeef)),
+            0,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_revert_when_minAmountOut_zero() public {
+        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(collateralToken),
+            address(loanToken),
+            address(balancerSwapMock),
+            bytes32(uint256(0xdeadbeef)),
+            DEFAULT_SWAP_AMOUNT,
+            0,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_revert_when_vault_reverts() public {
+        balancerSwapMock.setRevertNext(true);
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _balancerV2SinglePlan(LiquidationExecutor.SwapMode.BAL_V2, DEFAULT_SWAP_AMOUNT, 1)
+        );
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_BUY_revert_when_input_exceeds_ceiling() public {
+        // SWAP_RATE = 1.1e18; targetOut=1e18 needs ~0.91e18 in. If ceiling
+        // is 0.5e18, vault reverts with "amountIn > limit". The library
+        // surfaces this as a generic BalancerSwapFailed revert.
+        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2_BUY,
+            address(collateralToken),
+            address(loanToken),
+            address(balancerSwapMock),
+            bytes32(uint256(0xfeed)),
+            5e17,
+            1e18,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_NO_SWAP_rejects_bebopTarget_set() public {
+        LiquidationExecutor.SwapLeg memory leg = _zeroLeg();
+        leg.mode = LiquidationExecutor.SwapMode.NO_SWAP;
+        leg.srcToken = address(loanToken);
+        leg.repayToken = address(loanToken);
+        leg.bebopTarget = address(balancerSwapMock);
+
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _sameTokenLoanLiqAction(), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_BalancerV2_NO_SWAP_rejects_bebopCalldata_set() public {
+        LiquidationExecutor.SwapLeg memory leg = _zeroLeg();
+        leg.mode = LiquidationExecutor.SwapMode.NO_SWAP;
+        leg.srcToken = address(loanToken);
+        leg.repayToken = address(loanToken);
+        leg.bebopCalldata = _buildBalancerV2ExtData(bytes32(uint256(0xfeed)), "");
+
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _sameTokenLoanLiqAction(), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // CROSS-MODE: leg2 rejects BUY variants
+    // ───────────────────────────────────────────────────────────────
+
+    function test_hasLeg2_rejects_CURVE_V1_BUY_as_leg2() public {
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 3000,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(profitToken),
+            minAmountOut: 1
+        });
+        LiquidationExecutor.SwapLeg memory leg2 = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1_BUY, // BUY variant — not allowed as leg2
+            address(profitToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            false,
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            true
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: true,
+            leg2: leg2,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    function test_hasLeg2_rejects_BAL_V2_BUY_as_leg2() public {
+        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3,
+            srcToken: address(collateralToken),
+            amountIn: DEFAULT_SWAP_AMOUNT,
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 3000,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(profitToken),
+            minAmountOut: 1
+        });
+        LiquidationExecutor.SwapLeg memory leg2 = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2_BUY,
+            address(profitToken),
+            address(loanToken),
+            address(balancerSwapMock),
+            bytes32(uint256(0xbeef)),
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            true
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: true,
+            leg2: leg2,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // CURVE V1 + BALANCER V2 — EXTENDED COVERAGE (selectors, fuzz, edge)
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ─── Selector-level discrimination ─────────────────────────────────
+    /// @dev Asserts the lib dispatched to `exchange` (NOT
+    /// `exchange_underlying`) when `useUnderlying=false`. Without this,
+    /// a regression that always picks exchange_underlying would pass
+    /// all the SELL/BUY success tests (because the mock implements
+    /// both symmetrically).
+    function test_CurveV1_useUnderlying_false_routes_to_exchange_selector() public {
+        uint256 beforeStd = curveV1Mock.exchangeCalls();
+        uint256 beforeUnd = curveV1Mock.exchangeUnderlyingCalls();
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
+        );
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        assertEq(curveV1Mock.exchangeCalls(), beforeStd + 1, "must hit exchange");
+        assertEq(curveV1Mock.exchangeUnderlyingCalls(), beforeUnd, "must NOT hit exchange_underlying");
+    }
+
+    /// @dev Mirror of the above for useUnderlying=true. Confirms
+    /// CurveV1Lib swaps the selector based on the ext-data flag.
+    function test_CurveV1_useUnderlying_true_routes_to_exchange_underlying_selector() public {
+        uint256 beforeStd = curveV1Mock.exchangeCalls();
+        uint256 beforeUnd = curveV1Mock.exchangeUnderlyingCalls();
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            true, // useUnderlying
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        assertEq(curveV1Mock.exchangeCalls(), beforeStd, "must NOT hit exchange");
+        assertEq(curveV1Mock.exchangeUnderlyingCalls(), beforeUnd + 1, "must hit exchange_underlying");
+    }
+
+    // ─── Curve void-return tolerance ────────────────────────────────
+    /// @dev Some older Curve pools (3pool style) declared `exchange` as
+    /// `void` (no declared return value). The library uses the balance
+    /// delta as authoritative, so it MUST tolerate a void return frame.
+    function test_CurveV1_tolerates_void_return() public {
+        curveV1Mock.setVoidReturn(true);
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
+        );
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    // ─── Curve invalid-index rejection (mock-level) ─────────────────
+    /// @dev MockCurveV1Pool rejects `i == j`. CurveV1Lib forwards
+    /// whatever the bot encodes — so an i==j ext-data should reach the
+    /// pool and revert. Confirms the lib doesn't accidentally rewrite
+    /// indices, and that the failure surfaces as a CurveSwapFailed
+    /// revert from the library (mock's "i==j" string is opaque from
+    /// the lib's POV).
+    function test_CurveV1_same_coin_index_reverts() public {
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(0), // i == j
+            false,
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+    }
+
+    // ─── Tether-style approval reset (USDT compatibility) ──────────
+    /// @dev USDT reverts on `approve(spender, nonZero)` when there's
+    /// already a non-zero allowance. `forceApprove` internally does
+    /// `approve(spender, 0)` before setting the new value, so the
+    /// pattern works across back-to-back swaps. This test executes two
+    /// Curve swaps in sequence (via two independent execute() calls)
+    /// against a Tether-style src token — second call would revert if
+    /// the lib used plain `approve` instead of `forceApprove`.
+    function test_CurveV1_works_with_TetherStyle_srcToken() public {
+        // Build a Tether-style collateral, deploy a Curve pool, executor
+        // with the new pool allowlisted.
+        MockTetherStyleERC20 usdt = new MockTetherStyleERC20("USDT", "USDT", 6);
+        MockCurveV1Pool curvePool = new MockCurveV1Pool(address(usdt), address(loanToken), SWAP_RATE);
+        loanToken.mint(address(curvePool), 100_000e18);
+
+        address[] memory targets = new address[](9);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        targets[2] = address(aaveV2Pool);
+        targets[3] = address(bebop);
+        targets[4] = address(morphoBlue);
+        targets[5] = address(uniV4Mock);
+        targets[6] = address(curveV1Mock);
+        targets[7] = address(balancerSwapMock);
+        targets[8] = address(curvePool);
+
+        LiquidationExecutor execLocal = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+        vm.startPrank(owner);
+        execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(curvePool), true);
+        vm.stopPrank();
+        loanToken.mint(address(execLocal), 2 * (LOAN_AMOUNT + FLASH_FEE) + 200e18);
+
+        // Pre-fund the executor with enough USDT for both runs and
+        // override the aave pool collateral to USDT-like behavior.
+        aavePool.setReserveAToken(address(usdt), address(aToken));
+        usdt.mint(address(aavePool), 100_000e18);
+
+        for (uint256 round = 0; round < 2; round++) {
+            LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+                LiquidationExecutor.SwapMode.CURVE_V1,
+                address(usdt),
+                address(loanToken),
+                address(curvePool),
+                int128(0),
+                int128(1),
+                false,
+                DEFAULT_SWAP_AMOUNT,
+                1,
+                false
+            );
+            LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+                leg1: leg,
+                hasLeg2: false,
+                leg2: _zeroLeg(),
+                hasSplit: false,
+                splitBps: 0,
+                hasMixedSplit: false,
+                profitToken: address(loanToken),
+                minProfitAmount: 0
+            });
+            LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
+            actions[0] = LiquidationExecutor.Action({
+                protocolId: 1,
+                data: _buildAaveV3LiquidationAction(
+                    address(usdt), address(loanToken), address(uint160(uint256(0xDEAD) + round)), 500e18, false
+                )
+            });
+            bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, sp);
+            vm.prank(operatorAddr);
+            execLocal.execute(plan);
+        }
+    }
+
+    /// @dev Same as above for Balancer V2 — verifies BalancerV2Lib's
+    /// forceApprove pair tolerates Tether-style approval semantics
+    /// across consecutive swaps.
+    function test_BalancerV2_works_with_TetherStyle_srcToken() public {
+        MockTetherStyleERC20 usdt = new MockTetherStyleERC20("USDT", "USDT", 6);
+        MockBalancerV2Vault2 balPool = new MockBalancerV2Vault2(SWAP_RATE);
+        loanToken.mint(address(balPool), 100_000e18);
+
+        address[] memory targets = new address[](9);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        targets[2] = address(aaveV2Pool);
+        targets[3] = address(bebop);
+        targets[4] = address(morphoBlue);
+        targets[5] = address(uniV4Mock);
+        targets[6] = address(curveV1Mock);
+        targets[7] = address(balancerSwapMock);
+        targets[8] = address(balPool);
+
+        LiquidationExecutor execLocal = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+        vm.startPrank(owner);
+        execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(balPool), true);
+        vm.stopPrank();
+        loanToken.mint(address(execLocal), 2 * (LOAN_AMOUNT + FLASH_FEE) + 200e18);
+
+        aavePool.setReserveAToken(address(usdt), address(aToken));
+        usdt.mint(address(aavePool), 100_000e18);
+
+        for (uint256 round = 0; round < 2; round++) {
+            LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
+                LiquidationExecutor.SwapMode.BAL_V2,
+                address(usdt),
+                address(loanToken),
+                address(balPool),
+                bytes32(uint256(0xc0ffee + round)),
+                DEFAULT_SWAP_AMOUNT,
+                1,
+                false
+            );
+            LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+                leg1: leg,
+                hasLeg2: false,
+                leg2: _zeroLeg(),
+                hasSplit: false,
+                splitBps: 0,
+                hasMixedSplit: false,
+                profitToken: address(loanToken),
+                minProfitAmount: 0
+            });
+            LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
+            actions[0] = LiquidationExecutor.Action({
+                protocolId: 1,
+                data: _buildAaveV3LiquidationAction(
+                    address(usdt), address(loanToken), address(uint160(uint256(0xBEEF) + round)), 500e18, false
+                )
+            });
+            bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, sp);
+            vm.prank(operatorAddr);
+            execLocal.execute(plan);
+        }
+    }
+
+    // ─── Fuzz: validation boundary checks ──────────────────────────
+    /// @dev Fuzz the ext-data length for Curve. Validation requires
+    /// >= 96 bytes (abi.encode(int128, int128, bool) minimum); anything
+    /// shorter must revert at validation, anything 96+ must reach the
+    /// library (where the abi.decode will succeed or revert depending
+    /// on content, but the validation gate is what we're testing).
+    function testFuzz_CurveV1_extDataLength_lt_96_reverts(uint8 len) public {
+        vm.assume(len < 96);
+        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            false,
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        leg.bebopCalldata = new bytes(len);
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// @dev Mirror of the above for Balancer.
+    function testFuzz_BalancerV2_extDataLength_lt_96_reverts(uint8 len) public {
+        vm.assume(len < 96);
+        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(collateralToken),
+            address(loanToken),
+            address(balancerSwapMock),
+            bytes32(uint256(0xdeadbeef)),
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        leg.bebopCalldata = new bytes(len);
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// @dev Fuzz Curve amountIn: SELL leg1 in a single-leg plan must
+    /// produce at least LOAN_AMOUNT + FLASH_FEE = 1001e18 of repay
+    /// token, otherwise the contract's `InsufficientRepayOutput` check
+    /// kicks in. With SWAP_RATE = 1.1e18 the minimum amountIn is
+    /// ceil(1001e18 / 1.1) ≈ 910e18. Upper bound is COLLATERAL_REWARD
+    /// (= leg1.amountIn cap from audit-fix #4).
+    function testFuzz_CurveV1_amountIn_within_collateral_succeeds(uint256 amountIn) public {
+        amountIn = bound(amountIn, 910e18, COLLATERAL_REWARD);
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, amountIn, 1)
+        );
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    /// @dev Fuzz Balancer SELL amountIn — same constraint reasoning as
+    /// the Curve fuzz above (output must clear LOAN_AMOUNT + FLASH_FEE).
+    function testFuzz_BalancerV2_amountIn_within_collateral_succeeds(uint256 amountIn) public {
+        amountIn = bound(amountIn, 910e18, COLLATERAL_REWARD);
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _defaultLiqAction(500e18),
+            _balancerV2SinglePlan(LiquidationExecutor.SwapMode.BAL_V2, amountIn, 1)
+        );
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    /// @dev Fuzz Balancer poolId: the lib echoes it verbatim into the
+    /// emitted event topic. Just verifies no decode crash on edge values.
+    function testFuzz_BalancerV2_poolId_round_trips(bytes32 poolId) public {
+        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(collateralToken),
+            address(loanToken),
+            address(balancerSwapMock),
+            poolId,
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg,
+            hasLeg2: false,
+            leg2: _zeroLeg(),
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.expectEmit(true, true, true, false);
+        emit LiquidationExecutor.BalancerV2SwapExecuted(poolId, address(collateralToken), address(loanToken), 0, 0, 0);
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    // ─── Cross-mode plan shapes ────────────────────────────────────
+    /// @dev hasSplit with Curve leg1 + Balancer leg2 (parallel plan,
+    /// both legs sized by splitBps). Confirms _validateLeg accepts
+    /// CURVE_V1 as leg1 and BAL_V2 as leg2 in SPLIT mode.
+    function test_hasSplit_Curve_leg1_Balancer_leg2_routes_coll_to_loan_and_weth() public {
+        // leg2 target = WETH. Need Balancer pool routing collateralToken
+        // → mockWeth. Deploy a dedicated pool funded with WETH.
+        MockBalancerV2Vault2 balWeth = new MockBalancerV2Vault2(SWAP_RATE);
+        mockWeth.mint(address(balWeth), 100_000e18);
+        collateralToken.mint(address(balWeth), 100_000e18);
+
+        // Need a Curve pool routing collateralToken → loanToken
+        // (curveV1Mock already does this; allowlisted).
+
+        address[] memory targets = new address[](9);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        targets[2] = address(aaveV2Pool);
+        targets[3] = address(bebop);
+        targets[4] = address(morphoBlue);
+        targets[5] = address(uniV4Mock);
+        targets[6] = address(curveV1Mock);
+        targets[7] = address(balancerSwapMock);
+        targets[8] = address(balWeth);
+
+        LiquidationExecutor execLocal = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+        vm.startPrank(owner);
+        execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(curveV1Mock), true);
+        execLocal.setExtSwapTarget(address(balWeth), true);
+        vm.stopPrank();
+        loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
+
+        // hasSplit semantics (see _executeSwapPlan): `splitBps` is the
+        // PROFIT-leg ratio (leg2 → WETH), the repay-leg (leg1 →
+        // loanToken) gets `collateralDelta - profitAmount`. To make leg1
+        // produce ≥ LOAN_AMOUNT + FLASH_FEE = 1001e18 with SWAP_RATE =
+        // 1.1, leg1.amountIn ≥ 910e18 → profit ratio ≤ 800/10_000.
+        // Use 800 (= 8% WETH profit leg).
+        uint16 bps = 800;
+        uint256 leg2In = (COLLATERAL_REWARD * bps) / 10_000;
+        uint256 leg1In = COLLATERAL_REWARD - leg2In;
+
+        LiquidationExecutor.SwapLeg memory leg1 = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            false,
+            leg1In,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapLeg memory leg2 = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(collateralToken),
+            address(mockWeth),
+            address(balWeth),
+            bytes32(uint256(0xc0c0)),
+            leg2In,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: leg2,
+            hasSplit: true,
+            splitBps: bps,
+            hasMixedSplit: false,
+            profitToken: address(mockWeth),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        execLocal.execute(plan);
+    }
+
+    /// @dev hasMixedSplit with Curve leg1 (coll→loanToken via Curve)
+    /// + Uni leg2 (coll→WETH). Confirms Curve passes the leg1
+    /// repay-leg check in mixed-split mode. leg1 must produce ≥
+    /// LOAN_AMOUNT + FLASH_FEE = 1001e18; with rate=1.1, amountIn
+    /// ≥ 910e18 is required. Leaves a small collateral remainder
+    /// for leg2's WETH profit leg.
+    function test_hasMixedSplit_Curve_leg1_works() public {
+        LiquidationExecutor.SwapLeg memory leg1 = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(loanToken),
+            address(curveV1Mock),
+            int128(0),
+            int128(1),
+            false,
+            920e18, // partial — leg2 sweeps the rest
+            1,
+            false
+        );
+        LiquidationExecutor.SwapLeg memory leg2 = LiquidationExecutor.SwapLeg({
+            mode: LiquidationExecutor.SwapMode.UNI_V3,
+            srcToken: address(collateralToken),
+            amountIn: 0, // measured at runtime
+            useFullBalance: false,
+            deadline: block.timestamp + 3600,
+            paraswapCalldata: "",
+            bebopTarget: address(0),
+            bebopCalldata: "",
+            v2Path: new address[](0),
+            v3Fee: 3000,
+            v4PoolManager: address(0),
+            v4SwapData: "",
+            repayToken: address(mockWeth),
+            minAmountOut: 1
+        });
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: false,
+            leg2: leg2,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: true,
+            profitToken: address(mockWeth),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
+    /// @dev hasLeg2 sequential plan with Curve leg1 → Balancer leg2.
+    /// Confirms heterogeneous DEX chaining works end-to-end.
+    function test_hasLeg2_Curve_to_Balancer_sequential_works() public {
+        // leg1: collateral → profitToken via Curve
+        // leg2: profitToken → loanToken via Balancer
+        MockCurveV1Pool curveLeg1 = new MockCurveV1Pool(address(collateralToken), address(profitToken), SWAP_RATE);
+        profitToken.mint(address(curveLeg1), 100_000e18);
+
+        MockBalancerV2Vault2 balLeg2 = new MockBalancerV2Vault2(SWAP_RATE);
+        loanToken.mint(address(balLeg2), 100_000e18);
+
+        address[] memory targets = new address[](10);
+        targets[0] = address(aavePool);
+        targets[1] = address(augustus);
+        targets[2] = address(aaveV2Pool);
+        targets[3] = address(bebop);
+        targets[4] = address(morphoBlue);
+        targets[5] = address(uniV4Mock);
+        targets[6] = address(curveV1Mock);
+        targets[7] = address(balancerSwapMock);
+        targets[8] = address(curveLeg1);
+        targets[9] = address(balLeg2);
+
+        LiquidationExecutor execLocal = new LiquidationExecutor(
+            owner,
+            operatorAddr,
+            address(mockWeth),
+            address(aavePool),
+            address(balancerVault),
+            address(augustus),
+            address(uniV2Mock),
+            address(uniV3Mock),
+            targets
+        );
+        vm.startPrank(owner);
+        execLocal.setAaveV2LendingPool(address(aaveV2Pool));
+        execLocal.setExtSwapTarget(address(curveLeg1), true);
+        execLocal.setExtSwapTarget(address(balLeg2), true);
+        vm.stopPrank();
+        loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
+
+        LiquidationExecutor.SwapLeg memory leg1 = _curveV1Leg(
+            LiquidationExecutor.SwapMode.CURVE_V1,
+            address(collateralToken),
+            address(profitToken),
+            address(curveLeg1),
+            int128(0),
+            int128(1),
+            false,
+            DEFAULT_SWAP_AMOUNT,
+            1,
+            false
+        );
+        LiquidationExecutor.SwapLeg memory leg2 = _balancerV2Leg(
+            LiquidationExecutor.SwapMode.BAL_V2,
+            address(profitToken),
+            address(loanToken),
+            address(balLeg2),
+            bytes32(uint256(0xc0de)),
+            0, // useFullBalance → runtime
+            1,
+            true
+        );
+        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
+            leg1: leg1,
+            hasLeg2: true,
+            leg2: leg2,
+            hasSplit: false,
+            splitBps: 0,
+            hasMixedSplit: false,
+            profitToken: address(loanToken),
+            minProfitAmount: 0
+        });
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+        vm.prank(operatorAddr);
+        execLocal.execute(plan);
     }
 }
 

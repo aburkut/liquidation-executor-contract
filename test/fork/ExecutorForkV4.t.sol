@@ -172,7 +172,7 @@ contract ExecutorForkV4Test is Test {
         bytes memory plan = _wrapInPlan(sp);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.InvalidV4TokenOut.selector, WETH, USDC));
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -182,9 +182,7 @@ contract ExecutorForkV4Test is Test {
         bytes memory plan = _wrapInPlan(sp);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(0), int24(60))
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -194,9 +192,7 @@ contract ExecutorForkV4Test is Test {
         bytes memory plan = _wrapInPlan(sp);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(
-            abi.encodeWithSelector(LiquidationExecutor.InvalidV4FeeOrSpacing.selector, uint24(3000), int24(0))
-        );
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -207,7 +203,7 @@ contract ExecutorForkV4Test is Test {
         bytes memory plan = _wrapInPlan(sp);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.V4HookNotAllowed.selector, rogueHook));
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -216,7 +212,7 @@ contract ExecutorForkV4Test is Test {
         bytes memory plan = _wrapInPlan(sp);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidV4Data.selector);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
 
@@ -231,7 +227,7 @@ contract ExecutorForkV4Test is Test {
         bytes memory plan = _wrapInPlan(sp);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TargetNotAllowed.selector, stranger));
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.execute(plan);
     }
 
