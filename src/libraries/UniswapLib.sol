@@ -50,27 +50,7 @@ library UniswapLib {
         1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261;
 
     // SwapMode + SwapLeg now sourced from `../types/SwapTypes.sol`.
-
-    /// @dev Defensive zero-check for NO_SWAP legs. NO_SWAP doesn't
-    /// consult any DEX, so every DEX-related field must be zero/empty.
-    /// Currently NO consumer reads these for NO_SWAP, but a regression
-    /// in any future code path would silently inherit an attacker-
-    /// controlled payload. Asserting upstream makes the contract
-    /// regression-proof. Lib-hosted because the OR-chain is too heavy
-    /// for the main contract's EIP-170 budget.
-    function assertNoSwapLegZeroed(SwapLeg memory leg) external pure {
-        // NO_SWAP is the same-token branch — srcToken MUST equal repayToken.
-        // Every other mode enforces this via the post-NO_SWAP-early-return
-        // `srcToken == repayToken` check; mirroring it here closes the
-        // defense-in-depth gap surfaced by the re-audit.
-        if (leg.srcToken != leg.repayToken) revert InvalidPlan();
-        if (
-            leg.useFullBalance || leg.deadline != 0 || leg.amountIn != 0 || leg.minAmountOut != 0
-                || leg.paraswapCalldata.length != 0 || leg.bebopTarget != address(0) || leg.bebopCalldata.length != 0
-                || leg.v2Path.length != 0 || leg.v3Fee != 0 || leg.v4PoolManager != address(0)
-                || leg.v4SwapData.length != 0
-        ) revert InvalidPlan();
-    }
+    // assertNoSwapLegZeroed moved to SwapValidationLib (V10+ refactor).
 
     // ─── Errors (must match LiquidationExecutor signatures by name) ──
     error InsufficientSrcBalance(uint256 required, uint256 available);
