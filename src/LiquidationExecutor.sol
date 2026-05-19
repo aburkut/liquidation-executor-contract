@@ -19,6 +19,7 @@ import {SwapLegExecutorLib} from "./libraries/SwapLegExecutorLib.sol";
 import {UniswapLib} from "./libraries/UniswapLib.sol";
 import {CurveV1Lib} from "./libraries/CurveV1Lib.sol";
 import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
+import {SwapMode, SwapLeg} from "./types/SwapTypes.sol";
 
 interface IWETH {
     function withdraw(uint256 amount) external;
@@ -209,18 +210,13 @@ contract LiquidationExecutor is
     /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
-    /// @dev Dedicated narrow allowlist for Curve V1 / Balancer V2 pool
-    /// targets used by the CURVE_V1 and BAL_V2 swap modes. Separating
-    /// this from the generic `allowedTargets` set closes a selector-
-    /// collision surface: if any contract in `allowedTargets` (Aave
-    /// pool, Paraswap Augustus, Bebop, Uni routers, etc.) happens to
-    /// implement Curve's `exchange(int128,int128,uint256,uint256)`
-    /// selector (0x3df02124) or `exchange_underlying` (0xa6417ed6) —
-    /// or Balancer's `swap(SingleSwap, FundManagement, ...)` selector —
-    /// with side-effects, the operator could otherwise route a swap to
-    /// it. Pool addresses MUST be added to BOTH mappings (the broader
-    /// `allowedTargets` gate is preserved as a sanity floor).
-    mapping(address => bool) public allowedExtSwapTargets;
+    // V10+ refactor: the dedicated `allowedExtSwapTargets` allowlist
+    // for Curve V1 / Balancer V2 pool targets was removed. The
+    // executor holds zero balance between txs, so a hostile or buggy
+    // pool address can only burn gas — not steal funds. Pool sanity
+    // (`!= 0`, `code.length > 0`) is now enforced inside CurveV1Lib
+    // and BalancerV2Lib themselves; the bot is the trusted source of
+    // pool addresses.
 
     bytes32 private _activePlanHash;
 
@@ -301,108 +297,9 @@ contract LiquidationExecutor is
         uint256 finalRepayDelta
     );
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
-    event ExtSwapTargetUpdated(address indexed target, bool allowed);
 
-    // ─── Enums ────────────────────────────────────────────────────────
-    enum SwapMode {
-        PARASWAP_SINGLE,
-        BEBOP_MULTI,
-        UNI_V2,
-        UNI_V3,
-        UNI_V4,
-        NO_SWAP, // Same-token liquidation: srcToken == repayToken, no DEX call.
-        // BUY-side V3 — caller specifies EXACT `amountOut` (in
-        // `minAmountOut`) and MAX input (in `amountIn`, semantically
-        // `amountInMaximum`). Router refunds unused source. Library
-        // dispatches to `exactOutputSingle`. leg1-only; leg2 / split /
-        // sequential paths reject this mode.
-        UNI_V3_BUY,
-        // BUY-side V2 — same field remap as UNI_V3_BUY (`minAmountOut`
-        // is the EXACT amountOut, `amountIn` is amountInMax). Library
-        // dispatches to V2 router's `swapTokensForExactTokens`. Router
-        // consumes only the required input, the rest stays on the
-        // caller. leg1-only.
-        UNI_V2_BUY,
-        // BUY-side V4 — same field remap as the other *_BUY modes
-        // (`minAmountOut` = EXACT amountOut, `amountIn` = amountInMax).
-        // The unlock callback feeds the V4 PoolManager a positive
-        // `amountSpecified` (= EXACT amountOut) so the pool returns a
-        // variable-input / fixed-output delta. Post-unlock the main
-        // contract additionally enforces `consumed <= amountInMax` —
-        // the V4 PM has no client-side input ceiling, so the executor
-        // must police it. leg1-only (mirrors UNI_V3_BUY scope).
-        UNI_V4_BUY,
-        // Curve StableSwap V1 SELL — calls pool.exchange(int128 i,
-        // int128 j, uint256 dx, uint256 min_dy) (or exchange_underlying
-        // for lending pools). Pool address comes from `bebopTarget`;
-        // (i, j, useUnderlying) packed into `bebopCalldata` as
-        // abi.encode(int128, int128, bool). The Curve quoter on the
-        // bot side precomputes the indices and pool address.
-        // Implementation: CurveV1Lib.executeLeg.
-        CURVE_V1,
-        // Curve V1 BUY — Curve has no native exact-out. Bot precomputes
-        // `dx` such that get_dy(dx) >= targetOut, packs `dx` as
-        // `amountIn` and `targetOut` as `minAmountOut`. The on-chain
-        // swap is identical to CURVE_V1; only the event label flips.
-        // Excess output (rounding overage) stays on the executor.
-        CURVE_V1_BUY,
-        // Balancer V2 SELL — Vault.swap with SwapKind.GIVEN_IN. Vault
-        // address from `bebopTarget`; poolId + userData packed into
-        // `bebopCalldata` as abi.encode(bytes32, bytes).
-        // Implementation: BalancerV2Lib.executeLeg.
-        BAL_V2,
-        // Balancer V2 BUY — Vault.swap with SwapKind.GIVEN_OUT. Native
-        // exact-out support: amount = targetOut, limit = maxIn (=
-        // leg.amountIn). The Vault consumes ≤ limit and credits
-        // exact targetOut. Same lib as BAL_V2.
-        BAL_V2_BUY
-    }
-
-    // ─── Plan Structs ─────────────────────────────────────────────────
-
-    /// @dev One leg of a swap plan. The same struct shape is reused for leg1
-    /// and leg2; fields irrelevant to the chosen `mode` are ignored (and
-    /// must be zero per the validation rules below). See `_executeSwapPlan`
-    /// for the two-leg execution flow.
-    ///
-    /// Invariants (enforced in execute()):
-    ///   * leg1 may be any SwapMode.
-    ///   * leg2, when present, MUST be one of UNI_V2 / UNI_V3 / UNI_V4.
-    ///   * leg2.srcToken MUST equal leg1.repayToken (leg-linking).
-    ///   * For PARASWAP_SINGLE / BEBOP_MULTI: useFullBalance MUST be false
-    ///     (both modes carry their own amountIn inside calldata — using a
-    ///     delta would desync the pre-declared amountIn from reality).
-    struct SwapLeg {
-        SwapMode mode;
-        address srcToken;
-        uint256 amountIn;
-        bool useFullBalance;
-        uint256 deadline;
-
-        // Paraswap (PARASWAP_SINGLE only — leg1 only)
-        bytes paraswapCalldata;
-
-        // Bebop (BEBOP_MULTI only — leg1 only)
-        address bebopTarget;
-        bytes bebopCalldata;
-
-        // Uniswap V2 (UNI_V2 only)
-        address[] v2Path;
-
-        // Uniswap V3 (UNI_V3 only)
-        uint24 v3Fee;
-
-        // Uniswap V4 (UNI_V4 only)
-        address v4PoolManager;
-        bytes v4SwapData;
-
-        // Per-leg output binding.
-        // For leg1 in a one-leg plan: == outer plan.loanToken.
-        // For leg1 in a two-leg plan: == leg2.srcToken (intermediate).
-        // For leg2 always:            == outer plan.loanToken.
-        address repayToken;
-        uint256 minAmountOut;
-    }
+    // SwapMode + SwapLeg sourced from `./types/SwapTypes.sol` (V10+).
+    // See that file for the per-mode field-usage documentation.
 
     /// @dev Plan-shape matrix — EXACTLY ONE of {hasLeg2, hasSplit,
     /// hasMixedSplit} may be true (or all false = single-leg).
@@ -615,22 +512,10 @@ contract LiquidationExecutor is
         emit V4HookAllowedUpdated(hook, allowed);
     }
 
-    /// @notice Add/remove a Curve V1 pool or Balancer V2 Vault from the
-    /// dedicated ext-swap allowlist consulted by CURVE_V1 and BAL_V2
-    /// dispatch paths.
-    /// @dev Decoupled from `allowedTargets` to close the selector-
-    /// collision surface — if any contract in `allowedTargets` (Aave
-    /// pool, Paraswap Augustus, Bebop, Uni routers) happened to expose
-    /// Curve's `exchange(int128,int128,uint256,uint256)` (selector
-    /// 0x3df02124) or Balancer's `swap(...)` selector with side-effects,
-    /// operator could route a swap to it. Curve and Balancer regularly
-    /// deploy new pools, so unlike `allowedTargets` (constructor-only)
-    /// this allowlist is post-deploy curatable.
-    function setExtSwapTarget(address target, bool allowed) external onlyOwner {
-        if (target == address(0)) revert ZeroAddress();
-        allowedExtSwapTargets[target] = allowed;
-        emit ExtSwapTargetUpdated(target, allowed);
-    }
+    // V10+ refactor: `setExtSwapTarget` removed alongside the
+    // `allowedExtSwapTargets` mapping (see storage section). Curve V1
+    // and Balancer V2 dispatch paths sanity-check their pool / Vault
+    // targets inline now.
 
     function pause() external onlyOwner {
         _pause();
@@ -780,7 +665,7 @@ contract LiquidationExecutor is
         // fields without re-checking the mode. The OR-chain is hosted
         // in UniswapLib to fit the main contract's EIP-170 budget.
         if (m == SwapMode.NO_SWAP) {
-            UniswapLib.assertNoSwapLegZeroed(_asLibLeg(leg));
+            UniswapLib.assertNoSwapLegZeroed(leg);
             return;
         }
 
@@ -1519,15 +1404,14 @@ contract LiquidationExecutor is
 
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
         SwapMode m = leg.mode;
-        UniswapLib.SwapLeg memory libLeg = _asLibLeg(leg);
         if (m == SwapMode.PARASWAP_SINGLE) {
-            SwapLegExecutorLib.executeParaswapLeg(libLeg, paraswapAugustusV6);
+            SwapLegExecutorLib.executeParaswapLeg(leg, paraswapAugustusV6);
         } else if (m == SwapMode.BEBOP_MULTI) {
-            SwapLegExecutorLib.executeBebopLeg(libLeg, outBefore, allowedTargets[leg.bebopTarget]);
+            SwapLegExecutorLib.executeBebopLeg(leg, outBefore, allowedTargets[leg.bebopTarget]);
         } else if (m == SwapMode.UNI_V2 || m == SwapMode.UNI_V2_BUY) {
-            UniswapLib.executeUniV2Leg(libLeg, amountIn, uniV2Router);
+            UniswapLib.executeUniV2Leg(leg, amountIn, uniV2Router);
         } else if (m == SwapMode.UNI_V3 || m == SwapMode.UNI_V3_BUY) {
-            UniswapLib.executeUniV3Leg(libLeg, amountIn, uniV3Router);
+            UniswapLib.executeUniV3Leg(leg, amountIn, uniV3Router);
         } else if (m == SwapMode.UNI_V4 || m == SwapMode.UNI_V4_BUY) {
             // _executeUniV4Leg reads `leg.mode` to flip the V4
             // amountSpecified sign (BUY → positive = exact-output)
@@ -1540,30 +1424,25 @@ contract LiquidationExecutor is
             // Curve StableSwap V1. SELL and BUY produce identical
             // on-chain swaps; the bot precomputes `dx` for BUY so that
             // get_dy(dx) >= targetOut (Curve has no native exact-out).
-            CurveV1Lib.executeLeg(libLeg, amountIn, allowedExtSwapTargets[leg.bebopTarget]);
+            // V10+: no per-pool allowlist; the library does its own
+            // `pool != 0` + `code.length > 0` sanity gates.
+            CurveV1Lib.executeLeg(leg, amountIn);
         } else if (m == SwapMode.BAL_V2 || m == SwapMode.BAL_V2_BUY) {
             // Balancer V2. SwapKind flips inside the library based on
             // `leg.mode` (GIVEN_IN for SELL, GIVEN_OUT for BUY — native
-            // exact-out support).
-            BalancerV2Lib.executeLeg(libLeg, amountIn, allowedExtSwapTargets[leg.bebopTarget]);
+            // exact-out support). V10+: no per-pool allowlist; the lib
+            // sanity-checks `vault != 0` + `code.length > 0` and trusts
+            // the bot to pass the canonical Vault address.
+            BalancerV2Lib.executeLeg(leg, amountIn);
         } else {
             revert InvalidSwapMode();
         }
     }
 
-    /// @dev Reinterprets a main-contract `SwapLeg memory` pointer as a
-    /// `UniswapLib.SwapLeg memory` pointer. The two struct declarations
-    /// are byte-for-byte identical (field order + types); memory layout
-    /// is identical by ABI rules. Pure pointer retype, no memory copy.
-    /// Both UniswapLib and SwapLegExecutorLib's executeParaswapLeg take
-    /// `UniswapLib.SwapLeg memory` so a single cast helper covers both
-    /// dispatch paths. Keeping the two struct declarations in sync is
-    /// enforced by the STRUCT DISCIPLINE comments in UniswapLib.
-    function _asLibLeg(SwapLeg memory leg) internal pure returns (UniswapLib.SwapLeg memory libLeg) {
-        assembly {
-            libLeg := leg
-        }
-    }
+    // V10+ refactor: the `_asLibLeg` assembly retype helper is no longer
+    // needed — every library now consumes the shared
+    // `SwapTypes.SwapLeg` type, so the main contract's leg is accepted
+    // by-value with no cast.
 
     // Paraswap single leg moved to SwapLegExecutorLib (external library,
     // DELEGATECALL). See `_dispatchLeg` for the call site.

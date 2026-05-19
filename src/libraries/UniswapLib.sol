@@ -7,6 +7,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IUniV2Router} from "../interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "../interfaces/IUniV3SwapRouter.sol";
 import {IPoolManager, PoolKey, SwapParams} from "../interfaces/IPoolManager.sol";
+import {SwapMode, SwapLeg} from "../types/SwapTypes.sol";
 
 /// @title UniswapLib
 /// @notice External library housing ALL Uniswap leg execution logic
@@ -27,9 +28,10 @@ import {IPoolManager, PoolKey, SwapParams} from "../interfaces/IPoolManager.sol"
 /// library) — it has no relationship to Uniswap and a different
 /// validation surface (selector classifier + decoder).
 ///
-/// STRUCT DISCIPLINE: `SwapLeg` here MUST stay byte-for-byte identical
-/// to the `SwapLeg` declared in `LiquidationExecutor`. Divergence
-/// silently corrupts ABI decoding under DELEGATECALL.
+/// STRUCT DISCIPLINE: `SwapLeg` is imported from `../types/SwapTypes.sol`
+/// (V10+ refactor). Treat that file as the frozen interface — every
+/// library and contract that touches a leg under DELEGATECALL reads
+/// fields by position from the same definition.
 ///
 /// SECURITY DISCIPLINE: V4 entrypoints (`runV4UnlockSwap`,
 /// `runV4UnlockMultihop`) are invoked only inside
@@ -47,39 +49,7 @@ library UniswapLib {
     uint160 internal constant V4_MAX_SQRT_PRICE_LIMIT =
         1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261;
 
-    // ─── SwapMode enum + SwapLeg struct (MUST match main contract) ──
-    enum SwapMode {
-        PARASWAP_SINGLE,
-        BEBOP_MULTI,
-        UNI_V2,
-        UNI_V3,
-        UNI_V4,
-        NO_SWAP,
-        UNI_V3_BUY,
-        UNI_V2_BUY,
-        UNI_V4_BUY,
-        CURVE_V1,
-        CURVE_V1_BUY,
-        BAL_V2,
-        BAL_V2_BUY
-    }
-
-    struct SwapLeg {
-        SwapMode mode;
-        address srcToken;
-        uint256 amountIn;
-        bool useFullBalance;
-        uint256 deadline;
-        bytes paraswapCalldata;
-        address bebopTarget;
-        bytes bebopCalldata;
-        address[] v2Path;
-        uint24 v3Fee;
-        address v4PoolManager;
-        bytes v4SwapData;
-        address repayToken;
-        uint256 minAmountOut;
-    }
+    // SwapMode + SwapLeg now sourced from `../types/SwapTypes.sol`.
 
     /// @dev Defensive zero-check for NO_SWAP legs. NO_SWAP doesn't
     /// consult any DEX, so every DEX-related field must be zero/empty.

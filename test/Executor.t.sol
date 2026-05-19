@@ -9,6 +9,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 import {UniswapLib} from "../src/libraries/UniswapLib.sol";
+import {SwapMode, SwapLeg} from "../src/types/SwapTypes.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
 import {MarketParams} from "../src/interfaces/IMorphoBlue.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -231,8 +232,6 @@ contract ExecutorTest is Test {
         // Balancer V2 Vault targets must be flagged separately; the
         // broader allowedTargets gate is preserved as a sanity floor
         // but is no longer the CURVE_V1 / BAL_V2 dispatch gate.
-        executor.setExtSwapTarget(address(curveV1Mock), true);
-        executor.setExtSwapTarget(address(balancerSwapMock), true);
         vm.stopPrank();
 
         // Configure liquidation reward so the delta-based collateral check passes
@@ -513,9 +512,9 @@ contract ExecutorTest is Test {
         );
     }
 
-    function _zeroLeg() internal pure returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+    function _zeroLeg() internal pure returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: SwapMode.PARASWAP_SINGLE,
             srcToken: address(0),
             amountIn: 0,
             useFullBalance: false,
@@ -537,8 +536,8 @@ contract ExecutorTest is Test {
         view
         returns (LiquidationExecutor.SwapPlan memory)
     {
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.PARASWAP_SINGLE,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: false,
@@ -574,8 +573,8 @@ contract ExecutorTest is Test {
         address profitTkn,
         uint256 minProfitAmt
     ) internal view returns (LiquidationExecutor.SwapPlan memory) {
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.BEBOP_MULTI,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.BEBOP_MULTI,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: false,
@@ -612,8 +611,8 @@ contract ExecutorTest is Test {
         address[] memory path = new address[](2);
         path[0] = srcToken;
         path[1] = dstToken;
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V2,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V2,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: false,
@@ -648,8 +647,8 @@ contract ExecutorTest is Test {
         uint256 minOut,
         uint256 minProfitAmt
     ) internal view returns (LiquidationExecutor.SwapPlan memory) {
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V3,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: false,
@@ -687,8 +686,8 @@ contract ExecutorTest is Test {
         uint256 minOut,
         uint256 minProfitAmt
     ) internal view returns (LiquidationExecutor.SwapPlan memory) {
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V4,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V4,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: false,
@@ -718,12 +717,11 @@ contract ExecutorTest is Test {
     /// @dev Assemble a two-leg SwapPlan. Caller supplies two already-built
     /// SwapLeg values (via `_buildUniV2Leg` / `_buildUniV3Leg` / ... below)
     /// plus the outer profit/minProfit fields. hasLeg2 is forced true.
-    function _buildTwoLegPlan(
-        LiquidationExecutor.SwapLeg memory leg1,
-        LiquidationExecutor.SwapLeg memory leg2,
-        address profitTkn,
-        uint256 minProfitAmt
-    ) internal pure returns (LiquidationExecutor.SwapPlan memory) {
+    function _buildTwoLegPlan(SwapLeg memory leg1, SwapLeg memory leg2, address profitTkn, uint256 minProfitAmt)
+        internal
+        pure
+        returns (LiquidationExecutor.SwapPlan memory)
+    {
         return LiquidationExecutor.SwapPlan({
             leg1: leg1,
             hasLeg2: true,
@@ -739,10 +737,10 @@ contract ExecutorTest is Test {
     function _buildParaswapLeg(address srcToken, address dstToken, uint256 amountIn)
         internal
         view
-        returns (LiquidationExecutor.SwapLeg memory)
+        returns (SwapLeg memory)
     {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+        return SwapLeg({
+            mode: SwapMode.PARASWAP_SINGLE,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: false,
@@ -765,9 +763,9 @@ contract ExecutorTest is Test {
         address bebopTarget,
         bytes memory bebopCd,
         address repayTkn
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.BEBOP_MULTI,
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: SwapMode.BEBOP_MULTI,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: false,
@@ -787,13 +785,13 @@ contract ExecutorTest is Test {
     function _buildUniV2Leg(address srcToken, address dstToken, uint256 amountIn, uint256 minOut, bool fullBalance)
         internal
         view
-        returns (LiquidationExecutor.SwapLeg memory)
+        returns (SwapLeg memory)
     {
         address[] memory path = new address[](2);
         path[0] = srcToken;
         path[1] = dstToken;
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V2,
+        return SwapLeg({
+            mode: SwapMode.UNI_V2,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: fullBalance,
@@ -817,9 +815,9 @@ contract ExecutorTest is Test {
         uint24 fee,
         uint256 minOut,
         bool fullBalance
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3,
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: SwapMode.UNI_V3,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: fullBalance,
@@ -841,13 +839,13 @@ contract ExecutorTest is Test {
     function _buildUniV2BuyLeg(address srcToken, address dstToken, uint256 amountInMaximum, uint256 amountOut)
         internal
         view
-        returns (LiquidationExecutor.SwapLeg memory)
+        returns (SwapLeg memory)
     {
         address[] memory path = new address[](2);
         path[0] = srcToken;
         path[1] = dstToken;
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V2_BUY,
+        return SwapLeg({
+            mode: SwapMode.UNI_V2_BUY,
             srcToken: srcToken,
             amountIn: amountInMaximum,
             useFullBalance: false,
@@ -878,9 +876,9 @@ contract ExecutorTest is Test {
         uint256 amountInMaximum,
         uint24 fee,
         uint256 amountOut
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3_BUY,
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: SwapMode.UNI_V3_BUY,
             srcToken: srcToken,
             amountIn: amountInMaximum,
             useFullBalance: false,
@@ -907,9 +905,9 @@ contract ExecutorTest is Test {
         address poolManager,
         uint256 minOut,
         bool fullBalance
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V4,
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: SwapMode.UNI_V4,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: fullBalance,
@@ -956,9 +954,9 @@ contract ExecutorTest is Test {
         uint256 amountIn,
         bytes memory path,
         uint256 minAmountOut
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3,
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: SwapMode.UNI_V3,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: false,
@@ -983,9 +981,9 @@ contract ExecutorTest is Test {
         uint256 amountInMaximum,
         bytes memory pathReversed,
         uint256 amountOut
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3_BUY,
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: SwapMode.UNI_V3_BUY,
             srcToken: srcToken,
             amountIn: amountInMaximum,
             useFullBalance: false,
@@ -1021,9 +1019,9 @@ contract ExecutorTest is Test {
         UniswapLib.V4Hop[] memory hops,
         address poolManager,
         uint256 minAmountOut
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: isBuy ? LiquidationExecutor.SwapMode.UNI_V4_BUY : LiquidationExecutor.SwapMode.UNI_V4,
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: isBuy ? SwapMode.UNI_V4_BUY : SwapMode.UNI_V4,
             srcToken: srcToken,
             amountIn: amountIn,
             useFullBalance: false,
@@ -1049,9 +1047,9 @@ contract ExecutorTest is Test {
         address hook,
         address poolManager,
         uint256 amountOut
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V4_BUY,
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: SwapMode.UNI_V4_BUY,
             srcToken: srcToken,
             amountIn: amountInMaximum,
             useFullBalance: false,
@@ -1448,15 +1446,16 @@ contract ExecutorTest is Test {
         bytes32 planHash = keccak256(planBytes);
 
         // Storage layout (forge inspect LiquidationExecutor storage):
-        //   slot 10 = _activePlanHash       (bytes32)
-        //   slot 11 = _activeV4PoolManager  (address, offset 0)
+        //   slot 9  = _activePlanHash       (bytes32)
+        //   slot 10 = _activeV4PoolManager  (address, offset 0)
         //            _executionPhase        (uint8 enum, offset 20)
-        // (Slots shifted -1 after removing the unused `balancerVault`
-        // storage var per re-audit informational LEAD.) Force both into
-        // the "during flashloan" state so neither guard short-circuits.
+        // (Slots shifted -1 in V10 refactor after removing the
+        // `allowedExtSwapTargets` mapping; previously shifted -1 by the
+        // re-audit `balancerVault` removal.) Force both into the
+        // "during flashloan" state so neither guard short-circuits.
         // Byte at offset 20 (Solidity) corresponds to bit 160 of the uint256 slot.
-        vm.store(address(executor), bytes32(uint256(10)), planHash);
-        vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive
+        vm.store(address(executor), bytes32(uint256(9)), planHash);
+        vm.store(address(executor), bytes32(uint256(10)), bytes32(uint256(1) << 160)); // FlashLoanActive
 
         // Attacker (not the registered Morpho provider) hits the callback. The phase
         // and hash gates pass; only the caller check should reject.
@@ -1567,8 +1566,8 @@ contract ExecutorTest is Test {
         bytes memory targetAction =
             _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), seizedAssets);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: collateralReward,
                 useFullBalance: false,
@@ -1666,8 +1665,8 @@ contract ExecutorTest is Test {
     function test_paraswapSingle_revertsOnDeadlineExpired() public {
         uint256 expiredDeadline = block.timestamp - 1;
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2489,8 +2488,8 @@ contract ExecutorTest is Test {
         loanToken.mint(address(augustus), DEFAULT_SWAP_AMOUNT);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2548,8 +2547,8 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2592,8 +2591,8 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2640,8 +2639,8 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2683,8 +2682,8 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2724,8 +2723,8 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT / 2, 0, address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2765,8 +2764,8 @@ contract ExecutorTest is Test {
         bytes memory cd = abi.encodePacked(fakeSelector, new bytes(420)); // pad past length checks
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2807,8 +2806,8 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, badRecipient
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2856,8 +2855,8 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2900,8 +2899,8 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2941,8 +2940,8 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -2982,8 +2981,8 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -3020,8 +3019,8 @@ contract ExecutorTest is Test {
             address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0, badRecipient
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -3067,8 +3066,8 @@ contract ExecutorTest is Test {
         bytes memory cd = abi.encodePacked(rfqSelector, new bytes(420));
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -3102,8 +3101,8 @@ contract ExecutorTest is Test {
     function test_revertIfSwapRecipientInvalid() public {
         address badRecipient = address(0xBAAD);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -3145,8 +3144,8 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: specAmountIn,
                 useFullBalance: false,
@@ -3200,8 +3199,8 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -3295,8 +3294,8 @@ contract ExecutorTest is Test {
 
         // Build swap plan
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: collateralReward,
                 useFullBalance: false,
@@ -3383,8 +3382,8 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: collateralReward,
                 useFullBalance: false,
@@ -3465,8 +3464,8 @@ contract ExecutorTest is Test {
         uint256 swapOutput = collateralReward * 0.836e18 / 1e18; // 501.6e18
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: collateralReward,
                 useFullBalance: false,
@@ -3564,8 +3563,8 @@ contract ExecutorTest is Test {
         });
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: totalCollateral,
                 useFullBalance: false,
@@ -3656,8 +3655,8 @@ contract ExecutorTest is Test {
         });
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: collateralReward * 2,
                 useFullBalance: false,
@@ -3922,8 +3921,8 @@ contract ExecutorTest is Test {
         loanToken.mint(address(aavePool), 100_000e18);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: 1,
                 useFullBalance: false,
@@ -4572,8 +4571,8 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: collateralReward,
                 useFullBalance: false,
@@ -4691,8 +4690,8 @@ contract ExecutorTest is Test {
             _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), seizedAssets);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: collateralReward,
                 useFullBalance: false,
@@ -5408,8 +5407,8 @@ contract ExecutorTest is Test {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: maxAmountIn,
                 useFullBalance: false,
@@ -5627,8 +5626,8 @@ contract ExecutorTest is Test {
             address(executor)
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -5665,8 +5664,8 @@ contract ExecutorTest is Test {
     function test_balancerV2_invalidBlobSelector_reverts() public {
         bytes memory cd = _buildBalancerV2InvalidBlobCalldata(SWAP_EXACT_IN_BALANCER_V2_SELECTOR);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: 1,
                 useFullBalance: false,
@@ -5707,8 +5706,8 @@ contract ExecutorTest is Test {
             badRecipient
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -5754,8 +5753,8 @@ contract ExecutorTest is Test {
     /// regression in `_decodeAndValidateParaswap` surfaces as a test failure.
     function _runAcceptedSwap(bytes memory cd) internal {
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -5791,8 +5790,8 @@ contract ExecutorTest is Test {
     /// Drives a rejected-selector swap and asserts the canonical revert.
     function _expectRejectedSwap(bytes memory cd, bytes4 expectedSelector) internal {
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -5844,8 +5843,8 @@ contract ExecutorTest is Test {
 
         // Build a minimal plan using the crafted calldata.
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -5885,8 +5884,8 @@ contract ExecutorTest is Test {
         }
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
                 amountIn: DEFAULT_SWAP_AMOUNT,
                 useFullBalance: false,
@@ -6211,7 +6210,7 @@ contract ExecutorTest is Test {
         // BUY-side single-hop V2. amountInMax capped at collateralDelta
         // (= COLLATERAL_REWARD); router consumes amountOut/rate of it.
 
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV2BuyLeg(
+        SwapLeg memory leg1 = _buildUniV2BuyLeg(
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
@@ -6264,8 +6263,8 @@ contract ExecutorTest is Test {
         path[1] = address(intermediateToken);
         path[2] = address(loanToken);
 
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V2,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V2,
             srcToken: address(collateralToken),
             amountIn: DEFAULT_SWAP_AMOUNT,
             useFullBalance: false,
@@ -6309,8 +6308,8 @@ contract ExecutorTest is Test {
         path[1] = address(intermediateToken);
         path[2] = address(loanToken);
 
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V2_BUY,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V2_BUY,
             srcToken: address(collateralToken),
             amountIn: 1000e18, // amountInMaximum
             useFullBalance: false,
@@ -6357,7 +6356,7 @@ contract ExecutorTest is Test {
         // BUY-side single-hop V3. amountInMax capped at collateralDelta;
         // router consumes exactly amountOut/rate.
 
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3BuyLeg(
+        SwapLeg memory leg1 = _buildUniV3BuyLeg(
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
@@ -6416,7 +6415,7 @@ contract ExecutorTest is Test {
             3000, // tier intermediate→loan
             address(loanToken)
         );
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3MultihopSellLeg(
+        SwapLeg memory leg1 = _buildUniV3MultihopSellLeg(
             address(collateralToken),
             address(loanToken),
             DEFAULT_SWAP_AMOUNT,
@@ -6453,7 +6452,7 @@ contract ExecutorTest is Test {
         MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
         bytes memory pathReversed =
             _encodeV3PathBuy(address(collateralToken), 500, address(intermediateToken), 3000, address(loanToken));
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV3MultihopBuyLeg(
+        SwapLeg memory leg1 = _buildUniV3MultihopBuyLeg(
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
@@ -6495,7 +6494,7 @@ contract ExecutorTest is Test {
         // minAmountOut = EXACT amountOut. amountInMax capped at
         // collateralDelta (= COLLATERAL_REWARD).
 
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4BuyLeg(
+        SwapLeg memory leg1 = _buildUniV4BuyLeg(
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
@@ -6559,7 +6558,7 @@ contract ExecutorTest is Test {
         });
         hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
 
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg( /* isBuy */
+        SwapLeg memory leg1 = _buildUniV4MultihopLeg( /* isBuy */
             false,
             address(collateralToken),
             address(loanToken),
@@ -6610,7 +6609,7 @@ contract ExecutorTest is Test {
         // hop0→hop1 means input X for amountOut requires X = amountOut / rate^2.
         // For amountOut=1100e18 and rate=1.1: X = 1100/(1.1*1.1) = ~909.09e18.
         uint256 amountOutExact = 1100e18;
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg( /* isBuy */
+        SwapLeg memory leg1 = _buildUniV4MultihopLeg( /* isBuy */
             true,
             address(collateralToken),
             address(loanToken),
@@ -6659,7 +6658,7 @@ contract ExecutorTest is Test {
         MockERC20 wrongFirst = new MockERC20("Wrong", "WRG", 18);
         bytes memory path =
             _encodeV3PathSell(address(wrongFirst), 500, address(collateralToken), 3000, address(loanToken));
-        LiquidationExecutor.SwapLeg memory leg1 =
+        SwapLeg memory leg1 =
             _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, path, 1);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: leg1,
@@ -6683,7 +6682,7 @@ contract ExecutorTest is Test {
         MockERC20 wrongLast = new MockERC20("Wrong", "WRG", 18);
         bytes memory path =
             _encodeV3PathSell(address(collateralToken), 500, address(loanToken), 3000, address(wrongLast));
-        LiquidationExecutor.SwapLeg memory leg1 =
+        SwapLeg memory leg1 =
             _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, path, 1);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: leg1,
@@ -6707,7 +6706,7 @@ contract ExecutorTest is Test {
         // Path length must satisfy >= 66 AND (len - 20) % 23 == 0.
         // 50 bytes fails both — validator catches pre-flashloan (InvalidPlan).
         bytes memory badPath = new bytes(50);
-        LiquidationExecutor.SwapLeg memory leg1 =
+        SwapLeg memory leg1 =
             _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, badPath, 1);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: leg1,
@@ -6736,7 +6735,7 @@ contract ExecutorTest is Test {
         MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
         bytes memory forwardPath =
             _encodeV3PathSell(address(collateralToken), 500, address(intermediateToken), 3000, address(loanToken));
-        LiquidationExecutor.SwapLeg memory leg1 =
+        SwapLeg memory leg1 =
             _buildUniV3MultihopBuyLeg(address(collateralToken), address(loanToken), 1000e18, forwardPath, 1100e18);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: leg1,
@@ -6762,7 +6761,7 @@ contract ExecutorTest is Test {
         // `nHops < 2 → InvalidPlan` check inside decodeAndValidateV4MultihopShape.
         UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](1);
         hops[0] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 3000, tickSpacing: int24(60), hook: address(0)});
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+        SwapLeg memory leg1 = _buildUniV4MultihopLeg(
             false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
@@ -6792,7 +6791,7 @@ contract ExecutorTest is Test {
             tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: address(0)
         });
         hops[1] = UniswapLib.V4Hop({tokenOut: address(wrongFinal), fee: 500, tickSpacing: int24(10), hook: address(0)});
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+        SwapLeg memory leg1 = _buildUniV4MultihopLeg(
             false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
@@ -6819,7 +6818,7 @@ contract ExecutorTest is Test {
         hops[0] =
             UniswapLib.V4Hop({tokenOut: address(intermediateToken), fee: 0, tickSpacing: int24(60), hook: address(0)});
         hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+        SwapLeg memory leg1 = _buildUniV4MultihopLeg(
             false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
@@ -6847,7 +6846,7 @@ contract ExecutorTest is Test {
             tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(0), hook: address(0)
         });
         hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+        SwapLeg memory leg1 = _buildUniV4MultihopLeg(
             false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
@@ -6877,7 +6876,7 @@ contract ExecutorTest is Test {
             tokenOut: address(intermediateToken), fee: uint24(0x800000) | 3000, tickSpacing: int24(60), hook: address(0)
         });
         hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+        SwapLeg memory leg1 = _buildUniV4MultihopLeg(
             false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
@@ -6909,8 +6908,7 @@ contract ExecutorTest is Test {
         collateralToken.mint(address(executor), 5000e18);
         uniV2Mock.setRate(0.5e18);
 
-        LiquidationExecutor.SwapLeg memory leg1 =
-            _buildUniV2BuyLeg(address(collateralToken), address(loanToken), 100e18, 1100e18);
+        SwapLeg memory leg1 = _buildUniV2BuyLeg(address(collateralToken), address(loanToken), 100e18, 1100e18);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: leg1,
             hasLeg2: false,
@@ -6939,7 +6937,7 @@ contract ExecutorTest is Test {
         collateralToken.mint(address(executor), 5000e18);
         uniV4Mock.setRate(0.5e18);
 
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4BuyLeg(
+        SwapLeg memory leg1 = _buildUniV4BuyLeg(
             address(collateralToken),
             address(loanToken),
             /* amountInMaximum = */
@@ -6988,7 +6986,7 @@ contract ExecutorTest is Test {
             tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: strangerHook
         });
         hops[1] = UniswapLib.V4Hop({tokenOut: address(loanToken), fee: 500, tickSpacing: int24(10), hook: address(0)});
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4MultihopLeg(
+        SwapLeg memory leg1 = _buildUniV4MultihopLeg(
             false, address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, hops, address(uniV4Mock), 1
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
@@ -7476,11 +7474,10 @@ contract ExecutorTest is Test {
     /// @notice Task 12: Paraswap (collateral → profit) → UniV2 (profit → loan)
     function test_twoLeg_paraswap_to_uniV2_happyPath() public {
         // leg1: collateral → profitToken via Paraswap (SWAP_RATE = 1.1)
-        LiquidationExecutor.SwapLeg memory leg1 =
-            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+        SwapLeg memory leg1 = _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
 
         // leg2: profitToken → loanToken via UniV2, useFullBalance=true
-        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
+        SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7495,11 +7492,9 @@ contract ExecutorTest is Test {
 
     /// @notice Task 13a: Paraswap (collateral → profit) → UniV3 (profit → loan)
     function test_twoLeg_paraswap_to_uniV3_happyPath() public {
-        LiquidationExecutor.SwapLeg memory leg1 =
-            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+        SwapLeg memory leg1 = _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
 
-        LiquidationExecutor.SwapLeg memory leg2 =
-            _buildUniV3Leg(address(profitToken), address(loanToken), 0, 3000, 1, true);
+        SwapLeg memory leg2 = _buildUniV3Leg(address(profitToken), address(loanToken), 0, 3000, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7514,10 +7509,9 @@ contract ExecutorTest is Test {
 
     /// @notice Task 13b: Paraswap (collateral → profit) → UniV4 (profit → loan)
     function test_twoLeg_paraswap_to_uniV4_happyPath() public {
-        LiquidationExecutor.SwapLeg memory leg1 =
-            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+        SwapLeg memory leg1 = _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
 
-        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV4Leg(
+        SwapLeg memory leg2 = _buildUniV4Leg(
             address(profitToken), address(loanToken), 0, 3000, int24(60), address(0), address(uniV4Mock), 1, true
         );
 
@@ -7542,11 +7536,11 @@ contract ExecutorTest is Test {
 
         bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
 
-        LiquidationExecutor.SwapLeg memory leg1 = _buildBebopLeg(
+        SwapLeg memory leg1 = _buildBebopLeg(
             address(collateralToken), DEFAULT_SWAP_AMOUNT, address(bebop), bebopCd, address(profitToken)
         );
 
-        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
+        SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7566,12 +7560,11 @@ contract ExecutorTest is Test {
 
         bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
 
-        LiquidationExecutor.SwapLeg memory leg1 = _buildBebopLeg(
+        SwapLeg memory leg1 = _buildBebopLeg(
             address(collateralToken), DEFAULT_SWAP_AMOUNT, address(bebop), bebopCd, address(profitToken)
         );
 
-        LiquidationExecutor.SwapLeg memory leg2 =
-            _buildUniV3Leg(address(profitToken), address(loanToken), 0, 3000, 1, true);
+        SwapLeg memory leg2 = _buildUniV3Leg(address(profitToken), address(loanToken), 0, 3000, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7591,11 +7584,11 @@ contract ExecutorTest is Test {
 
         bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
 
-        LiquidationExecutor.SwapLeg memory leg1 = _buildBebopLeg(
+        SwapLeg memory leg1 = _buildBebopLeg(
             address(collateralToken), DEFAULT_SWAP_AMOUNT, address(bebop), bebopCd, address(profitToken)
         );
 
-        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV4Leg(
+        SwapLeg memory leg2 = _buildUniV4Leg(
             address(profitToken), address(loanToken), 0, 3000, int24(60), address(0), address(uniV4Mock), 1, true
         );
 
@@ -7612,11 +7605,10 @@ contract ExecutorTest is Test {
 
     /// @notice Task 15a: UniV3 (collateral → profit) → UniV3 (profit → loan)
     function test_twoLeg_uniV3_to_uniV3_happyPath() public {
-        LiquidationExecutor.SwapLeg memory leg1 =
+        SwapLeg memory leg1 =
             _buildUniV3Leg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, 3000, 1, false);
 
-        LiquidationExecutor.SwapLeg memory leg2 =
-            _buildUniV3Leg(address(profitToken), address(loanToken), 0, 500, 1, true);
+        SwapLeg memory leg2 = _buildUniV3Leg(address(profitToken), address(loanToken), 0, 500, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7631,7 +7623,7 @@ contract ExecutorTest is Test {
 
     /// @notice Task 15b: UniV4 (collateral → profit) → UniV3 (profit → loan)
     function test_twoLeg_uniV4_to_uniV3_happyPath() public {
-        LiquidationExecutor.SwapLeg memory leg1 = _buildUniV4Leg(
+        SwapLeg memory leg1 = _buildUniV4Leg(
             address(collateralToken),
             address(profitToken),
             DEFAULT_SWAP_AMOUNT,
@@ -7643,8 +7635,7 @@ contract ExecutorTest is Test {
             false
         );
 
-        LiquidationExecutor.SwapLeg memory leg2 =
-            _buildUniV3Leg(address(profitToken), address(loanToken), 0, 3000, 1, true);
+        SwapLeg memory leg2 = _buildUniV3Leg(address(profitToken), address(loanToken), 0, 3000, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7669,12 +7660,11 @@ contract ExecutorTest is Test {
         uint256 dust = 500e18;
         profitToken.mint(address(executor), dust);
 
-        LiquidationExecutor.SwapLeg memory leg1 =
-            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+        SwapLeg memory leg1 = _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
 
         // leg2 useFullBalance=true — must use ONLY the leg1-produced delta (~1100e18),
         // NOT leg1-delta + dust.
-        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
+        SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7696,8 +7686,7 @@ contract ExecutorTest is Test {
 
     /// @notice Task 17A: leg1.repayToken != leg2.srcToken → InvalidLegLink reverts.
     function test_twoLeg_invalidLink_leg1OutVsLeg2In_reverts() public {
-        LiquidationExecutor.SwapLeg memory leg1 =
-            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+        SwapLeg memory leg1 = _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
 
         // leg2 with deliberately mismatched srcToken (loanToken) — does not match
         // leg1.repayToken (profitToken). Also set repayToken to a token != leg.srcToken
@@ -7708,8 +7697,8 @@ contract ExecutorTest is Test {
         address[] memory path = new address[](2);
         path[0] = address(loanToken);
         path[1] = address(loanToken);
-        LiquidationExecutor.SwapLeg memory leg2 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V2,
+        SwapLeg memory leg2 = SwapLeg({
+            mode: SwapMode.UNI_V2,
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: true,
@@ -7743,10 +7732,10 @@ contract ExecutorTest is Test {
 
     /// @notice Task 17B: leg2 is Paraswap → Leg2ModeNotAllowed(PARASWAP_SINGLE) reverts.
     function test_twoLeg_leg2_paraswap_reverts() public {
-        LiquidationExecutor.SwapLeg memory leg1 =
+        SwapLeg memory leg1 =
             _buildUniV3Leg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, 3000, 1, false);
 
-        LiquidationExecutor.SwapLeg memory leg2 = _buildParaswapLeg(address(profitToken), address(loanToken), 100e18);
+        SwapLeg memory leg2 = _buildParaswapLeg(address(profitToken), address(loanToken), 100e18);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7755,21 +7744,19 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.Leg2ModeNotAllowed.selector, uint8(LiquidationExecutor.SwapMode.PARASWAP_SINGLE)
-            )
+            abi.encodeWithSelector(LiquidationExecutor.Leg2ModeNotAllowed.selector, uint8(SwapMode.PARASWAP_SINGLE))
         );
         executor.execute(plan);
     }
 
     /// @notice Task 17C: leg2 is Bebop → Leg2ModeNotAllowed(BEBOP_MULTI) reverts.
     function test_twoLeg_leg2_bebop_reverts() public {
-        LiquidationExecutor.SwapLeg memory leg1 =
+        SwapLeg memory leg1 =
             _buildUniV3Leg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, 3000, 1, false);
 
         // Bebop calldata/target values don't matter — Leg2ModeNotAllowed fires
         // before any Bebop validation.
-        LiquidationExecutor.SwapLeg memory leg2 = _buildBebopLeg(
+        SwapLeg memory leg2 = _buildBebopLeg(
             address(profitToken),
             100e18,
             address(bebop),
@@ -7784,21 +7771,18 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                LiquidationExecutor.Leg2ModeNotAllowed.selector, uint8(LiquidationExecutor.SwapMode.BEBOP_MULTI)
-            )
+            abi.encodeWithSelector(LiquidationExecutor.Leg2ModeNotAllowed.selector, uint8(SwapMode.BEBOP_MULTI))
         );
         executor.execute(plan);
     }
 
     /// @notice Paraswap as leg1 with useFullBalance=true → LegUseFullBalanceNotAllowed(PARASWAP_SINGLE).
     function test_twoLeg_leg1_paraswap_useFullBalance_reverts() public {
-        LiquidationExecutor.SwapLeg memory leg1 =
-            _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
+        SwapLeg memory leg1 = _buildParaswapLeg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT);
         // Mutate the built leg to enable useFullBalance — this is illegal for Paraswap.
         leg1.useFullBalance = true;
 
-        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
+        SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7808,8 +7792,7 @@ contract ExecutorTest is Test {
         vm.prank(operatorAddr);
         vm.expectRevert(
             abi.encodeWithSelector(
-                LiquidationExecutor.LegUseFullBalanceNotAllowed.selector,
-                uint8(LiquidationExecutor.SwapMode.PARASWAP_SINGLE)
+                LiquidationExecutor.LegUseFullBalanceNotAllowed.selector, uint8(SwapMode.PARASWAP_SINGLE)
             )
         );
         executor.execute(plan);
@@ -7818,12 +7801,12 @@ contract ExecutorTest is Test {
     /// @notice Bebop as leg1 with useFullBalance=true → LegUseFullBalanceNotAllowed(BEBOP_MULTI).
     function test_twoLeg_leg1_bebop_useFullBalance_reverts() public {
         bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
-        LiquidationExecutor.SwapLeg memory leg1 = _buildBebopLeg(
+        SwapLeg memory leg1 = _buildBebopLeg(
             address(collateralToken), DEFAULT_SWAP_AMOUNT, address(bebop), bebopCd, address(profitToken)
         );
         leg1.useFullBalance = true;
 
-        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
+        SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7833,8 +7816,7 @@ contract ExecutorTest is Test {
         vm.prank(operatorAddr);
         vm.expectRevert(
             abi.encodeWithSelector(
-                LiquidationExecutor.LegUseFullBalanceNotAllowed.selector,
-                uint8(LiquidationExecutor.SwapMode.BEBOP_MULTI)
+                LiquidationExecutor.LegUseFullBalanceNotAllowed.selector, uint8(SwapMode.BEBOP_MULTI)
             )
         );
         executor.execute(plan);
@@ -7845,11 +7827,11 @@ contract ExecutorTest is Test {
     /// hasLeg2==true but leg2.useFullBalance==false must revert with
     /// InvalidPlan; flipping the flag to true on the same plan must succeed.
     function test_leg2_requires_useFullBalance() public {
-        LiquidationExecutor.SwapLeg memory leg1 =
+        SwapLeg memory leg1 =
             _buildUniV3Leg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, 3000, 1, false);
 
         // leg2 with useFullBalance=false — forbidden.
-        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, false);
+        SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(loanToken), 0, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
 
@@ -7878,11 +7860,11 @@ contract ExecutorTest is Test {
         vm.coinbase(coinbase);
 
         // leg1: collateral → profitToken (UniV3, fixed amountIn)
-        LiquidationExecutor.SwapLeg memory leg1 =
+        SwapLeg memory leg1 =
             _buildUniV3Leg(address(collateralToken), address(profitToken), DEFAULT_SWAP_AMOUNT, 3000, 1, false);
 
         // leg2: profitToken → WETH (UniV2, tracked leftover)
-        LiquidationExecutor.SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(mockWeth), 0, 1, true);
+        SwapLeg memory leg2 = _buildUniV2Leg(address(profitToken), address(mockWeth), 0, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(mockWeth), 0);
 
@@ -7912,8 +7894,8 @@ contract ExecutorTest is Test {
 
     /// @dev Build a SwapPlan for hasSplit mode. leg1=repayLeg, leg2=profitLeg.
     function _buildSplitPlan(
-        LiquidationExecutor.SwapLeg memory repayLeg,
-        LiquidationExecutor.SwapLeg memory profitLeg,
+        SwapLeg memory repayLeg,
+        SwapLeg memory profitLeg,
         uint16 splitBps_,
         address profitTkn,
         uint256 minProfitAmt
@@ -7943,10 +7925,8 @@ contract ExecutorTest is Test {
         address coinbase = address(0xC01B);
         vm.coinbase(coinbase);
 
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 0, 3000, 1, false);
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 0, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildSplitPlan(repayLeg, profitLeg, 5000, address(mockWeth), 0);
 
@@ -7974,10 +7954,8 @@ contract ExecutorTest is Test {
 
     /// @notice Split mode rejects `splitBps == 0` and `splitBps >= 10000`.
     function test_split_invalid_bps() public {
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 0, 3000, 1, false);
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 0, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
 
         // bps == 0 rejected.
         LiquidationExecutor.SwapPlan memory swapPlan = _buildSplitPlan(repayLeg, profitLeg, 0, address(mockWeth), 0);
@@ -8010,10 +7988,8 @@ contract ExecutorTest is Test {
     function test_split_zero_amount_reverts() public {
         aavePool.setLiquidationCollateralReward(1);
 
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 0, 3000, 1, false);
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 0, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildSplitPlan(repayLeg, profitLeg, 1, address(mockWeth), 0);
 
@@ -8032,8 +8008,8 @@ contract ExecutorTest is Test {
 
     /// @dev Build a SwapPlan for hasMixedSplit mode.
     function _buildMixedSplitPlan(
-        LiquidationExecutor.SwapLeg memory repayLeg,
-        LiquidationExecutor.SwapLeg memory profitLeg,
+        SwapLeg memory repayLeg,
+        SwapLeg memory profitLeg,
         address profitTkn,
         uint256 minProfitAmt
     ) internal pure returns (LiquidationExecutor.SwapPlan memory) {
@@ -8064,10 +8040,8 @@ contract ExecutorTest is Test {
         address coinbase = address(0xC01C);
         vm.coinbase(coinbase);
 
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
 
@@ -8094,11 +8068,10 @@ contract ExecutorTest is Test {
 
     /// @notice MIXED_SPLIT rejects leg2 with a non-Uni mode (e.g. Paraswap).
     function test_mixed_split_rejects_non_uni_leg2() public {
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
         // leg2 set to PARASWAP_SINGLE — not allowed in MIXED_SPLIT.
-        LiquidationExecutor.SwapLeg memory profitLeg = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+        SwapLeg memory profitLeg = SwapLeg({
+            mode: SwapMode.PARASWAP_SINGLE,
             srcToken: address(collateralToken),
             amountIn: 1,
             useFullBalance: false,
@@ -8125,11 +8098,9 @@ contract ExecutorTest is Test {
 
     /// @notice MIXED_SPLIT rejects leg2.repayToken != WETH.
     function test_mixed_split_rejects_non_weth_profit_leg() public {
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
         // profit leg attempts to output loanToken instead of WETH.
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 0, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
         bytes memory plan =
@@ -8145,10 +8116,8 @@ contract ExecutorTest is Test {
     /// leg1 outputs an intermediate).
     function test_mixed_split_rejects_leg1_repay_not_loan_token() public {
         // leg1 outputs WETH (not loanToken) — this is the hasLeg2 shape.
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(mockWeth), 1100e18, 3000, 1, false);
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 1100e18, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
         bytes memory plan =
@@ -8163,12 +8132,10 @@ contract ExecutorTest is Test {
     /// profit leg MUST run on the same collateral as leg1 (parallel split,
     /// not sequential routing).
     function test_mixed_split_rejects_leg2_src_not_collateral() public {
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
         // leg2.srcToken is loanToken (not collateral) — violates MIXED_SPLIT
         // invariant.
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
         bytes memory plan =
@@ -8183,9 +8150,8 @@ contract ExecutorTest is Test {
     /// legs get an explicit amountIn (leg1 from its own calldata / struct,
     /// leg2 from the runtime-measured residual).
     function test_mixed_split_rejects_use_full_balance() public {
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
-        LiquidationExecutor.SwapLeg memory profitLeg = _buildUniV3Leg(
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(
             address(collateralToken),
             address(mockWeth),
             0,
@@ -8212,10 +8178,8 @@ contract ExecutorTest is Test {
         aavePool.setLiquidationCollateralReward(500e18);
         collateralToken.mint(address(aavePool), 100_000e18);
 
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 1000e18, 3000, 1, false);
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 1000e18, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
         bytes memory plan =
@@ -8232,10 +8196,8 @@ contract ExecutorTest is Test {
     /// @notice Plan-shape XOR guard: setting `hasSplit=true` AND
     /// `hasMixedSplit=true` simultaneously reverts `PlanShapeConflict`.
     function test_mixed_split_rejects_shape_conflict() public {
-        LiquidationExecutor.SwapLeg memory repayLeg =
-            _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory repayLeg = _buildUniV3Leg(address(collateralToken), address(loanToken), 1100e18, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: repayLeg,
@@ -8264,7 +8226,7 @@ contract ExecutorTest is Test {
     /// PARASWAP_DOUBLE as variant 5 (or renames one of the existing variants to it),
     /// this test fails, catching the reintroduction.
     function test_meta_noParaswapDoubleRemnants() public pure {
-        uint8 maxMode = uint8(LiquidationExecutor.SwapMode.UNI_V4);
+        uint8 maxMode = uint8(SwapMode.UNI_V4);
         assertEq(maxMode, 4, "SwapMode should have exactly 5 variants (0..4)");
     }
 }
@@ -8357,8 +8319,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
         returns (LiquidationExecutor.SwapPlan memory)
     {
         return LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.NO_SWAP,
+            leg1: SwapLeg({
+                mode: SwapMode.NO_SWAP,
                 srcToken: token,
                 amountIn: 0,
                 useFullBalance: false,
@@ -8510,8 +8472,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         // leg1: srcToken == aToken (skip-unwrap signal), repayToken == loanToken.
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(aToken),
                 amountIn: reward,
                 useFullBalance: false,
@@ -8588,8 +8550,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
         );
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken), // underlying, NOT aToken
                 amountIn: reward,
                 useFullBalance: false,
@@ -8661,8 +8623,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
         bytes memory action =
             _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
 
-        LiquidationExecutor.SwapLeg memory noSwapLeg = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.NO_SWAP,
+        SwapLeg memory noSwapLeg = SwapLeg({
+            mode: SwapMode.NO_SWAP,
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: false,
@@ -8678,8 +8640,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             minAmountOut: 0
         });
         // leg2 amountIn=0 — contract fills it at runtime from balance.
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: noSwapLeg,
@@ -8717,8 +8678,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
         bytes memory action =
             _buildAaveV3LiquidationAction(address(collateralToken), address(loanToken), address(0x1234), 500e18, false);
 
-        LiquidationExecutor.SwapLeg memory noSwapLeg = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.NO_SWAP,
+        SwapLeg memory noSwapLeg = SwapLeg({
+            mode: SwapMode.NO_SWAP,
             srcToken: address(collateralToken),
             amountIn: 0,
             useFullBalance: false,
@@ -8733,8 +8694,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             repayToken: address(loanToken),
             minAmountOut: 0
         });
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: noSwapLeg,
@@ -8766,8 +8726,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
         bytes memory action =
             _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
 
-        LiquidationExecutor.SwapLeg memory noSwapLeg = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.NO_SWAP,
+        SwapLeg memory noSwapLeg = SwapLeg({
+            mode: SwapMode.NO_SWAP,
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: false,
@@ -8782,8 +8742,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             repayToken: address(loanToken),
             minAmountOut: 0
         });
-        LiquidationExecutor.SwapLeg memory profitLeg =
-            _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
+        SwapLeg memory profitLeg = _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: noSwapLeg,
@@ -8822,8 +8781,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
         bytes memory action =
             _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), 500e18, false);
 
-        LiquidationExecutor.SwapLeg memory noSwapLeg = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.NO_SWAP,
+        SwapLeg memory noSwapLeg = SwapLeg({
+            mode: SwapMode.NO_SWAP,
             srcToken: address(loanToken),
             amountIn: 0,
             useFullBalance: false,
@@ -8844,8 +8803,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
         // Construct leg2 = loanToken → loanToken — this normally fails
         // _validateLeg but it doesn't matter: the new shape guard fires
         // FIRST so the test pins the correct error class.
-        LiquidationExecutor.SwapLeg memory leg2 =
-            _buildUniV3Leg(address(loanToken), address(loanToken), 0, 3000, 1, true);
+        SwapLeg memory leg2 = _buildUniV3Leg(address(loanToken), address(loanToken), 0, 3000, 1, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             leg1: noSwapLeg,
@@ -8881,8 +8839,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
         address bogus = address(0xBAD1);
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
-            leg1: LiquidationExecutor.SwapLeg({
-                mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+            leg1: SwapLeg({
+                mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: bogus, // neither collateralToken nor aToken
                 amountIn: 100e18,
                 useFullBalance: false,
@@ -9101,7 +9059,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function _curveV1Leg(
-        LiquidationExecutor.SwapMode m,
+        SwapMode m,
         address srcToken,
         address dstToken,
         address pool,
@@ -9111,8 +9069,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         uint256 amountIn,
         uint256 minAmountOut,
         bool useFullBalance
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
             mode: m,
             srcToken: srcToken,
             amountIn: amountIn,
@@ -9131,7 +9089,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function _balancerV2Leg(
-        LiquidationExecutor.SwapMode m,
+        SwapMode m,
         address srcToken,
         address dstToken,
         address vault,
@@ -9139,8 +9097,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         uint256 amountIn,
         uint256 minAmountOut,
         bool useFullBalance
-    ) internal view returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
+    ) internal view returns (SwapLeg memory) {
+        return SwapLeg({
             mode: m,
             srcToken: srcToken,
             amountIn: amountIn,
@@ -9158,7 +9116,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         });
     }
 
-    function _curveV1SinglePlan(LiquidationExecutor.SwapMode m, uint256 amountIn, uint256 minAmountOut)
+    function _curveV1SinglePlan(SwapMode m, uint256 amountIn, uint256 minAmountOut)
         internal
         view
         returns (LiquidationExecutor.SwapPlan memory)
@@ -9186,7 +9144,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         });
     }
 
-    function _balancerV2SinglePlan(LiquidationExecutor.SwapMode m, uint256 amountIn, uint256 minAmountOut)
+    function _balancerV2SinglePlan(SwapMode m, uint256 amountIn, uint256 minAmountOut)
         internal
         view
         returns (LiquidationExecutor.SwapPlan memory)
@@ -9223,7 +9181,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
+            _curveV1SinglePlan(SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
         );
         vm.expectEmit(true, true, true, false);
         emit LiquidationExecutor.CurveV1SwapExecuted(
@@ -9245,7 +9203,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1_BUY, dx, targetOut)
+            _curveV1SinglePlan(SwapMode.CURVE_V1_BUY, dx, targetOut)
         );
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -9255,8 +9213,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         // Set up plan with useUnderlying=true — library invokes the
         // `exchange_underlying` selector. Mock dispatches both selectors
         // to the same code path so the swap completes identically.
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -9322,15 +9280,14 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
-        execLocal.setExtSwapTarget(address(curveLeg2), true);
         vm.stopPrank();
 
         // Pre-fund the new executor so it can repay flashloans
         loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
         // leg1 collateral → profitToken via UniV3 (intermediate)
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V3,
             srcToken: address(collateralToken),
             amountIn: DEFAULT_SWAP_AMOUNT,
             useFullBalance: false,
@@ -9346,8 +9303,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             minAmountOut: 1
         });
         // leg2 profitToken → loanToken via Curve V1
-        LiquidationExecutor.SwapLeg memory leg2 = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg2 = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(profitToken),
             address(loanToken),
             address(curveLeg2),
@@ -9384,7 +9341,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _balancerV2SinglePlan(LiquidationExecutor.SwapMode.BAL_V2, DEFAULT_SWAP_AMOUNT, 1)
+            _balancerV2SinglePlan(SwapMode.BAL_V2, DEFAULT_SWAP_AMOUNT, 1)
         );
         vm.expectEmit(true, true, true, false);
         emit LiquidationExecutor.BalancerV2SwapExecuted(
@@ -9405,7 +9362,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _balancerV2SinglePlan(LiquidationExecutor.SwapMode.BAL_V2_BUY, ceiling, targetOut)
+            _balancerV2SinglePlan(SwapMode.BAL_V2_BUY, ceiling, targetOut)
         );
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -9440,12 +9397,11 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
-        execLocal.setExtSwapTarget(address(balLeg2), true);
         vm.stopPrank();
         loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V3,
             srcToken: address(collateralToken),
             amountIn: DEFAULT_SWAP_AMOUNT,
             useFullBalance: false,
@@ -9460,8 +9416,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             repayToken: address(profitToken),
             minAmountOut: 1
         });
-        LiquidationExecutor.SwapLeg memory leg2 = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
+        SwapLeg memory leg2 = _balancerV2Leg(
+            SwapMode.BAL_V2,
             address(profitToken),
             address(loanToken),
             address(balLeg2),
@@ -9489,41 +9445,15 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     // CURVE V1 — negative paths
     // ───────────────────────────────────────────────────────────────
 
-    function test_CurveV1_revert_when_targetNotAllowed() public {
-        MockCurveV1Pool roguePool = new MockCurveV1Pool(address(collateralToken), address(loanToken), SWAP_RATE);
-        loanToken.mint(address(roguePool), 100_000e18);
-
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
-            address(collateralToken),
-            address(loanToken),
-            address(roguePool), // NOT in allowedTargets
-            int128(0),
-            int128(1),
-            false,
-            DEFAULT_SWAP_AMOUNT,
-            1,
-            false
-        );
-        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
-            leg1: leg,
-            hasLeg2: false,
-            leg2: _zeroLeg(),
-            hasSplit: false,
-            splitBps: 0,
-            hasMixedSplit: false,
-            profitToken: address(loanToken),
-            minProfitAmount: 0
-        });
-        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
-        vm.prank(operatorAddr);
-        vm.expectRevert();
-        executor.execute(plan);
-    }
+    // V10 refactor: `test_CurveV1_revert_when_targetNotAllowed`
+    // removed. The per-pool allowlist (`allowedExtSwapTargets`) it
+    // exercised was dropped — see CurveV1Lib doc-comment. Sanity gate
+    // (`pool != 0` + `pool.code.length > 0`) remains; covered by the
+    // bytecode-only failure modes elsewhere.
 
     function test_CurveV1_revert_when_extData_empty() public {
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -9553,8 +9483,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
 
     function test_CurveV1_revert_when_extData_too_short() public {
         // 95 bytes < 96 bytes minimum — fails the _validateLeg length check.
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -9583,8 +9513,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function test_CurveV1_revert_when_pool_address_zero() public {
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(0), // pool address zero — fails _validateLeg
@@ -9616,8 +9546,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         // with useFullBalance=true ships amountIn=0 on the wire and is
         // legal). The runtime ZeroSwapInput revert from CurveV1Lib is
         // the source of truth for the empty-input failure.
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -9645,8 +9575,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function test_CurveV1_revert_when_minAmountOut_zero() public {
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -9681,7 +9611,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
+            _curveV1SinglePlan(SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
         );
         vm.prank(operatorAddr);
         vm.expectRevert();
@@ -9697,7 +9627,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1101e18)
+            _curveV1SinglePlan(SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1101e18)
         );
         vm.prank(operatorAddr);
         vm.expectRevert();
@@ -9724,8 +9654,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         // Liq must be same-token (col==loan) so srcToken == repayToken
         // == loanToken satisfies the SrcTokenNotCollateral guard and
         // execution reaches the NO_SWAP validator.
-        LiquidationExecutor.SwapLeg memory leg = _zeroLeg();
-        leg.mode = LiquidationExecutor.SwapMode.NO_SWAP;
+        SwapLeg memory leg = _zeroLeg();
+        leg.mode = SwapMode.NO_SWAP;
         leg.srcToken = address(loanToken);
         leg.repayToken = address(loanToken);
         leg.bebopTarget = address(curveV1Mock); // illegal on NO_SWAP
@@ -9747,8 +9677,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function test_CurveV1_NO_SWAP_rejects_bebopCalldata_set() public {
-        LiquidationExecutor.SwapLeg memory leg = _zeroLeg();
-        leg.mode = LiquidationExecutor.SwapMode.NO_SWAP;
+        SwapLeg memory leg = _zeroLeg();
+        leg.mode = SwapMode.NO_SWAP;
         leg.srcToken = address(loanToken);
         leg.repayToken = address(loanToken);
         leg.bebopCalldata = _buildCurveV1ExtData(int128(0), int128(1), false);
@@ -9773,39 +9703,16 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     // BALANCER V2 — negative paths
     // ───────────────────────────────────────────────────────────────
 
-    function test_BalancerV2_revert_when_targetNotAllowed() public {
-        MockBalancerV2Vault2 rogueVault = new MockBalancerV2Vault2(SWAP_RATE);
-        loanToken.mint(address(rogueVault), 100_000e18);
-
-        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
-            address(collateralToken),
-            address(loanToken),
-            address(rogueVault),
-            bytes32(uint256(0xdead)),
-            DEFAULT_SWAP_AMOUNT,
-            1,
-            false
-        );
-        LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
-            leg1: leg,
-            hasLeg2: false,
-            leg2: _zeroLeg(),
-            hasSplit: false,
-            splitBps: 0,
-            hasMixedSplit: false,
-            profitToken: address(loanToken),
-            minProfitAmount: 0
-        });
-        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
-        vm.prank(operatorAddr);
-        vm.expectRevert();
-        executor.execute(plan);
-    }
+    // V10 refactor: `test_BalancerV2_revert_when_targetNotAllowed`
+    // removed. The per-pool allowlist (`allowedExtSwapTargets`) it
+    // exercised was dropped — the new BalancerV2Lib gates on
+    // `vault != 0` + `vault.code.length > 0` (sanity floor only) since
+    // the executor holds zero balance between txs and the bot is the
+    // trusted source of the Vault address.
 
     function test_BalancerV2_revert_when_extData_empty() public {
-        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
+        SwapLeg memory leg = _balancerV2Leg(
+            SwapMode.BAL_V2,
             address(collateralToken),
             address(loanToken),
             address(balancerSwapMock),
@@ -9832,8 +9739,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function test_BalancerV2_revert_when_vault_address_zero() public {
-        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
+        SwapLeg memory leg = _balancerV2Leg(
+            SwapMode.BAL_V2,
             address(collateralToken),
             address(loanToken),
             address(0),
@@ -9862,8 +9769,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         // Same reasoning as test_CurveV1_revert_when_amountIn_zero —
         // BalancerV2Lib enforces ZeroSwapInput at dispatch; validation
         // accepts zero so leg2 useFullBalance=true plans pass.
-        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
+        SwapLeg memory leg = _balancerV2Leg(
+            SwapMode.BAL_V2,
             address(collateralToken),
             address(loanToken),
             address(balancerSwapMock),
@@ -9889,8 +9796,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function test_BalancerV2_revert_when_minAmountOut_zero() public {
-        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
+        SwapLeg memory leg = _balancerV2Leg(
+            SwapMode.BAL_V2,
             address(collateralToken),
             address(loanToken),
             address(balancerSwapMock),
@@ -9923,7 +9830,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _balancerV2SinglePlan(LiquidationExecutor.SwapMode.BAL_V2, DEFAULT_SWAP_AMOUNT, 1)
+            _balancerV2SinglePlan(SwapMode.BAL_V2, DEFAULT_SWAP_AMOUNT, 1)
         );
         vm.prank(operatorAddr);
         vm.expectRevert();
@@ -9934,8 +9841,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         // SWAP_RATE = 1.1e18; targetOut=1e18 needs ~0.91e18 in. If ceiling
         // is 0.5e18, vault reverts with "amountIn > limit". The library
         // surfaces this as a generic BalancerSwapFailed revert.
-        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2_BUY,
+        SwapLeg memory leg = _balancerV2Leg(
+            SwapMode.BAL_V2_BUY,
             address(collateralToken),
             address(loanToken),
             address(balancerSwapMock),
@@ -9961,8 +9868,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function test_BalancerV2_NO_SWAP_rejects_bebopTarget_set() public {
-        LiquidationExecutor.SwapLeg memory leg = _zeroLeg();
-        leg.mode = LiquidationExecutor.SwapMode.NO_SWAP;
+        SwapLeg memory leg = _zeroLeg();
+        leg.mode = SwapMode.NO_SWAP;
         leg.srcToken = address(loanToken);
         leg.repayToken = address(loanToken);
         leg.bebopTarget = address(balancerSwapMock);
@@ -9984,8 +9891,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function test_BalancerV2_NO_SWAP_rejects_bebopCalldata_set() public {
-        LiquidationExecutor.SwapLeg memory leg = _zeroLeg();
-        leg.mode = LiquidationExecutor.SwapMode.NO_SWAP;
+        SwapLeg memory leg = _zeroLeg();
+        leg.mode = SwapMode.NO_SWAP;
         leg.srcToken = address(loanToken);
         leg.repayToken = address(loanToken);
         leg.bebopCalldata = _buildBalancerV2ExtData(bytes32(uint256(0xfeed)), "");
@@ -10011,8 +9918,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     // ───────────────────────────────────────────────────────────────
 
     function test_hasLeg2_rejects_CURVE_V1_BUY_as_leg2() public {
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V3,
             srcToken: address(collateralToken),
             amountIn: DEFAULT_SWAP_AMOUNT,
             useFullBalance: false,
@@ -10027,8 +9934,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             repayToken: address(profitToken),
             minAmountOut: 1
         });
-        LiquidationExecutor.SwapLeg memory leg2 = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1_BUY, // BUY variant — not allowed as leg2
+        SwapLeg memory leg2 = _curveV1Leg(
+            SwapMode.CURVE_V1_BUY, // BUY variant — not allowed as leg2
             address(profitToken),
             address(loanToken),
             address(curveV1Mock),
@@ -10056,8 +9963,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 
     function test_hasLeg2_rejects_BAL_V2_BUY_as_leg2() public {
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V3,
             srcToken: address(collateralToken),
             amountIn: DEFAULT_SWAP_AMOUNT,
             useFullBalance: false,
@@ -10072,8 +9979,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             repayToken: address(profitToken),
             minAmountOut: 1
         });
-        LiquidationExecutor.SwapLeg memory leg2 = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2_BUY,
+        SwapLeg memory leg2 = _balancerV2Leg(
+            SwapMode.BAL_V2_BUY,
             address(profitToken),
             address(loanToken),
             address(balancerSwapMock),
@@ -10117,7 +10024,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
+            _curveV1SinglePlan(SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
         );
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -10130,8 +10037,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     function test_CurveV1_useUnderlying_true_routes_to_exchange_underlying_selector() public {
         uint256 beforeStd = curveV1Mock.exchangeCalls();
         uint256 beforeUnd = curveV1Mock.exchangeUnderlyingCalls();
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -10171,7 +10078,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
+            _curveV1SinglePlan(SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
         );
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -10185,8 +10092,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     /// revert from the library (mock's "i==j" string is opaque from
     /// the lib's POV).
     function test_CurveV1_same_coin_index_reverts() public {
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -10252,7 +10159,6 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
-        execLocal.setExtSwapTarget(address(curvePool), true);
         vm.stopPrank();
         loanToken.mint(address(execLocal), 2 * (LOAN_AMOUNT + FLASH_FEE) + 200e18);
 
@@ -10262,8 +10168,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         usdt.mint(address(aavePool), 100_000e18);
 
         for (uint256 round = 0; round < 2; round++) {
-            LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-                LiquidationExecutor.SwapMode.CURVE_V1,
+            SwapLeg memory leg = _curveV1Leg(
+                SwapMode.CURVE_V1,
                 address(usdt),
                 address(loanToken),
                 address(curvePool),
@@ -10329,7 +10235,6 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
-        execLocal.setExtSwapTarget(address(balPool), true);
         vm.stopPrank();
         loanToken.mint(address(execLocal), 2 * (LOAN_AMOUNT + FLASH_FEE) + 200e18);
 
@@ -10337,8 +10242,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         usdt.mint(address(aavePool), 100_000e18);
 
         for (uint256 round = 0; round < 2; round++) {
-            LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
-                LiquidationExecutor.SwapMode.BAL_V2,
+            SwapLeg memory leg = _balancerV2Leg(
+                SwapMode.BAL_V2,
                 address(usdt),
                 address(loanToken),
                 address(balPool),
@@ -10378,8 +10283,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     /// on content, but the validation gate is what we're testing).
     function testFuzz_CurveV1_extDataLength_lt_96_reverts(uint8 len) public {
         vm.assume(len < 96);
-        LiquidationExecutor.SwapLeg memory leg = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -10410,8 +10315,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     /// @dev Mirror of the above for Balancer.
     function testFuzz_BalancerV2_extDataLength_lt_96_reverts(uint8 len) public {
         vm.assume(len < 96);
-        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
+        SwapLeg memory leg = _balancerV2Leg(
+            SwapMode.BAL_V2,
             address(collateralToken),
             address(loanToken),
             address(balancerSwapMock),
@@ -10451,7 +10356,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _curveV1SinglePlan(LiquidationExecutor.SwapMode.CURVE_V1, amountIn, 1)
+            _curveV1SinglePlan(SwapMode.CURVE_V1, amountIn, 1)
         );
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -10467,7 +10372,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             LOAN_AMOUNT,
             FLASH_FEE,
             _defaultLiqAction(500e18),
-            _balancerV2SinglePlan(LiquidationExecutor.SwapMode.BAL_V2, amountIn, 1)
+            _balancerV2SinglePlan(SwapMode.BAL_V2, amountIn, 1)
         );
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -10476,8 +10381,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     /// @dev Fuzz Balancer poolId: the lib echoes it verbatim into the
     /// emitted event topic. Just verifies no decode crash on edge values.
     function testFuzz_BalancerV2_poolId_round_trips(bytes32 poolId) public {
-        LiquidationExecutor.SwapLeg memory leg = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
+        SwapLeg memory leg = _balancerV2Leg(
+            SwapMode.BAL_V2,
             address(collateralToken),
             address(loanToken),
             address(balancerSwapMock),
@@ -10541,8 +10446,6 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
-        execLocal.setExtSwapTarget(address(curveV1Mock), true);
-        execLocal.setExtSwapTarget(address(balWeth), true);
         vm.stopPrank();
         loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
@@ -10556,8 +10459,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         uint256 leg2In = (COLLATERAL_REWARD * bps) / 10_000;
         uint256 leg1In = COLLATERAL_REWARD - leg2In;
 
-        LiquidationExecutor.SwapLeg memory leg1 = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg1 = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -10568,8 +10471,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             1,
             false
         );
-        LiquidationExecutor.SwapLeg memory leg2 = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
+        SwapLeg memory leg2 = _balancerV2Leg(
+            SwapMode.BAL_V2,
             address(collateralToken),
             address(mockWeth),
             address(balWeth),
@@ -10600,8 +10503,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     /// ≥ 910e18 is required. Leaves a small collateral remainder
     /// for leg2's WETH profit leg.
     function test_hasMixedSplit_Curve_leg1_works() public {
-        LiquidationExecutor.SwapLeg memory leg1 = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg1 = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(loanToken),
             address(curveV1Mock),
@@ -10612,8 +10515,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             1,
             false
         );
-        LiquidationExecutor.SwapLeg memory leg2 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V3,
+        SwapLeg memory leg2 = SwapLeg({
+            mode: SwapMode.UNI_V3,
             srcToken: address(collateralToken),
             amountIn: 0, // measured at runtime
             useFullBalance: false,
@@ -10679,13 +10582,11 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         vm.startPrank(owner);
         execLocal.setAaveV2LendingPool(address(aaveV2Pool));
-        execLocal.setExtSwapTarget(address(curveLeg1), true);
-        execLocal.setExtSwapTarget(address(balLeg2), true);
         vm.stopPrank();
         loanToken.mint(address(execLocal), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
-        LiquidationExecutor.SwapLeg memory leg1 = _curveV1Leg(
-            LiquidationExecutor.SwapMode.CURVE_V1,
+        SwapLeg memory leg1 = _curveV1Leg(
+            SwapMode.CURVE_V1,
             address(collateralToken),
             address(profitToken),
             address(curveLeg1),
@@ -10696,8 +10597,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             1,
             false
         );
-        LiquidationExecutor.SwapLeg memory leg2 = _balancerV2Leg(
-            LiquidationExecutor.SwapMode.BAL_V2,
+        SwapLeg memory leg2 = _balancerV2Leg(
+            SwapMode.BAL_V2,
             address(profitToken),
             address(loanToken),
             address(balLeg2),

@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import {UniswapLib} from "./UniswapLib.sol";
+import {SwapMode, SwapLeg} from "../types/SwapTypes.sol";
 
 /// @dev Subset of Balancer V2 Vault — single-swap entrypoint only.
 /// `IAsset` in Balancer == address with native-ETH sentinel; we never
@@ -70,14 +70,17 @@ interface IBalancerV2Vault {
 ///
 /// SECURITY:
 ///   * Vault address from `leg.bebopTarget` (re-purposed as external
-///     swap target). Caller MUST validate against `allowedTargets[...]`
-///     BEFORE delegatecalling here.
+///     swap target). V10+: no per-pool allowlist —`executeLeg` does
+///     `vault != 0` and `vault.code.length > 0` sanity gates; the bot
+///     is the trusted source of the Vault address. The single canonical
+///     Balancer V2 Vault `0xBA12222222228d8Ba445958a75a0704d566BF2C8`
+///     is the only one a real plan should ever reference.
 ///   * `forceApprove(vault, amountIn) → swap → forceApprove(vault, 0)`.
 ///   * Output delta floor: `received >= leg.minAmountOut`.
 ///
-/// STRUCT DISCIPLINE: `UniswapLib.SwapLeg memory` is the canonical
-/// argument shape — divergence silently corrupts ABI decoding under
-/// DELEGATECALL.
+/// STRUCT DISCIPLINE: `SwapLeg` imported from `../types/SwapTypes.sol`
+/// — same struct used by every executor and per-mode library, no
+/// re-declaration or cast required.
 ///
 /// EXT-DATA ENCODING (re-uses the `bebopCalldata` byte field):
 ///   `bebopCalldata = abi.encode(bytes32 poolId, bytes userData)`
@@ -92,7 +95,7 @@ library BalancerV2Lib {
     // ─── Errors ──────────────────────────────────────────────────────
     error InsufficientSrcBalance(uint256 required, uint256 available);
     error InsufficientRepayOutput(uint256 actual, uint256 required);
-    error TargetNotAllowed();
+    error InvalidVaultTarget();
     error ZeroSwapInput();
     error ZeroSwapOutput();
     error InvalidPlan();
@@ -113,16 +116,15 @@ library BalancerV2Lib {
     /// @dev Single entrypoint for BAL_V2 (SELL) and BAL_V2_BUY. The
     /// caller's `mode` field selects SwapKind.
     ///
-    /// @param leg             SwapLeg (must be ABI-identical to LiquidationExecutor.SwapLeg)
-    /// @param amountIn        Caller-resolved input amount (full-balance applied upstream).
-    /// @param isTargetAllowed `allowedTargets[leg.bebopTarget]` — Vault re-validation.
-    function executeLeg(UniswapLib.SwapLeg memory leg, uint256 amountIn, bool isTargetAllowed) external {
+    /// @param leg       SwapLeg (shared definition in SwapTypes.sol).
+    /// @param amountIn  Caller-resolved input amount (full-balance applied upstream).
+    function executeLeg(SwapLeg memory leg, uint256 amountIn) external {
         if (amountIn == 0) revert ZeroSwapInput();
         if (leg.minAmountOut == 0) revert ZeroSwapOutput();
 
         address vault = leg.bebopTarget;
-        if (!isTargetAllowed) revert TargetNotAllowed();
-        if (vault.code.length == 0) revert TargetNotAllowed();
+        if (vault == address(0)) revert InvalidVaultTarget();
+        if (vault.code.length == 0) revert InvalidVaultTarget();
 
         // Decode ext-data: (poolId, userData)
         if (leg.bebopCalldata.length == 0) revert InvalidPlan();
@@ -134,7 +136,7 @@ library BalancerV2Lib {
 
         IERC20(leg.srcToken).forceApprove(vault, amountIn);
 
-        bool isBuy = leg.mode == UniswapLib.SwapMode.BAL_V2_BUY;
+        bool isBuy = leg.mode == SwapMode.BAL_V2_BUY;
         IBalancerV2Vault.SwapKind kind =
             isBuy ? IBalancerV2Vault.SwapKind.GIVEN_OUT : IBalancerV2Vault.SwapKind.GIVEN_IN;
         uint256 swapAmount = isBuy ? leg.minAmountOut : amountIn;

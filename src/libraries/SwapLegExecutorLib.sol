@@ -5,7 +5,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {ParaswapDecoderLib} from "./ParaswapDecoderLib.sol";
-import {UniswapLib} from "./UniswapLib.sol";
+import {SwapLeg} from "../types/SwapTypes.sol";
 
 /// @title SwapLegExecutorLib
 /// @notice External library housing the Paraswap leg orchestrator.
@@ -19,9 +19,9 @@ import {UniswapLib} from "./UniswapLib.sol";
 /// in the main contract because it needs runtime `allowedTargets[...]`
 /// allowlist re-checks against an operator-supplied target.
 ///
-/// STRUCT DISCIPLINE: `SwapLeg` here MUST stay byte-for-byte identical
-/// to the `SwapLeg` declared in `LiquidationExecutor`. Divergence
-/// silently corrupts ABI decoding under DELEGATECALL.
+/// STRUCT DISCIPLINE: `SwapLeg` is imported from `../types/SwapTypes.sol`
+/// (V10+ refactor) — single source of truth for both this library and
+/// its callers.
 ///
 /// SECURITY NOTE — removed allowlist check: the main contract's pre-
 /// library `_executeParaswapCall` used to re-assert
@@ -34,12 +34,9 @@ import {UniswapLib} from "./UniswapLib.sol";
 library SwapLegExecutorLib {
     using SafeERC20 for IERC20;
 
-    // ─── SwapLeg struct + SwapMode enum imported from UniswapLib ─────
-    // Single source of truth for the struct shape — both the Uniswap
-    // and the Paraswap libs accept the SAME `UniswapLib.SwapLeg memory`
-    // pointer and the main contract uses ONE cast helper for both.
-    // STRUCT DISCIPLINE: the struct in UniswapLib MUST stay byte-for-
-    // byte identical to `LiquidationExecutor.SwapLeg`.
+    // SwapLeg sourced from `../types/SwapTypes.sol` (V10+ refactor).
+    // Same struct used by every executor and per-mode library, no
+    // re-declaration or cast required.
 
     // ─── Errors (must match LiquidationExecutor signatures by name) ──
     error InsufficientSrcBalance(uint256 required, uint256 available);
@@ -65,7 +62,7 @@ library SwapLegExecutorLib {
     /// `augustus` is `paraswapAugustusV6` from the main contract; the
     /// caller is responsible for ensuring it is non-zero (constructor-
     /// pinned, so always non-zero in practice).
-    function executeParaswapLeg(UniswapLib.SwapLeg memory leg, address augustus) external {
+    function executeParaswapLeg(SwapLeg memory leg, address augustus) external {
         (address srcToken, address dstToken, uint256 declaredIn, uint256 minAmountOut, bool isExactIn) =
             ParaswapDecoderLib.decodeAndValidate(leg.paraswapCalldata, address(this));
 
@@ -125,7 +122,7 @@ library SwapLegExecutorLib {
     ///
     /// Security model unchanged: allowlist re-check + exact-approval pair
     /// + output delta floor.
-    function executeBebopLeg(UniswapLib.SwapLeg memory leg, uint256 repayBefore, bool isTargetAllowed) external {
+    function executeBebopLeg(SwapLeg memory leg, uint256 repayBefore, bool isTargetAllowed) external {
         address target = leg.bebopTarget;
         if (target.code.length == 0) revert BebopTargetNotContract();
         if (!isTargetAllowed) revert TargetNotAllowed();

@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {LiquidationExecutor} from "../../src/LiquidationExecutor.sol";
+import {SwapMode, SwapLeg} from "../../src/types/SwapTypes.sol";
 
 /// @title ExecutorForkV4Test
 /// @notice FORK-ONLY tests for the Uniswap V4 swap path against the real
@@ -75,9 +76,9 @@ contract ExecutorForkV4Test is Test {
 
     // ─── Helpers ──────────────────────────────────────────────────────
 
-    function _zeroLeg() internal pure returns (LiquidationExecutor.SwapLeg memory) {
-        return LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.PARASWAP_SINGLE,
+    function _zeroLeg() internal pure returns (SwapLeg memory) {
+        return SwapLeg({
+            mode: SwapMode.PARASWAP_SINGLE,
             srcToken: address(0),
             amountIn: 0,
             useFullBalance: false,
@@ -95,8 +96,8 @@ contract ExecutorForkV4Test is Test {
     }
 
     function _basePlan(bytes memory v4Data) internal view returns (LiquidationExecutor.SwapPlan memory) {
-        LiquidationExecutor.SwapLeg memory leg1 = LiquidationExecutor.SwapLeg({
-            mode: LiquidationExecutor.SwapMode.UNI_V4,
+        SwapLeg memory leg1 = SwapLeg({
+            mode: SwapMode.UNI_V4,
             srcToken: USDC,
             amountIn: 1000e6,
             useFullBalance: false,
