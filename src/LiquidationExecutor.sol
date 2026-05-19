@@ -20,11 +20,11 @@ import {UniswapLib} from "./libraries/UniswapLib.sol";
 import {CurveV1Lib} from "./libraries/CurveV1Lib.sol";
 import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
 import {SwapValidationLib} from "./libraries/SwapValidationLib.sol";
+import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
 import {SwapMode, SwapLeg} from "./types/SwapTypes.sol";
 
-interface IWETH {
-    function withdraw(uint256 amount) external;
-}
+// V10+ refactor: IWETH interface moved into CoinbasePaymentLib
+// (the only consumer of `IWETH.withdraw` after `_payCoinbase` migrated).
 
 /// @title LiquidationExecutor
 /// @notice Flashloan + multi-swap + liquidation executor.
@@ -170,9 +170,8 @@ contract LiquidationExecutor is
 
     uint8 public constant ACTION_PAY_COINBASE = 1;
 
-    /// @dev Gas limit on coinbase ETH transfers. Small bound keeps a
-    /// malicious block.coinbase from grinding gas in the callback.
-    uint256 private constant COINBASE_CALL_GAS = 10_000;
+    // V10+ refactor: COINBASE_CALL_GAS moved to CoinbasePaymentLib
+    // (constant lives next to the only function that reads it).
 
     /// @dev V4 sqrt-price-limit constants moved to UniswapLib (used only
     /// inside the unlock callback now). Slippage enforcement remains the
@@ -1040,7 +1039,7 @@ contract LiquidationExecutor is
         // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
         // BEFORE flash repay. This is the authoritative base that ACTION_PAY_COINBASE
         // basis-points arithmetic multiplies against.
-        realizedProfit = _computeRealizedProfit(
+        realizedProfit = CoinbasePaymentLib.computeRealizedProfit(
             plan.loanToken, plan.swapPlan.profitToken, profitBefore, plan.loanAmount, flashRepayAmount
         );
 
@@ -1055,29 +1054,9 @@ contract LiquidationExecutor is
         }
     }
 
-    /// @dev Compute realized on-chain profit net of the flashloan obligation, but
-    /// BEFORE any coinbase bid is paid. Used as the base for bps-sized coinbase
-    /// payments and for the final `minProfitAmount` check.
-    function _computeRealizedProfit(
-        address asset,
-        address profitTkn,
-        uint256 profitBefore,
-        uint256 principalAmount,
-        uint256 repayAmount
-    ) internal view returns (uint256) {
-        uint256 profitNow = IERC20(profitTkn).balanceOf(address(this));
-        if (profitTkn == asset) {
-            // profitBefore was snapshotted AFTER flashloan arrival (includes principal).
-            // profitNow is post-swap, pre-repay, pre-coinbase (still includes principal).
-            // Realized profit once repay is settled:
-            //   (profitNow - repayAmount) - (profitBefore - principalAmount)
-            // Saturating subtraction — underflow means the swap under-delivered.
-            uint256 lhs = profitNow + principalAmount;
-            uint256 rhs = profitBefore + repayAmount;
-            return lhs > rhs ? lhs - rhs : 0;
-        }
-        return profitNow > profitBefore ? profitNow - profitBefore : 0;
-    }
+    // V10+ refactor: `_computeRealizedProfit` moved to
+    // `CoinbasePaymentLib.computeRealizedProfit` — single source of
+    // truth shared with ArbExecutor.
 
     // ─── Internal: Finalize Flashloan (unified) ──────────────────────
     /// @dev Single repayment + profit-check path. Aave-style callbacks pull via
@@ -1103,25 +1082,11 @@ contract LiquidationExecutor is
             IERC20(asset).safeTransfer(vault, repayAmount);
         }
 
-        _checkProfit(realizedProfit, totalCoinbasePayment, minProfitAmount);
+        CoinbasePaymentLib.checkProfit(realizedProfit, totalCoinbasePayment, minProfitAmount);
     }
 
-    // ─── Internal: Check Profit ──────────────────────────────────────
-    /// @dev Pure: `realizedProfit` already accounts for the flashloan obligation,
-    /// and `totalCoinbasePayment` is the on-chain bps-derived sum already paid.
-    /// The `> realizedProfit` branch is defensive against multiple coinbase
-    /// actions whose bps sum exceeds 100% (each per-action bps is <= 10000,
-    /// but nothing blocks operators from stacking them).
-    function _checkProfit(uint256 realizedProfit, uint256 totalCoinbasePayment, uint256 minProfitAmount) internal pure {
-        if (totalCoinbasePayment > realizedProfit) {
-            revert CoinbaseExceedsProfit(totalCoinbasePayment, realizedProfit);
-        }
-        uint256 effectiveProfit;
-        unchecked {
-            effectiveProfit = realizedProfit - totalCoinbasePayment;
-        }
-        if (effectiveProfit < minProfitAmount) revert InsufficientProfit(effectiveProfit, minProfitAmount);
-    }
+    // V10+ refactor: `_checkProfit` moved to
+    // `CoinbasePaymentLib.checkProfit`.
 
     // ─── Internal: Execute Swap Plan ─────────────────────────────────
     /// @dev Dispatches swap by mode, validates delta-based repay balance covers flash loan obligation.
@@ -1716,42 +1681,18 @@ contract LiquidationExecutor is
 
             coinbasePaid = realizedProfit * coinbaseBps / 10_000;
             if (coinbasePaid > 0) {
-                _payCoinbase(coinbasePaid);
+                CoinbasePaymentLib.payCoinbase(coinbasePaid, weth);
             }
         } else {
             revert InvalidAction(actionType);
         }
     }
 
-    /// @dev Send ETH to block.coinbase. Only reachable when profitToken == weth
-    /// (enforced by caller). Auto-unwraps WETH if insufficient ETH.
-    function _payCoinbase(uint256 amount) internal {
-        if (amount == 0) return;
-        if (block.coinbase == address(0)) revert InvalidCoinbase();
-
-        // Auto-unwrap WETH if insufficient ETH
-        if (address(this).balance < amount) {
-            address wethAddr = weth;
-            if (wethAddr != address(0)) {
-                uint256 deficit = amount - address(this).balance;
-                uint256 wethBal = IERC20(wethAddr).balanceOf(address(this));
-                uint256 toUnwrap = deficit < wethBal ? deficit : wethBal;
-                if (toUnwrap > 0) {
-                    IWETH(wethAddr).withdraw(toUnwrap);
-                }
-            }
-        }
-
-        if (address(this).balance < amount) revert InsufficientEth(amount, address(this).balance);
-
-        // Gas-capped transfer: bounds work a hostile block.coinbase can perform
-        // in the receive fallback. ETH transfer to any well-behaved EOA or
-        // builder contract completes in <2300 gas; 10_000 is ample slack.
-        (bool success,) = block.coinbase.call{value: amount, gas: COINBASE_CALL_GAS}("");
-        if (!success) revert CoinbasePaymentFailed();
-
-        emit CoinbasePaid(block.coinbase, amount);
-    }
+    // V10+ refactor: `_payCoinbase` moved to
+    // `CoinbasePaymentLib.payCoinbase(amount, weth)`. The library
+    // takes `weth` as a parameter (libs cannot read another contract's
+    // immutable variables) and emits the same `CoinbasePaid` event
+    // signature.
 
     // ─── Rescue Functions ────────────────────────────────────────────
     function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
