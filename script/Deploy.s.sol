@@ -16,7 +16,7 @@ import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 ///
 /// Usage:
 ///   PRIVATE_KEY=<owner> forge script script/Deploy.s.sol:Deploy \
-///     --rpc-url $ETHEREUM_RPC_URL --broadcast --verify
+///     --rpc-url $ETHEREUM_RPC_URL --broadcast --legacy
 ///
 /// Executor address + auto-deployed library addresses land in
 /// `broadcast/Deploy.s.sol/1/run-latest.json`.
