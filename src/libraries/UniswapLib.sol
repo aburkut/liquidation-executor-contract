@@ -45,9 +45,16 @@ library UniswapLib {
     using SafeERC20 for IERC20;
 
     // ─── V4 sqrt-price-limit constants (mirror LiquidationExecutor) ──
+    // Reference: v4-core TickMath.MIN_SQRT_PRICE / MAX_SQRT_PRICE.
+    //   MIN_SQRT_PRICE = 4_295_128_739
+    //   MAX_SQRT_PRICE = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342
+    // V4 PoolManager reverts `PriceLimitOutOfBounds` when
+    //   zeroForOne  && sqrtPriceLimitX96 <= MIN_SQRT_PRICE, or
+    //   !zeroForOne && sqrtPriceLimitX96 >= MAX_SQRT_PRICE.
+    // Our sentinels must therefore be MIN+1 and MAX-1.
     uint160 internal constant V4_MIN_SQRT_PRICE_LIMIT = 4_295_128_740;
     uint160 internal constant V4_MAX_SQRT_PRICE_LIMIT =
-        1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261;
+        1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_341;
 
     // SwapMode + SwapLeg now sourced from `../types/SwapTypes.sol`.
     // assertNoSwapLegZeroed moved to SwapValidationLib (V10+ refactor).

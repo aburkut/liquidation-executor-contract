@@ -10579,3 +10579,35 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     }
 }
 
+/// Regression: UniswapLib's V4 sqrt-price sentinels must match v4-core
+/// `TickMath` exactly. The pre-fix `V4_MAX_SQRT_PRICE_LIMIT` was
+/// `1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261`,
+/// strictly greater than v4-core `MAX_SQRT_PRICE`. V4 PoolManager
+/// reverted `PriceLimitOutOfBounds` on every `!zeroForOne` swap.
+contract UniswapLibV4SqrtConstantsTest is Test {
+    // v4-core TickMath.sol (https://github.com/Uniswap/v4-core)
+    uint160 internal constant V4_CORE_MIN_SQRT_PRICE = 4_295_128_739;
+    uint160 internal constant V4_CORE_MAX_SQRT_PRICE =
+        1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
+
+    function test_minSqrtPriceLimit_is_min_plus_one() public pure {
+        assertEq(UniswapLib.V4_MIN_SQRT_PRICE_LIMIT, V4_CORE_MIN_SQRT_PRICE + 1);
+    }
+
+    function test_maxSqrtPriceLimit_is_max_minus_one() public pure {
+        assertEq(UniswapLib.V4_MAX_SQRT_PRICE_LIMIT, V4_CORE_MAX_SQRT_PRICE - 1);
+    }
+
+    function test_maxSqrtPriceLimit_strictly_below_v4_max() public pure {
+        // PoolManager reverts when sqrtPriceLimitX96 >= MAX_SQRT_PRICE
+        // for !zeroForOne swaps. Our sentinel MUST be strictly below.
+        assertLt(UniswapLib.V4_MAX_SQRT_PRICE_LIMIT, V4_CORE_MAX_SQRT_PRICE);
+    }
+
+    function test_minSqrtPriceLimit_strictly_above_v4_min() public pure {
+        // PoolManager reverts when sqrtPriceLimitX96 <= MIN_SQRT_PRICE
+        // for zeroForOne swaps. Our sentinel MUST be strictly above.
+        assertGt(UniswapLib.V4_MIN_SQRT_PRICE_LIMIT, V4_CORE_MIN_SQRT_PRICE);
+    }
+}
+
