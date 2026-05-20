@@ -3,24 +3,23 @@ pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
-import {ArbExecutor} from "../src/ArbExecutor.sol";
 
 /// @title V10 Deploy
-/// @notice Deploys the V10 family — `LiquidationExecutor` (current
-/// liquidation pipeline) and `ArbExecutor` (atomic DEX arbitrage) —
-/// against the canonical mainnet protocol addresses. Forge auto-
-/// deploys + links the six shared external libraries
-/// (`SwapValidationLib`, `CoinbasePaymentLib`, `UniswapLib`,
-/// `CurveV1Lib`, `BalancerV2Lib`, `SwapLegExecutorLib`) on first use
-/// and reuses the same deployment when ArbExecutor is constructed
-/// later in the run, so both contracts share library bytecode.
+/// @notice Deploys `LiquidationExecutor` V10 against canonical mainnet
+/// protocol addresses. Forge auto-deploys + links the six shared
+/// external libraries (`SwapValidationLib`, `CoinbasePaymentLib`,
+/// `UniswapLib`, `CurveV1Lib`, `BalancerV2Lib`, `SwapLegExecutorLib`)
+/// on first use.
+///
+/// ArbExecutor is intentionally NOT deployed here — it ships in a
+/// separate run when bot-side arb integration is ready.
 ///
 /// Usage:
 ///   PRIVATE_KEY=<owner> forge script script/Deploy.s.sol:Deploy \
 ///     --rpc-url $ETHEREUM_RPC_URL --broadcast --verify
 ///
-/// Both executor addresses + the auto-deployed library addresses
-/// land in `broadcast/Deploy.s.sol/1/run-latest.json`.
+/// Executor address + auto-deployed library addresses land in
+/// `broadcast/Deploy.s.sol/1/run-latest.json`.
 contract Deploy is Script {
     // ─── Canonical mainnet addresses ────────────────────────────────
     address constant OWNER = 0xC338094Bb79AA610E9c57166fc4FA959db6234Ab;
@@ -38,7 +37,7 @@ contract Deploy is Script {
     address constant AAVE_V2_POOL = 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9;
     address constant UNI_V4_POOL_MANAGER = 0x000000000004444c5dc75cB358380D2e3dE08A90;
 
-    function run() external returns (address liqExecutor, address arbExecutor) {
+    function run() external returns (address liqExecutor) {
         // V10+ liquidation allowlist seed: Bebop settlement +
         // Aave V2 lending pool + Uni V4 PoolManager. Morpho is
         // constructor-pinned (not in `allowed[]`).
@@ -46,16 +45,6 @@ contract Deploy is Script {
         liqAllowed[0] = BEBOP_SETTLEMENT;
         liqAllowed[1] = AAVE_V2_POOL;
         liqAllowed[2] = UNI_V4_POOL_MANAGER;
-
-        // ArbExecutor seed: just Bebop. Curve / Balancer pool
-        // addresses are NOT allowlisted — V10 dropped that mechanism
-        // (see `allowedExtSwapTargets` removal commit). The routers,
-        // Balancer Vault, Morpho, and Paraswap are constructor-seeded
-        // into `allowedTargets` automatically inside ArbExecutor's
-        // constructor; no additional entries are required for the
-        // baseline arb routes (V2/V3/Curve/Balancer/Paraswap/Bebop).
-        address[] memory arbAllowed = new address[](1);
-        arbAllowed[0] = BEBOP_SETTLEMENT;
 
         vm.startBroadcast();
 
@@ -74,23 +63,8 @@ contract Deploy is Script {
             )
         );
 
-        arbExecutor = address(
-            new ArbExecutor(
-                OWNER,
-                OPERATOR,
-                WETH,
-                BALANCER_VAULT,
-                MORPHO_BLUE,
-                PARASWAP_AUGUSTUS,
-                UNI_V2_ROUTER,
-                UNI_V3_ROUTER,
-                arbAllowed
-            )
-        );
-
         vm.stopBroadcast();
 
         console2.log("LiquidationExecutor V10:", liqExecutor);
-        console2.log("ArbExecutor V1:        ", arbExecutor);
     }
 }
