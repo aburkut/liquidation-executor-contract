@@ -35,6 +35,7 @@ contract ExecutorForkV4Test is Test {
     address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     address constant AAVE_V3_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
     address constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+    address constant MORPHO_BLUE = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
     address constant PARASWAP_AUGUSTUS = 0x6A000F20005980200259B80c5102003040001068;
     address constant UNI_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
     address constant UNI_V3_ROUTER = 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45;
@@ -67,6 +68,7 @@ contract ExecutorForkV4Test is Test {
             WETH,
             AAVE_V3_POOL,
             BALANCER_VAULT,
+            MORPHO_BLUE,
             PARASWAP_AUGUSTUS,
             UNI_V2_ROUTER,
             UNI_V3_ROUTER,

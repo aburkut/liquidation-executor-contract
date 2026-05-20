@@ -81,6 +81,7 @@ contract ArbExecutorTest is Test {
             operatorAddr,
             address(weth),
             address(balancerFlash),
+            address(morpho),
             address(augustus),
             address(uniV2),
             address(uniV3),
@@ -89,7 +90,6 @@ contract ArbExecutorTest is Test {
 
         // Wire Morpho as flash provider (mirrors LiquidationExecutor).
         vm.prank(ownerAddr);
-        exec.configureMorpho(address(morpho));
 
         // Seed swap venues + flash sources with liquidity so they can
         // honour callbacks / swaps.
@@ -476,9 +476,5 @@ contract ArbExecutorTest is Test {
         exec.setAllowedTarget(address(0xBEEF), true);
     }
 
-    function test_revert_configureMorphoFromNonOwner() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        exec.configureMorpho(address(0xBEEF));
-    }
+    // V10+: `configureMorpho` removed (Morpho is constructor-pinned).
 }

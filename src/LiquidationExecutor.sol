@@ -250,7 +250,8 @@ contract LiquidationExecutor is
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
-    event FlashProviderUpdated(uint8 indexed providerId, address indexed oldProvider, address indexed newProvider);
+    // V10+: FlashProviderUpdated dropped — both flash providers
+    // (Balancer Vault, Morpho Blue) are now constructor-pinned.
     event FlashExecuted(uint8 indexed providerId, address indexed loanToken, uint256 loanAmount);
     event RepayExecuted(
         uint8 indexed protocolId, bytes32 indexed positionKeyHash, address indexed asset, uint256 amount
@@ -403,12 +404,24 @@ contract LiquidationExecutor is
     }
 
     // ─── Constructor ─────────────────────────────────────────────────
+    /// @dev V10+: `morpho_` is constructor-pinned (was post-deploy
+    /// `configureMorpho` in V9). Both `morphoBlue` (liquidation target
+    /// for PROTOCOL_MORPHO_BLUE actions) and
+    /// `allowedFlashProviders[FLASH_PROVIDER_MORPHO]` (flash source +
+    /// the only authorized `onMorphoFlashLoan` caller) are initialized
+    /// atomically here. Eliminates the post-deploy "did you call
+    /// configureMorpho?" footgun. Future Morpho address rotation
+    /// requires a redeploy — acceptable because Morpho Blue's mainnet
+    /// address `0xBBBBBb…EEFFCb` has been stable since launch.
+    /// Same rationale applies to `balancerVault_` which was already
+    /// constructor-pinned.
     constructor(
         address owner_,
         address operator_,
         address weth_,
         address aavePool_,
         address balancerVault_,
+        address morpho_,
         address paraswapAugustus_,
         address uniV2Router_,
         address uniV3Router_,
@@ -418,6 +431,7 @@ contract LiquidationExecutor is
         if (weth_ == address(0)) revert ZeroAddress();
         if (aavePool_ == address(0)) revert ZeroAddress();
         if (balancerVault_ == address(0)) revert ZeroAddress();
+        if (morpho_ == address(0)) revert ZeroAddress();
         if (paraswapAugustus_ == address(0)) revert ZeroAddress();
         if (uniV2Router_ == address(0)) revert ZeroAddress();
         if (uniV3Router_ == address(0)) revert ZeroAddress();
@@ -428,11 +442,14 @@ contract LiquidationExecutor is
         uniV3Router = uniV3Router_;
         aavePool = aavePool_;
         paraswapAugustusV6 = paraswapAugustus_;
+        morphoBlue = morpho_;
 
         allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
+        allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho_;
 
         allowedTargets[aavePool_] = true;
         allowedTargets[balancerVault_] = true;
+        allowedTargets[morpho_] = true;
         allowedTargets[paraswapAugustus_] = true;
         allowedTargets[uniV2Router_] = true;
         allowedTargets[uniV3Router_] = true;
@@ -467,56 +484,15 @@ contract LiquidationExecutor is
         emit ConfigUpdated("aaveV2Pool", old, pool);
     }
 
-    /// @notice Update a flashloan provider slot. Restricted to
-    /// `FLASH_PROVIDER_BALANCER` only — Morpho re-configuration MUST go
-    /// through `configureMorpho` to keep the liquidation-target and
-    /// callback-authority slots synced. Unknown providerIds were
-    /// inert dispatch-side but used to pollute the mapping namespace;
-    /// pinning to BALANCER closes both concerns.
-    function setFlashProvider(uint8 providerId, address provider) external onlyOwner {
-        if (providerId != FLASH_PROVIDER_BALANCER) revert InvalidPlan();
-        if (provider == address(0)) revert ZeroAddress();
-        if (!allowedTargets[provider]) revert TargetNotAllowed();
-        address old = allowedFlashProviders[providerId];
-        allowedFlashProviders[providerId] = provider;
-        // V10 audit fix: revoke the old provider from the generic
-        // allowedTargets allowlist so a deprecated Vault cannot be
-        // re-used as a Bebop settlement target. Skip when old == new.
-        if (old != address(0) && old != provider) {
-            allowedTargets[old] = false;
-            emit AllowedTargetUpdated(old, false);
-        }
-        emit FlashProviderUpdated(providerId, old, provider);
-    }
-
-    /// @notice Atomic config helper that pins both Morpho roles to the same address.
-    /// @dev `morphoBlue` (used as liquidation target via PROTOCOL_MORPHO_BLUE) and
-    /// `allowedFlashProviders[FLASH_PROVIDER_MORPHO]` (used as the flashloan source +
-    /// the only authorized `onMorphoFlashLoan` caller) are independent storage slots.
-    /// Setting them via the legacy single-purpose setters in two transactions creates
-    /// a window where the two halves disagree. This helper writes both slots in one
-    /// call. Validation (zero address, allowedTargets gate) and events
-    /// (ConfigUpdated, FlashProviderUpdated) match the legacy setters exactly so that
-    /// off-chain consumers see the same signals. Legacy setters remain available for
-    /// the rare case the two roles intentionally diverge (testnets, migrations).
-    function configureMorpho(address morpho) external onlyOwner {
-        if (morpho == address(0)) revert ZeroAddress();
-        if (!allowedTargets[morpho]) revert TargetNotAllowed();
-
-        address oldMorpho = morphoBlue;
-        morphoBlue = morpho;
-        emit ConfigUpdated("morphoBlue", oldMorpho, morpho);
-
-        address oldProvider = allowedFlashProviders[FLASH_PROVIDER_MORPHO];
-        allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho;
-        // V10 audit fix: revoke the old Morpho from allowedTargets on
-        // rotation. Mirrors `setFlashProvider`.
-        if (oldProvider != address(0) && oldProvider != morpho) {
-            allowedTargets[oldProvider] = false;
-            emit AllowedTargetUpdated(oldProvider, false);
-        }
-        emit FlashProviderUpdated(FLASH_PROVIDER_MORPHO, oldProvider, morpho);
-    }
+    // V10+ refactor: `setFlashProvider` and `configureMorpho` removed.
+    // Both flashloan providers (Balancer Vault + Morpho Blue) are now
+    // constructor-pinned. Both have stable mainnet addresses
+    // (`0xBA12…BF2C8`, `0xBBBB…EEFFCb`) that have not rotated since
+    // launch. Future rotation requires a redeploy — acceptable cost
+    // for the simpler surface (one source of truth, no post-deploy
+    // "did you call configureMorpho?" footgun, no rotation-race
+    // hygiene around the dual `morphoBlue` / `allowedFlashProviders`
+    // slots).
 
     /// @notice V10 audit fix — symmetry with ArbExecutor. Owner-curated
     /// post-deploy admin for the `allowedTargets` allowlist (Bebop

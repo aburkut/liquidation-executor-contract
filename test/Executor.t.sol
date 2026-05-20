@@ -219,6 +219,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -227,7 +228,7 @@ contract ExecutorTest is Test {
 
         vm.startPrank(owner);
         executor.setAaveV2LendingPool(address(aaveV2Pool));
-        executor.configureMorpho(address(morphoBlue));
+
         // Audit-fix #3: dedicated ext-swap allowlist. Curve V1 pool and
         // Balancer V2 Vault targets must be flagged separately; the
         // broader allowedTargets gate is preserved as a sanity floor
@@ -1292,7 +1293,16 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](0);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
         new LiquidationExecutor(
-            address(0), address(1), address(2), address(3), address(4), address(5), address(6), address(7), targets
+            address(0),
+            address(1),
+            address(2),
+            address(3),
+            address(4),
+            address(5),
+            address(6),
+            address(7),
+            address(8),
+            targets
         );
     }
 
@@ -1387,8 +1397,6 @@ contract ExecutorTest is Test {
     /// even though both ultimately call into the same Morpho Blue contract.
     function test_morphoFlash_paraswap_morphoRepay() public {
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
-        vm.prank(owner);
-        executor.configureMorpho(address(morphoBlue));
 
         uint256 seizedAssets = 500e18;
         LiquidationExecutor.SwapPlan memory swapPlan =
@@ -1431,8 +1439,6 @@ contract ExecutorTest is Test {
         // Register Morpho as the flashloan provider so the auth check has a concrete
         // address to compare against.
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
-        vm.prank(owner);
-        executor.configureMorpho(address(morphoBlue));
 
         // Build a real plan and abi-encode it; the plan hash must match what we
         // plant into _activePlanHash for the hash check to pass.
@@ -1464,66 +1470,33 @@ contract ExecutorTest is Test {
         executor.onMorphoFlashLoan(LOAN_AMOUNT, planBytes);
     }
 
-    /// configureMorpho must atomically set both the morphoBlue (liquidation) slot
-    /// AND the FLASH_PROVIDER_MORPHO entry in allowedFlashProviders. Without this
-    /// helper, two-tx config could leave the two roles pointing at different
-    /// addresses — opening a window where the flashloan callback is gated by an
-    /// outdated provider while liquidation calls go to a new contract.
-    function test_configureMorphoAtomicallyPinsBothSlots() public {
+    /// V10+: Morpho is now constructor-pinned. Verify both slots
+    /// (morphoBlue and the FLASH_PROVIDER_MORPHO entry) are populated
+    /// by the constructor without any post-deploy setter call.
+    function test_constructorPinsBothMorphoSlots() public {
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
-
-        // setUp now seeds both slots via configureMorpho already, so the
-        // initial state already pins them. Verify both, then deploy a
-        // fresh executor where neither slot has been touched and assert
-        // that `configureMorpho` atomically populates both.
         assertEq(executor.morphoBlue(), address(morphoBlue));
         assertEq(executor.allowedFlashProviders(morphoFlashId), address(morphoBlue));
+        // morphoBlue is also auto-added to allowedTargets by the constructor.
+        assertTrue(executor.allowedTargets(address(morphoBlue)));
+    }
 
-        // Fresh executor: same constructor allowlist but no post-deploy config.
-        address[] memory targets = new address[](6);
-        targets[0] = address(aavePool);
-        targets[1] = address(augustus);
-        targets[2] = address(aaveV2Pool);
-        targets[3] = address(bebop);
-        targets[4] = address(morphoBlue);
-        targets[5] = address(uniV4Mock);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+    /// V10+: constructor rejects a zero Morpho address.
+    function test_constructorRejectsZeroMorpho() public {
+        address[] memory targets = new address[](0);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        new LiquidationExecutor(
             owner,
             operatorAddr,
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(0), // morpho_ == 0 → revert
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
             targets
         );
-        assertEq(freshExecutor.morphoBlue(), address(0));
-        assertEq(freshExecutor.allowedFlashProviders(morphoFlashId), address(0));
-
-        vm.prank(owner);
-        freshExecutor.configureMorpho(address(morphoBlue));
-
-        assertEq(freshExecutor.morphoBlue(), address(morphoBlue), "morphoBlue must be set");
-        assertEq(
-            freshExecutor.allowedFlashProviders(morphoFlashId),
-            address(morphoBlue),
-            "FLASH_PROVIDER_MORPHO entry must be set to the same address"
-        );
-    }
-
-    /// Validation parity: configureMorpho must apply the same zero-address and
-    /// allowedTargets gates as the legacy setters so the helper cannot smuggle an
-    /// unwhitelisted address into either slot.
-    function test_configureMorphoRejectsZeroAndUnwhitelisted() public {
-        vm.prank(owner);
-        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
-        executor.configureMorpho(address(0));
-
-        address notWhitelisted = address(0xDEADBEEF);
-        vm.prank(owner);
-        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
-        executor.configureMorpho(notWhitelisted);
     }
 
     /// Insufficient repay balance: a fresh executor with no pre-funding plus a swap that
@@ -1539,6 +1512,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -1547,8 +1521,7 @@ contract ExecutorTest is Test {
 
         uint8 morphoFlashId = freshExecutor.FLASH_PROVIDER_MORPHO();
         vm.startPrank(owner);
-        freshExecutor.configureMorpho(address(morphoBlue));
-        freshExecutor.configureMorpho(address(morphoBlue));
+
         vm.stopPrank();
 
         uint256 seizedAssets = 500e18;
@@ -1804,6 +1777,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -2003,26 +1977,25 @@ contract ExecutorTest is Test {
         loanToken.mint(address(liarVault), 100_000e18);
         collateralToken.mint(address(liarVault), 100_000e18);
 
-        address[] memory targets = new address[](4);
+        // V10+: Balancer Vault is constructor-pinned, no post-deploy
+        // setter to swap in a liar. Deploy a fresh executor with the
+        // liar as the Balancer slot directly.
+        address[] memory targets = new address[](3);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(aaveV2Pool);
-        targets[3] = address(liarVault);
         LiquidationExecutor exec2 = new LiquidationExecutor(
             owner,
             operatorAddr,
             address(mockWeth),
             address(aavePool),
-            address(balancerVault),
+            address(liarVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
             targets
         );
-
-        vm.startPrank(owner);
-        exec2.setFlashProvider(2, address(liarVault));
-        vm.stopPrank();
 
         loanToken.mint(address(exec2), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(exec2), 1000e18);
@@ -2039,26 +2012,23 @@ contract ExecutorTest is Test {
         MockBalancerVaultAmountLiar liarVault = new MockBalancerVaultAmountLiar(FLASH_FEE);
         loanToken.mint(address(liarVault), 100_000e18);
 
-        address[] memory targets = new address[](4);
+        // V10+: liar vault pinned via constructor.
+        address[] memory targets = new address[](3);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(aaveV2Pool);
-        targets[3] = address(liarVault);
         LiquidationExecutor exec2 = new LiquidationExecutor(
             owner,
             operatorAddr,
             address(mockWeth),
             address(aavePool),
-            address(balancerVault),
+            address(liarVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
             targets
         );
-
-        vm.startPrank(owner);
-        exec2.setFlashProvider(2, address(liarVault));
-        vm.stopPrank();
 
         loanToken.mint(address(exec2), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
@@ -2148,41 +2118,11 @@ contract ExecutorTest is Test {
         executor.setAaveV2LendingPool(address(0));
     }
 
-    function test_setFlashProviderZeroReverts() public {
-        // setFlashProvider is now Balancer-pinned (FLASH_PROVIDER_BALANCER = 2).
-        vm.prank(owner);
-        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
-        executor.setFlashProvider(2, address(0));
-    }
-
-    function test_setFlashProviderRejectsNonWhitelisted() public {
-        address notWhitelisted = address(0xDEAD3);
-        vm.prank(owner);
-        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
-        executor.setFlashProvider(2, notWhitelisted);
-    }
-
-    function test_setFlashProviderAcceptsWhitelisted() public {
-        // aavePool is in allowedTargets (set in constructor). Re-uses
-        // the BALANCER slot — purely a setter parity check, doesn't
-        // affect dispatch.
-        vm.prank(owner);
-        executor.setFlashProvider(2, address(aavePool));
-        assertEq(executor.allowedFlashProviders(2), address(aavePool));
-    }
-
-    /// @dev Audit-fix #5/#10: providerIds other than BALANCER revert
-    /// at the validation gate (Morpho re-config must go through
-    /// `configureMorpho`; unknown ids would pollute the mapping
-    /// namespace and silently couple to future dispatcher branches).
-    function test_setFlashProviderRejectsNonBalancerId() public {
-        vm.prank(owner);
-        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
-        executor.setFlashProvider(3, address(morphoBlue)); // FLASH_PROVIDER_MORPHO
-        vm.prank(owner);
-        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
-        executor.setFlashProvider(5, address(aavePool)); // arbitrary unknown id
-    }
+    // V10+: `setFlashProvider` and `configureMorpho` removed. Both
+    // flash providers (Balancer Vault + Morpho Blue) are now
+    // constructor-pinned. The dedicated setter-shape tests
+    // (`test_setFlashProvider*`, `test_configureMorpho*`) were
+    // deleted alongside the functions they exercised.
 
     function test_setAaveV2LendingPoolRejectsNonWhitelisted() public {
         address notWhitelisted = address(0xDEAD2);
@@ -3265,6 +3205,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -3358,6 +3299,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -3438,6 +3380,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -3526,6 +3469,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -3622,6 +3566,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -3910,6 +3855,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -4547,6 +4493,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -4667,14 +4614,12 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
             targets
         );
-
-        vm.prank(owner);
-        freshExecutor.configureMorpho(address(morphoBlue));
 
         uint256 seizedAssets = 500e18;
         uint256 collateralReward = COLLATERAL_REWARD;
@@ -4828,13 +4773,12 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
-        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
@@ -4886,6 +4830,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(emptyPool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -4998,13 +4943,12 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
-        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
@@ -5047,13 +4991,12 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
-        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
@@ -5099,13 +5042,12 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
-        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
@@ -5169,13 +5111,12 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
             targets
         );
-        vm.prank(owner);
-        freshExec.configureMorpho(address(morphoBlue));
 
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
         collateralToken.mint(address(freshExec), DEFAULT_SWAP_AMOUNT - COLLATERAL_REWARD);
@@ -6167,6 +6108,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(0),
             address(uniV3Mock),
@@ -6183,6 +6125,7 @@ contract ExecutorTest is Test {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(0),
@@ -8529,6 +8472,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -8928,6 +8872,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -9273,6 +9218,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -9390,6 +9336,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -10152,6 +10099,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -10228,6 +10176,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -10439,6 +10388,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),
@@ -10575,6 +10525,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             address(mockWeth),
             address(aavePool),
             address(balancerVault),
+            address(morphoBlue),
             address(augustus),
             address(uniV2Mock),
             address(uniV3Mock),

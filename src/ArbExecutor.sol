@@ -106,7 +106,7 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
         bytes32 indexed planHash, address indexed loanToken, uint256 realizedProfit, uint256 coinbasePaid
     );
     event AllowedTargetUpdated(address indexed target, bool allowed);
-    event FlashProviderUpdated(uint8 indexed providerId, address indexed oldProvider, address indexed newProvider);
+    // V10+: FlashProviderUpdated dropped — both providers constructor-pinned.
     event Withdraw(address indexed token, address indexed to, uint256 amount);
     // Mirrors CoinbasePaymentLib.CoinbasePaid for tests that pin the topic.
     event CoinbasePaid(address indexed coinbase, uint256 amount);
@@ -140,11 +140,17 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
     ExecutionPhase private _executionPhase;
 
     // ─── Constructor ─────────────────────────────────────────────────
+    /// @dev Both flash providers (Balancer Vault + Morpho Blue) are
+    /// constructor-pinned. Mainnet addresses (`0xBA12…BF2C8`,
+    /// `0xBBBB…EEFFCb`) have been stable since launch; rotation
+    /// requires redeploy. Eliminates the "did you call
+    /// configureMorpho?" post-deploy footgun.
     constructor(
         address owner_,
         address operator_,
         address weth_,
         address balancerVault_,
+        address morpho_,
         address paraswapAugustus_,
         address uniV2Router_,
         address uniV3Router_,
@@ -154,6 +160,7 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
         if (operator_ == address(0)) revert ZeroAddress();
         if (weth_ == address(0)) revert ZeroAddress();
         if (balancerVault_ == address(0)) revert ZeroAddress();
+        if (morpho_ == address(0)) revert ZeroAddress();
         if (paraswapAugustus_ == address(0)) revert ZeroAddress();
         if (uniV2Router_ == address(0)) revert ZeroAddress();
         if (uniV3Router_ == address(0)) revert ZeroAddress();
@@ -163,11 +170,14 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
         paraswapAugustusV6 = paraswapAugustus_;
         uniV2Router = uniV2Router_;
         uniV3Router = uniV3Router_;
+        morphoBlue = morpho_;
 
         allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
+        allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho_;
         // Seed allowedTargets with the routers + Paraswap so Bebop
         // dispatch can re-check `allowedTargets[bebopTarget]` if used.
         allowedTargets[balancerVault_] = true;
+        allowedTargets[morpho_] = true;
         allowedTargets[paraswapAugustus_] = true;
         allowedTargets[uniV2Router_] = true;
         allowedTargets[uniV3Router_] = true;
@@ -185,34 +195,9 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
     }
 
     // ─── Owner: admin ────────────────────────────────────────────────
-    function configureMorpho(address morpho) external onlyOwner {
-        if (morpho == address(0)) revert ZeroAddress();
-        morphoBlue = morpho;
-        address oldProvider = allowedFlashProviders[FLASH_PROVIDER_MORPHO];
-        allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho;
-        // V10 audit fix: revoke old provider on rotation.
-        if (oldProvider != address(0) && oldProvider != morpho) {
-            allowedTargets[oldProvider] = false;
-            emit AllowedTargetUpdated(oldProvider, false);
-        }
-        emit FlashProviderUpdated(FLASH_PROVIDER_MORPHO, oldProvider, morpho);
-    }
-
-    function setFlashProvider(uint8 providerId, address provider) external onlyOwner {
-        // Mirrors LiquidationExecutor: Balancer-only reconfig path.
-        // Morpho re-configuration MUST go through `configureMorpho`.
-        if (providerId != FLASH_PROVIDER_BALANCER) revert InvalidPlan();
-        if (provider == address(0)) revert ZeroAddress();
-        address old = allowedFlashProviders[providerId];
-        allowedFlashProviders[providerId] = provider;
-        allowedTargets[provider] = true;
-        // V10 audit fix: revoke old provider on rotation.
-        if (old != address(0) && old != provider) {
-            allowedTargets[old] = false;
-            emit AllowedTargetUpdated(old, false);
-        }
-        emit FlashProviderUpdated(providerId, old, provider);
-    }
+    // V10+: `configureMorpho` and `setFlashProvider` removed. Both
+    // flash providers are constructor-pinned; rotation requires
+    // redeploy.
 
     function setAllowedTarget(address target, bool allowed) external onlyOwner {
         if (target == address(0)) revert ZeroAddress();
