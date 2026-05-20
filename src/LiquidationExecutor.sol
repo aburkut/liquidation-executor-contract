@@ -297,6 +297,11 @@ contract LiquidationExecutor is
         uint256 finalRepayDelta
     );
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
+    /// @dev V10 audit fix: emitted by `setAllowedTarget` and by the
+    /// provider-rotation revocation paths (`setFlashProvider`,
+    /// `configureMorpho`) when the old provider's allowlist entry is
+    /// cleared on rotation.
+    event AllowedTargetUpdated(address indexed target, bool allowed);
 
     // SwapMode + SwapLeg sourced from `./types/SwapTypes.sol` (V10+).
     // See that file for the per-mode field-usage documentation.
@@ -474,6 +479,13 @@ contract LiquidationExecutor is
         if (!allowedTargets[provider]) revert TargetNotAllowed();
         address old = allowedFlashProviders[providerId];
         allowedFlashProviders[providerId] = provider;
+        // V10 audit fix: revoke the old provider from the generic
+        // allowedTargets allowlist so a deprecated Vault cannot be
+        // re-used as a Bebop settlement target. Skip when old == new.
+        if (old != address(0) && old != provider) {
+            allowedTargets[old] = false;
+            emit AllowedTargetUpdated(old, false);
+        }
         emit FlashProviderUpdated(providerId, old, provider);
     }
 
@@ -497,7 +509,24 @@ contract LiquidationExecutor is
 
         address oldProvider = allowedFlashProviders[FLASH_PROVIDER_MORPHO];
         allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho;
+        // V10 audit fix: revoke the old Morpho from allowedTargets on
+        // rotation. Mirrors `setFlashProvider`.
+        if (oldProvider != address(0) && oldProvider != morpho) {
+            allowedTargets[oldProvider] = false;
+            emit AllowedTargetUpdated(oldProvider, false);
+        }
         emit FlashProviderUpdated(FLASH_PROVIDER_MORPHO, oldProvider, morpho);
+    }
+
+    /// @notice V10 audit fix — symmetry with ArbExecutor. Owner-curated
+    /// post-deploy admin for the `allowedTargets` allowlist (Bebop
+    /// settlement targets, supplementary protocol addresses). Constructor
+    /// seeds the canonical set; this function lets the owner extend or
+    /// revoke without redeploying.
+    function setAllowedTarget(address target, bool allowed) external onlyOwner {
+        if (target == address(0)) revert ZeroAddress();
+        allowedTargets[target] = allowed;
+        emit AllowedTargetUpdated(target, allowed);
     }
 
     /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.
@@ -886,6 +915,12 @@ contract LiquidationExecutor is
             revert InvalidCallbackCaller();
         }
         if (keccak256(userData) != _activePlanHash) revert InvalidPlan();
+        // V10 audit fix: clear plan hash immediately so a hostile or
+        // buggy flash provider re-invoking the callback in the same flash
+        // (with the same userData) fails the hash gate on the second
+        // entry. V4 `unlockCallback` does not consult `_activePlanHash`
+        // so this clear does not break the V4 leg dispatch path.
+        _activePlanHash = bytes32(0);
         if (tokens.length != 1) revert BalancerSingleTokenOnly();
 
         Plan memory plan = abi.decode(userData, (Plan));
@@ -920,6 +955,9 @@ contract LiquidationExecutor is
         if (_activePlanHash == bytes32(0)) revert NoActivePlan();
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_MORPHO]) revert InvalidCallbackCaller();
         if (keccak256(data) != _activePlanHash) revert InvalidPlan();
+        // V10 audit fix: clear plan hash to block callback re-entry
+        // within the same flash. Mirror of `receiveFlashLoan`.
+        _activePlanHash = bytes32(0);
 
         Plan memory plan = abi.decode(data, (Plan));
 
@@ -1191,7 +1229,22 @@ contract LiquidationExecutor is
             // loss-making; native Panic(0x11) is a fail-closed signal
             // — operator should never have submitted it.
             if (leg1.mode == SwapMode.NO_SWAP) {
+                // V10 audit fix: snapshot loanToken balance pre-leg2 and
+                // assert delta after dispatch covers the flash repay.
+                // Mirrors the splitRepayDelta check the sibling
+                // non-NO_SWAP branch performs below; restores the
+                // delta-vs-absolute invariant the surrounding branches
+                // share. NO_SWAP means leg1.srcToken == loanToken so
+                // `finalRepayBefore` (set earlier) is the right baseline.
                 _dispatchLeg(plan.leg2, collateralDelta - flashFee, 0);
+                uint256 splitRepayAfter = IERC20(finalRepayToken).balanceOf(address(this));
+                // leg2 consumes loanToken in the NO_SWAP same-asset case,
+                // so the post-leg2 balance is LOWER than the pre-leg2
+                // baseline. The remaining balance must still cover the
+                // flash repay (principal + fee).
+                if (splitRepayAfter < flashRepayAmount) {
+                    revert InsufficientRepayOutput(splitRepayAfter, flashRepayAmount);
+                }
                 return;
             }
 

@@ -190,6 +190,11 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
         morphoBlue = morpho;
         address oldProvider = allowedFlashProviders[FLASH_PROVIDER_MORPHO];
         allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho;
+        // V10 audit fix: revoke old provider on rotation.
+        if (oldProvider != address(0) && oldProvider != morpho) {
+            allowedTargets[oldProvider] = false;
+            emit AllowedTargetUpdated(oldProvider, false);
+        }
         emit FlashProviderUpdated(FLASH_PROVIDER_MORPHO, oldProvider, morpho);
     }
 
@@ -201,6 +206,11 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
         address old = allowedFlashProviders[providerId];
         allowedFlashProviders[providerId] = provider;
         allowedTargets[provider] = true;
+        // V10 audit fix: revoke old provider on rotation.
+        if (old != address(0) && old != provider) {
+            allowedTargets[old] = false;
+            emit AllowedTargetUpdated(old, false);
+        }
         emit FlashProviderUpdated(providerId, old, provider);
     }
 
@@ -305,6 +315,12 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
         if (_activePlanHash == bytes32(0)) revert NoActivePlan();
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) revert InvalidCallbackCaller();
         if (keccak256(userData) != _activePlanHash) revert InvalidPlan();
+        // V10 audit fix: clear plan hash to block callback re-entry
+        // within the same flash. The triple-gate (phase + hash + caller)
+        // is otherwise stable for the entire flash window — a hostile
+        // or buggy flash provider invoking the callback twice would pass
+        // all three checks without this clear.
+        _activePlanHash = bytes32(0);
         if (tokens.length != 1) revert BalancerSingleTokenOnly();
 
         ArbTypes.ArbPlan memory plan = abi.decode(userData, (ArbTypes.ArbPlan));
@@ -326,6 +342,9 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
         if (_activePlanHash == bytes32(0)) revert NoActivePlan();
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_MORPHO]) revert InvalidCallbackCaller();
         if (keccak256(data) != _activePlanHash) revert InvalidPlan();
+        // V10 audit fix: clear plan hash to block callback re-entry.
+        // Mirror of `receiveFlashLoan`.
+        _activePlanHash = bytes32(0);
 
         ArbTypes.ArbPlan memory plan = abi.decode(data, (ArbTypes.ArbPlan));
         if (amount != plan.loanAmount) revert CallbackAmountMismatch();
@@ -349,20 +368,33 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
         uint256 profitBefore = IERC20(loanToken).balanceOf(address(this));
 
         // Run the chain. leg[0] consumes `loanAmount`; subsequent legs
-        // either useFullBalance (typical) or carry an explicit
-        // `amountIn` (e.g. when the bot wants to retain some
-        // intermediate token on the contract).
+        // either useFullBalance (delta-based, sweeping ONLY tokens
+        // produced by the previous leg — matches `LiquidationExecutor`'s
+        // `hasLeg2` accounting) or carry an explicit `amountIn`.
+        //
+        // V10 audit fix: useFullBalance reads the DELTA produced by the
+        // previous leg (`postLegBal - srcBalBefore`), not the absolute
+        // balance. The pre-leg `srcBalBefore` snapshot freezes any
+        // pre-existing srcToken balance out of the chain so a stray
+        // donation or rescue residue cannot inflate `realizedProfit` and
+        // route into the coinbase bribe.
+        uint256 prevSrcBefore;
         for (uint256 i = 0; i < plan.legs.length; ++i) {
             SwapLeg memory leg = plan.legs[i];
             uint256 amountIn;
             if (i == 0) {
                 amountIn = plan.loanAmount;
             } else if (leg.useFullBalance) {
-                amountIn = IERC20(leg.srcToken).balanceOf(address(this));
+                uint256 srcBalNow = IERC20(leg.srcToken).balanceOf(address(this));
+                amountIn = srcBalNow > prevSrcBefore ? srcBalNow - prevSrcBefore : 0;
             } else {
                 amountIn = leg.amountIn;
             }
             uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
+            // Snapshot the NEXT leg's srcToken pre-balance BEFORE this
+            // leg runs — `leg.repayToken == legs[i+1].srcToken` by the
+            // chain-wiring invariant enforced in `execute`.
+            prevSrcBefore = outBefore;
             _dispatchLeg(leg, amountIn, outBefore);
         }
 

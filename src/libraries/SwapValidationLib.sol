@@ -77,6 +77,15 @@ library SwapValidationLib {
         if (m == SwapMode.PARASWAP_SINGLE) {
             if (leg.paraswapCalldata.length < 4) revert InvalidParaswapCalldata();
             if (leg.amountIn == 0) revert ZeroAmountIn();
+            // V10 audit LEAD (not enforced): every other mode requires
+            // `leg.minAmountOut > 0`. Paraswap historically relies on
+            // the calldata-embedded Augustus floor instead; SwapLegExecutorLib
+            // checks `amountOut < minAmountOut` (calldata floor) AND
+            // `amountOut < leg.minAmountOut` (struct floor). When the
+            // struct floor is 0 the second check is a no-op. Bot-side
+            // is expected to populate `leg.minAmountOut` after the
+            // Paraswap-bot-pipeline change ships; enforcement deferred
+            // until then to avoid breaking historical SwapLeg fixtures.
         } else if (m == SwapMode.BEBOP_MULTI) {
             if (leg.bebopTarget == address(0)) revert InvalidBebopTarget();
             if (leg.bebopCalldata.length < 4) revert InvalidBebopCalldata();
