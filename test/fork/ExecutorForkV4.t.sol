@@ -93,7 +93,7 @@ contract ExecutorForkV4Test is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(0),
-            minAmountOut: 0
+            minAmountOut: 1
         });
     }
 

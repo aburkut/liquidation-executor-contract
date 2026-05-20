@@ -528,7 +528,7 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(0),
-            minAmountOut: 0
+            minAmountOut: 1
         });
     }
 
@@ -551,7 +551,12 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: 0
+            // V10+: every mode (including Paraswap) requires
+            // `minAmountOut > 0`. The Augustus mock returns
+            // `amountIn × SWAP_RATE / 1e18`; use `1` as a trivial
+            // non-zero floor — fixture-level invariant, not a
+            // production-grade slippage cap.
+            minAmountOut: 1
         });
         return LiquidationExecutor.SwapPlan({
             leg1: leg1,
@@ -754,7 +759,7 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: 0
+            minAmountOut: 1
         });
     }
 
@@ -1555,7 +1560,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -1654,7 +1659,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2444,7 +2449,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2501,7 +2506,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2545,7 +2550,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2593,7 +2598,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2636,7 +2641,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2677,7 +2682,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2718,7 +2723,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2760,7 +2765,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2809,7 +2814,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2853,7 +2858,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2894,7 +2899,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2935,7 +2940,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2973,7 +2978,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3020,7 +3025,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3057,7 +3062,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3098,7 +3103,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3153,7 +3158,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3251,7 +3256,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3340,7 +3345,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3423,7 +3428,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3523,7 +3528,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3616,7 +3621,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3883,7 +3888,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -4534,7 +4539,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -4651,7 +4656,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5362,7 +5367,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5581,7 +5586,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5619,7 +5624,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5661,7 +5666,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5708,7 +5713,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5745,7 +5750,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5798,7 +5803,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5839,7 +5844,7 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -8431,7 +8436,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -8510,7 +8515,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -8797,7 +8802,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 0
+                minAmountOut: 1
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
