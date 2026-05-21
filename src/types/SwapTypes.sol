@@ -34,7 +34,11 @@ enum SwapMode {
     CURVE_V1, // 9
     CURVE_V1_BUY, // 10
     BAL_V2, // 11
-    BAL_V2_BUY // 12
+    BAL_V2_BUY, // 12
+    CURVE_V1_MH, // 13 — Curve RouterNG.exchange(address[11], uint256[5][5], …) multihop SELL
+    CURVE_V1_MH_BUY, // 14 — multihop BUY (same router selector; min_dy interpreted as exact-out)
+    BAL_V2_MH, // 15 — Balancer Vault.batchSwap(SwapKind.GIVEN_IN, …) multihop SELL
+    BAL_V2_MH_BUY // 16 — Balancer Vault.batchSwap(SwapKind.GIVEN_OUT, …) multihop BUY
 }
 
 /// @dev Single swap leg descriptor.
@@ -53,6 +57,14 @@ enum SwapMode {
 ///                       abi.encode(int128 i, int128 j, bool useUnderlying)
 ///   * BAL_V2{,_BUY}   → `bebopTarget` = Vault, `bebopCalldata` =
 ///                       abi.encode(bytes32 poolId, bytes userData)
+///   * CURVE_V1_MH{,_BUY} →
+///                       `bebopTarget` = Curve RouterNG (canonical), `bebopCalldata` =
+///                       abi.encode(address[11] path, uint256[5][5] swapParams,
+///                                  address[5] pools)
+///   * BAL_V2_MH{,_BUY}  →
+///                       `bebopTarget` = Vault, `bebopCalldata` =
+///                       abi.encode(IBalancerVault.BatchSwapStep[] swaps,
+///                                  address[] assets, int256[] limits)
 ///   * NO_SWAP         → every field above MUST be zero/empty; src==repay
 struct SwapLeg {
     SwapMode mode;

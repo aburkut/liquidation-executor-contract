@@ -36,6 +36,32 @@ interface IBalancerV2Vault {
         external
         payable
         returns (uint256 amountCalculated);
+
+    /// Multi-pool routing primitive — chains N pools in one call.
+    /// For SELL (GIVEN_IN): `swaps[0].amount` = total input, subsequent
+    /// steps pass through with `amount = 0` (Vault uses preceding step's
+    /// output as input).
+    /// For BUY (GIVEN_OUT): the LAST step's `amount` = exact output
+    /// target, earlier steps `amount = 0` (Vault back-calculates each
+    /// preceding step's required input).
+    /// `limits[i]` corresponds to `assets[i]` — negative = max we pay,
+    /// positive = min we receive.
+    struct BatchSwapStep {
+        bytes32 poolId;
+        uint256 assetInIndex;
+        uint256 assetOutIndex;
+        uint256 amount;
+        bytes userData;
+    }
+
+    function batchSwap(
+        SwapKind kind,
+        BatchSwapStep[] memory swaps,
+        address[] memory assets,
+        FundManagement memory funds,
+        int256[] memory limits,
+        uint256 deadline
+    ) external payable returns (int256[] memory assetDeltas);
 }
 
 /// @title BalancerV2Lib
@@ -164,5 +190,88 @@ library BalancerV2Lib {
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
         emit BalancerV2SwapExecuted(poolId, leg.srcToken, leg.repayToken, amountIn, received, uint8(kind));
+    }
+
+    // ─── Multihop entrypoint ─────────────────────────────────────────
+    /// @dev Native multihop via Vault.batchSwap — chains N pools in
+    /// one Vault call. Used by SwapModes BAL_V2_MH (SELL, GIVEN_IN)
+    /// and BAL_V2_MH_BUY (BUY, GIVEN_OUT).
+    ///
+    /// SwapLeg encoding (re-uses `bebopTarget` + `bebopCalldata`):
+    ///   * `bebopTarget`   = Vault address (same as single-swap path).
+    ///   * `bebopCalldata` = abi.encode(
+    ///         IBalancerV2Vault.BatchSwapStep[] swaps,
+    ///         address[] assets,                       // first=srcToken, last=repayToken
+    ///         int256[] limits                         // per-asset; bot pre-computes
+    ///     )
+    ///
+    /// SELL semantics: `swaps[0].amount = amountIn`, every subsequent
+    /// step amount=0 (Vault chains output→input). The Vault enforces
+    /// `limits[srcIdx] <= -amountIn` and `limits[dstIdx] >= minOut`
+    /// implicitly via per-asset deltas; we re-verify the output delta
+    /// post-call as defense-in-depth.
+    ///
+    /// BUY semantics: `swaps[last].amount = exact-out target`, every
+    /// preceding step amount=0 (Vault back-solves the required input).
+    /// We approve `amountIn` (the upper-bound source) and check that
+    /// the actual consumption ≤ amountIn after the call.
+    function executeLegBatchSwap(SwapLeg memory leg, uint256 amountIn) external {
+        if (amountIn == 0) revert ZeroSwapInput();
+        if (leg.minAmountOut == 0) revert ZeroSwapOutput();
+
+        address vault = leg.bebopTarget;
+        if (vault == address(0)) revert InvalidVaultTarget();
+        if (vault.code.length == 0) revert InvalidVaultTarget();
+
+        if (leg.bebopCalldata.length == 0) revert InvalidPlan();
+        (IBalancerV2Vault.BatchSwapStep[] memory swaps, address[] memory assets, int256[] memory limits) =
+            abi.decode(leg.bebopCalldata, (IBalancerV2Vault.BatchSwapStep[], address[], int256[]));
+
+        if (swaps.length == 0) revert InvalidPlan();
+        if (assets.length < 2 || assets.length != limits.length) revert InvalidPlan();
+
+        // Endpoint sanity: assets[0] is the source, assets[last] is the
+        // destination. The Vault itself walks `swaps[]`; the index-
+        // arithmetic guarantees that arbitrary mid-assets can never be
+        // claimed for repayToken (post-balance delta check enforces it).
+        if (assets[0] != leg.srcToken) revert InvalidPlan();
+        if (assets[assets.length - 1] != leg.repayToken) revert InvalidPlan();
+
+        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
+        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
+
+        uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
+        uint256 inBefore = IERC20(leg.srcToken).balanceOf(address(this));
+
+        IERC20(leg.srcToken).forceApprove(vault, amountIn);
+
+        bool isBuy = leg.mode == SwapMode.BAL_V2_MH_BUY;
+        IBalancerV2Vault.SwapKind kind =
+            isBuy ? IBalancerV2Vault.SwapKind.GIVEN_OUT : IBalancerV2Vault.SwapKind.GIVEN_IN;
+
+        IBalancerV2Vault.FundManagement memory funds = IBalancerV2Vault.FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        IBalancerV2Vault(vault).batchSwap(kind, swaps, assets, funds, limits, leg.deadline);
+        IERC20(leg.srcToken).forceApprove(vault, 0);
+
+        uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
+        if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
+
+        // BUY-side input cap — make sure the Vault didn't pull more
+        // than we explicitly approved. `limits[srcIdx]` should already
+        // enforce this Vault-side; the explicit check is defense in
+        // depth against malformed limits.
+        uint256 consumed = inBefore - IERC20(leg.srcToken).balanceOf(address(this));
+        if (consumed > amountIn) revert InsufficientSrcBalance(consumed, amountIn);
+
+        // poolId slot in the event = poolId of the FIRST hop (the entry
+        // pool). Full hop sequence lives in the call's `swaps` array
+        // (off-chain consumers parse the calldata).
+        emit BalancerV2SwapExecuted(swaps[0].poolId, leg.srcToken, leg.repayToken, consumed, received, uint8(kind));
     }
 }
