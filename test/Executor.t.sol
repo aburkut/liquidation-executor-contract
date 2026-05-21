@@ -184,7 +184,7 @@ contract ExecutorTest is Test {
         )
     ); // 0xda35bb0d
 
-    function setUp() public {
+    function setUp() public virtual {
         loanToken = new MockERC20("Loan Token", "LOAN", 18);
         collateralToken = new MockERC20("Collateral Token", "COLL", 18);
         profitToken = new MockERC20("Profit Token", "PROF", 18);

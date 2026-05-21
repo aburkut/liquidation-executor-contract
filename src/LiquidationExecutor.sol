@@ -751,7 +751,7 @@ contract LiquidationExecutor is
             SwapMode m2 = plan.swapPlan.leg2.mode;
             if (
                 m2 != SwapMode.UNI_V2 && m2 != SwapMode.UNI_V3 && m2 != SwapMode.UNI_V4 && m2 != SwapMode.CURVE_V1
-                    && m2 != SwapMode.BAL_V2
+                    && m2 != SwapMode.BAL_V2 && m2 != SwapMode.CURVE_V1_MH && m2 != SwapMode.BAL_V2_MH
             ) {
                 revert Leg2ModeNotAllowed(uint8(m2));
             }
@@ -776,12 +776,12 @@ contract LiquidationExecutor is
             SwapMode m1 = plan.swapPlan.leg1.mode;
             if (
                 m1 != SwapMode.UNI_V2 && m1 != SwapMode.UNI_V3 && m1 != SwapMode.UNI_V4 && m1 != SwapMode.CURVE_V1
-                    && m1 != SwapMode.BAL_V2
+                    && m1 != SwapMode.BAL_V2 && m1 != SwapMode.CURVE_V1_MH && m1 != SwapMode.BAL_V2_MH
             ) revert InvalidPlan();
             SwapMode mp = plan.swapPlan.leg2.mode;
             if (
                 mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4 && mp != SwapMode.CURVE_V1
-                    && mp != SwapMode.BAL_V2
+                    && mp != SwapMode.BAL_V2 && mp != SwapMode.CURVE_V1_MH && mp != SwapMode.BAL_V2_MH
             ) revert InvalidPlan();
             if (plan.swapPlan.leg2.repayToken != weth) revert InvalidPlan();
             if (collateralAsset != address(0) && plan.swapPlan.leg2.srcToken != collateralAsset) {
@@ -826,7 +826,7 @@ contract LiquidationExecutor is
             SwapMode mp = plan.swapPlan.leg2.mode;
             if (
                 mp != SwapMode.UNI_V2 && mp != SwapMode.UNI_V3 && mp != SwapMode.UNI_V4 && mp != SwapMode.CURVE_V1
-                    && mp != SwapMode.BAL_V2
+                    && mp != SwapMode.BAL_V2 && mp != SwapMode.CURVE_V1_MH && mp != SwapMode.BAL_V2_MH
             ) {
                 revert InvalidPlan();
             }
@@ -1337,6 +1337,13 @@ contract LiquidationExecutor is
             // V10+: no per-pool allowlist; the library does its own
             // `pool != 0` + `code.length > 0` sanity gates.
             CurveV1Lib.executeLeg(leg, amountIn);
+        } else if (m == SwapMode.CURVE_V1_MH || m == SwapMode.CURVE_V1_MH_BUY) {
+            // Curve V1 multihop via RouterNG `exchange(address[11], …)`.
+            // SELL and BUY both compile down to the same Router call; the
+            // bot precomputes `dx` for BUY (Router has no native exact-out).
+            // `leg.bebopTarget` holds the RouterNG address; bot is the
+            // trusted source.
+            CurveV1Lib.executeLegMultihop(leg, amountIn);
         } else if (m == SwapMode.BAL_V2 || m == SwapMode.BAL_V2_BUY) {
             // Balancer V2. SwapKind flips inside the library based on
             // `leg.mode` (GIVEN_IN for SELL, GIVEN_OUT for BUY — native
@@ -1344,6 +1351,13 @@ contract LiquidationExecutor is
             // sanity-checks `vault != 0` + `code.length > 0` and trusts
             // the bot to pass the canonical Vault address.
             BalancerV2Lib.executeLeg(leg, amountIn);
+        } else if (m == SwapMode.BAL_V2_MH || m == SwapMode.BAL_V2_MH_BUY) {
+            // Balancer V2 multihop via Vault.batchSwap. SELL uses
+            // GIVEN_IN with `swaps[0].amount = amountIn`; BUY uses
+            // GIVEN_OUT with `swaps[last].amount = exactOut`. The
+            // library decodes the BatchSwapStep[]/assets[]/limits[]
+            // payload from `leg.bebopCalldata`.
+            BalancerV2Lib.executeLegBatchSwap(leg, amountIn);
         } else {
             revert InvalidSwapMode();
         }
