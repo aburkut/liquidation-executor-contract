@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import {UniswapLib} from "./UniswapLib.sol";
+import {SwapLeg} from "../types/SwapTypes.sol";
 
 /// @title CurveV1Lib
 /// @notice External library housing Curve StableSwap V1 leg execution
@@ -35,16 +35,21 @@ import {UniswapLib} from "./UniswapLib.sol";
 ///
 /// SECURITY:
 ///   * Pool address comes from `leg.bebopTarget` (re-purposed as
-///     "external swap target"). Caller MUST validate it against
-///     `allowedTargets[...]` BEFORE delegatecalling here.
+///     "external swap target"). V10+: no per-pool allowlist —
+///     `executeLeg` checks `pool.code.length > 0` as a basic sanity
+///     gate; the bot is the trusted source of pool addresses. Earlier
+///     versions gated on `allowedExtSwapTargets[pool]` (owner-curated)
+///     but the executor holds zero balance between txs so the only
+///     attack window was selector-collision via `allowedTargets`,
+///     which is empirically empty for `exchange(int128,int128,...)`.
 ///   * Approval pattern: `forceApprove(pool, dx)` → `exchange(...)` →
 ///     `forceApprove(pool, 0)`. Tether-style approvals supported.
 ///   * Output delta floor: `received >= leg.minAmountOut`. Curve's
 ///     own `min_dy` (passed as the 4th arg) provides defense in depth.
 ///
-/// STRUCT DISCIPLINE: `UniswapLib.SwapLeg memory` is the canonical
-/// argument shape — divergence silently corrupts ABI decoding under
-/// DELEGATECALL. See UniswapLib for the field order of record.
+/// STRUCT DISCIPLINE: `SwapLeg` imported from `../types/SwapTypes.sol`
+/// — same struct used by every executor and per-mode library, no
+/// re-declaration or cast required.
 ///
 /// EXT-DATA ENCODING (re-uses the `bebopCalldata` byte field, which
 /// is empty for all non-Bebop/non-Curve/non-Balancer modes):
@@ -61,7 +66,7 @@ library CurveV1Lib {
     error CurveSwapFailed();
     error InsufficientSrcBalance(uint256 required, uint256 available);
     error InsufficientRepayOutput(uint256 actual, uint256 required);
-    error TargetNotAllowed();
+    error InvalidPoolTarget();
     error ZeroSwapInput();
     error ZeroSwapOutput();
     error InvalidPlan();
@@ -78,17 +83,15 @@ library CurveV1Lib {
     /// SELL and BUY produce identical on-chain swaps; the mode only
     /// flips the event label.
     ///
-    /// @param leg     SwapLeg (must be ABI-identical to LiquidationExecutor.SwapLeg)
+    /// @param leg     SwapLeg (shared definition in SwapTypes.sol).
     /// @param amountIn Caller-resolved input amount (full-balance helper applied upstream).
-    /// @param isTargetAllowed `allowedTargets[leg.bebopTarget]` read by caller — pool
-    ///   address is re-validated against the executor's allowlist BEFORE swap.
-    function executeLeg(UniswapLib.SwapLeg memory leg, uint256 amountIn, bool isTargetAllowed) external {
+    function executeLeg(SwapLeg memory leg, uint256 amountIn) external {
         if (amountIn == 0) revert ZeroSwapInput();
         if (leg.minAmountOut == 0) revert ZeroSwapOutput();
 
         address pool = leg.bebopTarget;
-        if (!isTargetAllowed) revert TargetNotAllowed();
-        if (pool.code.length == 0) revert TargetNotAllowed();
+        if (pool == address(0)) revert InvalidPoolTarget();
+        if (pool.code.length == 0) revert InvalidPoolTarget();
 
         // Decode ext-data: (i, j, useUnderlying)
         if (leg.bebopCalldata.length == 0) revert InvalidPlan();

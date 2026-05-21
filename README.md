@@ -4,51 +4,67 @@
 
 | Parameter | Value |
 |---|---|
-| **Contract (V9)** | `0x5b1E7FCf175Aac717F4841321bA2C8D17558a6Fd` |
-| **Deploy tx** | `0x460acabd932c1e7e8a5738ce9b9fbe863602c90c0f848c954b7aab277a9669f8` (block 25117625) |
-| **UniswapLib** | `0x2de78cea514e35c387951903a6fa2170ecba8ce4` |
-| **UniswapLib deploy tx** | `0xadd4cdb135771c29a78dc55097cddbd2be481dff0bb16b4013c60527d49dabc5` |
-| **SwapLegExecutorLib** | `0x60a3eef08b5014d1940b9fe96433642f7e3fda58` (re-deployed — now hosts `executeBebopLeg` moved from main contract for size budget) |
-| **SwapLegExecutorLib deploy tx** | `0x6928cf7862f46a9d3d6e2c04a7ab44832dcbcfdf520602299e9140410147b69f` |
-| **ParaswapDecoderLib** | `0x498e1dc8e2d7d221da9afc8d1a1aaa82b3b2ee08` (re-deployed) |
-| **ParaswapDecoderLib deploy tx** | `0x27e3efe2b8641712f8bef4d21cf9f0f348774fbdddab88a77c245e4e4518bbb7` |
-| **CurveV1Lib** | `0x6f84083a9c5f2e155d93b90de28c9081402d1c32` (new in V9 — `exchange` / `exchange_underlying` dispatchers, SELL + BUY) |
-| **CurveV1Lib deploy tx** | `0x2b0b61694bd31f057a6b52f568b3c5816537fdb91b0e1a49a116788b5c7a1788` |
-| **BalancerV2Lib** | `0xd60d1afd06575532aa6048068ec9db2616bb056c` (new in V9 — `swap(...)` GIVEN_IN/GIVEN_OUT dispatchers) |
-| **BalancerV2Lib deploy tx** | `0xe8f805c1df18ec47d1acb3392fa3e2db8931f4d478f5befa18ca7a04e46fde63` |
-| **Runtime bytecode size** | 24 508 bytes (68 bytes margin under EIP-170) — V9 absorbs +4 SwapMode variants (Curve V1, Balancer V2 × SELL/BUY) + 10 audit hardenings while freeing space via Bebop-leg extraction to `SwapLegExecutorLib` and `balancerVault` slot removal (re-audit cleanup) |
+| **Contract (V10)** | `0x7FF9D22393a825A735E5889624cA07f86D28A374` |
+| **Deploy tx** | `0xfe000c9c7e44e06ca31ff190147a513ab746b8778a6a1d3819a97e3a9799c984` (block 25138634) |
+| **BalancerV2Lib** | `0x5def208c6df62574a6949423d1d653efda80072b` (re-deployed — V10 signature drop: no longer takes `isTargetAllowed`) |
+| **BalancerV2Lib deploy tx** | `0xb24f9cfb7d16a52a94cdd3fa268ac01812d54587eac97b3f2f61ae1dc54e571f` |
+| **UniswapLib** | `0x532a595f32b7da458e35deb86601e24ea35be86e` (re-deployed — V4_MAX_SQRT_PRICE_LIMIT corrected to v4-core `MAX_SQRT_PRICE − 1`; pre-V10 sentinel exceeded `MAX_SQRT_PRICE` and reverted every `!zeroForOne` V4 swap with `PriceLimitOutOfBounds`) |
+| **UniswapLib deploy tx** | `0xb82b9a29e14e176a59d33ed862fa916007f665863fc6612ea6369dbc43c1cd5b` |
+| **SwapValidationLib** | `0x639a41463fbcc86ef11ba4f6313cb4e046922944` (new in V10 — extracted `validateNonV4Leg` + `assertNoSwapLegZeroed` + PARASWAP_SINGLE `minAmountOut > 0` floor) |
+| **SwapValidationLib deploy tx** | `0x50c689b18b5366835010875dd4a0ebcd5e959b69ce332dfa0794a28ee5cd2cc2` |
+| **CoinbasePaymentLib** | `0x0c89bfe7abf50fe03300620affd589499ad398f2` (new in V10 — extracted `payCoinbase` / `computeRealizedProfit` / `checkProfit`) |
+| **CoinbasePaymentLib deploy tx** | `0xdef7d8283a509a1093b2cfd0f9868451c79ef5cba6bf9d1edf02956ea0264e4f` |
+| **SwapLegExecutorLib** | `0x1483a7e66a792bfc6c39a6bdfba61fb501b8e75c` (re-deployed for V10 signature alignment) |
+| **SwapLegExecutorLib deploy tx** | `0x9952c51c2b17c171e1ec3b13f244c6ecf43be8f733e1229da941e7dc95869528` |
+| **CurveV1Lib** | `0xf72becd7512fa82e4374646374b51a728cba2602` (re-deployed — V10 signature drop: no longer takes `isTargetAllowed`) |
+| **CurveV1Lib deploy tx** | `0x04bf8a4159ed9318f9c521d037a0619fb8b4b46f2d2f9f159319ca4ff61210bc` |
+| **ParaswapDecoderLib** | `0x498e1dc8e2d7d221da9afc8d1a1aaa82b3b2ee08` (re-used from V9 — internal dependency of `SwapLegExecutorLib`, source unchanged) |
+| **Runtime bytecode size** | 22 633 bytes (1 943 bytes margin under EIP-170) — V10 absorbs the V9 feature set while freeing ~1.9 KB via the SwapValidationLib + CoinbasePaymentLib extraction and the `allowedExtSwapTargets` mapping removal (constructor-pinned Morpho/Balancer eliminates the runtime allow-list lookup for those targets) |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
 | **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
 | **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
 | **Deployer** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` |
 | **Aave V3 Pool** | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` (liquidation target; V3 flashloan path removed) |
-| **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` (registered as flash provider id=2 in constructor; no longer a public storage var — re-audit cleanup) |
+| **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` (constructor-pinned as flash provider id=2 — V10 dropped the post-deploy `setFlashProvider` setter) |
 | **ParaSwap AugustusV6** | `0x6A000F20005980200259B80c5102003040001068` |
 | **Uniswap V2 Router02** | `0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D` (immutable) |
 | **Uniswap V3 SwapRouter02** | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` (immutable) |
 | **Uniswap V4 PoolManager** | `0x000000000004444c5dc75cB358380D2e3dE08A90` (in `allowedTargets`, used per-swap) |
-| **Morpho Blue** | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` (liquidation target + flashloan id=3 — configured via `configureMorpho` ✅) |
+| **Morpho Blue** | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` (liquidation target + flashloan id=3 — constructor-pinned in V10, `configureMorpho` removed) |
 | **Bebop Settlement** | `0xbbbbbBB520d69a9775E85b458C58c648259FAD5F` (allowlisted) |
 | **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (allowlisted — set via `setAaveV2LendingPool` when V2 liquidations are wired) |
 | **Solidity** | 0.8.24, Shanghai, optimizer 1 run, `via_ir=true`, `bytecode_hash=none` |
+| **Total deploy cost** | 9 948 191 gas / 0.001009 ETH (gas price 0.101 gwei across blocks 25138631-25138634) |
 
-V9 adds **Curve V1 + Balancer V2 dispatchers** (SELL + BUY, leg1 + leg2) and closes 9/10 LEAD-level findings from a fresh `/solidity-auditor` sweep:
+V10 is a refactor pass on top of V9: same feature surface, structural cleanup, one critical V4 bug-fix.
 
-1. **Curve V1 / Balancer V2 SwapModes** — `CURVE_V1`, `CURVE_V1_BUY`, `BAL_V2`, `BAL_V2_BUY` join the swap-leg dispatcher. Curve uses `exchange(int128,int128,uint256,uint256)` (selector `0x3df02124`) or `exchange_underlying` for metapools; Balancer uses the Vault's `swap(...)` with native `SwapKind.GIVEN_IN` / `GIVEN_OUT` for exact-out. Each path is gated by a new `allowedExtSwapTargets` allowlist (owner-curatable via `setExtSwapTarget`) so a non-Curve contract in the broad `allowedTargets` set cannot be invoked through the ext-swap dispatcher.
-2. **Skip-unwrap leg1.amountIn cap** — `_runFlashloanPipeline` now caps `leg1.amountIn ≤ aTokenDelta` in the `receiveAToken=true` branch, symmetric to the existing collateral cap. Closes the dipping vector where a compromised operator could oversize the input through an allowlisted swap target.
-3. **`_verifyATokenAddress` returndatasize guard** — assembly read of slot 9 from `getReserveData` is now gated by `returndatasize() ≥ 288`. If the pool ever downgraded to a smaller struct, the read would target uninitialized scratch memory and the canonical aToken value could become attacker-influenceable; now reverts deterministically.
-4. **`setMorphoBlue` removed; `setFlashProvider` BALANCER-only** — Morpho config must go through `configureMorpho` (atomic pin of both the liquidation-target slot and the callback-authority slot). `setFlashProvider` rejects any providerId other than `FLASH_PROVIDER_BALANCER (=2)`, eliminating the desync window and the namespace-pollution surface on unused providerIds.
-5. **Paraswap leg.minAmountOut floor** — `SwapLegExecutorLib.executeParaswapLeg` now enforces BOTH the calldata-embedded `minAmountOut` AND `leg.minAmountOut` as floors, restoring per-leg slippage parity with Uniswap V2/V3/V4, Curve V1, and Balancer V2.
-6. **V4 multihop non-simple-path rejection** — `UniswapLib.decodeAndValidateV4MultihopShape` rejects any hop whose `tokenOut` equals `srcToken` or any earlier hop's `tokenOut`, closing the implicit-aliasing surface where paths like A→B→A→C passed shape validation (SELL was safe via PoolManager credit-ledger netting; BUY relied on the post-unlock `consumed > amountIn` check).
-7. **`_v3PathEndpoints` precondition tightened** to `>= 43` bytes (was `>= 40`) — matches the real Uniswap V3 path minimum (token + fee + token) and forbids degenerate lengths where the first-20 / last-20 byte loads could overlap.
-8. **Re-audit cleanup**: unused `balancerVault` public storage slot removed (the slot was written in the constructor but never read on-chain — the public auto-getter served no on-chain purpose; storage authority for the Balancer-flashloan path lives in `allowedFlashProviders[FLASH_PROVIDER_BALANCER]`). Frees 56 B of bytecode and one storage slot.
+Headline changes:
+
+1. **V4_MAX_SQRT_PRICE_LIMIT corrected** (`src/libraries/UniswapLib.sol`). The pre-V10 sentinel was `1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261` — strictly greater than v4-core `TickMath.MAX_SQRT_PRICE`. V4 PoolManager reverts `PriceLimitOutOfBounds(uint160)` when `!zeroForOne && sqrtPriceLimitX96 >= MAX_SQRT_PRICE`, so every token1→token0 V4 swap reverted by construction since the first V4 commit. Fix: `MAX_SQRT_PRICE − 1 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_341`. Pinned by `UniswapLibV4SqrtConstantsTest` (4 regression assertions anchoring both `V4_MIN_SQRT_PRICE_LIMIT` and `V4_MAX_SQRT_PRICE_LIMIT` to v4-core literals and to the PoolManager's strict-inequality check).
+2. **`allowedExtSwapTargets` mapping removed** (was V9 slot 9). Curve V1 and Balancer V2 dispatchers now route through the existing `allowedTargets` allowlist alongside Uni V2/V3/V4 — one allowlist for everything. `_activePlanHash` and successors shift down one slot (`9` → was `10`, etc.). `setExtSwapTarget` removed accordingly.
+3. **Morpho / Balancer Vault constructor-pinned.** `configureMorpho` and the BALANCER-only `setFlashProvider` are gone — both addresses are constructor arguments now and live in immutable storage, eliminating the post-deploy desync window where the contract could exist with one provider unset.
+4. **`SwapValidationLib` extracted** (~ first half of the V9 `_validateLeg` body). Hosts `validateNonV4Leg` + `assertNoSwapLegZeroed`. Adds the deferred audit fix: PARASWAP_SINGLE now requires `leg.minAmountOut > 0` — restores per-leg slippage parity with every other swap mode (V9 deferred to Augustus' calldata-embedded floor, making the dispatch-side `amountOut < leg.minAmountOut` check a no-op when the struct field was 0).
+5. **`CoinbasePaymentLib` extracted.** Hosts `payCoinbase` + `computeRealizedProfit` + `checkProfit` — the bribe-sizing math the contract uses to compute the basis-points coinbase payment from on-chain-measured realized profit.
+
+Carried forward from V9: Curve V1 + Balancer V2 dispatchers (SELL + BUY, leg1 + leg2). Carried forward from V8: same-asset NO_SWAP + hasMixedSplit (`col == debt != WETH` opportunities with a coinbase-capable WETH bribe leg). Carried forward from V7: V4 unlock-callback re-entry + tokenIn pin, explicit NO_SWAP + hasLeg2 / hasMixedSplit guards (the latter relaxed in V8 for the same-asset case). Carried forward from V6: `hasMixedSplit` plan shape; all three of {`hasLeg2`, `hasSplit`, `hasMixedSplit`} remain mutually exclusive — enforced pre-flashloan with `PlanShapeConflict`.
+
+V9's audit-LEAD hardenings remain in force (the underlying invariants stay intact in V10; only their host surfaces shifted):
+
+1. **Curve V1 / Balancer V2 SwapModes** — `CURVE_V1`, `CURVE_V1_BUY`, `BAL_V2`, `BAL_V2_BUY` are dispatched out of `CurveV1Lib` / `BalancerV2Lib`. V10 routes them through the unified `allowedTargets` allowlist (the V9 `allowedExtSwapTargets` mapping is gone, see headline change #2 above).
+2. **Skip-unwrap leg1.amountIn cap** — `_runFlashloanPipeline` caps `leg1.amountIn ≤ aTokenDelta` in the `receiveAToken=true` branch, symmetric to the existing collateral cap.
+3. **`_verifyATokenAddress` returndatasize guard** — assembly read of slot 9 from `getReserveData` gated by `returndatasize() ≥ 288`.
+4. **Morpho / Balancer Vault wiring locked at construction time** — V9 routed this through `configureMorpho` + a BALANCER-only `setFlashProvider`. V10 promotes both to constructor parameters (see headline change #3), so the desync window is eliminated structurally rather than by setter-level guards.
+5. **Paraswap per-leg `minAmountOut` floor** — `SwapLegExecutorLib.executeParaswapLeg` enforces BOTH the calldata-embedded `minAmountOut` AND `leg.minAmountOut`. V10 additionally rejects `leg.minAmountOut == 0` at the validator (see headline change #4).
+6. **V4 multihop non-simple-path rejection** — `UniswapLib.decodeAndValidateV4MultihopShape` rejects any hop whose `tokenOut` aliases `srcToken` or an earlier hop's `tokenOut`.
+7. **`_v3PathEndpoints` precondition tightened** to `>= 43` bytes (token + fee + token minimum), forbidding degenerate lengths where first-20 / last-20 loads could overlap.
+8. **`balancerVault` public storage slot removed** (V9 re-audit cleanup) — Balancer-flashloan path authority lives in `allowedFlashProviders[FLASH_PROVIDER_BALANCER]`.
 
 The one remaining LEAD (Bebop arbitrary calldata) is a design constraint: `target.call(leg.bebopCalldata)` is structurally an arbitrary-call primitive against allowlisted contracts. The output-delta floor blocks pure value-extraction; closing the state-only side-effect surface would require either removing Bebop or porting it to a typed-interface dispatcher with selector whitelisting.
 
-Carried forward from V8: same-asset NO_SWAP + hasMixedSplit (`col == debt != WETH` opportunities with a coinbase-capable WETH bribe leg). Carried forward from V7: V4 unlock-callback re-entry + tokenIn pin, explicit NO_SWAP + hasLeg2 / hasMixedSplit guards (the latter relaxed in V8 for the same-asset case). Carried forward from V6: `hasMixedSplit` plan shape; all three of {`hasLeg2`, `hasSplit`, `hasMixedSplit`} remain mutually exclusive — enforced pre-flashloan with `PlanShapeConflict`.
-
 | Previous deployments | |
 |---|---|
+| **V9 Contract** | `0x5b1E7FCf175Aac717F4841321bA2C8D17558a6Fd` (deprecated — superseded by V10: V4_MAX_SQRT_PRICE_LIMIT fix + SwapValidationLib/CoinbasePaymentLib extraction + constructor-pinned Morpho/Balancer + `allowedExtSwapTargets` mapping removal) |
+| **V9 deploy tx** | `0x460acabd932c1e7e8a5738ce9b9fbe863602c90c0f848c954b7aab277a9669f8` |
 | **V8 Contract** | `0xB48378b1035dDA425bB9AA76F81c7f1695B0aeE0` (deprecated — superseded by V9 Curve V1 + Balancer V2 dispatchers + 9 audit-LEAD hardenings) |
 | **V8 deploy tx** | `0xe011e1029adb704e0f64a37b072bc17a82d9ddd1a403a6d06ad5370f63cc6827` |
 | **V7 Contract** | `0xb18e3A861961BF399b08Bdd8500019319Be58779` (deprecated — superseded by V8 same-asset NO_SWAP + hasMixedSplit support; V7 rejected the combination outright) |
@@ -515,10 +531,8 @@ struct MorphoLiquidation {
 
 | Function | Description |
 |---|---|
-| `configureMorpho(address)` | Atomic helper — sets `morphoBlue` **and** `allowedFlashProviders[FLASH_PROVIDER_MORPHO]` in one call (must be in `allowedTargets`). |
-| `setMorphoBlue(address)` | Legacy: configure Morpho Blue liquidation target only (must be in `allowedTargets`) |
 | `setAaveV2LendingPool(address)` | Configure Aave V2 Pool (must be in `allowedTargets`) |
-| `setFlashProvider(uint8, address)` | Register flash provider by ID (must be in `allowedTargets`) |
+| `setAllowedTarget(address, bool)` | Allow-list or revoke a call target (Bebop settlement, Curve pool, Balancer Vault entry, etc.) |
 | `setV4HookAllowed(address, bool)` | Allow-list or revoke a Uniswap V4 hook contract |
 | `pause()` / `unpause()` | Emergency pause toggle |
 | `rescueERC20(token, to, amount)` | Recover stuck tokens |
@@ -526,10 +540,12 @@ struct MorphoLiquidation {
 | `rescueERC20Batch(tokens[], to)` | Recover multiple token balances |
 | `rescueETH(to, amount)` | Recover stuck ETH |
 
-> **Note**: `allowedTargets` is write-once (constructor only). There is no post-deploy setter.
-> All addresses that may be used with `setMorphoBlue` / `configureMorpho`,
-> `setAaveV2LendingPool`, `setFlashProvider`, or a `UNI_V4` `v4PoolManager` must be included
-> in the constructor's `allowedTargets_` array.
+> **Note**: V10 dropped `setMorphoBlue`, `configureMorpho`, and `setFlashProvider`.
+> Morpho Blue and the Balancer Vault are now constructor parameters and live in
+> immutable storage. Any address that may appear as a `UNI_V4` `v4PoolManager`,
+> as a target for `setAaveV2LendingPool`, or as a swap target must either be
+> included in the constructor's `allowedTargets_` array or added later via
+> `setAllowedTarget(addr, true)`.
 
 ## Project Structure
 
@@ -587,118 +603,52 @@ ETHEREUM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
 ETHERSCAN_API_KEY=...
 ```
 
-### 2. Deploy (three steps — two external libraries)
+### 2. Deploy (single `forge script` run)
 
-Two external libraries are called via `DELEGATECALL` from the main contract:
-
-1. `src/libraries/ParaswapDecoderLib.sol` — Augustus V6.2 selector classifier
-   and per-family decoders (pure decode, no state).
-2. `src/libraries/SwapLegExecutorLib.sol` — Paraswap single + UniV2 + UniV3
-   leg execution orchestrators (approve / call / delta check / event). V4
-   stays in the main contract (depends on `_activeV4PoolManager` storage +
-   `unlockCallback` entrypoint). Bebop stays in the main contract
-   (runtime `allowedTargets[target]` lookup against operator-supplied target).
-
-Pulling these out of the main contract's own bytecode is what keeps the
-deployed executor comfortably under the EIP-170 24,576-byte limit — but the
-price is that the main contract's compiled bytecode contains **two**
-unresolved link placeholders (`__$...$__`) where the library addresses need to
-be spliced in at deploy time. `forge create` refuses to deploy such bytecode
-without concrete library addresses, hence the three-step flow below.
-
-Both libraries are stateless and ownerless — once deployed, each can be reused
-for every future `LiquidationExecutor` deployment on the same chain, so steps
-2.1 and 2.2 normally only run once.
-
-#### 2.1 — Deploy `ParaswapDecoderLib`
+`script/Deploy.s.sol` is the canonical entry-point: it deploys
+`LiquidationExecutor` against the canonical mainnet protocol addresses and lets
+forge auto-deploy + link the seven external libraries (`UniswapLib`,
+`BalancerV2Lib`, `CurveV1Lib`, `SwapLegExecutorLib`, `SwapValidationLib`,
+`CoinbasePaymentLib`, plus the internal `ParaswapDecoderLib` dependency of
+`SwapLegExecutorLib`). Each subsequent run on the same chain reuses libraries
+whose source has not changed — forge tracks per-chain library addresses in
+`broadcast/Deploy.s.sol/<chain>/run-latest.json` under the `libraries` field
+and matches them by bytecode hash.
 
 ```bash
-forge create src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib \
+PRIVATE_KEY=$PRIVATE_KEY forge script script/Deploy.s.sol:Deploy \
   --rpc-url $ETHEREUM_RPC_URL \
-  --private-key $PRIVATE_KEY \
-  --broadcast
-```
-
-Copy the `Deployed to:` address from the output:
-
-```bash
-export PARASWAP_LIB_ADDR=<deployed-paraswap-decoder-library-address>
-```
-
-#### 2.2 — Deploy `SwapLegExecutorLib` (linked to `ParaswapDecoderLib`)
-
-`SwapLegExecutorLib` itself calls into `ParaswapDecoderLib`, so the Paraswap
-decoder address must be linked into the swap-leg library's bytecode at deploy:
-
-```bash
-forge create src/libraries/SwapLegExecutorLib.sol:SwapLegExecutorLib \
-  --rpc-url $ETHEREUM_RPC_URL \
-  --private-key $PRIVATE_KEY \
   --broadcast \
-  --libraries "src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib:$PARASWAP_LIB_ADDR"
+  --legacy
 ```
 
-Copy the `Deployed to:` address:
+The script's `run()` returns the deployed executor address and logs every
+library + executor address; both also land in
+`broadcast/Deploy.s.sol/1/run-latest.json` for downstream tooling.
 
-```bash
-export SWAPLEG_LIB_ADDR=<deployed-swap-leg-executor-library-address>
-```
-
-#### 2.3 — Deploy `LiquidationExecutor` linked to both libraries
-
-```bash
-forge create src/LiquidationExecutor.sol:LiquidationExecutor \
-  --rpc-url $ETHEREUM_RPC_URL \
-  --private-key $PRIVATE_KEY \
-  --broadcast \
-  --libraries "src/libraries/ParaswapDecoderLib.sol:ParaswapDecoderLib:$PARASWAP_LIB_ADDR" \
-  --libraries "src/libraries/SwapLegExecutorLib.sol:SwapLegExecutorLib:$SWAPLEG_LIB_ADDR" \
-  --constructor-args \
-    <OWNER_ADDRESS> \
-    <OPERATOR_ADDRESS> \
-    0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 \
-    0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2 \
-    0xBA12222222228d8Ba445958a75a0704d566BF2C8 \
-    0x6A000F20005980200259B80c5102003040001068 \
-    0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D \
-    0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45 \
-    "[0xbbbbbBB520d69a9775E85b458C58c648259FAD5F,0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb,0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9,0x000000000004444c5dc75cB358380D2e3dE08A90]"
-```
-
-The `--libraries` flag format is `<file>:<name>:<address>` — pass it **twice**,
-once per library; forge replaces both placeholders before broadcast. To verify
-each contract on Etherscan in the same run, append
-`--verify --etherscan-api-key $ETHERSCAN_API_KEY` to every `forge create` above.
-Etherscan needs upstream library addresses to reproduce each linked bytecode,
-so verification order MUST be `ParaswapDecoderLib` → `SwapLegExecutorLib` →
-`LiquidationExecutor`.
-
-Constructor arg order:
-1. Owner (Safe multisig)
-2. Operator (bot EOA, immutable)
-3. WETH
-4. Aave V3 Pool (liquidation target only — V3 flashloan path is removed in source)
-5. Balancer Vault (auto-registered as flash provider id=2)
-6. ParaSwap AugustusV6
-7. Uniswap V2 Router02 (immutable)
-8. Uniswap V3 SwapRouter02 (immutable)
-9. `allowedTargets_` array — include Bebop Settlement, Morpho Blue (both liquidation target and flashloan source share the same address), Aave V2 Pool, Uniswap V4 PoolManager, and any V4 hooks you plan to allow-list later (`setV4HookAllowed`).
+`ArbExecutor` is intentionally NOT deployed by this script — it ships in a
+separate run when bot-side arb integration is ready.
 
 ### 3. Post-Deploy Configuration
+
+V10 wires Morpho and the Balancer Vault in the constructor, so neither
+`configureMorpho` nor `setFlashProvider` exists anymore. The only routine
+post-deploy step is wiring Aave V2 when V2 liquidations are added; everything
+else is constructor-supplied.
 
 ```bash
 EXECUTOR=<DEPLOYED_ADDRESS>
 
-# Configure Morpho Blue (atomic — sets both liquidation target and flash provider)
-cast send $EXECUTOR "configureMorpho(address)" 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb \
-  --rpc-url $ETHEREUM_RPC_URL --private-key $PRIVATE_KEY
-
-# Configure Aave V2 LendingPool (liquidation target)
+# Configure Aave V2 LendingPool (must already be in `allowedTargets`)
 cast send $EXECUTOR "setAaveV2LendingPool(address)" 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9 \
   --rpc-url $ETHEREUM_RPC_URL --private-key $PRIVATE_KEY
 
 # Allow-list any Uniswap V4 hooks you plan to use (optional — default disallows all)
 # cast send $EXECUTOR "setV4HookAllowed(address,bool)" <HOOK> true \
+#   --rpc-url $ETHEREUM_RPC_URL --private-key $PRIVATE_KEY
+
+# Add a swap / liquidation target after deploy (e.g. a new Curve pool)
+# cast send $EXECUTOR "setAllowedTarget(address,bool)" <TARGET> true \
 #   --rpc-url $ETHEREUM_RPC_URL --private-key $PRIVATE_KEY
 ```
 

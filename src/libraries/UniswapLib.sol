@@ -7,6 +7,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IUniV2Router} from "../interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "../interfaces/IUniV3SwapRouter.sol";
 import {IPoolManager, PoolKey, SwapParams} from "../interfaces/IPoolManager.sol";
+import {SwapMode, SwapLeg} from "../types/SwapTypes.sol";
 
 /// @title UniswapLib
 /// @notice External library housing ALL Uniswap leg execution logic
@@ -27,9 +28,10 @@ import {IPoolManager, PoolKey, SwapParams} from "../interfaces/IPoolManager.sol"
 /// library) — it has no relationship to Uniswap and a different
 /// validation surface (selector classifier + decoder).
 ///
-/// STRUCT DISCIPLINE: `SwapLeg` here MUST stay byte-for-byte identical
-/// to the `SwapLeg` declared in `LiquidationExecutor`. Divergence
-/// silently corrupts ABI decoding under DELEGATECALL.
+/// STRUCT DISCIPLINE: `SwapLeg` is imported from `../types/SwapTypes.sol`
+/// (V10+ refactor). Treat that file as the frozen interface — every
+/// library and contract that touches a leg under DELEGATECALL reads
+/// fields by position from the same definition.
 ///
 /// SECURITY DISCIPLINE: V4 entrypoints (`runV4UnlockSwap`,
 /// `runV4UnlockMultihop`) are invoked only inside
@@ -43,64 +45,19 @@ library UniswapLib {
     using SafeERC20 for IERC20;
 
     // ─── V4 sqrt-price-limit constants (mirror LiquidationExecutor) ──
+    // Reference: v4-core TickMath.MIN_SQRT_PRICE / MAX_SQRT_PRICE.
+    //   MIN_SQRT_PRICE = 4_295_128_739
+    //   MAX_SQRT_PRICE = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342
+    // V4 PoolManager reverts `PriceLimitOutOfBounds` when
+    //   zeroForOne  && sqrtPriceLimitX96 <= MIN_SQRT_PRICE, or
+    //   !zeroForOne && sqrtPriceLimitX96 >= MAX_SQRT_PRICE.
+    // Our sentinels must therefore be MIN+1 and MAX-1.
     uint160 internal constant V4_MIN_SQRT_PRICE_LIMIT = 4_295_128_740;
     uint160 internal constant V4_MAX_SQRT_PRICE_LIMIT =
-        1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261;
+        1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_341;
 
-    // ─── SwapMode enum + SwapLeg struct (MUST match main contract) ──
-    enum SwapMode {
-        PARASWAP_SINGLE,
-        BEBOP_MULTI,
-        UNI_V2,
-        UNI_V3,
-        UNI_V4,
-        NO_SWAP,
-        UNI_V3_BUY,
-        UNI_V2_BUY,
-        UNI_V4_BUY,
-        CURVE_V1,
-        CURVE_V1_BUY,
-        BAL_V2,
-        BAL_V2_BUY
-    }
-
-    struct SwapLeg {
-        SwapMode mode;
-        address srcToken;
-        uint256 amountIn;
-        bool useFullBalance;
-        uint256 deadline;
-        bytes paraswapCalldata;
-        address bebopTarget;
-        bytes bebopCalldata;
-        address[] v2Path;
-        uint24 v3Fee;
-        address v4PoolManager;
-        bytes v4SwapData;
-        address repayToken;
-        uint256 minAmountOut;
-    }
-
-    /// @dev Defensive zero-check for NO_SWAP legs. NO_SWAP doesn't
-    /// consult any DEX, so every DEX-related field must be zero/empty.
-    /// Currently NO consumer reads these for NO_SWAP, but a regression
-    /// in any future code path would silently inherit an attacker-
-    /// controlled payload. Asserting upstream makes the contract
-    /// regression-proof. Lib-hosted because the OR-chain is too heavy
-    /// for the main contract's EIP-170 budget.
-    function assertNoSwapLegZeroed(SwapLeg memory leg) external pure {
-        // NO_SWAP is the same-token branch — srcToken MUST equal repayToken.
-        // Every other mode enforces this via the post-NO_SWAP-early-return
-        // `srcToken == repayToken` check; mirroring it here closes the
-        // defense-in-depth gap surfaced by the re-audit.
-        if (leg.srcToken != leg.repayToken) revert InvalidPlan();
-        if (
-            leg.useFullBalance || leg.deadline != 0 || leg.amountIn != 0 || leg.minAmountOut != 0
-                || leg.paraswapCalldata.length != 0 || leg.bebopTarget != address(0) || leg.bebopCalldata.length != 0
-                || leg.v2Path.length != 0 || leg.v3Fee != 0 || leg.v4PoolManager != address(0)
-                || leg.v4SwapData.length != 0
-        ) revert InvalidPlan();
-    }
+    // SwapMode + SwapLeg now sourced from `../types/SwapTypes.sol`.
+    // assertNoSwapLegZeroed moved to SwapValidationLib (V10+ refactor).
 
     // ─── Errors (must match LiquidationExecutor signatures by name) ──
     error InsufficientSrcBalance(uint256 required, uint256 available);
