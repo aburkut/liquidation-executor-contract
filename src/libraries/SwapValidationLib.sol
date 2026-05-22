@@ -54,6 +54,8 @@ library SwapValidationLib {
         if (m == SwapMode.UNI_V2_BUY) m = SwapMode.UNI_V2;
         if (m == SwapMode.CURVE_V1_BUY) m = SwapMode.CURVE_V1;
         if (m == SwapMode.BAL_V2_BUY) m = SwapMode.BAL_V2;
+        if (m == SwapMode.CURVE_V1_MH_BUY) m = SwapMode.CURVE_V1_MH;
+        if (m == SwapMode.BAL_V2_MH_BUY) m = SwapMode.BAL_V2_MH;
         // V4 BUY remains its own enum value here — falls through to
         // the `InvalidSwapMode` revert below as a defense-in-depth
         // assertion that the caller dispatched V4 elsewhere.
@@ -149,6 +151,31 @@ library SwapValidationLib {
             // leg2 plans (where amountIn = 0 on-wire) are accepted.
             if (leg.bebopTarget == address(0)) revert InvalidPlan();
             if (leg.bebopCalldata.length < 96) revert InvalidPlan();
+            if (leg.minAmountOut == 0) revert InvalidPlan();
+        } else if (m == SwapMode.CURVE_V1_MH) {
+            // Curve V1 multihop via RouterNG. `bebopTarget` = Router
+            // address; `bebopCalldata` = abi.encode(address[11] path,
+            // uint256[5][5] swapParams, address[5] pools). Fixed-size
+            // arrays encode without offsets/lengths:
+            //   11 * 32 (path) + 25 * 32 (swapParams) + 5 * 32 (pools)
+            //   = 41 * 32 = 1312 bytes.
+            // Library re-decodes and asserts path endpoints match
+            // srcToken / repayToken at dispatch.
+            if (leg.bebopTarget == address(0)) revert InvalidPlan();
+            if (leg.bebopCalldata.length < 1312) revert InvalidPlan();
+            if (leg.minAmountOut == 0) revert InvalidPlan();
+        } else if (m == SwapMode.BAL_V2_MH) {
+            // Balancer V2 multihop via Vault.batchSwap. `bebopTarget` =
+            // Vault address; `bebopCalldata` = abi.encode(
+            //   BatchSwapStep[] swaps, address[] assets, int256[] limits).
+            // All three are dynamic arrays — minimum non-empty encoding
+            // is three offset words (3 * 32 = 96) plus three length
+            // words (3 * 32 = 96) = 192 bytes for the headers, plus the
+            // contents. Cheapest sanity threshold is therefore 192
+            // bytes; library re-decodes and checks asset endpoints +
+            // step shape at dispatch.
+            if (leg.bebopTarget == address(0)) revert InvalidPlan();
+            if (leg.bebopCalldata.length < 192) revert InvalidPlan();
             if (leg.minAmountOut == 0) revert InvalidPlan();
         } else {
             // V4 (SELL or BUY) or anything else — caller must dispatch.

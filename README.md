@@ -4,41 +4,65 @@
 
 | Parameter | Value |
 |---|---|
-| **Contract (V10)** | `0x7FF9D22393a825A735E5889624cA07f86D28A374` |
-| **Deploy tx** | `0xfe000c9c7e44e06ca31ff190147a513ab746b8778a6a1d3819a97e3a9799c984` (block 25138634) |
-| **BalancerV2Lib** | `0x5def208c6df62574a6949423d1d653efda80072b` (re-deployed — V10 signature drop: no longer takes `isTargetAllowed`) |
-| **BalancerV2Lib deploy tx** | `0xb24f9cfb7d16a52a94cdd3fa268ac01812d54587eac97b3f2f61ae1dc54e571f` |
-| **UniswapLib** | `0x532a595f32b7da458e35deb86601e24ea35be86e` (re-deployed — V4_MAX_SQRT_PRICE_LIMIT corrected to v4-core `MAX_SQRT_PRICE − 1`; pre-V10 sentinel exceeded `MAX_SQRT_PRICE` and reverted every `!zeroForOne` V4 swap with `PriceLimitOutOfBounds`) |
-| **UniswapLib deploy tx** | `0xb82b9a29e14e176a59d33ed862fa916007f665863fc6612ea6369dbc43c1cd5b` |
-| **SwapValidationLib** | `0x639a41463fbcc86ef11ba4f6313cb4e046922944` (new in V10 — extracted `validateNonV4Leg` + `assertNoSwapLegZeroed` + PARASWAP_SINGLE `minAmountOut > 0` floor) |
-| **SwapValidationLib deploy tx** | `0x50c689b18b5366835010875dd4a0ebcd5e959b69ce332dfa0794a28ee5cd2cc2` |
-| **CoinbasePaymentLib** | `0x0c89bfe7abf50fe03300620affd589499ad398f2` (new in V10 — extracted `payCoinbase` / `computeRealizedProfit` / `checkProfit`) |
-| **CoinbasePaymentLib deploy tx** | `0xdef7d8283a509a1093b2cfd0f9868451c79ef5cba6bf9d1edf02956ea0264e4f` |
-| **SwapLegExecutorLib** | `0x1483a7e66a792bfc6c39a6bdfba61fb501b8e75c` (re-deployed for V10 signature alignment) |
-| **SwapLegExecutorLib deploy tx** | `0x9952c51c2b17c171e1ec3b13f244c6ecf43be8f733e1229da941e7dc95869528` |
-| **CurveV1Lib** | `0xf72becd7512fa82e4374646374b51a728cba2602` (re-deployed — V10 signature drop: no longer takes `isTargetAllowed`) |
-| **CurveV1Lib deploy tx** | `0x04bf8a4159ed9318f9c521d037a0619fb8b4b46f2d2f9f159319ca4ff61210bc` |
-| **ParaswapDecoderLib** | `0x498e1dc8e2d7d221da9afc8d1a1aaa82b3b2ee08` (re-used from V9 — internal dependency of `SwapLegExecutorLib`, source unchanged) |
-| **Runtime bytecode size** | 22 633 bytes (1 943 bytes margin under EIP-170) — V10 absorbs the V9 feature set while freeing ~1.9 KB via the SwapValidationLib + CoinbasePaymentLib extraction and the `allowedExtSwapTargets` mapping removal (constructor-pinned Morpho/Balancer eliminates the runtime allow-list lookup for those targets) |
+| **Contract (V11)** | `0xE065DDaC4a7E2c795f9238E1fccd4C68FcE0Be14` |
+| **Deploy tx** | `0x178095fc1ea469d65b7c89f1664601cbf33b34a4fd714396ea646c339ac7fe86` (block 25151987) |
+| **BalancerV2Lib** | `0x20f99445Fe31475a2c7f1D7697af476129603338` (re-deployed — V11 added `executeLegBatchSwap` for native multihop via `Vault.batchSwap`) |
+| **BalancerV2Lib deploy tx** | `0x7c0ce1506d9470852107aea7e53251dba78634b56842f2c42d11136bb2d0c255` |
+| **UniswapLib** | `0x737c3Af6343ad6c8a33735A7624ec00766fdF55C` (re-deployed — bytecode hash changed because of `via_ir` differences across builds; source identical to V10) |
+| **UniswapLib deploy tx** | `0x4e727732f7d3d6b5202c5d62f2f8b5e5a8a8c078cc50e29c0c198323221fe672` |
+| **SwapValidationLib** | `0xE25d939bC12c5ce820C7Bd35E471ef825dEd7073` (re-deployed — added validator arms for `CURVE_V1_MH/MH_BUY` + `BAL_V2_MH/MH_BUY`) |
+| **SwapValidationLib deploy tx** | `0xa4d9605110b76a6a8ea991828a770b996f2186d31219f1a860febf1e524c0563` |
+| **CoinbasePaymentLib** | `0x0c89bfe7abf50fe03300620affd589499ad398f2` (re-used from V10 — source unchanged) |
+| **SwapLegExecutorLib** | `0x15401B0e9Af93Dd5754F9ECF843f420739Cd78aa` (re-deployed — relinked against the new BalancerV2/CurveV1/SwapValidationLib addresses) |
+| **SwapLegExecutorLib deploy tx** | `0x371c768b8cef643a0219711e6f2884279753e01e2b25c24e850c4c84e598a04f` |
+| **CurveV1Lib** | `0x67AD8eE249F7FEe465224322E7553852B72Db086` (re-deployed — V11 added `executeLegMultihop` for native multihop via Curve RouterNG `exchange(address[11], …)`) |
+| **CurveV1Lib deploy tx** | `0x6c3068c2a4e2ddee8815439da296b5a73773e2c35d3bed501ac96738b6e84dce` |
+| **ParaswapDecoderLib** | `0x498e1dc8e2d7d221da9afc8d1a1aaa82b3b2ee08` (re-used from V9/V10 — source unchanged) |
+| **Runtime bytecode size** | 23 060 bytes (1 516 bytes margin under EIP-170) — V11 adds 4 new dispatch arms (CURVE_V1_MH, CURVE_V1_MH_BUY, BAL_V2_MH, BAL_V2_MH_BUY) plus extended allowlists in leg2 / SPLIT / MIXED_SPLIT validators. +427 bytes vs V10 |
 | **Owner** | `0xC338094Bb79AA610E9c57166fc4FA959db6234Ab` (Safe multisig) |
 | **Operator** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` (immutable) |
 | **WETH** | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` (immutable) |
 | **Deployer** | `0x1e9e18152552609175826f3ee6F8bFD639532E37` |
 | **Aave V3 Pool** | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` (liquidation target; V3 flashloan path removed) |
-| **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` (constructor-pinned as flash provider id=2 — V10 dropped the post-deploy `setFlashProvider` setter) |
+| **Balancer Vault** | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` (constructor-pinned as flash provider id=2; also serves V11 multihop via `Vault.batchSwap`) |
+| **Curve RouterNG** | `0x16C6521Dff6baB339122a0FE25a9116693265353` (V11 multihop target — used as `bebopTarget` for `CURVE_V1_MH/MH_BUY` legs) |
 | **ParaSwap AugustusV6** | `0x6A000F20005980200259B80c5102003040001068` |
 | **Uniswap V2 Router02** | `0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D` (immutable) |
 | **Uniswap V3 SwapRouter02** | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` (immutable) |
 | **Uniswap V4 PoolManager** | `0x000000000004444c5dc75cB358380D2e3dE08A90` (in `allowedTargets`, used per-swap) |
-| **Morpho Blue** | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` (liquidation target + flashloan id=3 — constructor-pinned in V10, `configureMorpho` removed) |
+| **Morpho Blue** | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` (liquidation target + flashloan id=3 — constructor-pinned, `configureMorpho` removed in V10) |
 | **Bebop Settlement** | `0xbbbbbBB520d69a9775E85b458C58c648259FAD5F` (allowlisted) |
 | **Aave V2 LendingPool** | `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9` (allowlisted — set via `setAaveV2LendingPool` when V2 liquidations are wired) |
 | **Solidity** | 0.8.24, Shanghai, optimizer 1 run, `via_ir=true`, `bytecode_hash=none` |
-| **Total deploy cost** | 9 948 191 gas / 0.001009 ETH (gas price 0.101 gwei across blocks 25138631-25138634) |
+| **Total deploy cost** | 10 640 641 gas / 0.001214 ETH (gas price 0.117 gwei across blocks 25151984-25151987) |
 
-V10 is a refactor pass on top of V9: same feature surface, structural cleanup, one critical V4 bug-fix.
+V11 adds native multihop dispatchers for Curve V1 and Balancer V2 on top of the V10 refactor. Four new `SwapMode` enum values:
 
-Headline changes:
+* `CURVE_V1_MH` (13) — Curve RouterNG `exchange(address[11], uint256[5][5], uint256, uint256, address[5], address)` (selector `0xc872a3c5`). SELL path; chains up to 5 StableSwap hops in one call.
+* `CURVE_V1_MH_BUY` (14) — same on-chain primitive (RouterNG has no native exact-out); bot back-solves `dx_max` via the Router's `get_dy` view + 50 bps safety buffer.
+* `BAL_V2_MH` (15) — `Vault.batchSwap(GIVEN_IN, …)`. Straight-chain N-pool routing through the Balancer V2 Vault.
+* `BAL_V2_MH_BUY` (16) — `Vault.batchSwap(GIVEN_OUT, …)` — native exact-out support (Balancer is one of the few external DEXes that exposes this).
+
+Per-mode security:
+
+* Curve multihop endpoint check — `path[0] == leg.srcToken` AND the last non-zero token-slot equals `leg.repayToken`; otherwise reverts `InvalidPlan` before approval.
+* Balancer multihop endpoint check — `assets[0] == leg.srcToken` AND `assets[last] == leg.repayToken`. BUY-side additionally caps consumed input at `leg.amountIn` post-call (defense-in-depth against malformed `limits[]`).
+* Both libraries verify output via post-balance delta vs `leg.minAmountOut` (Curve mirrors Router's own `_expected`; Balancer mirrors the Vault's per-asset limits).
+* No per-pool allowlist — `bot` is the trusted source of router/vault addresses (same model as V10's single-hop Curve/Balancer dispatchers).
+
+Validator (`SwapValidationLib.validateNonV4Leg`) enforces sanity for the new modes at the calldata-size level:
+
+* Curve MH: `bebopCalldata.length == 1312` (fixed-size encode of `address[11]` + `uint256[5][5]` + `address[5]`).
+* Balancer MH: `bebopCalldata.length >= 192` (three dynamic arrays — minimum header size for `BatchSwapStep[]` + `assets[]` + `limits[]`).
+* `bebopTarget != address(0)` and `minAmountOut > 0` apply across all four modes.
+
+Plan-shape allowlists for `leg2` (TwoLeg sequential), `splitBps` (SPLIT), and MIXED_SPLIT `leg2` (profit leg) extended to admit the new SELL modes (`CURVE_V1_MH`, `BAL_V2_MH`); the BUY variants are gated out by the existing logic since `useFullBalance` semantics don't make sense for BUY-side flows.
+
+V11 also carries V10 forward verbatim — same V4_MAX_SQRT_PRICE_LIMIT fix, same `allowedExtSwapTargets` removal, same constructor-pinned Morpho/Balancer, same SwapValidationLib + CoinbasePaymentLib extraction, same PARASWAP_SINGLE `minAmountOut > 0` floor. Tests: 1184/1184 forge unit pass (33 of those are the new `ExecutorMultihopTest` suite); 8 fork-only skipped.
+
+### V10 → V11 carry-forward changes (still in effect)
+
+V10 was a refactor pass on top of V9: same feature surface, structural cleanup, one critical V4 bug-fix.
 
 1. **V4_MAX_SQRT_PRICE_LIMIT corrected** (`src/libraries/UniswapLib.sol`). The pre-V10 sentinel was `1_461_446_703_529_909_599_001_367_844_790_673_715_015_930_149_261` — strictly greater than v4-core `TickMath.MAX_SQRT_PRICE`. V4 PoolManager reverts `PriceLimitOutOfBounds(uint160)` when `!zeroForOne && sqrtPriceLimitX96 >= MAX_SQRT_PRICE`, so every token1→token0 V4 swap reverted by construction since the first V4 commit. Fix: `MAX_SQRT_PRICE − 1 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_341`. Pinned by `UniswapLibV4SqrtConstantsTest` (4 regression assertions anchoring both `V4_MIN_SQRT_PRICE_LIMIT` and `V4_MAX_SQRT_PRICE_LIMIT` to v4-core literals and to the PoolManager's strict-inequality check).
 2. **`allowedExtSwapTargets` mapping removed** (was V9 slot 9). Curve V1 and Balancer V2 dispatchers now route through the existing `allowedTargets` allowlist alongside Uni V2/V3/V4 — one allowlist for everything. `_activePlanHash` and successors shift down one slot (`9` → was `10`, etc.). `setExtSwapTarget` removed accordingly.
@@ -63,6 +87,8 @@ The one remaining LEAD (Bebop arbitrary calldata) is a design constraint: `targe
 
 | Previous deployments | |
 |---|---|
+| **V10 Contract** | `0x7FF9D22393a825A735E5889624cA07f86D28A374` (deprecated — superseded by V11: native multihop dispatchers for Curve V1 (RouterNG) and Balancer V2 (Vault.batchSwap), 4 new SwapModes 13-16) |
+| **V10 deploy tx** | `0xfe000c9c7e44e06ca31ff190147a513ab746b8778a6a1d3819a97e3a9799c984` |
 | **V9 Contract** | `0x5b1E7FCf175Aac717F4841321bA2C8D17558a6Fd` (deprecated — superseded by V10: V4_MAX_SQRT_PRICE_LIMIT fix + SwapValidationLib/CoinbasePaymentLib extraction + constructor-pinned Morpho/Balancer + `allowedExtSwapTargets` mapping removal) |
 | **V9 deploy tx** | `0x460acabd932c1e7e8a5738ce9b9fbe863602c90c0f848c954b7aab277a9669f8` |
 | **V8 Contract** | `0xB48378b1035dDA425bB9AA76F81c7f1695B0aeE0` (deprecated — superseded by V9 Curve V1 + Balancer V2 dispatchers + 9 audit-LEAD hardenings) |
