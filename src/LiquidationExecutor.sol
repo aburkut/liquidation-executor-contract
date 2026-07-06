@@ -397,7 +397,7 @@ contract LiquidationExecutor is
     uint32 private constant FLAG_USE_FULL_BALANCE = 1 << 0; // inject balanceOf(srcToken) at fromAmountPos
     uint32 private constant FLAG_USE_PREV_RETURN = 1 << 1; // inject previous op output at fromAmountPos
     uint32 private constant FLAG_IS_V3_CALLBACK = 1 << 2; // op.target is a V3-style pool; pay in uniswapV3SwapCallback
-    // Reserved: 1<<3 IS_V4_UNLOCK.
+    uint32 private constant FLAG_IS_V4 = 1 << 3; // op.target is a V4 PoolManager; run via the existing V4 unlock/settle path
 
     uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
@@ -1446,6 +1446,28 @@ contract LiquidationExecutor is
                 amount = op.srcToken == address(0) ? 0 : IERC20(op.srcToken).balanceOf(address(this));
             } else if (op.flags & FLAG_USE_PREV_RETURN != 0) {
                 amount = prevReturn;
+            }
+
+            // V4: reuse the existing (audited) unlock/settle leg machinery by
+            // synthesising a UNI_V4 leg. op.target is the PoolManager (checked
+            // via allowedTargets above + _validateV4Leg's hook allowlist);
+            // op.callData is the v4SwapData (pool key / hops).
+            if (op.flags & FLAG_IS_V4 != 0) {
+                SwapLeg memory vleg;
+                vleg.mode = SwapMode.UNI_V4;
+                vleg.srcToken = op.srcToken;
+                vleg.repayToken = op.outToken;
+                vleg.v4PoolManager = op.target;
+                vleg.v4SwapData = op.callData;
+                vleg.deadline = block.timestamp;
+                // Nominal non-zero floor (required by _validateV4Leg). Per-op
+                // slippage is subsumed by the aggregate repay + minProfit gate.
+                vleg.minAmountOut = 1;
+                _validateV4Leg(vleg);
+                uint256 v4OutBefore = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
+                _executeUniV4Leg(vleg, amount);
+                prevReturn = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this)) - v4OutBefore;
+                continue;
             }
 
             // Patch runtime values into the pre-built calldata (bounds-checked).

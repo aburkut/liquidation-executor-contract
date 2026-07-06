@@ -202,4 +202,23 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         executor.execute(plan);
         assertEq(interToken.allowance(address(executor), address(dex)), 0, "inter approval reset");
     }
+
+    // ── V4 family: op reuses the existing unlock/settle leg machinery ──
+    function test_GenericSequence_V4_HappyPath() public {
+        // uniV4Mock is allowlisted + funded by the base setUp. v4SwapData is
+        // the single-hop shape abi.encode(src, dst, fee, tickSpacing, hook).
+        uint32 flagV4 = 1 << 3;
+        LiquidationExecutor.Op memory op;
+        op.target = address(uniV4Mock);
+        op.srcToken = address(collateralToken);
+        op.outToken = address(loanToken);
+        op.flags = flagV4 | FLAG_FULL_BALANCE;
+        op.callData = abi.encode(address(collateralToken), address(loanToken), uint24(3000), int24(60), address(0));
+
+        bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 1e18);
+        uint256 before = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        assertGe(loanToken.balanceOf(address(executor)), before, "V4 profit retained");
+    }
 }
