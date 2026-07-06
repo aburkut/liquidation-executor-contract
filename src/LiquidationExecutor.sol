@@ -164,6 +164,7 @@ contract LiquidationExecutor is
     error OpCallFailed(uint256 opIndex);
     error UnexpectedCallback();
     error V3FactoryNotRegistered();
+    error CollateralOverspent(uint256 spent, uint256 allowed);
 
     // ─── Constants ───────────────────────────────────────────────────
     // FLASH_PROVIDER_AAVE_V3 (1) removed — Aave V3 flashloan path deleted.
@@ -384,7 +385,8 @@ contract LiquidationExecutor is
     /// offchain; the executor patches runtime amounts into it before the call.
     struct Op {
         address target; // DEX pool / router (must be in `allowedTarget`)
-        uint256 value; // native ETH to forward (usually 0)
+        uint256 value; // MUST be 0 — native ETH forwarding is forbidden (audit)
+        uint256 amountIn; // explicit input amount when neither FULL_BALANCE nor PREV_RETURN set (e.g. split legs)
         uint16 fromAmountPos; // byte offset in callData to inject the input amount; 0 = none
         uint16 returnAmountPos; // byte offset to inject the previous op's output; 0 = none
         uint32 flags; // see FLAG_* below
@@ -1209,7 +1211,7 @@ contract LiquidationExecutor is
         // the outer pipeline asserts minProfit + coinbase. Subsumes the shapes
         // below (which stay for gas-optimal common cases).
         if (plan.hasGenericSequence) {
-            _runGenericSequence(plan.ops, loanToken, flashRepayAmount);
+            _runGenericSequence(plan.ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta);
             return;
         }
 
@@ -1422,16 +1424,31 @@ contract LiquidationExecutor is
     /// SECURITY: entry is `onlyOperator` (caller side); every target is checked
     /// against `allowedTarget`; calldata patch positions are bounds-checked; a
     /// hostile/incorrect sequence can only revert, never under-repay/-profit.
-    function _runGenericSequence(Op[] memory ops, address loanToken, uint256 flashRepayAmount) internal {
+    function _runGenericSequence(
+        Op[] memory ops,
+        address loanToken,
+        uint256 flashRepayAmount,
+        address collateralAsset,
+        uint256 collateralDelta
+    ) internal {
         uint256 n = ops.length;
         if (n == 0) revert EmptyOps();
         if (n > MAX_OPS) revert TooManyOps();
 
         uint256 loanBefore = IERC20(loanToken).balanceOf(address(this));
+        // Snapshot the collateral balance so the whole sequence can be capped at
+        // collateralDelta (the value THIS tx produced), mirroring the
+        // single-leg/SPLIT/MIXED_SPLIT caps. Without this a compromised operator
+        // could size a FULL_BALANCE op off a pre-existing/standing balance and
+        // route it out — the containment vector every other path closes.
+        uint256 collBefore = collateralAsset == address(0) ? 0 : IERC20(collateralAsset).balanceOf(address(this));
         uint256 prevReturn = 0;
 
         for (uint256 i = 0; i < n; ++i) {
             Op memory op = ops[i];
+            // No native value is ever needed to swap tokens; forbid it so an op
+            // cannot push the executor's ETH to an arbitrary target.
+            if (op.value != 0) revert InvalidPlan();
             bool isV3 = op.flags & FLAG_IS_V3_CALLBACK != 0;
             // Direct-call targets must be allowlisted. V3-callback pools are
             // instead authenticated by CREATE2 recomputation in
@@ -1440,10 +1457,15 @@ contract LiquidationExecutor is
             // the verified callback, and no output trips the repay gate.
             if (!isV3 && !allowedTargets[op.target]) revert TargetNotAllowed();
 
-            // Resolve the input amount for this op.
-            uint256 amount = prevReturn;
+            // Resolve the input amount. FULL_BALANCE is restricted to the
+            // collateral asset and capped at collateralDelta, so it can never
+            // sweep a standing balance of any token; every other op sizes from
+            // the previous op's output (chained) or an explicit literal.
+            uint256 amount = op.amountIn;
             if (op.flags & FLAG_USE_FULL_BALANCE != 0) {
-                amount = op.srcToken == address(0) ? 0 : IERC20(op.srcToken).balanceOf(address(this));
+                if (collateralAsset == address(0) || op.srcToken != collateralAsset) revert InvalidPlan();
+                uint256 bal = IERC20(collateralAsset).balanceOf(address(this));
+                amount = bal < collateralDelta ? bal : collateralDelta;
             } else if (op.flags & FLAG_USE_PREV_RETURN != 0) {
                 amount = prevReturn;
             }
@@ -1515,6 +1537,15 @@ contract LiquidationExecutor is
         uint256 loanAfter = IERC20(loanToken).balanceOf(address(this));
         uint256 repayDelta = loanAfter > loanBefore ? loanAfter - loanBefore : 0;
         if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+
+        // Collateral-consumption cap: the sequence must not have spent more of
+        // the collateral asset than this tx produced — the backstop that keeps
+        // pre-existing/standing balances out of a generic sequence.
+        if (collateralAsset != address(0)) {
+            uint256 collAfter = IERC20(collateralAsset).balanceOf(address(this));
+            uint256 spent = collBefore > collAfter ? collBefore - collAfter : 0;
+            if (spent > collateralDelta) revert CollateralOverspent(spent, collateralDelta);
+        }
     }
 
     /// @dev Write a 32-byte `value` into `data` at byte offset `pos`, reverting
@@ -1533,11 +1564,17 @@ contract LiquidationExecutor is
     /// from being paid. `data` = abi.encode(srcToken, factory, token0, token1,
     /// fee), built offchain (token0 < token1, sorted).
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
-        // Must be inside an armed op and from that exact pool.
+        // Must be inside the active flashloan window AND an armed op, from that
+        // exact pool (phase check mirrors unlockCallback — defense-in-depth).
+        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert UnexpectedCallback();
         if (_armedV3Pool == address(0) || msg.sender != _armedV3Pool) revert UnexpectedCallback();
 
         (address srcToken, address factory, address token0, address token1, uint24 fee) =
             abi.decode(data, (address, address, address, address, uint24));
+
+        // srcToken (what we pay) must be one of the authenticated pool's tokens —
+        // otherwise a crafted `data` could pay the pool in an unrelated token.
+        if (srcToken != token0 && srcToken != token1) revert UnexpectedCallback();
 
         bytes32 initHash = v3FactoryInitHash[factory];
         if (initHash == bytes32(0)) revert V3FactoryNotRegistered();

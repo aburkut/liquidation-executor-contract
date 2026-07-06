@@ -221,4 +221,39 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         executor.execute(plan);
         assertGe(loanToken.balanceOf(address(executor)), before, "V4 profit retained");
     }
+
+    // ── containment (audit fix): compromised operator cannot drain ──
+
+    function test_GenericSequence_FullBalanceOnNonCollateral_Reverts() public {
+        // FULL_BALANCE is permitted ONLY for the collateral asset, so it can
+        // never sweep a standing balance of some other token.
+        LiquidationExecutor.Op memory op = _swapOp(address(loanToken), address(loanToken), 1e18, FLAG_FULL_BALANCE);
+        bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_GenericSequence_CollateralOverspend_Reverts() public {
+        // Pre-fund STANDING collateral, then try to spend more than this tx's
+        // collateralDelta (COLLATERAL_REWARD) via an explicit literal amount →
+        // CollateralOverspent (the containment cap).
+        collateralToken.mint(address(executor), 500e18); // standing balance
+        LiquidationExecutor.Op memory op = _swapOp(address(collateralToken), address(loanToken), 1.1e18, 0);
+        op.amountIn = COLLATERAL_REWARD + 500e18; // dips into the standing 500e18
+        bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(); // CollateralOverspent(spent, allowed)
+        executor.execute(plan);
+    }
+
+    function test_GenericSequence_NonZeroValue_Reverts() public {
+        LiquidationExecutor.Op memory op =
+            _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
+        op.value = 1; // native ETH forwarding forbidden
+        bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
 }
