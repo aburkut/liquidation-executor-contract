@@ -218,21 +218,6 @@ contract LiquidationExecutor is
     /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
-
-    /// @dev GENERIC_SEQUENCE V3-callback family. Registers a Uniswap-V3-style
-    /// factory → its pool init-code-hash. A V3 swap op's callback recomputes
-    /// the pool address from `factory + initHash + (token0,token1,fee)` and
-    /// requires the caller to equal it — the authenticity gate that stops a
-    /// fake "pool" from tricking the executor into paying it. initHash == 0
-    /// means the factory is not registered. Owner-curated (same trust root as
-    /// allowedTargets / allowedV4Hooks).
-    mapping(address => bytes32) public v3FactoryInitHash;
-    /// @dev Transient "armed" pool during an in-flight IS_V3_CALLBACK op — the
-    /// only window in which `uniswapV3SwapCallback` is accepted, and only from
-    /// this exact pool. Reset to address(0) around each op; execute() is
-    /// nonReentrant, so it never leaks across calls.
-    address private _armedV3Pool;
-
     // V10+ refactor: the dedicated `allowedExtSwapTargets` allowlist
     // for Curve V1 / Balancer V2 pool targets was removed. The
     // executor holds zero balance between txs, so a hostile or buggy
@@ -270,6 +255,20 @@ contract LiquidationExecutor is
     /// callback payload. Declared AFTER `_executionPhase` so the legacy
     /// slot 11 packing (read by storage-poking tests) stays untouched.
     address private _activeV4TokenIn;
+
+    /// @dev GENERIC_SEQUENCE V3-callback family. Declared LAST (after every
+    /// slot-hardcoded var) so storage-poking tests' slots stay untouched —
+    /// same rationale as `_activeV4TokenIn` above.
+    /// Registers a Uniswap-V3-style factory → its pool init-code-hash; the V3
+    /// callback recomputes the pool from `factory + initHash + (token0,token1,
+    /// fee)` and requires the caller to equal it (fake-pool authenticity gate).
+    /// initHash == 0 = not registered. Owner-curated.
+    mapping(address => bytes32) public v3FactoryInitHash;
+    /// @dev Transient "armed" pool during an in-flight IS_V3_CALLBACK op — the
+    /// only window `uniswapV3SwapCallback` is accepted, and only from this
+    /// exact pool. Reset around each op; execute() is nonReentrant so it never
+    /// leaks across calls.
+    address private _armedV3Pool;
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
