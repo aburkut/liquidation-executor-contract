@@ -10,6 +10,18 @@ stay for the common gas-optimal cases. We add ONE new shape, `GENERIC_SEQUENCE`,
 alongside them and dispatch by `plan.swapPlan.shape`. Zero regression on what is
 already deployed and live.
 
+### Locked decisions (Phase 0 review)
+
+1. **Encoding = ABI-decodable `Op[]`** for Phase 1 (clarity + safety). A packed
+   v6-style calldata format is a later gas optimization behind the same
+   semantics — not Phase 1.
+2. **V4 is in the first pass** (Phase 1), not deferred — its unlock/settle
+   handler ships with the other families.
+3. **Allowlist = reuse the existing governance-mutable `allowedTarget`** (already
+   in the contract), granularity at **singletons/factories** (not pools), owner
+   = multisig/timelock. The only new piece is a V3-factory registry for callback
+   authenticity. See §6.
+
 ---
 
 ## 1. Why the 2-leg model blocks us
@@ -156,26 +168,69 @@ a wrong/hostile sequence can only **revert**, never under-repay or under-profit.
 ## 6. Security / threat model
 
 The generic executor's attack surface is "arbitrary `call(target, data)`."
-It is bounded by:
+**Good news: the current contract already ships the primitives this needs** —
+`GENERIC_SEQUENCE` reuses them rather than adding new trust surface:
 
-1. **Empty between txs.** The executor holds no funds and no standing approvals
+- `modifier onlyOperator` (`msg.sender == operator`) — the swap entry is already
+  **permissioned**; only our bot key can run a sequence at all.
+- `mapping allowedTarget` + `setAllowedTarget(address,bool) onlyOwner` — a
+  governance-mutable **target allowlist already exists**.
+- `setV4HookAllowed(address,bool) onlyOwner` — V4 hook allowlist already exists.
+- `owner ≠ operator`, plus `rescueERC20/ETH(onlyOwner)` for recovery.
+
+### Layered defenses (allowlist is defense-in-depth, not the sole gate)
+
+1. **Permissioned entry (`onlyOperator`) — primary.** An external attacker
+   cannot run a sequence. Only our (hot) operator key can.
+2. **Empty between txs.** The executor holds no funds and no standing approvals
    across transactions (input arrives via the flashloan each tx; approvals are
-   set and cleared within the op loop). A hostile sequence has nothing to steal
-   from a future victim — worst case is this tx reverts.
-2. **Two-output gate (atomic backstop).** Repay + minProfit must hold at the end
+   set and cleared within the op loop). Nothing to steal from a future victim.
+3. **Two-output gate (atomic backstop).** Repay + minProfit must hold at the end
    or the whole tx reverts. Value cannot leak below the promised profit.
-3. **Target allowlist (direct-call).** `allowedTargets[target]` gate on every
-   direct op — even a bug in our offchain generator cannot call an unknown
-   contract. We generate the calldata ourselves (trusted), so this is a free
-   defense-in-depth ParaSwap can't have (they need open routing).
-4. **Callback authenticity (callback DEXes).** Every callback verifies
+4. **Target allowlist (`allowedTarget`, reused).** Every direct-call op requires
+   `allowedTarget[op.target]`. Bounds blast radius if our offchain generator has
+   a bug or the operator key is compromised. We generate the calldata ourselves,
+   so this costs us nothing (ParaSwap can't have it — they need open routing).
+5. **Callback authenticity (callback DEXes).** Every callback verifies
    `msg.sender == computePool(factory, initHash, tokens, fee)` from a registered
-   factory set. Prevents fake-pool callback drains.
-5. **Reentrancy guard** on the entry; callbacks only permitted while an op with
+   factory set. Prevents fake-pool callback drains. This is the **one addition**
+   Phase 1 needs on top of the existing primitives: a V3-factory registry
+   (`setAllowedV3Factory(factory, initHash) onlyOwner`), mirroring
+   `setV4HookAllowed`.
+6. **Reentrancy guard** on the entry; callbacks only permitted while an op with
    the matching `IS_*_CALLBACK` flag is in flight (armed context), and only from
    the expected pool.
-6. **Approval hygiene.** Approvals set to exact amount and reset to 0 after the
-   consuming op (or use Permit2 transient approvals) — no lingering allowance.
+7. **Approval hygiene.** Approvals set to exact amount and reset to 0 after the
+   consuming op (or Permit2 transient approvals) — no lingering allowance.
+
+### Allowlist granularity — SINGLETONS, not pools
+
+So that "add DEX without redeploy" actually holds, we allowlist singletons and
+verify pools from factories, never individual pools:
+
+| Reach | What is allowlisted | New pools |
+|---|---|---|
+| Direct-call via router/vault (Balancer Vault, Curve router, Uni V2 router) | the **router/vault** address | auto-covered (routed through it) |
+| Direct pool call (Uni V2 pair, V3 pool) | the **factory** + verify pool derives from it | auto-covered |
+| Callback (V3 + forks) | **factory + init-code-hash** (authenticity check §5) | auto-covered |
+| V4 | pool manager + hook (`setV4HookAllowed`) | auto-covered |
+
+→ adding a **new DEX = one `setAllowedTarget` / factory-register owner tx (no
+redeploy)**; new pools within a known DEX = zero action. This is the v6 win.
+
+### Management decision
+
+- **A. Hardcoded at deploy** — rejected; defeats "add DEX without redeploy".
+- **B. Governance-mutable registry (`setAllowedTarget` onlyOwner)** — **chosen;
+  already implemented.** Keep.
+- **C. Hybrid immutable-core + mutable** — overkill given owner + rescue exist.
+
+**Owner-key hygiene (the one real ask):** since the allowlist root of trust is
+`onlyOwner`, set **owner = multisig/timelock** (operator/bot key stays a
+separate hot key — already the design). A single compromised key then cannot
+instantly whitelist a malicious target; and even if it did, the two-output gate
++ empty-executor bound the loss and `rescueERC20` recovers. Revocation is
+instant: `setAllowedTarget(x, false)`.
 
 Open items to nail in Phase 1 review: calldata patch bounds-checking
 (`fromAmountPos + 32 <= callData.length`), gas-griefing via long sequences
@@ -209,10 +264,11 @@ emits these ops.
 
 - **Phase 0** (this doc) — families table + encoding + security model.
 - **Phase 1** — `GENERIC_SEQUENCE` shape in the contract alongside existing
-  shapes: op loop + injection + two-output gate + target allowlist + the ~5–6
-  family handlers (direct-call, V2, V3-callback+factory registry, Balancer,
-  Curve; V4 optional). Adversarial tests (hostile sequence → revert; fake-pool
-  callback → revert; under-repay/under-profit → revert).
+  shapes: op loop + injection + two-output gate + reuse `allowedTarget` + the
+  full family handler set (direct-call, Uni V2, Uni V3-callback + new V3-factory
+  registry, Balancer V2, Curve, **and V4 unlock/settle**). Adversarial tests
+  (hostile sequence → revert; fake-pool callback → revert; unlisted target →
+  revert; under-repay / under-profit → revert; calldata-patch OOB → revert).
 - **Phase 2** — bot generates `swapSequence` (single route first, then splits).
 - **Phase 3** — port the knapsack solver locally; feed optimal splits into ops.
 - **Phase 4** — audit + redeploy + migrate the bot's default path.
