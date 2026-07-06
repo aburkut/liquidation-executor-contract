@@ -115,6 +115,8 @@ contract ExecutorForkV4Test is Test {
             minAmountOut: 1
         });
         return LiquidationExecutor.SwapPlan({
+            hasGenericSequence: false,
+            ops: new LiquidationExecutor.Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),

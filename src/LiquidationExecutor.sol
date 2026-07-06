@@ -157,6 +157,12 @@ contract LiquidationExecutor is
     /// just passed in), and no on-chain consumer parses the arg.
     error TargetNotAllowed();
 
+    // ─── GENERIC_SEQUENCE errors ─────────────────────────────────────
+    error EmptyOps();
+    error TooManyOps();
+    error CalldataPatchOOB();
+    error OpCallFailed(uint256 opIndex);
+
     // ─── Constants ───────────────────────────────────────────────────
     // FLASH_PROVIDER_AAVE_V3 (1) removed — Aave V3 flashloan path deleted.
     // IDs 2 and 3 kept stable for bot integration compatibility.
@@ -348,7 +354,34 @@ contract LiquidationExecutor is
         bool hasMixedSplit;
         address profitToken;
         uint256 minProfitAmount;
+        // GENERIC_SEQUENCE (additive, Phase 1) — a flat, offchain-built list of
+        // DEX calls executed sequentially. Subsumes the 2-leg topology: the ops
+        // produce BOTH loanToken (repay) and profitToken (profit), and the same
+        // repay + minProfit + coinbase gates apply. Enables value-splits and
+        // adding DEXes offchain without a redeploy. See docs/GENERIC_SEQUENCE_DESIGN.md.
+        bool hasGenericSequence;
+        Op[] ops;
     }
+
+    /// @dev One generic DEX call in a GENERIC_SEQUENCE. `callData` is built
+    /// offchain; the executor patches runtime amounts into it before the call.
+    struct Op {
+        address target; // DEX pool / router (must be in `allowedTarget`)
+        uint256 value; // native ETH to forward (usually 0)
+        uint16 fromAmountPos; // byte offset in callData to inject the input amount; 0 = none
+        uint16 returnAmountPos; // byte offset to inject the previous op's output; 0 = none
+        uint32 flags; // see FLAG_* below
+        address srcToken; // token spent by this op (approved to target); 0 = none
+        address outToken; // token received (its balance delta = this op's output)
+        bytes callData; // selector + args, pre-built offchain
+    }
+
+    // GENERIC_SEQUENCE op flags.
+    uint32 private constant FLAG_USE_FULL_BALANCE = 1 << 0; // inject balanceOf(srcToken) at fromAmountPos
+    uint32 private constant FLAG_USE_PREV_RETURN = 1 << 1; // inject previous op output at fromAmountPos
+    // Reserved for later steps (callback families): 1<<2.. IS_V3_CALLBACK / IS_V4_UNLOCK.
+
+    uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     struct Action {
         uint8 protocolId;
@@ -690,8 +723,13 @@ contract LiquidationExecutor is
         // Final-leg repayToken MUST equal outer loanToken. For hasSplit, leg1
         // IS the repay leg (collateral → loanToken), matching the single-leg
         // derivation since hasLeg2 is forbidden in split mode (see block below).
-        address finalRepayToken = plan.swapPlan.hasLeg2 ? plan.swapPlan.leg2.repayToken : plan.swapPlan.leg1.repayToken;
-        if (finalRepayToken != plan.loanToken) revert InvalidPlan();
+        // GENERIC_SEQUENCE derives repay from the loanToken balance delta, not
+        // from a leg's repayToken — skip the leg-based final-repay-token check.
+        if (!plan.swapPlan.hasGenericSequence) {
+            address finalRepayToken =
+                plan.swapPlan.hasLeg2 ? plan.swapPlan.leg2.repayToken : plan.swapPlan.leg1.repayToken;
+            if (finalRepayToken != plan.loanToken) revert InvalidPlan();
+        }
 
         // Validate all actions use same debt/collateral assets
         (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
@@ -702,7 +740,10 @@ contract LiquidationExecutor is
         // becomes the swap input). trackingToken differs from
         // collateralAsset only when receiveAToken=true, so the aToken
         // path is only reachable with that setting.
-        if (collateralAsset != address(0)) {
+        // GENERIC_SEQUENCE spends collateral via its ops (each op's srcToken is
+        // approved to an allowlisted target), so the leg1.srcToken linkage check
+        // does not apply.
+        if (collateralAsset != address(0) && !plan.swapPlan.hasGenericSequence) {
             address src = plan.swapPlan.leg1.srcToken;
             if (src != collateralAsset && src != trackingToken) {
                 revert SrcTokenNotCollateral(collateralAsset, src);
@@ -720,16 +761,30 @@ contract LiquidationExecutor is
             if (plan.swapPlan.hasLeg2) shapeCount++;
             if (plan.swapPlan.hasSplit) shapeCount++;
             if (plan.swapPlan.hasMixedSplit) shapeCount++;
+            if (plan.swapPlan.hasGenericSequence) shapeCount++;
             if (shapeCount > 1) revert PlanShapeConflict();
         }
 
-        // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
-        // a single-leg plan — combined with hasLeg2 / hasMixedSplit it
-        // would silently bypass the second leg in _executeSwapPlan. Both
-        // combinations are rejected explicitly inside the corresponding
-        // shape-validation blocks below. NO_SWAP + hasSplit is rejected
-        // by hasSplit's m1-must-be-Uni check.
-        _validateLeg(plan.swapPlan.leg1);
+        // GENERIC_SEQUENCE: validate the op list instead of the legs (legs are
+        // unused). Non-empty, bounded, and every target allowlisted (the
+        // runtime re-checks each target too). The has* shape blocks below all
+        // self-skip (their flags are false, enforced by the XOR guard above).
+        if (plan.swapPlan.hasGenericSequence) {
+            uint256 nOps = plan.swapPlan.ops.length;
+            if (nOps == 0) revert EmptyOps();
+            if (nOps > MAX_OPS) revert TooManyOps();
+            for (uint256 i = 0; i < nOps; ++i) {
+                if (!allowedTargets[plan.swapPlan.ops[i].target]) revert TargetNotAllowed();
+            }
+        } else {
+            // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
+            // a single-leg plan — combined with hasLeg2 / hasMixedSplit it
+            // would silently bypass the second leg in _executeSwapPlan. Both
+            // combinations are rejected explicitly inside the corresponding
+            // shape-validation blocks below. NO_SWAP + hasSplit is rejected
+            // by hasSplit's m1-must-be-Uni check.
+            _validateLeg(plan.swapPlan.leg1);
+        }
 
         // Validate leg2 (must be Uni V2/V3/V4, must link to leg1 output).
         if (plan.swapPlan.hasLeg2) {
@@ -1048,7 +1103,7 @@ contract LiquidationExecutor is
         // Underflow → loss-making opp; native Panic(0x11) is a fail-
         // closed signal the operator should never have submitted.
         uint256 flashFee = flashRepayAmount - plan.loanAmount;
-        _executeSwapPlan(plan.swapPlan, flashRepayAmount, flashFee, collateralAsset, collateralDelta);
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount, flashFee, collateralAsset, collateralDelta, plan.loanToken);
 
         // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
         // BEFORE flash repay. This is the authoritative base that ACTION_PAY_COINBASE
@@ -1112,8 +1167,18 @@ contract LiquidationExecutor is
         uint256 flashRepayAmount,
         uint256 flashFee,
         address collateralAsset,
-        uint256 collateralDelta
+        uint256 collateralDelta,
+        address loanToken
     ) internal {
+        // GENERIC_SEQUENCE: run the flat op list. It produces BOTH loanToken
+        // (repay) and profitToken (profit); this branch asserts the repay leg,
+        // the outer pipeline asserts minProfit + coinbase. Subsumes the shapes
+        // below (which stay for gas-optimal common cases).
+        if (plan.hasGenericSequence) {
+            _runGenericSequence(plan.ops, loanToken, flashRepayAmount);
+            return;
+        }
+
         SwapLeg memory leg1 = plan.leg1;
 
         // NO_SWAP: same-token liquidation (col == loanToken).
@@ -1309,6 +1374,86 @@ contract LiquidationExecutor is
 
         if (plan.hasLeg2) {
             emit TwoLegSwapExecuted(plan.leg2.srcToken, leg1AmountIn, trackedLeftover, trackedLeftover, repayDelta);
+        }
+    }
+
+    /// @dev GENERIC_SEQUENCE executor (Phase 1: direct-call family only).
+    /// Runs `ops` sequentially, each an approve(target)+call(target) against an
+    /// ALLOWLISTED DEX. Runtime amounts (full-balance / previous-op output) are
+    /// patched into the offchain-built calldata at the op's declared offsets.
+    /// Asserts the repay leg here (loanToken delta ≥ flashRepay); the outer
+    /// pipeline asserts minProfit + coinbase from the profitToken delta. The
+    /// executor holds no funds/approvals across txs (approvals reset per op).
+    ///
+    /// SECURITY: entry is `onlyOperator` (caller side); every target is checked
+    /// against `allowedTarget`; calldata patch positions are bounds-checked; a
+    /// hostile/incorrect sequence can only revert, never under-repay/-profit.
+    function _runGenericSequence(Op[] memory ops, address loanToken, uint256 flashRepayAmount) internal {
+        uint256 n = ops.length;
+        if (n == 0) revert EmptyOps();
+        if (n > MAX_OPS) revert TooManyOps();
+
+        uint256 loanBefore = IERC20(loanToken).balanceOf(address(this));
+        uint256 prevReturn = 0;
+
+        for (uint256 i = 0; i < n; ++i) {
+            Op memory op = ops[i];
+            if (!allowedTargets[op.target]) revert TargetNotAllowed();
+
+            // Resolve the input amount for this op.
+            uint256 amount = prevReturn;
+            if (op.flags & FLAG_USE_FULL_BALANCE != 0) {
+                amount = op.srcToken == address(0) ? 0 : IERC20(op.srcToken).balanceOf(address(this));
+            } else if (op.flags & FLAG_USE_PREV_RETURN != 0) {
+                amount = prevReturn;
+            }
+
+            // Patch runtime values into the pre-built calldata (bounds-checked).
+            bytes memory data = op.callData;
+            if (op.fromAmountPos != 0) {
+                _patchWord(data, op.fromAmountPos, amount);
+            }
+            if (op.returnAmountPos != 0) {
+                _patchWord(data, op.returnAmountPos, prevReturn);
+            }
+
+            // Approve exact input to the target (reset to 0 after).
+            if (op.srcToken != address(0) && amount != 0) {
+                IERC20(op.srcToken).forceApprove(op.target, amount);
+            }
+
+            uint256 outBefore = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
+
+            (bool ok, bytes memory ret) = op.target.call{value: op.value}(data);
+            if (!ok) {
+                // Bubble the DEX revert reason if present, else a tagged error.
+                if (ret.length > 0) {
+                    assembly {
+                        revert(add(ret, 0x20), mload(ret))
+                    }
+                }
+                revert OpCallFailed(i);
+            }
+
+            if (op.srcToken != address(0)) {
+                IERC20(op.srcToken).forceApprove(op.target, 0);
+            }
+
+            prevReturn = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this)) - outBefore;
+        }
+
+        // Repay leg gate (mirrors the split/mixed-split repay assertion).
+        uint256 loanAfter = IERC20(loanToken).balanceOf(address(this));
+        uint256 repayDelta = loanAfter > loanBefore ? loanAfter - loanBefore : 0;
+        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+    }
+
+    /// @dev Write a 32-byte `value` into `data` at byte offset `pos`, reverting
+    /// if the write would read/overwrite out of bounds.
+    function _patchWord(bytes memory data, uint256 pos, uint256 value) private pure {
+        if (pos + 32 > data.length) revert CalldataPatchOOB();
+        assembly {
+            mstore(add(add(data, 0x20), pos), value)
         }
     }
 
