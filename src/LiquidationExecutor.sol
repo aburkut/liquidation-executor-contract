@@ -162,6 +162,8 @@ contract LiquidationExecutor is
     error TooManyOps();
     error CalldataPatchOOB();
     error OpCallFailed(uint256 opIndex);
+    error UnexpectedCallback();
+    error V3FactoryNotRegistered();
 
     // ─── Constants ───────────────────────────────────────────────────
     // FLASH_PROVIDER_AAVE_V3 (1) removed — Aave V3 flashloan path deleted.
@@ -216,6 +218,21 @@ contract LiquidationExecutor is
     /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
+
+    /// @dev GENERIC_SEQUENCE V3-callback family. Registers a Uniswap-V3-style
+    /// factory → its pool init-code-hash. A V3 swap op's callback recomputes
+    /// the pool address from `factory + initHash + (token0,token1,fee)` and
+    /// requires the caller to equal it — the authenticity gate that stops a
+    /// fake "pool" from tricking the executor into paying it. initHash == 0
+    /// means the factory is not registered. Owner-curated (same trust root as
+    /// allowedTargets / allowedV4Hooks).
+    mapping(address => bytes32) public v3FactoryInitHash;
+    /// @dev Transient "armed" pool during an in-flight IS_V3_CALLBACK op — the
+    /// only window in which `uniswapV3SwapCallback` is accepted, and only from
+    /// this exact pool. Reset to address(0) around each op; execute() is
+    /// nonReentrant, so it never leaks across calls.
+    address private _armedV3Pool;
+
     // V10+ refactor: the dedicated `allowedExtSwapTargets` allowlist
     // for Curve V1 / Balancer V2 pool targets was removed. The
     // executor holds zero balance between txs, so a hostile or buggy
@@ -304,6 +321,7 @@ contract LiquidationExecutor is
         uint256 finalRepayDelta
     );
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
+    event V3FactoryUpdated(address indexed factory, bytes32 initCodeHash);
     /// @dev V10 audit fix: emitted by `setAllowedTarget` and by the
     /// provider-rotation revocation paths (`setFlashProvider`,
     /// `configureMorpho`) when the old provider's allowlist entry is
@@ -379,7 +397,8 @@ contract LiquidationExecutor is
     // GENERIC_SEQUENCE op flags.
     uint32 private constant FLAG_USE_FULL_BALANCE = 1 << 0; // inject balanceOf(srcToken) at fromAmountPos
     uint32 private constant FLAG_USE_PREV_RETURN = 1 << 1; // inject previous op output at fromAmountPos
-    // Reserved for later steps (callback families): 1<<2.. IS_V3_CALLBACK / IS_V4_UNLOCK.
+    uint32 private constant FLAG_IS_V3_CALLBACK = 1 << 2; // op.target is a V3-style pool; pay in uniswapV3SwapCallback
+    // Reserved: 1<<3 IS_V4_UNLOCK.
 
     uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
@@ -548,6 +567,17 @@ contract LiquidationExecutor is
         if (hook == address(0)) revert ZeroAddress();
         allowedV4Hooks[hook] = allowed;
         emit V4HookAllowedUpdated(hook, allowed);
+    }
+
+    /// @notice Register/deregister a Uniswap-V3-style factory for GENERIC_SEQUENCE
+    /// V3-callback ops. `initCodeHash` is the factory's pool creation-code hash;
+    /// pass bytes32(0) to deregister. Same owner trust root as the other
+    /// allowlists. New pools from a registered factory are covered
+    /// automatically (verified by CREATE2 recomputation in the callback).
+    function setV3Factory(address factory, bytes32 initCodeHash) external onlyOwner {
+        if (factory == address(0)) revert ZeroAddress();
+        v3FactoryInitHash[factory] = initCodeHash;
+        emit V3FactoryUpdated(factory, initCodeHash);
     }
 
     // V10+ refactor: `setExtSwapTarget` removed alongside the
@@ -774,7 +804,12 @@ contract LiquidationExecutor is
             if (nOps == 0) revert EmptyOps();
             if (nOps > MAX_OPS) revert TooManyOps();
             for (uint256 i = 0; i < nOps; ++i) {
-                if (!allowedTargets[plan.swapPlan.ops[i].target]) revert TargetNotAllowed();
+                Op memory o = plan.swapPlan.ops[i];
+                // V3-callback pools are authenticated at runtime (factory
+                // registry), not via allowedTargets — skip them here.
+                if (o.flags & FLAG_IS_V3_CALLBACK == 0 && !allowedTargets[o.target]) {
+                    revert TargetNotAllowed();
+                }
             }
         } else {
             // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
@@ -1398,7 +1433,13 @@ contract LiquidationExecutor is
 
         for (uint256 i = 0; i < n; ++i) {
             Op memory op = ops[i];
-            if (!allowedTargets[op.target]) revert TargetNotAllowed();
+            bool isV3 = op.flags & FLAG_IS_V3_CALLBACK != 0;
+            // Direct-call targets must be allowlisted. V3-callback pools are
+            // instead authenticated by CREATE2 recomputation in
+            // uniswapV3SwapCallback (factory registry), so they are gated there
+            // — calling an unverified target's swap() is safe: we only pay in
+            // the verified callback, and no output trips the repay gate.
+            if (!isV3 && !allowedTargets[op.target]) revert TargetNotAllowed();
 
             // Resolve the input amount for this op.
             uint256 amount = prevReturn;
@@ -1417,9 +1458,14 @@ contract LiquidationExecutor is
                 _patchWord(data, op.returnAmountPos, prevReturn);
             }
 
-            // Approve exact input to the target (reset to 0 after).
-            if (op.srcToken != address(0) && amount != 0) {
+            // Approve exact input to the target (reset to 0 after). V3 pools
+            // pull payment via the callback, so no allowance is granted.
+            if (!isV3 && op.srcToken != address(0) && amount != 0) {
                 IERC20(op.srcToken).forceApprove(op.target, amount);
+            }
+            // Arm the V3 callback window for exactly this pool.
+            if (isV3) {
+                _armedV3Pool = op.target;
             }
 
             uint256 outBefore = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
@@ -1435,7 +1481,9 @@ contract LiquidationExecutor is
                 revert OpCallFailed(i);
             }
 
-            if (op.srcToken != address(0)) {
+            if (isV3) {
+                _armedV3Pool = address(0);
+            } else if (op.srcToken != address(0)) {
                 IERC20(op.srcToken).forceApprove(op.target, 0);
             }
 
@@ -1455,6 +1503,46 @@ contract LiquidationExecutor is
         assembly {
             mstore(add(add(data, 0x20), pos), value)
         }
+    }
+
+    /// @notice Uniswap-V3-style swap callback for GENERIC_SEQUENCE V3 ops.
+    /// Accepted ONLY while an IS_V3_CALLBACK op is in flight (armed) and ONLY
+    /// from the exact armed pool, which must itself be the CREATE2-derived pool
+    /// of a REGISTERED factory — the authenticity gate that stops a fake "pool"
+    /// from being paid. `data` = abi.encode(srcToken, factory, token0, token1,
+    /// fee), built offchain (token0 < token1, sorted).
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        // Must be inside an armed op and from that exact pool.
+        if (_armedV3Pool == address(0) || msg.sender != _armedV3Pool) revert UnexpectedCallback();
+
+        (address srcToken, address factory, address token0, address token1, uint24 fee) =
+            abi.decode(data, (address, address, address, address, uint24));
+
+        bytes32 initHash = v3FactoryInitHash[factory];
+        if (initHash == bytes32(0)) revert V3FactoryNotRegistered();
+        // Authenticity: msg.sender must be the canonical pool for (factory,
+        // token0, token1, fee). A forged caller cannot match a CREATE2 address.
+        if (msg.sender != _computeV3Pool(factory, initHash, token0, token1, fee)) revert UnexpectedCallback();
+
+        // Pay the pool exactly what it is owed (the positive delta = our input).
+        uint256 owed = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
+        IERC20(srcToken).safeTransfer(msg.sender, owed);
+    }
+
+    /// @dev Canonical Uniswap-V3 pool address = CREATE2(factory, salt =
+    /// keccak(token0,token1,fee), initCodeHash).
+    function _computeV3Pool(address factory, bytes32 initHash, address token0, address token1, uint24 fee)
+        private
+        pure
+        returns (address)
+    {
+        return address(
+            uint160(
+                uint256(
+                    keccak256(abi.encodePacked(hex"ff", factory, keccak256(abi.encode(token0, token1, fee)), initHash))
+                )
+            )
+        );
     }
 
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
