@@ -221,12 +221,17 @@ contract LiquidationExecutor is
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
     // V10+ refactor: the dedicated `allowedExtSwapTargets` allowlist
-    // for Curve V1 / Balancer V2 pool targets was removed. The
-    // executor holds zero balance between txs, so a hostile or buggy
-    // pool address can only burn gas — not steal funds. Pool sanity
-    // (`!= 0`, `code.length > 0`) is now enforced inside CurveV1Lib
-    // and BalancerV2Lib themselves; the bot is the trusted source of
-    // pool addresses.
+    // for Curve V1 / Balancer V2 pool targets was removed. Fund safety
+    // for an operator-supplied pool does NOT rest on "zero balance" —
+    // the executor DOES hold and approve up to `amountIn` of collateral
+    // to the pool mid-tx. It rests on: (a) the exact `forceApprove(pool,
+    // amountIn) → call → forceApprove(pool, 0)` reset so the pool can pull
+    // at most the capped `amountIn` and never a standing balance, and
+    // (b) the authoritative post-swap `received >= minAmountOut` balance-
+    // delta floor in CurveV1Lib / BalancerV2Lib (output must land on this
+    // contract). A hostile/buggy pool can therefore only DoS (revert),
+    // not steal. Pool sanity (`!= 0`, `code.length > 0`) is enforced in
+    // those libraries; the bot is the trusted source of pool addresses.
 
     bytes32 private _activePlanHash;
 
@@ -1561,7 +1566,12 @@ contract LiquidationExecutor is
             // attacker produces a zero delta and is rejected (the recipient
             // exfiltration vector the structured legs close via pinned
             // library recipients).
-            uint256 outDelta = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this)) - outBefore;
+            // Saturating delta (matches the rest of the codebase's `x>y?x-y:0`
+            // idiom): if outToken == srcToken and the op net-decreased it, this
+            // reverts cleanly with OpOutputNotReceived instead of a raw-
+            // subtraction Panic(0x11).
+            uint256 outBal = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
+            uint256 outDelta = outBal > outBefore ? outBal - outBefore : 0;
             if (outDelta == 0) revert OpOutputNotReceived(i);
             prevReturn = outDelta;
         }
