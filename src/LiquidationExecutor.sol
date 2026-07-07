@@ -1809,6 +1809,13 @@ contract LiquidationExecutor is
         //   positive = exact-output (BUY,  UNI_V4_BUY)
         // The unlock callback derives isBuy = amountSpec > 0 — no need
         // to pass a separate bool through the wire.
+        // Bound-check the uint256→int256 cast so a value >= 2^255 cannot wrap
+        // the sign and flip the SELL/BUY discriminator. Unreachable for real
+        // token amounts (amountIn <= collateralDelta; minAmountOut token-scale),
+        // but the guard makes the direction encoding robust rather than relying
+        // on magnitudes.
+        uint256 castVal = leg.mode == SwapMode.UNI_V4_BUY ? leg.minAmountOut : amountIn;
+        if (castVal > uint256(type(int256).max)) revert InvalidPlan();
         int256 amountSpec = leg.mode == SwapMode.UNI_V4_BUY ? int256(leg.minAmountOut) : -int256(amountIn);
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
