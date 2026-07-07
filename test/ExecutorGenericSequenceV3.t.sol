@@ -93,8 +93,12 @@ contract ExecutorGenericSequenceV3Test is ExecutorTest {
         // Read the init-code-hash BEFORE the prank — passing it as an inline
         // call argument would consume vm.prank on that call instead.
         bytes32 initHash = factory.poolInitCodeHash();
-        vm.prank(owner);
+        vm.startPrank(owner);
         executor.setV3Factory(address(factory), initHash);
+        // V3-callback pools must now ALSO be allowlisted as targets (the
+        // CREATE2 callback check is defense-in-depth on top of the allowlist).
+        executor.setAllowedTarget(address(pool), true);
+        vm.stopPrank();
     }
 
     function _sorted() internal view returns (address t0, address t1) {

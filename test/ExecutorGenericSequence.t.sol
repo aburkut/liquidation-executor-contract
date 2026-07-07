@@ -256,4 +256,25 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
         executor.execute(plan);
     }
+
+    // Re-audit finding: the per-srcToken cap must protect a standing balance of
+    // ANY token, not only the collateral asset. A sequence that repays via
+    // collateral but ALSO spends a standing non-collateral balance (accumulated
+    // WETH profit awaiting owner rescue) must revert.
+    function test_GenericSequence_StandingNonCollateralDrain_Reverts() public {
+        uint256 standing = 10e18;
+        MockERC20(address(mockWeth)).mint(address(executor), standing); // standing profit
+
+        LiquidationExecutor.Op[] memory ops = new LiquidationExecutor.Op[](2);
+        // op0: legit collateral → loanToken, satisfies the repay gate.
+        ops[0] = _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
+        // op1: spend the standing WETH via an explicit literal amount.
+        ops[1] = _swapOp(address(mockWeth), address(loanToken), 1e18, 0);
+        ops[1].amountIn = standing;
+
+        bytes memory plan = _genericPlan(ops, address(loanToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(); // CollateralOverspent(spent=standing, allowed=0) on WETH
+        executor.execute(plan);
+    }
 }
