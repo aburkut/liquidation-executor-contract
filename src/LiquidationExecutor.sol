@@ -21,7 +21,8 @@ import {CurveV1Lib} from "./libraries/CurveV1Lib.sol";
 import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
 import {SwapValidationLib} from "./libraries/SwapValidationLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
-import {SwapMode, SwapLeg} from "./types/SwapTypes.sol";
+import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
+import {SwapMode, SwapLeg, Op} from "./types/SwapTypes.sol";
 
 // V10+ refactor: IWETH interface moved into CoinbasePaymentLib
 // (the only consumer of `IWETH.withdraw` after `_payCoinbase` migrated).
@@ -162,8 +163,6 @@ contract LiquidationExecutor is
     error TooManyOps();
     error CalldataPatchOOB();
     error OpCallFailed(uint256 opIndex);
-    error UnexpectedCallback();
-    error V3FactoryNotRegistered();
     error CollateralOverspent(uint256 spent, uint256 allowed);
     error OpOutputNotReceived(uint256 opIndex);
 
@@ -263,24 +262,6 @@ contract LiquidationExecutor is
     /// slot 11 packing (read by storage-poking tests) stays untouched.
     address private _activeV4TokenIn;
 
-    /// @dev GENERIC_SEQUENCE V3-callback family. Declared LAST (after every
-    /// slot-hardcoded var) so storage-poking tests' slots stay untouched —
-    /// same rationale as `_activeV4TokenIn` above.
-    /// Registers a Uniswap-V3-style factory → its pool init-code-hash; the V3
-    /// callback recomputes the pool from `factory + initHash + (token0,token1,
-    /// fee)` and requires the caller to equal it (fake-pool authenticity gate).
-    /// initHash == 0 = not registered. Owner-curated.
-    mapping(address => bytes32) public v3FactoryInitHash;
-    /// @dev Transient "armed" pool during an in-flight IS_V3_CALLBACK op — the
-    /// only window `uniswapV3SwapCallback` is accepted, and only from this
-    /// exact pool. Reset around each op; execute() is nonReentrant so it never
-    /// leaks across calls.
-    address private _armedV3Pool;
-    /// @dev The srcToken the armed V3 op will pay — the callback must pay this
-    /// exact token (which the op declared and the per-srcToken cap snapshotted),
-    /// not an arbitrary token from the callback payload.
-    address private _armedV3SrcToken;
-
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
     // V10+: FlashProviderUpdated dropped — both flash providers
@@ -331,7 +312,6 @@ contract LiquidationExecutor is
         uint256 finalRepayDelta
     );
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
-    event V3FactoryUpdated(address indexed factory, bytes32 initCodeHash);
     /// @dev V10 audit fix: emitted by `setAllowedTarget` and by the
     /// provider-rotation revocation paths (`setFlashProvider`,
     /// `configureMorpho`) when the old provider's allowlist entry is
@@ -391,26 +371,13 @@ contract LiquidationExecutor is
         Op[] ops;
     }
 
-    /// @dev One generic DEX call in a GENERIC_SEQUENCE. `callData` is built
-    /// offchain; the executor patches runtime amounts into it before the call.
-    struct Op {
-        address target; // DEX pool / router (must be in `allowedTarget`)
-        uint256 value; // MUST be 0 — native ETH forwarding is forbidden (audit)
-        uint256 amountIn; // explicit input amount when neither FULL_BALANCE nor PREV_RETURN set (e.g. split legs)
-        uint16 fromAmountPos; // byte offset in callData to inject the input amount; 0 = none
-        uint16 returnAmountPos; // byte offset to inject the previous op's output; 0 = none
-        uint32 flags; // see FLAG_* below
-        address srcToken; // token spent by this op (approved to target); 0 = none
-        address outToken; // token received (its balance delta = this op's output)
-        bytes callData; // selector + args, pre-built offchain
-    }
-
-    // GENERIC_SEQUENCE op flags.
-    uint32 private constant FLAG_USE_FULL_BALANCE = 1 << 0; // inject balanceOf(srcToken) at fromAmountPos
-    uint32 private constant FLAG_USE_PREV_RETURN = 1 << 1; // inject previous op output at fromAmountPos
-    uint32 private constant FLAG_IS_V3_CALLBACK = 1 << 2; // op.target is a V3-style pool; pay in uniswapV3SwapCallback
-    uint32 private constant FLAG_IS_V4 = 1 << 3; // op.target is a V4 PoolManager; run via the existing V4 unlock/settle path
-
+    // `Op` (one generic DEX call) is defined in `./types/SwapTypes.sol` and
+    // shared with `GenericSequenceLib`, which holds the op-execution loop
+    // (DELEGATECALL). GENERIC_SEQUENCE supports DIRECT-CALL routing ops only —
+    // ops target allowlisted routers/aggregators whose calldata is built
+    // offchain. (Raw-V3-pool-callback and V4 op variants were removed to stay
+    // under the EIP-170 code-size limit; structured UNI_V4 swap legs remain
+    // fully supported.) Op flags live in `GenericSequenceLib`.
     uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     struct Action {
@@ -578,17 +545,6 @@ contract LiquidationExecutor is
         if (hook == address(0)) revert ZeroAddress();
         allowedV4Hooks[hook] = allowed;
         emit V4HookAllowedUpdated(hook, allowed);
-    }
-
-    /// @notice Register/deregister a Uniswap-V3-style factory for GENERIC_SEQUENCE
-    /// V3-callback ops. `initCodeHash` is the factory's pool creation-code hash;
-    /// pass bytes32(0) to deregister. Same owner trust root as the other
-    /// allowlists. New pools from a registered factory are covered
-    /// automatically (verified by CREATE2 recomputation in the callback).
-    function setV3Factory(address factory, bytes32 initCodeHash) external onlyOwner {
-        if (factory == address(0)) revert ZeroAddress();
-        v3FactoryInitHash[factory] = initCodeHash;
-        emit V3FactoryUpdated(factory, initCodeHash);
     }
 
     // V10+ refactor: `setExtSwapTarget` removed alongside the
@@ -815,8 +771,9 @@ contract LiquidationExecutor is
             if (nOps == 0) revert EmptyOps();
             if (nOps > MAX_OPS) revert TooManyOps();
             for (uint256 i = 0; i < nOps; ++i) {
-                // Every op target must be allowlisted — including V3-callback
-                // pools (the CREATE2 callback check is defense-in-depth on top).
+                // Every op target must be allowlisted. This is the authoritative
+                // target gate — GenericSequenceLib runs the ops via DELEGATECALL
+                // and cannot re-read `allowedTargets`, so it trusts this check.
                 if (!allowedTargets[plan.swapPlan.ops[i].target]) revert TargetNotAllowed();
             }
         } else {
@@ -1218,7 +1175,11 @@ contract LiquidationExecutor is
         // the outer pipeline asserts minProfit + coinbase. Subsumes the shapes
         // below (which stay for gas-optimal common cases).
         if (plan.hasGenericSequence) {
-            _runGenericSequence(plan.ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta);
+            // Op targets were already validated as allowlisted in execute()'s
+            // pre-flashloan validation; the heavy op loop + per-srcToken
+            // containment run in GenericSequenceLib via DELEGATECALL (to keep
+            // this contract under the EIP-170 size limit).
+            GenericSequenceLib.run(plan.ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta);
             return;
         }
 
@@ -1418,240 +1379,6 @@ contract LiquidationExecutor is
         if (plan.hasLeg2) {
             emit TwoLegSwapExecuted(plan.leg2.srcToken, leg1AmountIn, trackedLeftover, trackedLeftover, repayDelta);
         }
-    }
-
-    /// @dev GENERIC_SEQUENCE executor (Phase 1: direct-call family only).
-    /// Runs `ops` sequentially, each an approve(target)+call(target) against an
-    /// ALLOWLISTED DEX. Runtime amounts (full-balance / previous-op output) are
-    /// patched into the offchain-built calldata at the op's declared offsets.
-    /// Asserts the repay leg here (loanToken delta ≥ flashRepay); the outer
-    /// pipeline asserts minProfit + coinbase from the profitToken delta. The
-    /// executor holds no funds/approvals across txs (approvals reset per op).
-    ///
-    /// SECURITY: entry is `onlyOperator` (caller side); every target is checked
-    /// against `allowedTarget`; calldata patch positions are bounds-checked; a
-    /// hostile/incorrect sequence can only revert, never under-repay/-profit.
-    function _runGenericSequence(
-        Op[] memory ops,
-        address loanToken,
-        uint256 flashRepayAmount,
-        address collateralAsset,
-        uint256 collateralDelta
-    ) internal {
-        uint256 n = ops.length;
-        if (n == 0) revert EmptyOps();
-        if (n > MAX_OPS) revert TooManyOps();
-
-        uint256 loanBefore = IERC20(loanToken).balanceOf(address(this));
-
-        // Per-srcToken containment. Snapshot every DISTINCT token any op will
-        // spend so the post-check can bound each token's net spend to what THIS
-        // tx produced — collateralDelta for the collateral asset, ZERO for
-        // everything else. This is what keeps a compromised operator from
-        // routing out a standing/pre-existing balance of ANY token (accumulated
-        // profit awaiting owner rescue, aToken residue, donations) — the
-        // containment every other swap shape gets by pinning srcToken to
-        // collateral. Capping only the collateral asset (the prior fix) left
-        // every other token drainable.
-        address[] memory snapTok = new address[](n);
-        uint256[] memory snapBal = new uint256[](n);
-        uint256 nSnap = 0;
-        for (uint256 i = 0; i < n; ++i) {
-            address t = ops[i].srcToken;
-            if (t == address(0)) continue;
-            bool seen = false;
-            for (uint256 j = 0; j < nSnap; ++j) {
-                if (snapTok[j] == t) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) {
-                snapTok[nSnap] = t;
-                snapBal[nSnap] = IERC20(t).balanceOf(address(this));
-                ++nSnap;
-            }
-        }
-
-        uint256 prevReturn = 0;
-
-        for (uint256 i = 0; i < n; ++i) {
-            Op memory op = ops[i];
-            // No native value is ever needed to swap tokens; forbid it so an op
-            // cannot push the executor's ETH to an arbitrary target.
-            if (op.value != 0) revert InvalidPlan();
-            // EVERY op's target must be allowlisted — INCLUDING V3-callback ops.
-            // Skipping the check for V3 let an op make an arbitrary external
-            // call (e.g. token.transfer to an attacker) that simply never
-            // triggers the callback authentication. A raw V3 pool must be
-            // allowlisted as a target; the CREATE2 callback check is then
-            // defense-in-depth on top.
-            if (!allowedTargets[op.target]) revert TargetNotAllowed();
-            // Every op must declare the token it spends, so the per-srcToken cap
-            // above snapshots it — a srcToken==0 op would otherwise sit outside
-            // the containment set (it is separately blocked by the outDelta>0
-            // check, but requiring srcToken removes that coupling).
-            if (op.srcToken == address(0)) revert InvalidPlan();
-            bool isV3 = op.flags & FLAG_IS_V3_CALLBACK != 0;
-
-            // Resolve the input amount. FULL_BALANCE is restricted to the
-            // collateral asset (capped at collateralDelta); other inputs come
-            // from the previous op's output (chained) or an explicit literal.
-            // The per-srcToken cap below is the real backstop.
-            uint256 amount = op.amountIn;
-            if (op.flags & FLAG_USE_FULL_BALANCE != 0) {
-                if (collateralAsset == address(0) || op.srcToken != collateralAsset) revert InvalidPlan();
-                uint256 bal = IERC20(collateralAsset).balanceOf(address(this));
-                amount = bal < collateralDelta ? bal : collateralDelta;
-            } else if (op.flags & FLAG_USE_PREV_RETURN != 0) {
-                amount = prevReturn;
-            }
-
-            uint256 outBefore = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
-
-            if (op.flags & FLAG_IS_V4 != 0) {
-                // V4: reuse the existing (audited) unlock/settle leg machinery
-                // by synthesising a UNI_V4 leg.
-                SwapLeg memory vleg;
-                vleg.mode = SwapMode.UNI_V4;
-                vleg.srcToken = op.srcToken;
-                vleg.repayToken = op.outToken;
-                vleg.v4PoolManager = op.target;
-                vleg.v4SwapData = op.callData;
-                vleg.deadline = block.timestamp;
-                vleg.minAmountOut = 1; // nominal floor; aggregate gates are the real check
-                _validateV4Leg(vleg);
-                _executeUniV4Leg(vleg, amount);
-            } else {
-                // Patch runtime values into the pre-built calldata (bounds-checked).
-                bytes memory data = op.callData;
-                if (op.fromAmountPos != 0) {
-                    _patchWord(data, op.fromAmountPos, amount);
-                }
-                if (op.returnAmountPos != 0) {
-                    _patchWord(data, op.returnAmountPos, prevReturn);
-                }
-
-                // Approve exact input (reset to 0 after). V3 pools pull payment
-                // via the callback, so no allowance is granted; instead the
-                // armed pool + srcToken pin the callback to this exact op.
-                if (!isV3 && op.srcToken != address(0) && amount != 0) {
-                    IERC20(op.srcToken).forceApprove(op.target, amount);
-                }
-                if (isV3) {
-                    _armedV3Pool = op.target;
-                    _armedV3SrcToken = op.srcToken;
-                }
-
-                (bool ok, bytes memory ret) = op.target.call(data); // op.value == 0 (checked above)
-                if (!ok) {
-                    if (ret.length > 0) {
-                        assembly {
-                            revert(add(ret, 0x20), mload(ret))
-                        }
-                    }
-                    revert OpCallFailed(i);
-                }
-
-                if (isV3) {
-                    _armedV3Pool = address(0);
-                    _armedV3SrcToken = address(0);
-                } else if (op.srcToken != address(0)) {
-                    IERC20(op.srcToken).forceApprove(op.target, 0);
-                }
-            }
-
-            // Output MUST accrue to the executor — this pins the swap recipient
-            // to this contract. An op whose raw calldata routed output to an
-            // attacker produces a zero delta and is rejected (the recipient
-            // exfiltration vector the structured legs close via pinned
-            // library recipients).
-            // Saturating delta (matches the rest of the codebase's `x>y?x-y:0`
-            // idiom): if outToken == srcToken and the op net-decreased it, this
-            // reverts cleanly with OpOutputNotReceived instead of a raw-
-            // subtraction Panic(0x11).
-            uint256 outBal = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
-            uint256 outDelta = outBal > outBefore ? outBal - outBefore : 0;
-            if (outDelta == 0) revert OpOutputNotReceived(i);
-            prevReturn = outDelta;
-        }
-
-        // Repay leg gate (mirrors the split/mixed-split repay assertion).
-        uint256 loanAfter = IERC20(loanToken).balanceOf(address(this));
-        uint256 repayDelta = loanAfter > loanBefore ? loanAfter - loanBefore : 0;
-        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
-
-        // Per-srcToken containment cap: no token may be net-spent past what this
-        // tx produced (collateralDelta for the collateral asset, 0 otherwise).
-        // Intermediates produced within the sequence raise their balance above
-        // the snapshot, so spending them stays within budget; a standing
-        // balance can never drop below its pre-sequence level.
-        for (uint256 k = 0; k < nSnap; ++k) {
-            uint256 allowed = snapTok[k] == collateralAsset ? collateralDelta : 0;
-            uint256 balAfter = IERC20(snapTok[k]).balanceOf(address(this));
-            uint256 spent = snapBal[k] > balAfter ? snapBal[k] - balAfter : 0;
-            if (spent > allowed) revert CollateralOverspent(spent, allowed);
-        }
-    }
-
-    /// @dev Write a 32-byte `value` into `data` at byte offset `pos`, reverting
-    /// if the write would read/overwrite out of bounds.
-    function _patchWord(bytes memory data, uint256 pos, uint256 value) private pure {
-        if (pos + 32 > data.length) revert CalldataPatchOOB();
-        assembly {
-            mstore(add(add(data, 0x20), pos), value)
-        }
-    }
-
-    /// @notice Uniswap-V3-style swap callback for GENERIC_SEQUENCE V3 ops.
-    /// Accepted ONLY while an IS_V3_CALLBACK op is in flight (armed) and ONLY
-    /// from the exact armed pool, which must itself be the CREATE2-derived pool
-    /// of a REGISTERED factory — the authenticity gate that stops a fake "pool"
-    /// from being paid. `data` = abi.encode(srcToken, factory, token0, token1,
-    /// fee), built offchain (token0 < token1, sorted).
-    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
-        // Must be inside the active flashloan window AND an armed op, from that
-        // exact pool (phase check mirrors unlockCallback — defense-in-depth).
-        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert UnexpectedCallback();
-        if (_armedV3Pool == address(0) || msg.sender != _armedV3Pool) revert UnexpectedCallback();
-
-        (address srcToken, address factory, address token0, address token1, uint24 fee) =
-            abi.decode(data, (address, address, address, address, uint24));
-
-        // srcToken (what we pay) must be EXACTLY the token the armed op declared
-        // as its srcToken — that token was snapshotted by the per-srcToken cap,
-        // so the payment cannot dip into some other standing balance.
-        if (srcToken != _armedV3SrcToken) revert UnexpectedCallback();
-        // …and it must be the pool token on the side we actually owe (the
-        // positive delta), not just any pool token — a direction cross-check.
-        address owedToken = amount0Delta > 0 ? token0 : token1;
-        if (srcToken != owedToken) revert UnexpectedCallback();
-
-        bytes32 initHash = v3FactoryInitHash[factory];
-        if (initHash == bytes32(0)) revert V3FactoryNotRegistered();
-        // Authenticity: msg.sender must be the canonical pool for (factory,
-        // token0, token1, fee). A forged caller cannot match a CREATE2 address.
-        if (msg.sender != _computeV3Pool(factory, initHash, token0, token1, fee)) revert UnexpectedCallback();
-
-        // Pay the pool exactly what it is owed (the positive delta = our input).
-        uint256 owed = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
-        IERC20(srcToken).safeTransfer(msg.sender, owed);
-    }
-
-    /// @dev Canonical Uniswap-V3 pool address = CREATE2(factory, salt =
-    /// keccak(token0,token1,fee), initCodeHash).
-    function _computeV3Pool(address factory, bytes32 initHash, address token0, address token1, uint24 fee)
-        private
-        pure
-        returns (address)
-    {
-        return address(
-            uint160(
-                uint256(
-                    keccak256(abi.encodePacked(hex"ff", factory, keccak256(abi.encode(token0, token1, fee)), initHash))
-                )
-            )
-        );
     }
 
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {

@@ -9,7 +9,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 import {UniswapLib} from "../src/libraries/UniswapLib.sol";
-import {SwapMode, SwapLeg} from "../src/types/SwapTypes.sol";
+import {SwapMode, SwapLeg, Op} from "../src/types/SwapTypes.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
 import {MarketParams} from "../src/interfaces/IMorphoBlue.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -560,7 +560,7 @@ contract ExecutorTest is Test {
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -599,7 +599,7 @@ contract ExecutorTest is Test {
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -639,7 +639,7 @@ contract ExecutorTest is Test {
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -677,7 +677,7 @@ contract ExecutorTest is Test {
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -718,7 +718,7 @@ contract ExecutorTest is Test {
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -740,7 +740,7 @@ contract ExecutorTest is Test {
     {
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: true,
             leg2: leg2,
@@ -1557,7 +1557,7 @@ contract ExecutorTest is Test {
             _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), seizedAssets);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -1658,7 +1658,7 @@ contract ExecutorTest is Test {
         uint256 expiredDeadline = block.timestamp - 1;
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2450,7 +2450,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2511,7 +2511,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2557,7 +2557,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2607,7 +2607,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2652,7 +2652,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2695,7 +2695,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2738,7 +2738,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2782,7 +2782,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2833,7 +2833,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2879,7 +2879,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2922,7 +2922,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -2965,7 +2965,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3005,7 +3005,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3054,7 +3054,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3091,7 +3091,7 @@ contract ExecutorTest is Test {
         address badRecipient = address(0xBAAD);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3136,7 +3136,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3193,7 +3193,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3291,7 +3291,7 @@ contract ExecutorTest is Test {
         // Build swap plan
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3382,7 +3382,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3467,7 +3467,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3569,7 +3569,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3664,7 +3664,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -3933,7 +3933,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -4586,7 +4586,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -4705,7 +4705,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -5420,7 +5420,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -5641,7 +5641,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -5681,7 +5681,7 @@ contract ExecutorTest is Test {
         bytes memory cd = _buildBalancerV2InvalidBlobCalldata(SWAP_EXACT_IN_BALANCER_V2_SELECTOR);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -5725,7 +5725,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -5774,7 +5774,7 @@ contract ExecutorTest is Test {
     function _runAcceptedSwap(bytes memory cd) internal {
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -5813,7 +5813,7 @@ contract ExecutorTest is Test {
     function _expectRejectedSwap(bytes memory cd, bytes4 expectedSelector) internal {
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -5868,7 +5868,7 @@ contract ExecutorTest is Test {
         // Build a minimal plan using the crafted calldata.
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -5911,7 +5911,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken),
@@ -6250,7 +6250,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6313,7 +6313,7 @@ contract ExecutorTest is Test {
         });
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6360,7 +6360,7 @@ contract ExecutorTest is Test {
         });
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6403,7 +6403,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6463,7 +6463,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6503,7 +6503,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6550,7 +6550,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6614,7 +6614,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6667,7 +6667,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6710,7 +6710,7 @@ contract ExecutorTest is Test {
             _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, path, 1);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6736,7 +6736,7 @@ contract ExecutorTest is Test {
             _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, path, 1);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6762,7 +6762,7 @@ contract ExecutorTest is Test {
             _buildUniV3MultihopSellLeg(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, badPath, 1);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6793,7 +6793,7 @@ contract ExecutorTest is Test {
             _buildUniV3MultihopBuyLeg(address(collateralToken), address(loanToken), 1000e18, forwardPath, 1100e18);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6822,7 +6822,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6854,7 +6854,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6883,7 +6883,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6913,7 +6913,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6945,7 +6945,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6977,7 +6977,7 @@ contract ExecutorTest is Test {
         SwapLeg memory leg1 = _buildUniV2BuyLeg(address(collateralToken), address(loanToken), 100e18, 1100e18);
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -7019,7 +7019,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -7061,7 +7061,7 @@ contract ExecutorTest is Test {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -7974,7 +7974,7 @@ contract ExecutorTest is Test {
     ) internal pure returns (LiquidationExecutor.SwapPlan memory) {
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: repayLeg,
             hasLeg2: false,
             leg2: profitLeg,
@@ -8089,7 +8089,7 @@ contract ExecutorTest is Test {
     ) internal pure returns (LiquidationExecutor.SwapPlan memory) {
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: repayLeg,
             hasLeg2: false,
             leg2: profitLeg,
@@ -8277,7 +8277,7 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: repayLeg,
             hasLeg2: false,
             leg2: profitLeg,
@@ -8398,7 +8398,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
     {
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.NO_SWAP,
                 srcToken: token,
@@ -8553,7 +8553,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
         // leg1: srcToken == aToken (skip-unwrap signal), repayToken == loanToken.
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(aToken),
@@ -8634,7 +8634,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: address(collateralToken), // underlying, NOT aToken
@@ -8729,7 +8729,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: noSwapLeg,
             hasLeg2: false,
             leg2: profitLeg,
@@ -8785,7 +8785,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: noSwapLeg,
             hasLeg2: false,
             leg2: profitLeg,
@@ -8835,7 +8835,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: noSwapLeg,
             hasLeg2: false,
             leg2: profitLeg,
@@ -8898,7 +8898,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: noSwapLeg,
             hasLeg2: true,
             leg2: leg2,
@@ -8933,7 +8933,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: SwapLeg({
                 mode: SwapMode.PARASWAP_SINGLE,
                 srcToken: bogus, // neither collateralToken nor aToken
@@ -9219,7 +9219,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     {
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: _curveV1Leg(
                 m,
                 address(collateralToken),
@@ -9249,7 +9249,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     {
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: _balancerV2Leg(
                 m,
                 address(collateralToken),
@@ -9327,7 +9327,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9420,7 +9420,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: true,
             leg2: leg2,
@@ -9534,7 +9534,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: true,
             leg2: leg2,
@@ -9575,7 +9575,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         leg.bebopCalldata = ""; // strip ext-data after building
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9608,7 +9608,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         leg.bebopCalldata = new bytes(95);
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9639,7 +9639,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9674,7 +9674,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9705,7 +9705,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9780,7 +9780,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9805,7 +9805,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9846,7 +9846,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         leg.bebopCalldata = "";
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9875,7 +9875,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9907,7 +9907,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9936,7 +9936,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9983,7 +9983,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -10008,7 +10008,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -10033,7 +10033,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -10084,7 +10084,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: true,
             leg2: leg2,
@@ -10129,7 +10129,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: true,
             leg2: leg2,
@@ -10191,7 +10191,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -10248,7 +10248,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -10327,7 +10327,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             );
             LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
                 hasGenericSequence: false,
-                ops: new LiquidationExecutor.Op[](0),
+                ops: new Op[](0),
                 leg1: leg,
                 hasLeg2: false,
                 leg2: _zeroLeg(),
@@ -10402,7 +10402,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             );
             LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
                 hasGenericSequence: false,
-                ops: new LiquidationExecutor.Op[](0),
+                ops: new Op[](0),
                 leg1: leg,
                 hasLeg2: false,
                 leg2: _zeroLeg(),
@@ -10448,7 +10448,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         leg.bebopCalldata = new bytes(len);
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -10480,7 +10480,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         leg.bebopCalldata = new bytes(len);
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -10547,7 +10547,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -10640,7 +10640,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: leg2,
@@ -10692,7 +10692,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         });
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: leg2,
@@ -10771,7 +10771,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: true,
             leg2: leg2,

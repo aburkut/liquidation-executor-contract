@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {ExecutorTest} from "./Executor.t.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
+import {Op} from "../src/types/SwapTypes.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 interface IMiniERC20 {
@@ -59,7 +60,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     function _swapOp(address tokenIn, address tokenOut, uint256 rate, uint32 flags)
         internal
         view
-        returns (LiquidationExecutor.Op memory op)
+        returns (Op memory op)
     {
         op.target = address(dex);
         op.srcToken = tokenIn;
@@ -69,11 +70,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         op.callData = _dexCall(tokenIn, tokenOut, rate);
     }
 
-    function _genericPlan(LiquidationExecutor.Op[] memory ops, address profitTkn, uint256 minProfit)
-        internal
-        view
-        returns (bytes memory)
-    {
+    function _genericPlan(Op[] memory ops, address profitTkn, uint256 minProfit) internal view returns (bytes memory) {
         LiquidationExecutor.SwapPlan memory sp;
         sp.hasGenericSequence = true;
         sp.ops = ops;
@@ -82,22 +79,22 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         return _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
     }
 
-    function _oneOp(LiquidationExecutor.Op memory op) internal pure returns (LiquidationExecutor.Op[] memory ops) {
-        ops = new LiquidationExecutor.Op[](1);
+    function _oneOp(Op memory op) internal pure returns (Op[] memory ops) {
+        ops = new Op[](1);
         ops[0] = op;
     }
 
     // ── validation gates (pre-flashloan) ─────────────────────────────
 
     function test_GenericSequence_EmptyOps_Reverts() public {
-        bytes memory plan = _genericPlan(new LiquidationExecutor.Op[](0), address(mockWeth), 0);
+        bytes memory plan = _genericPlan(new Op[](0), address(mockWeth), 0);
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.EmptyOps.selector);
         executor.execute(plan);
     }
 
     function test_GenericSequence_TooManyOps_Reverts() public {
-        LiquidationExecutor.Op[] memory ops = new LiquidationExecutor.Op[](33);
+        Op[] memory ops = new Op[](33);
         for (uint256 i = 0; i < 33; ++i) {
             ops[i].target = address(morphoBlue); // allowlisted; length check fires first
         }
@@ -108,7 +105,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     }
 
     function test_GenericSequence_UnlistedTarget_Reverts() public {
-        LiquidationExecutor.Op[] memory ops = new LiquidationExecutor.Op[](1);
+        Op[] memory ops = new Op[](1);
         ops[0].target = address(0xDEAD);
         bytes memory plan = _genericPlan(ops, address(mockWeth), 0);
         vm.prank(operatorAddr);
@@ -117,7 +114,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     }
 
     function test_GenericSequence_ConflictsWithOtherShape_Reverts() public {
-        LiquidationExecutor.Op[] memory ops = new LiquidationExecutor.Op[](1);
+        Op[] memory ops = new Op[](1);
         ops[0].target = address(dex);
         LiquidationExecutor.SwapPlan memory sp;
         sp.hasGenericSequence = true;
@@ -146,8 +143,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     function test_GenericSequence_DirectCall_HappyPath() public {
         // Full-balance collateral → loanToken at 1.1×: covers flashRepay
         // (1001e18) and leaves loanToken profit.
-        LiquidationExecutor.Op memory op =
-            _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
+        Op memory op = _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
         bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 1e18);
 
         uint256 before = loanToken.balanceOf(address(executor));
@@ -160,8 +156,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
 
     function test_GenericSequence_UnderRepay_Reverts() public {
         // 0.5× output cannot cover the flash repay → InsufficientRepayOutput.
-        LiquidationExecutor.Op memory op =
-            _swapOp(address(collateralToken), address(loanToken), 0.5e18, FLAG_FULL_BALANCE);
+        Op memory op = _swapOp(address(collateralToken), address(loanToken), 0.5e18, FLAG_FULL_BALANCE);
         bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
         vm.prank(operatorAddr);
         vm.expectRevert(); // InsufficientRepayOutput(actual, required)
@@ -170,8 +165,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
 
     function test_GenericSequence_UnderProfit_Reverts() public {
         // Repay is covered (1.1×) but minProfit is set absurdly high.
-        LiquidationExecutor.Op memory op =
-            _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
+        Op memory op = _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
         bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 1_000_000e18);
         vm.prank(operatorAddr);
         vm.expectRevert(); // InsufficientProfit(actual, required)
@@ -180,8 +174,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
 
     function test_GenericSequence_OOBPatch_Reverts() public {
         // fromAmountPos past the end of callData → CalldataPatchOOB.
-        LiquidationExecutor.Op memory op =
-            _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
+        Op memory op = _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
         op.fromAmountPos = 200; // callData is 132 bytes
         bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
         vm.prank(operatorAddr);
@@ -193,7 +186,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         // op0: full collateral → intermediate (1.0×); op1: prev-return
         // intermediate → loanToken (1.1×). Verifies output-of-prev feeds the
         // next op's amount, and the chain repays + profits.
-        LiquidationExecutor.Op[] memory ops = new LiquidationExecutor.Op[](2);
+        Op[] memory ops = new Op[](2);
         ops[0] = _swapOp(address(collateralToken), address(interToken), 1e18, FLAG_FULL_BALANCE);
         ops[1] = _swapOp(address(interToken), address(loanToken), 1.1e18, FLAG_PREV_RETURN);
         bytes memory plan = _genericPlan(ops, address(loanToken), 1e18);
@@ -203,31 +196,12 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         assertEq(interToken.allowance(address(executor), address(dex)), 0, "inter approval reset");
     }
 
-    // ── V4 family: op reuses the existing unlock/settle leg machinery ──
-    function test_GenericSequence_V4_HappyPath() public {
-        // uniV4Mock is allowlisted + funded by the base setUp. v4SwapData is
-        // the single-hop shape abi.encode(src, dst, fee, tickSpacing, hook).
-        uint32 flagV4 = 1 << 3;
-        LiquidationExecutor.Op memory op;
-        op.target = address(uniV4Mock);
-        op.srcToken = address(collateralToken);
-        op.outToken = address(loanToken);
-        op.flags = flagV4 | FLAG_FULL_BALANCE;
-        op.callData = abi.encode(address(collateralToken), address(loanToken), uint24(3000), int24(60), address(0));
-
-        bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 1e18);
-        uint256 before = loanToken.balanceOf(address(executor));
-        vm.prank(operatorAddr);
-        executor.execute(plan);
-        assertGe(loanToken.balanceOf(address(executor)), before, "V4 profit retained");
-    }
-
     // ── containment (audit fix): compromised operator cannot drain ──
 
     function test_GenericSequence_FullBalanceOnNonCollateral_Reverts() public {
         // FULL_BALANCE is permitted ONLY for the collateral asset, so it can
         // never sweep a standing balance of some other token.
-        LiquidationExecutor.Op memory op = _swapOp(address(loanToken), address(loanToken), 1e18, FLAG_FULL_BALANCE);
+        Op memory op = _swapOp(address(loanToken), address(loanToken), 1e18, FLAG_FULL_BALANCE);
         bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
@@ -239,7 +213,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         // collateralDelta (COLLATERAL_REWARD) via an explicit literal amount →
         // CollateralOverspent (the containment cap).
         collateralToken.mint(address(executor), 500e18); // standing balance
-        LiquidationExecutor.Op memory op = _swapOp(address(collateralToken), address(loanToken), 1.1e18, 0);
+        Op memory op = _swapOp(address(collateralToken), address(loanToken), 1.1e18, 0);
         op.amountIn = COLLATERAL_REWARD + 500e18; // dips into the standing 500e18
         bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
         vm.prank(operatorAddr);
@@ -248,8 +222,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     }
 
     function test_GenericSequence_NonZeroValue_Reverts() public {
-        LiquidationExecutor.Op memory op =
-            _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
+        Op memory op = _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
         op.value = 1; // native ETH forwarding forbidden
         bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
         vm.prank(operatorAddr);
@@ -265,7 +238,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         uint256 standing = 10e18;
         MockERC20(address(mockWeth)).mint(address(executor), standing); // standing profit
 
-        LiquidationExecutor.Op[] memory ops = new LiquidationExecutor.Op[](2);
+        Op[] memory ops = new Op[](2);
         // op0: legit collateral → loanToken, satisfies the repay gate.
         ops[0] = _swapOp(address(collateralToken), address(loanToken), 1.1e18, FLAG_FULL_BALANCE);
         // op1: spend the standing WETH via an explicit literal amount.

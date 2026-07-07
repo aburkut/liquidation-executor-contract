@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {LiquidationExecutor} from "../../src/LiquidationExecutor.sol";
-import {SwapMode, SwapLeg} from "../../src/types/SwapTypes.sol";
+import {SwapMode, SwapLeg, Op} from "../../src/types/SwapTypes.sol";
 
 /// @title ExecutorForkV4Test
 /// @notice FORK-ONLY tests for the Uniswap V4 swap path against the real
@@ -116,7 +116,7 @@ contract ExecutorForkV4Test is Test {
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: false,
             leg2: _zeroLeg(),

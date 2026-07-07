@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import {ExecutorTest} from "./Executor.t.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
-import {SwapMode, SwapLeg} from "../src/types/SwapTypes.sol";
+import {SwapMode, SwapLeg, Op} from "../src/types/SwapTypes.sol";
 import {CurveV1Lib} from "../src/libraries/CurveV1Lib.sol";
 import {BalancerV2Lib, IBalancerV2Vault} from "../src/libraries/BalancerV2Lib.sol";
 import {SwapValidationLib} from "../src/libraries/SwapValidationLib.sol";
@@ -108,7 +108,7 @@ contract ExecutorMultihopTest is ExecutorTest {
     {
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: _curveMHLeg(
                 m, address(collateralToken), address(loanToken), address(curveRouter), path, amountIn, minOut, false
             ),
@@ -463,7 +463,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -496,7 +496,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         leg.bebopCalldata = hex"de";
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -525,7 +525,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -637,7 +637,7 @@ contract ExecutorMultihopTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -692,7 +692,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -737,7 +737,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -781,7 +781,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -817,7 +817,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -853,7 +853,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -885,7 +885,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         leg.bebopCalldata = hex"de"; // below 192-byte sanity floor
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -916,7 +916,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -949,7 +949,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -985,7 +985,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg,
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -1122,7 +1122,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: leg1,
             hasLeg2: true,
             leg2: leg2,
@@ -1171,7 +1171,7 @@ contract ExecutorMultihopTest is ExecutorTest {
 
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
-            ops: new LiquidationExecutor.Op[](0),
+            ops: new Op[](0),
             leg1: repayLeg,
             hasLeg2: false,
             leg2: profitLeg,

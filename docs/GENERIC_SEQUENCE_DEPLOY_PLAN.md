@@ -53,12 +53,12 @@ executor + the route-variant fan-out (#184–#186) — untouched.
      generator's direct-call target), plus any Curve router / Balancer Vault /
      Uni V2 router the bot routes through.
    - Flash providers (Balancer Vault, Morpho) are constructor-pinned — no action.
-4. **Register V3 factories** (`setV3Factory(factory, initCodeHash)`, owner) if
-   raw-V3-callback ops will be used (the direct-call SwapRouter path does NOT
-   need this — the router handles the callback). Canonical Uni V3 factory +
-   its pool init-code-hash.
+4. **(removed)** `setV3Factory` / raw-V3-pool-callback ops and V4 ops were
+   dropped from GENERIC_SEQUENCE to fit under the EIP-170 code-size limit — the
+   generator only ever emitted direct-call SwapRouter ops. Nothing to register.
+   Structured UNI_V4 swap legs (normal leg plans) are unaffected.
 5. **V4 hooks** (`setV4HookAllowed`) — keep EMPTY unless a specific hook is
-   needed and audited.
+   needed and audited (still relevant for structured UNI_V4 legs).
 6. **Sanity:** run one small liquidation through a leg-based plan (existing
    shape) against the new executor on a fork/tenderly before the bot cutover.
 
