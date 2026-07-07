@@ -1482,6 +1482,11 @@ contract LiquidationExecutor is
             // allowlisted as a target; the CREATE2 callback check is then
             // defense-in-depth on top.
             if (!allowedTargets[op.target]) revert TargetNotAllowed();
+            // Every op must declare the token it spends, so the per-srcToken cap
+            // above snapshots it — a srcToken==0 op would otherwise sit outside
+            // the containment set (it is separately blocked by the outDelta>0
+            // check, but requiring srcToken removes that coupling).
+            if (op.srcToken == address(0)) revert InvalidPlan();
             bool isV3 = op.flags & FLAG_IS_V3_CALLBACK != 0;
 
             // Resolve the input amount. FULL_BALANCE is restricted to the
