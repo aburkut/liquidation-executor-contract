@@ -91,3 +91,18 @@ struct SwapLeg {
     address repayToken;
     uint256 minAmountOut;
 }
+
+/// @dev One generic DEX call in a GENERIC_SEQUENCE (direct-call routing).
+/// `callData` is built offchain; the executor patches runtime amounts into it
+/// before the call. Shared by `LiquidationExecutor` and `GenericSequenceLib`.
+struct Op {
+    address target; // DEX router/aggregator (must be in `allowedTargets`)
+    uint256 value; // MUST be 0 — native ETH forwarding is forbidden (audit)
+    uint256 amountIn; // explicit input amount when neither FULL_BALANCE nor PREV_RETURN set
+    uint16 fromAmountPos; // byte offset in callData to inject the input amount; 0 = none
+    uint16 returnAmountPos; // byte offset to inject the previous op's output; 0 = none
+    uint32 flags; // see GenericSequenceLib FLAG_*
+    address srcToken; // token spent by this op (approved to target)
+    address outToken; // token received (its balance delta = this op's output)
+    bytes callData; // selector + args, pre-built offchain
+}

@@ -358,6 +358,11 @@ library UniswapLib {
         V4Hop[] memory hopArr = abi.decode(data, (V4Hop[]));
         uint256 nHops = hopArr.length;
         if (nHops < 2) revert InvalidPlan();
+        // Upper bound the hop count: the uniqueness check below is O(n²) with a
+        // per-hop external hookAllowed CALL, so an unbounded nHops is a gas
+        // grief vector (operator-only today, but a cheap belt-and-suspenders and
+        // parity with MAX_OPS / MAX_ACTIONS). 10 hops far exceeds any real route.
+        if (nHops > 10) revert InvalidPlan();
         // Reject non-simple paths: every hop's tokenOut must be unique
         // and must NOT equal srcToken. The prior validator only blocked
         // immediate self-loops (curIn == h.tokenOut). Multi-hop paths

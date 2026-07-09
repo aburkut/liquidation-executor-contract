@@ -21,7 +21,8 @@ import {CurveV1Lib} from "./libraries/CurveV1Lib.sol";
 import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
 import {SwapValidationLib} from "./libraries/SwapValidationLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
-import {SwapMode, SwapLeg} from "./types/SwapTypes.sol";
+import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
+import {SwapMode, SwapLeg, Op} from "./types/SwapTypes.sol";
 
 // V10+ refactor: IWETH interface moved into CoinbasePaymentLib
 // (the only consumer of `IWETH.withdraw` after `_payCoinbase` migrated).
@@ -157,6 +158,14 @@ contract LiquidationExecutor is
     /// just passed in), and no on-chain consumer parses the arg.
     error TargetNotAllowed();
 
+    // ─── GENERIC_SEQUENCE errors ─────────────────────────────────────
+    error EmptyOps();
+    error TooManyOps();
+    error CalldataPatchOOB();
+    error OpCallFailed(uint256 opIndex);
+    error CollateralOverspent(uint256 spent, uint256 allowed);
+    error OpOutputNotReceived(uint256 opIndex);
+
     // ─── Constants ───────────────────────────────────────────────────
     // FLASH_PROVIDER_AAVE_V3 (1) removed — Aave V3 flashloan path deleted.
     // IDs 2 and 3 kept stable for bot integration compatibility.
@@ -211,12 +220,17 @@ contract LiquidationExecutor is
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
     // V10+ refactor: the dedicated `allowedExtSwapTargets` allowlist
-    // for Curve V1 / Balancer V2 pool targets was removed. The
-    // executor holds zero balance between txs, so a hostile or buggy
-    // pool address can only burn gas — not steal funds. Pool sanity
-    // (`!= 0`, `code.length > 0`) is now enforced inside CurveV1Lib
-    // and BalancerV2Lib themselves; the bot is the trusted source of
-    // pool addresses.
+    // for Curve V1 / Balancer V2 pool targets was removed. Fund safety
+    // for an operator-supplied pool does NOT rest on "zero balance" —
+    // the executor DOES hold and approve up to `amountIn` of collateral
+    // to the pool mid-tx. It rests on: (a) the exact `forceApprove(pool,
+    // amountIn) → call → forceApprove(pool, 0)` reset so the pool can pull
+    // at most the capped `amountIn` and never a standing balance, and
+    // (b) the authoritative post-swap `received >= minAmountOut` balance-
+    // delta floor in CurveV1Lib / BalancerV2Lib (output must land on this
+    // contract). A hostile/buggy pool can therefore only DoS (revert),
+    // not steal. Pool sanity (`!= 0`, `code.length > 0`) is enforced in
+    // those libraries; the bot is the trusted source of pool addresses.
 
     bytes32 private _activePlanHash;
 
@@ -348,7 +362,23 @@ contract LiquidationExecutor is
         bool hasMixedSplit;
         address profitToken;
         uint256 minProfitAmount;
+        // GENERIC_SEQUENCE (additive, Phase 1) — a flat, offchain-built list of
+        // DEX calls executed sequentially. Subsumes the 2-leg topology: the ops
+        // produce BOTH loanToken (repay) and profitToken (profit), and the same
+        // repay + minProfit + coinbase gates apply. Enables value-splits and
+        // adding DEXes offchain without a redeploy. See docs/GENERIC_SEQUENCE_DESIGN.md.
+        bool hasGenericSequence;
+        Op[] ops;
     }
+
+    // `Op` (one generic DEX call) is defined in `./types/SwapTypes.sol` and
+    // shared with `GenericSequenceLib`, which holds the op-execution loop
+    // (DELEGATECALL). GENERIC_SEQUENCE supports DIRECT-CALL routing ops only —
+    // ops target allowlisted routers/aggregators whose calldata is built
+    // offchain. (Raw-V3-pool-callback and V4 op variants were removed to stay
+    // under the EIP-170 code-size limit; structured UNI_V4 swap legs remain
+    // fully supported.) Op flags live in `GenericSequenceLib`.
+    uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     struct Action {
         uint8 protocolId;
@@ -690,8 +720,13 @@ contract LiquidationExecutor is
         // Final-leg repayToken MUST equal outer loanToken. For hasSplit, leg1
         // IS the repay leg (collateral → loanToken), matching the single-leg
         // derivation since hasLeg2 is forbidden in split mode (see block below).
-        address finalRepayToken = plan.swapPlan.hasLeg2 ? plan.swapPlan.leg2.repayToken : plan.swapPlan.leg1.repayToken;
-        if (finalRepayToken != plan.loanToken) revert InvalidPlan();
+        // GENERIC_SEQUENCE derives repay from the loanToken balance delta, not
+        // from a leg's repayToken — skip the leg-based final-repay-token check.
+        if (!plan.swapPlan.hasGenericSequence) {
+            address finalRepayToken =
+                plan.swapPlan.hasLeg2 ? plan.swapPlan.leg2.repayToken : plan.swapPlan.leg1.repayToken;
+            if (finalRepayToken != plan.loanToken) revert InvalidPlan();
+        }
 
         // Validate all actions use same debt/collateral assets
         (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
@@ -702,7 +737,10 @@ contract LiquidationExecutor is
         // becomes the swap input). trackingToken differs from
         // collateralAsset only when receiveAToken=true, so the aToken
         // path is only reachable with that setting.
-        if (collateralAsset != address(0)) {
+        // GENERIC_SEQUENCE spends collateral via its ops (each op's srcToken is
+        // approved to an allowlisted target), so the leg1.srcToken linkage check
+        // does not apply.
+        if (collateralAsset != address(0) && !plan.swapPlan.hasGenericSequence) {
             address src = plan.swapPlan.leg1.srcToken;
             if (src != collateralAsset && src != trackingToken) {
                 revert SrcTokenNotCollateral(collateralAsset, src);
@@ -720,16 +758,33 @@ contract LiquidationExecutor is
             if (plan.swapPlan.hasLeg2) shapeCount++;
             if (plan.swapPlan.hasSplit) shapeCount++;
             if (plan.swapPlan.hasMixedSplit) shapeCount++;
+            if (plan.swapPlan.hasGenericSequence) shapeCount++;
             if (shapeCount > 1) revert PlanShapeConflict();
         }
 
-        // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
-        // a single-leg plan — combined with hasLeg2 / hasMixedSplit it
-        // would silently bypass the second leg in _executeSwapPlan. Both
-        // combinations are rejected explicitly inside the corresponding
-        // shape-validation blocks below. NO_SWAP + hasSplit is rejected
-        // by hasSplit's m1-must-be-Uni check.
-        _validateLeg(plan.swapPlan.leg1);
+        // GENERIC_SEQUENCE: validate the op list instead of the legs (legs are
+        // unused). Non-empty, bounded, and every target allowlisted (the
+        // runtime re-checks each target too). The has* shape blocks below all
+        // self-skip (their flags are false, enforced by the XOR guard above).
+        if (plan.swapPlan.hasGenericSequence) {
+            uint256 nOps = plan.swapPlan.ops.length;
+            if (nOps == 0) revert EmptyOps();
+            if (nOps > MAX_OPS) revert TooManyOps();
+            for (uint256 i = 0; i < nOps; ++i) {
+                // Every op target must be allowlisted. This is the authoritative
+                // target gate — GenericSequenceLib runs the ops via DELEGATECALL
+                // and cannot re-read `allowedTargets`, so it trusts this check.
+                if (!allowedTargets[plan.swapPlan.ops[i].target]) revert TargetNotAllowed();
+            }
+        } else {
+            // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
+            // a single-leg plan — combined with hasLeg2 / hasMixedSplit it
+            // would silently bypass the second leg in _executeSwapPlan. Both
+            // combinations are rejected explicitly inside the corresponding
+            // shape-validation blocks below. NO_SWAP + hasSplit is rejected
+            // by hasSplit's m1-must-be-Uni check.
+            _validateLeg(plan.swapPlan.leg1);
+        }
 
         // Validate leg2 (must be Uni V2/V3/V4, must link to leg1 output).
         if (plan.swapPlan.hasLeg2) {
@@ -1048,7 +1103,7 @@ contract LiquidationExecutor is
         // Underflow → loss-making opp; native Panic(0x11) is a fail-
         // closed signal the operator should never have submitted.
         uint256 flashFee = flashRepayAmount - plan.loanAmount;
-        _executeSwapPlan(plan.swapPlan, flashRepayAmount, flashFee, collateralAsset, collateralDelta);
+        _executeSwapPlan(plan.swapPlan, flashRepayAmount, flashFee, collateralAsset, collateralDelta, plan.loanToken);
 
         // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
         // BEFORE flash repay. This is the authoritative base that ACTION_PAY_COINBASE
@@ -1112,8 +1167,22 @@ contract LiquidationExecutor is
         uint256 flashRepayAmount,
         uint256 flashFee,
         address collateralAsset,
-        uint256 collateralDelta
+        uint256 collateralDelta,
+        address loanToken
     ) internal {
+        // GENERIC_SEQUENCE: run the flat op list. It produces BOTH loanToken
+        // (repay) and profitToken (profit); this branch asserts the repay leg,
+        // the outer pipeline asserts minProfit + coinbase. Subsumes the shapes
+        // below (which stay for gas-optimal common cases).
+        if (plan.hasGenericSequence) {
+            // Op targets were already validated as allowlisted in execute()'s
+            // pre-flashloan validation; the heavy op loop + per-srcToken
+            // containment run in GenericSequenceLib via DELEGATECALL (to keep
+            // this contract under the EIP-170 size limit).
+            GenericSequenceLib.run(plan.ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta);
+            return;
+        }
+
         SwapLeg memory leg1 = plan.leg1;
 
         // NO_SWAP: same-token liquidation (col == loanToken).
@@ -1467,6 +1536,13 @@ contract LiquidationExecutor is
         //   positive = exact-output (BUY,  UNI_V4_BUY)
         // The unlock callback derives isBuy = amountSpec > 0 — no need
         // to pass a separate bool through the wire.
+        // Bound-check the uint256→int256 cast so a value >= 2^255 cannot wrap
+        // the sign and flip the SELL/BUY discriminator. Unreachable for real
+        // token amounts (amountIn <= collateralDelta; minAmountOut token-scale),
+        // but the guard makes the direction encoding robust rather than relying
+        // on magnitudes.
+        uint256 castVal = leg.mode == SwapMode.UNI_V4_BUY ? leg.minAmountOut : amountIn;
+        if (castVal > uint256(type(int256).max)) revert InvalidPlan();
         int256 amountSpec = leg.mode == SwapMode.UNI_V4_BUY ? int256(leg.minAmountOut) : -int256(amountIn);
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));

@@ -2,6 +2,10 @@
 src = "src"
 out = "out"
 libs = ["lib"]
+# Emit the AST into each artifact so tooling (tenderly_replay) can map
+# immutableReferences AST ids → variable names to resolve immutables into the
+# state-override runtime bytecode.
+ast = true
 solc_version = "0.8.24"
 evm_version = "shanghai"
 optimizer = true
