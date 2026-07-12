@@ -39,17 +39,25 @@ contract Deploy is Script {
     /// GENERIC_SEQUENCE direct-call target: the V3 SwapRouter the bot's
     /// sequence generator emits ops against (deploy plan §2.3).
     address constant UNI_V3_SWAP_ROUTER_01 = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    /// GENERIC_SEQUENCE knapsack Curve slices call the RouterNG — the one
+    /// allowlistable front for every Curve pool (pools are dynamic and
+    /// allowedTargets is required for ALL ops).
+    address constant CURVE_ROUTER_NG = 0x16C6521Dff6baB339122a0FE25a9116693265353;
 
     function run() external returns (address liqExecutor) {
         // V10+ liquidation allowlist seed: Bebop settlement + Aave V2
-        // lending pool + Uni V4 PoolManager + V3 SwapRouter (the
-        // GENERIC_SEQUENCE generator's direct-call target). Morpho is
-        // constructor-pinned (not in `allowed[]`).
-        address[] memory liqAllowed = new address[](4);
+        // lending pool + Uni V4 PoolManager + the GENERIC_SEQUENCE
+        // direct-call routers (V3 SwapRouter01, V2 Router02, Curve
+        // RouterNG, Balancer Vault) the knapsack split generator emits
+        // ops against. Morpho is constructor-pinned (not in `allowed[]`).
+        address[] memory liqAllowed = new address[](7);
         liqAllowed[0] = BEBOP_SETTLEMENT;
         liqAllowed[1] = AAVE_V2_POOL;
         liqAllowed[2] = UNI_V4_POOL_MANAGER;
         liqAllowed[3] = UNI_V3_SWAP_ROUTER_01;
+        liqAllowed[4] = UNI_V2_ROUTER;
+        liqAllowed[5] = CURVE_ROUTER_NG;
+        liqAllowed[6] = BALANCER_VAULT;
 
         vm.startBroadcast();
 
@@ -88,6 +96,9 @@ contract Deploy is Script {
         require(ex.allowedTargets(AAVE_V2_POOL), "readback: aaveV2 allowed");
         require(ex.allowedTargets(UNI_V4_POOL_MANAGER), "readback: v4pm allowed");
         require(ex.allowedTargets(UNI_V3_SWAP_ROUTER_01), "readback: v3router01 allowed");
+        require(ex.allowedTargets(UNI_V2_ROUTER), "readback: v2router allowed");
+        require(ex.allowedTargets(CURVE_ROUTER_NG), "readback: curve routerNG allowed");
+        require(ex.allowedTargets(BALANCER_VAULT), "readback: bal vault allowed");
 
         console2.log("LiquidationExecutor V10:", liqExecutor);
     }
