@@ -5,6 +5,7 @@ import {ExecutorTest} from "./Executor.t.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 import {Op} from "../src/types/SwapTypes.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockV4PoolManager} from "./mocks/MockV4PoolManager.sol";
 
 interface IMiniERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -248,6 +249,107 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         bytes memory plan = _genericPlan(ops, address(loanToken), 0);
         vm.prank(operatorAddr);
         vm.expectRevert(); // CollateralOverspent(spent=standing, allowed=0) on WETH
+        executor.execute(plan);
+    }
+
+    // ── FLAG_V4_UNLOCK ops (V4 single-hop exact-out via PoolManager) ──
+
+    uint32 internal constant FLAG_V4_UNLOCK = 1 << 2;
+
+    /// Build a V4 unlock op: exact-out `amountOut` of `tokenOut` paid from
+    /// `tokenIn` through the mock PoolManager. callData is the RAW 160-byte
+    /// single-hop v4SwapData 5-tuple (not selector-prefixed) — the lib wraps
+    /// it into `unlock(abi.encode(inner, int256(amountOut)))` itself.
+    function _v4Op(address tokenIn, address tokenOut, uint256 amountOut) internal view returns (Op memory op) {
+        op.target = address(uniV4Mock);
+        op.srcToken = tokenIn;
+        op.outToken = tokenOut;
+        op.flags = FLAG_V4_UNLOCK;
+        op.amountIn = amountOut; // reinterpreted: exact-out amountSpec
+        op.callData = abi.encode(tokenIn, tokenOut, uint24(500), int24(10), address(0));
+    }
+
+    /// Selector pin: the lib hardcodes `unlock(bytes)` = 0x48c89491 (same
+    /// pinned-selector idiom as the Curve RouterNG dispatcher).
+    function test_v4UnlockSelectorPin() public pure {
+        assertEq(bytes4(keccak256("unlock(bytes)")), bytes4(0x48c89491), "unlock selector drifted");
+    }
+
+    /// Happy path: single V4 exact-out op repays the flash loan; leftover
+    /// collateral is the profit. Passing THROUGH the executor's real
+    /// `unlockCallback` (guards: `msg.sender == _activeV4PoolManager`,
+    /// `_activeV4TokenIn != 0`) is what proves the lib armed the correct
+    /// storage slots — wrong slot constants revert InvalidCallbackCaller.
+    function test_GenericSequence_V4UnlockOp_ExactOut_HappyPath() public {
+        uint256 repay = LOAN_AMOUNT + FLASH_FEE; // 1001e18 exact-out
+        bytes32 slot10Before = vm.load(address(executor), bytes32(uint256(10)));
+
+        Op memory op = _v4Op(address(collateralToken), address(loanToken), repay);
+        bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 1e18);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // Disarm proof: slot 10 (PM address bytes 0..19, packed with
+        // _executionPhase at byte 20) is bit-identical to pre-execute — the
+        // arm preserved the phase byte and the disarm cleared the PM. Slot 11
+        // (tokenIn) is zero (CLAIMed by the callback, re-cleared by the lib).
+        assertEq(vm.load(address(executor), bytes32(uint256(10))), slot10Before, "slot 10 must round-trip (PM + phase)");
+        assertEq(vm.load(address(executor), bytes32(uint256(11))), bytes32(0), "tokenIn slot must be cleared");
+    }
+
+    /// Multihop v4SwapData (> 160 bytes) is forbidden on the op path — its
+    /// hook allowlist walk lives in the structured-leg validator that generic
+    /// ops bypass.
+    function test_GenericSequence_V4UnlockOp_WrongDataLength_Reverts() public {
+        Op memory op = _v4Op(address(collateralToken), address(loanToken), LOAN_AMOUNT + FLASH_FEE);
+        op.callData =
+            abi.encode(address(collateralToken), address(loanToken), uint24(500), int24(10), address(0), uint256(1)); // 192 bytes
+        bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// FULL_BALANCE / PREV_RETURN inject an INPUT amount; a V4 op's amount is
+    /// the exact-OUT spec — the combination must be rejected.
+    function test_GenericSequence_V4UnlockOp_FullBalanceCombo_Reverts() public {
+        Op memory op = _v4Op(address(collateralToken), address(loanToken), LOAN_AMOUNT + FLASH_FEE);
+        op.flags = FLAG_V4_UNLOCK | FLAG_FULL_BALANCE;
+        bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    function test_GenericSequence_V4UnlockOp_ZeroAmount_Reverts() public {
+        Op memory op = _v4Op(address(collateralToken), address(loanToken), 0);
+        bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// The op-target allowlist walk in the main contract covers V4 ops like
+    /// every other op — an unlisted PoolManager never reaches the lib.
+    function test_GenericSequence_V4UnlockOp_UnlistedPM_Reverts() public {
+        MockV4PoolManager stray = new MockV4PoolManager(1.1e18);
+        Op memory op = _v4Op(address(collateralToken), address(loanToken), LOAN_AMOUNT + FLASH_FEE);
+        op.target = address(stray);
+        bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
+        executor.execute(plan);
+    }
+
+    /// The callback-time hook allowlist re-check stays authoritative on the
+    /// op path (single-hop shape guarantees the branch that performs it).
+    function test_GenericSequence_V4UnlockOp_DisallowedHook_Reverts() public {
+        Op memory op = _v4Op(address(collateralToken), address(loanToken), LOAN_AMOUNT + FLASH_FEE);
+        op.callData = abi.encode(address(collateralToken), address(loanToken), uint24(500), int24(10), address(0xBEEF));
+        bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidV4CallbackHook.selector);
         executor.execute(plan);
     }
 }

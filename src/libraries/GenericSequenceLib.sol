@@ -34,8 +34,47 @@ library GenericSequenceLib {
     /// GENERIC_SEQUENCE op flags — direct-call routing only.
     uint32 internal constant FLAG_USE_FULL_BALANCE = 1 << 0; // inject balanceOf(srcToken) at fromAmountPos
     uint32 internal constant FLAG_USE_PREV_RETURN = 1 << 1; // inject previous op output at fromAmountPos
-    uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN;
+    /// V4 single-hop exact-out via the PoolManager unlock-callback pattern.
+    /// The op's fields are reinterpreted:
+    ///   * `target`    = the V4 PoolManager (allowlist-checked by the caller
+    ///                   like every op target);
+    ///   * `amountIn`  = the EXACT-OUT amount (positive `amountSpec` — the
+    ///                   knapsack repay slices are exact-out BUYs);
+    ///   * `callData`  = the raw 160-byte single-hop v4SwapData 5-tuple
+    ///                   `(tokenIn, tokenOut, fee, tickSpacing, hook)` — NOT
+    ///                   selector-prefixed calldata. The lib wraps it into
+    ///                   `unlock(abi.encode(inner, int256(amountIn)))` itself,
+    ///                   so the unlock-payload shape is correct BY CONSTRUCTION
+    ///                   and the executor's `unlockCallback` single-hop branch
+    ///                   (with its callback-time hook-allowlist re-check)
+    ///                   handles the swap exactly as for structured V4 legs.
+    /// Multihop v4SwapData is intentionally NOT accepted here: its hook
+    /// allowlist walk lives in the structured-leg pre-flashloan validator,
+    /// which generic ops bypass — the strict 160-byte shape keeps the
+    /// callback-time hook re-check authoritative.
+    uint32 internal constant FLAG_V4_UNLOCK = 1 << 2;
+    uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK;
     uint16 internal constant MAX_OPS = 32; // gas-grief bound on sequence length
+
+    /// @dev `LiquidationExecutor` storage slots for the V4 unlock arming
+    /// fields. This lib runs via DELEGATECALL, so `sstore` writes the
+    /// executor's storage. Slot numbers are pinned against
+    /// `forge inspect storageLayout` by `test_v4SlotConstantsMatchLayout`
+    /// (same pattern as the replay CLI's allowlist slot constants); any
+    /// layout drift fails the suite instead of silently mis-arming.
+    /// Slot 10 packs `_activeV4PoolManager` (bytes 0..19) WITH
+    /// `_executionPhase` (byte 20) — arming must preserve the high bytes.
+    uint256 private constant V4_PM_SLOT = 10;
+    uint256 private constant V4_TOKENIN_SLOT = 11;
+
+    /// @dev `IPoolManager.unlock(bytes)` selector, pinned by
+    /// `test_v4UnlockSelectorPin` (keccak("unlock(bytes)")[..4]) — the same
+    /// hardcoded-selector idiom the Curve RouterNG dispatcher uses.
+    bytes4 private constant V4_UNLOCK_SELECTOR = 0x48c89491;
+
+    /// @dev Strict size of a single-hop v4SwapData tuple — 5 × 32-byte words.
+    /// Mirrors `LiquidationExecutor.V4_SWAP_DATA_LENGTH`.
+    uint256 private constant V4_SWAP_DATA_LENGTH = 160;
 
     /// @notice Execute a flat `Op[]` sequence with per-srcToken containment.
     /// @dev MUST be invoked via DELEGATECALL (as `GenericSequenceLib.run(...)`)
@@ -109,31 +148,86 @@ library GenericSequenceLib {
 
             uint256 outBefore = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
 
-            // Direct call into an allowlisted router/aggregator whose calldata
-            // was built offchain. Patch runtime values into the pre-built
-            // calldata (bounds-checked), approve exact input, call, then reset.
-            bytes memory data = op.callData;
-            if (op.fromAmountPos != 0) {
-                _patchWord(data, op.fromAmountPos, amount);
-            }
-            if (op.returnAmountPos != 0) {
-                _patchWord(data, op.returnAmountPos, prevReturn);
-            }
-            if (amount != 0) {
-                IERC20(op.srcToken).forceApprove(op.target, amount);
-            }
+            if (op.flags & FLAG_V4_UNLOCK != 0) {
+                // ── V4 single-hop exact-out via PoolManager unlock ──
+                // The executor's `unlockCallback` (audited for structured V4
+                // legs) performs the swap; this branch only arms the two
+                // storage fields its guards read (`_activeV4PoolManager`,
+                // `_activeV4TokenIn`) and wraps the 160-byte tuple into the
+                // canonical unlock payload. Token movement happens inside the
+                // callback (settle/take) — no allowance is granted, so the
+                // approve/reset pair is skipped. The shared outToken delta
+                // check below still pins the swap output to the executor, and
+                // the per-srcToken containment cap bounds what the op spends.
+                if (op.callData.length != V4_SWAP_DATA_LENGTH) revert InvalidPlan();
+                // FULL_BALANCE / PREV_RETURN would make `amount` an INPUT
+                // amount, but a V4 op's `amount` is the exact-OUT spec —
+                // reject the combination instead of mis-signing the swap.
+                if (op.flags & (FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN) != 0) revert InvalidPlan();
+                // Positive int256 discriminates exact-out in the callback;
+                // bound the cast so the sign can never flip (mirrors
+                // `_executeUniV4Leg`).
+                if (amount == 0 || amount > uint256(type(int256).max)) revert InvalidPlan();
 
-            (bool ok, bytes memory ret) = op.target.call(data); // op.value == 0 (checked above)
-            if (!ok) {
-                if (ret.length > 0) {
-                    assembly {
-                        revert(add(ret, 0x20), mload(ret))
-                    }
+                // Arm. Slot 10 packs `_executionPhase` in byte 20 — preserve
+                // everything above the address.
+                uint256 pmSlot = V4_PM_SLOT;
+                uint256 tokenInSlot = V4_TOKENIN_SLOT;
+                address pm = op.target;
+                address tokenIn = op.srcToken;
+                assembly {
+                    let cur := sload(pmSlot)
+                    sstore(pmSlot, or(and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)), pm))
+                    sstore(tokenInSlot, tokenIn)
                 }
-                revert OpCallFailed(i);
-            }
 
-            IERC20(op.srcToken).forceApprove(op.target, 0);
+                (bool okV4, bytes memory retV4) =
+                    op.target.call(abi.encodeWithSelector(V4_UNLOCK_SELECTOR, abi.encode(op.callData, int256(amount))));
+
+                // Disarm — the callback CLAIMs tokenIn itself, but clear both
+                // defensively (an unlock that never reached our callback must
+                // not leave the executor armed for a later stray callback).
+                assembly {
+                    let cur := sload(pmSlot)
+                    sstore(pmSlot, and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)))
+                    sstore(tokenInSlot, 0)
+                }
+
+                if (!okV4) {
+                    if (retV4.length > 0) {
+                        assembly {
+                            revert(add(retV4, 0x20), mload(retV4))
+                        }
+                    }
+                    revert OpCallFailed(i);
+                }
+            } else {
+                // Direct call into an allowlisted router/aggregator whose calldata
+                // was built offchain. Patch runtime values into the pre-built
+                // calldata (bounds-checked), approve exact input, call, then reset.
+                bytes memory data = op.callData;
+                if (op.fromAmountPos != 0) {
+                    _patchWord(data, op.fromAmountPos, amount);
+                }
+                if (op.returnAmountPos != 0) {
+                    _patchWord(data, op.returnAmountPos, prevReturn);
+                }
+                if (amount != 0) {
+                    IERC20(op.srcToken).forceApprove(op.target, amount);
+                }
+
+                (bool ok, bytes memory ret) = op.target.call(data); // op.value == 0 (checked above)
+                if (!ok) {
+                    if (ret.length > 0) {
+                        assembly {
+                            revert(add(ret, 0x20), mload(ret))
+                        }
+                    }
+                    revert OpCallFailed(i);
+                }
+
+                IERC20(op.srcToken).forceApprove(op.target, 0);
+            }
 
             // Output MUST accrue to the executor — pins the swap recipient to
             // this contract. An op whose raw calldata routed output elsewhere
