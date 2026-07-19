@@ -64,8 +64,13 @@ library GenericSequenceLib {
     /// layout drift fails the suite instead of silently mis-arming.
     /// Slot 10 packs `_activeV4PoolManager` (bytes 0..19) WITH
     /// `_executionPhase` (byte 20) — arming must preserve the high bytes.
+    /// Slot 11 packs `_activeV4TokenIn` (bytes 0..19) WITH `_v4Armed`
+    /// (byte 20, the re-entry sentinel `unlockCallback` actually gates
+    /// on — tokenIn alone can be zero for a native-ETH leg, so this lib
+    /// must set the armed bit too, not just tokenIn).
     uint256 private constant V4_PM_SLOT = 10;
     uint256 private constant V4_TOKENIN_SLOT = 11;
+    uint256 private constant V4_ARMED_BIT = 1 << 160;
 
     /// @dev `IPoolManager.unlock(bytes)` selector, pinned by
     /// `test_v4UnlockSelectorPin` (keccak("unlock(bytes)")[..4]) — the same
@@ -170,23 +175,27 @@ library GenericSequenceLib {
                 if (amount == 0 || amount > uint256(type(int256).max)) revert InvalidPlan();
 
                 // Arm. Slot 10 packs `_executionPhase` in byte 20 — preserve
-                // everything above the address.
+                // everything above the address. Slot 11 packs `_v4Armed` in
+                // byte 20 — that bit, not tokenIn, is what `unlockCallback`
+                // actually gates on, so set it alongside tokenIn.
                 uint256 pmSlot = V4_PM_SLOT;
                 uint256 tokenInSlot = V4_TOKENIN_SLOT;
+                uint256 armedBit = V4_ARMED_BIT;
                 address pm = op.target;
                 address tokenIn = op.srcToken;
                 assembly {
                     let cur := sload(pmSlot)
                     sstore(pmSlot, or(and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)), pm))
-                    sstore(tokenInSlot, tokenIn)
+                    sstore(tokenInSlot, or(tokenIn, armedBit))
                 }
 
                 (bool okV4, bytes memory retV4) =
                     op.target.call(abi.encodeWithSelector(V4_UNLOCK_SELECTOR, abi.encode(op.callData, int256(amount))));
 
-                // Disarm — the callback CLAIMs tokenIn itself, but clear both
-                // defensively (an unlock that never reached our callback must
-                // not leave the executor armed for a later stray callback).
+                // Disarm — the callback CLAIMs tokenIn + the armed bit
+                // itself, but clear both defensively (an unlock that never
+                // reached our callback must not leave the executor armed
+                // for a later stray callback).
                 assembly {
                     let cur := sload(pmSlot)
                     sstore(pmSlot, and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)))

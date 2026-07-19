@@ -252,15 +252,30 @@ contract LiquidationExecutor is
 
     /// @dev tokenIn pinned for the active V4 unlock. Set by
     /// `_executeUniV4Leg` BEFORE `unlock()`, CLEARED to address(0) by
-    /// `unlockCallback` on entry. The clear-on-entry semantics double as
-    /// a re-entry guard: a nested `unlockCallback` (e.g. from a malicious
-    /// hook calling `pm.unlock()` mid-swap) would see `_activeV4TokenIn
-    /// == 0` and the entry guard rejects it. Reading tokenIn from
-    /// storage (rather than decoding from `data`) also closes the
-    /// substitution drain — `pm` cannot influence storage, only the
-    /// callback payload. Declared AFTER `_executionPhase` so the legacy
-    /// slot 11 packing (read by storage-poking tests) stays untouched.
+    /// `unlockCallback` on entry (hygiene — no stale address left in
+    /// storage — but no longer the re-entry sentinel itself; see
+    /// `_v4Armed`). Reading tokenIn from storage (rather than decoding
+    /// from `data`) closes the substitution drain — `pm` cannot
+    /// influence storage, only the callback payload. Declared AFTER
+    /// `_executionPhase` so the legacy slot 11 packing (read by
+    /// storage-poking tests) stays untouched.
     address private _activeV4TokenIn;
+
+    /// @dev Dedicated re-entry/arming sentinel for the V4 unlock-callback
+    /// flow, decoupled from `_activeV4TokenIn`. Before this flag, the
+    /// sentinel WAS `_activeV4TokenIn != 0`, which collided with a
+    /// native-ETH leg (tokenIn == address(0)) — an armed native swap was
+    /// indistinguishable from "not armed". Set `true` by `_executeUniV4Leg`
+    /// immediately before `unlock()`, CLAIMed (set back to `false`) by
+    /// `unlockCallback` on entry — the clear-on-entry semantics double as
+    /// the re-entry guard: a nested `unlockCallback` (e.g. from a
+    /// malicious hook calling `pm.unlock()` mid-swap) sees `_v4Armed ==
+    /// false` and the entry guard rejects it, regardless of what tokenIn
+    /// happens to be. Declared directly after `_activeV4TokenIn` so both
+    /// pack into the same slot (slot 11) — the existing slot 10/11
+    /// storage-poking tests are unaffected since neither touches byte
+    /// offset 20 of slot 11.
+    bool private _v4Armed;
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
@@ -1550,6 +1565,7 @@ contract LiquidationExecutor is
         address pm = leg.v4PoolManager;
         _activeV4PoolManager = pm;
         _activeV4TokenIn = tokenIn;
+        _v4Armed = true;
         // tokenIn is NOT included in the unlock payload — the callback
         // reads it from storage so the PM cannot substitute it.
         // Single-hop vs multihop is dispatched by v4SwapData length:
@@ -1567,6 +1583,7 @@ contract LiquidationExecutor is
         // V4Hop[]. Main never has to crack the inner shape.
         IPoolManager(pm).unlock(abi.encode(leg.v4SwapData, amountSpec));
         _activeV4PoolManager = address(0);
+        _v4Armed = false;
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
@@ -1600,7 +1617,7 @@ contract LiquidationExecutor is
     ///   exact-input single-hop ERC20→ERC20 swap inside the flashloan pipeline.
     /// @dev Three layers of protection against stray or adversarial calls:
     ///   1. `ExecutionPhase.FlashLoanActive` — only valid inside execute()
-    ///   2. `_activeV4PoolManager != 0`     — only while `_executeUniV4Leg` is mid-unlock
+    ///   2. `_v4Armed`                       — only while `_executeUniV4Leg` is mid-unlock
     ///   3. `msg.sender == _activeV4PoolManager` — only the pinned PoolManager
     /// BalanceDelta invariant: tokenInDelta < 0 (we owe) AND tokenOutDelta > 0
     /// (we receive). Any other shape — including zero-output swaps, partial
@@ -1611,14 +1628,18 @@ contract LiquidationExecutor is
         if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
         // tokenIn is read from storage (pinned by _executeUniV4Leg) rather
         // than from `data` — PM controls the data, not storage, so
-        // substitution is impossible by construction. Clearing on entry
-        // doubles as the re-entry guard: a nested unlockCallback from
-        // inside swap() finds tokenIn == 0 and the combined check below
-        // fails closed. The msg.sender check covers the not-in-flow case
-        // (_activeV4PoolManager == 0 → msg.sender != 0 = always true).
+        // substitution is impossible by construction. The re-entry guard
+        // is `_v4Armed` (NOT tokenIn != 0 — that collided with native-ETH
+        // legs, where tokenIn == address(0) by design): claiming it
+        // (clearing to false) on entry means a nested unlockCallback from
+        // inside swap() finds `_v4Armed == false` and the combined check
+        // below fails closed, regardless of what tokenIn is. The
+        // msg.sender check covers the not-in-flow case (_activeV4PoolManager
+        // == 0 → msg.sender != 0 = always true).
         address tokenIn = _activeV4TokenIn;
-        if (tokenIn == address(0) || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
-        _activeV4TokenIn = address(0); // CLAIM
+        if (!_v4Armed || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
+        _v4Armed = false; // CLAIM — nested unlockCallback finds false and fails closed
+        _activeV4TokenIn = address(0); // CLAIM (hygiene only now — see above)
 
         // Uniform unlock-data shape for single-hop AND multihop:
         //   abi.encode(bytes inner, int256 amountSpec)
