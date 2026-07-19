@@ -275,6 +275,94 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         assertEq(bytes4(keccak256("unlock(bytes)")), bytes4(0x48c89491), "unlock selector drifted");
     }
 
+    /// Drift guard for `GenericSequenceLib`'s hardcoded V4_PM_SLOT /
+    /// V4_TOKENIN_SLOT / V4_ARMED_BIT raw-`sstore` constants (private to the
+    /// lib, so restated here as literals — the library doc comment claims
+    /// they are pinned by this test's name). Confirmed against
+    /// `forge inspect LiquidationExecutor storagelayout`:
+    ///   slot 10, offset 0  (bytes 0..19) = _activeV4PoolManager (address)
+    ///   slot 10, offset 20 (byte 20)     = _executionPhase (enum, FlashLoanActive=1)
+    ///   slot 11, offset 0  (bytes 0..19) = _activeV4TokenIn (address)
+    ///   slot 11, offset 20 (byte 20)     = _v4Armed (bool) == bit 160
+    /// Two independent, non-vacuous probes — either drifting fails the test:
+    ///   (1) a raw storage poke at these exact slot/offsets, followed by a
+    ///       DIRECT call to the real `unlockCallback`, must swap using the
+    ///       literal `loanToken` ADDRESS decoded from slot 11 (not merely the
+    ///       armed bit — the existing native-ETH pin test uses tokenIn == 0,
+    ///       which can't distinguish a correct address decode from garbage).
+    ///       This pins LiquidationExecutor's COMPILED layout to the literals.
+    ///   (2) driving a real GENERIC_SEQUENCE V4 op through `execute()` (the
+    ///       lib's own raw `sstore`s, using its private constants) must still
+    ///       complete successfully — if the lib's constants themselves ever
+    ///       diverge from this layout, this half fails even though (1) alone
+    ///       would not catch it (probe 1 never invokes the lib).
+    function test_v4SlotConstantsMatchLayout() public {
+        uint256 V4_PM_SLOT = 10;
+        uint256 V4_TOKENIN_SLOT = 11;
+        uint256 V4_ARMED_BIT = 1 << 160;
+        uint256 PHASE_FLASHLOAN_ACTIVE = 1;
+
+        // ── Probe 1: direct field round-trip via unlockCallback ──
+        bytes32 slot10 = bytes32(uint256(uint160(address(uniV4Mock)))) | bytes32(PHASE_FLASHLOAN_ACTIVE << 160);
+        vm.store(address(executor), bytes32(V4_PM_SLOT), slot10);
+        bytes32 slot11 = bytes32(uint256(uint160(address(loanToken)))) | bytes32(V4_ARMED_BIT);
+        vm.store(address(executor), bytes32(V4_TOKENIN_SLOT), slot11);
+
+        uint256 execLoanBefore = loanToken.balanceOf(address(executor));
+        uint256 execCollBefore = collateralToken.balanceOf(address(executor));
+
+        // tokenIn in `inner` is ignored by the callback decode (real tokenIn
+        // is read from storage) — see unlockCallback's substitution-drain note.
+        bytes memory inner = abi.encode(address(0), address(collateralToken), uint24(500), int24(10), address(0));
+        bytes memory data = abi.encode(inner, int256(-1e18)); // sell 1e18 tokenIn, exact-in
+
+        vm.prank(address(uniV4Mock));
+        executor.unlockCallback(data); // must NOT revert — proves slot 10/11 decode exactly right
+
+        assertEq(
+            loanToken.balanceOf(address(executor)),
+            execLoanBefore - 1e18,
+            "tokenIn must decode to the loanToken address planted at slot 11, not garbage"
+        );
+        assertGt(collateralToken.balanceOf(address(executor)), execCollBefore, "swap must have paid out tokenOut");
+
+        // CLAIM proof: unlockCallback clears tokenIn + armed bit at the exact
+        // same slot it read them from.
+        assertEq(
+            vm.load(address(executor), bytes32(V4_TOKENIN_SLOT)),
+            bytes32(0),
+            "slot 11 must be fully cleared post-callback"
+        );
+        // unlockCallback doesn't touch the PM half of slot 10 — only the
+        // outer `_executeUniV4Leg` disarms it — so the phase byte we poked
+        // must still read back untouched at the same byte offset.
+        assertEq(
+            vm.load(address(executor), bytes32(V4_PM_SLOT)) & bytes32(~uint256(type(uint160).max)),
+            bytes32(PHASE_FLASHLOAN_ACTIVE << 160),
+            "phase byte at slot 10 offset 20 must be untouched"
+        );
+
+        // ── Probe 2: the real GenericSequenceLib arming path, end to end ──
+        // Reset to Idle/disarmed (probe 1 raw-poked phase=FlashLoanActive;
+        // `execute()` expects to start from Idle).
+        vm.store(address(executor), bytes32(V4_PM_SLOT), bytes32(0));
+        vm.store(address(executor), bytes32(V4_TOKENIN_SLOT), bytes32(0));
+
+        uint256 repay = LOAN_AMOUNT + FLASH_FEE;
+        Op memory op = _v4Op(address(collateralToken), address(loanToken), repay);
+        bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 1e18);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan); // reverts InvalidCallbackCaller inside the
+        // real unlockCallback if GenericSequenceLib's own V4_PM_SLOT /
+        // V4_TOKENIN_SLOT / V4_ARMED_BIT constants ever address anything
+        // other than these same fields.
+
+        assertEq(
+            vm.load(address(executor), bytes32(V4_TOKENIN_SLOT)), bytes32(0), "post-execute tokenIn slot must be clear"
+        );
+    }
+
     /// Happy path: single V4 exact-out op repays the flash loan; leftover
     /// collateral is the profit. Passing THROUGH the executor's real
     /// `unlockCallback` (guards: `msg.sender == _activeV4PoolManager`,
