@@ -5,6 +5,13 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Op} from "../types/SwapTypes.sol";
 
+/// @dev Subset of WETH9 used by the `FLAG_WETH_UNWRAP` op — the same one-method
+/// shape `CoinbasePaymentLib` duplicates. Only `withdraw` is needed; it burns
+/// the executor's WETH and forwards native ETH to its `receive()`.
+interface IWETH {
+    function withdraw(uint256 amount) external;
+}
+
 /// @title GenericSequenceLib
 /// @notice DELEGATECALL library holding the GENERIC_SEQUENCE op executor,
 /// split out of `LiquidationExecutor` to stay under the EIP-170 runtime
@@ -53,7 +60,22 @@ library GenericSequenceLib {
     /// which generic ops bypass — the strict 160-byte shape keeps the
     /// callback-time hook re-check authoritative.
     uint32 internal constant FLAG_V4_UNLOCK = 1 << 2;
-    uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK;
+    /// WETH→native-ETH unwrap. The op spends its `srcToken` (which MUST equal
+    /// the executor's constructor-pinned `weth`) by calling
+    /// `IWETH(weth).withdraw(amountIn)`, converting that WETH to native ETH held
+    /// by the executor (its `receive()` accepts the transfer). It funds a
+    /// downstream native-ETH V4 leg whose deep pool wants raw ETH, not WETH.
+    /// Deliberately a dedicated flag rather than allowlisting WETH: allowlisting
+    /// would open WETH's deposit/transfer/withdraw as a general op call surface,
+    /// whereas this flag can ONLY invoke `withdraw` on the pinned `weth`. The op
+    /// carries no external `target` (the caller's pre-flashloan allowlist walk
+    /// exempts unwrap ops for that reason) and produces no ERC20 output, so the
+    /// approve/external-call and outToken-delta machinery is skipped. The WETH
+    /// spend is still snapshotted and bounded by the per-srcToken containment
+    /// cap exactly like any ERC20 op.
+    uint32 internal constant FLAG_WETH_UNWRAP = 1 << 3;
+    uint32 internal constant FLAG_KNOWN_MASK =
+        FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK | FLAG_WETH_UNWRAP;
     uint16 internal constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     /// @dev `LiquidationExecutor` storage slots for the V4 unlock arming
@@ -90,7 +112,8 @@ library GenericSequenceLib {
         address loanToken,
         uint256 flashRepayAmount,
         address collateralAsset,
-        uint256 collateralDelta
+        uint256 collateralDelta,
+        address weth
     ) external {
         uint256 n = ops.length;
         if (n == 0) revert EmptyOps();
@@ -137,6 +160,32 @@ library GenericSequenceLib {
             // Only the direct-call routing flags are supported; any other bit is
             // rejected so a stale plan can never silently mis-execute.
             if (op.flags & ~FLAG_KNOWN_MASK != 0) revert InvalidPlan();
+
+            if (op.flags & FLAG_WETH_UNWRAP != 0) {
+                // ── WETH → native-ETH unwrap ──
+                // An unwrap op does exactly one thing: burn `amountIn` WETH for
+                // native ETH. It combines with no other flag (`amountIn` is an
+                // explicit literal — FULL_BALANCE / PREV_RETURN would reinterpret
+                // it as a derived input, and V4_UNLOCK reinterprets it as an
+                // exact-out spec), so require the flag word to be EXACTLY this
+                // bit. `srcToken` MUST be the executor's own `weth` — this is
+                // what keeps the flag from being a general `withdraw(uint256)`
+                // call surface onto any operator-chosen address. The withdrawn
+                // WETH is snapshotted in the per-srcToken cap above, so the
+                // containment post-check bounds it like any other spend.
+                if (op.flags != FLAG_WETH_UNWRAP) revert InvalidPlan();
+                if (op.srcToken != weth) revert InvalidPlan();
+                if (op.amountIn == 0) revert InvalidPlan();
+
+                IWETH(weth).withdraw(op.amountIn);
+
+                // No ERC20 output to delta-check (native ETH lands in the
+                // executor's balance, not an ERC20 balance). Surface the
+                // unwrapped amount as the chainable prev-return so a following
+                // op can size off it if the plan wants.
+                prevReturn = op.amountIn;
+                continue;
+            }
 
             // Resolve the input amount. FULL_BALANCE is restricted to the
             // collateral asset (capped at collateralDelta); other inputs come

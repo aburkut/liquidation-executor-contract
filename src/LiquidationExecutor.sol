@@ -786,6 +786,12 @@ contract LiquidationExecutor is
             if (nOps == 0) revert EmptyOps();
             if (nOps > MAX_OPS) revert TooManyOps();
             for (uint256 i = 0; i < nOps; ++i) {
+                // WETH-unwrap ops carry no external `target` — they only invoke
+                // `IWETH(weth).withdraw` on the contract-pinned `weth` inside the
+                // lib (which enforces `srcToken == weth` and the exact-flag
+                // shape), so there is nothing to allowlist. Exempt them from the
+                // target gate; every other op's target must be allowlisted.
+                if (plan.swapPlan.ops[i].flags & GenericSequenceLib.FLAG_WETH_UNWRAP != 0) continue;
                 // Every op target must be allowlisted. This is the authoritative
                 // target gate — GenericSequenceLib runs the ops via DELEGATECALL
                 // and cannot re-read `allowedTargets`, so it trusts this check.
@@ -1194,7 +1200,7 @@ contract LiquidationExecutor is
             // pre-flashloan validation; the heavy op loop + per-srcToken
             // containment run in GenericSequenceLib via DELEGATECALL (to keep
             // this contract under the EIP-170 size limit).
-            GenericSequenceLib.run(plan.ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta);
+            GenericSequenceLib.run(plan.ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta, weth);
             return;
         }
 
