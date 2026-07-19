@@ -23,6 +23,11 @@ contract MockV4PoolManager is IPoolManager {
     bool public revertOnUnlock;
     bool public zeroOut;
 
+    /// @dev Native-ETH value received across all `settle{value: ...}()`
+    /// calls in this test — lets tests assert the exact wei forwarded for
+    /// a native-tokenIn V4 leg (currency `address(0)` in the delta map).
+    uint256 public settledValue;
+
     address private _syncedCurrency;
     /// @dev Signed net-delta per currency, accumulated within one unlock.
     /// Negative = caller owes us (settle deducts). Positive = we owe
@@ -93,15 +98,29 @@ contract MockV4PoolManager is IPoolManager {
     }
 
     function settle() external payable returns (uint256 paid) {
-        address currency = _syncedCurrency;
-        int256 d = _delta[currency];
-        require(d <= 0, "MockV4PM: nothing owed for sync'd currency");
-        uint256 owed = uint256(-d);
-        uint256 received = IERC20(currency).balanceOf(address(this));
-        require(received >= owed, "MockV4PM: unsettled");
-        _delta[currency] = 0;
+        if (msg.value > 0) {
+            // Native-ETH settlement: no `sync` precedes this (native has no
+            // ERC20 balance to diff against) — currency is always
+            // `address(0)` in the delta map, matching `runV4UnlockSwap`'s
+            // native branch (which skips sync/approve entirely).
+            address currency = address(0);
+            int256 d = _delta[currency];
+            require(d <= 0, "MockV4PM: nothing owed native");
+            uint256 owed = uint256(-d);
+            require(msg.value >= owed, "MockV4PM: unsettled native");
+            _delta[currency] = 0;
+            settledValue += msg.value;
+            return owed;
+        }
+        address syncedCurrency = _syncedCurrency;
+        int256 d2 = _delta[syncedCurrency];
+        require(d2 <= 0, "MockV4PM: nothing owed for sync'd currency");
+        uint256 owed2 = uint256(-d2);
+        uint256 received = IERC20(syncedCurrency).balanceOf(address(this));
+        require(received >= owed2, "MockV4PM: unsettled");
+        _delta[syncedCurrency] = 0;
         _syncedCurrency = address(0);
-        return owed;
+        return owed2;
     }
 
     function take(address currency, address to, uint256 amount) external {

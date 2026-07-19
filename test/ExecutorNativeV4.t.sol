@@ -79,4 +79,44 @@ contract ExecutorNativeV4Test is ExecutorTest {
         vm.expectRevert(LiquidationExecutor.InvalidCallbackCaller.selector);
         executor.unlockCallback(_nativeUnlockData());
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Task 2 — native-ETH settle{value} in runV4UnlockSwap
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Same shape as `_nativeUnlockData()` but with a caller-chosen
+    /// exact-in `amountSpec` (SELL: negative = exact input wei).
+    function _nativeUnlockData(uint256 amountIn) internal view returns (bytes memory) {
+        bytes memory inner = abi.encode(address(0), address(loanToken), uint24(3000), int24(60), address(0));
+        return abi.encode(inner, -int256(amountIn));
+    }
+
+    /// Drives a native-ETH single-hop V4 leg through the real
+    /// `unlockCallback` -> `UniswapLib.runV4UnlockSwap` path: primes the
+    /// same mid-unlock storage `_armNativeCallback(true)` uses (PM pinned,
+    /// phase active, tokenIn left at its native/zero default, armed), funds
+    /// the executor with `amountIn` wei (standing in for the Task-3 unwrap
+    /// this task deliberately does not implement), and lets the PM mock
+    /// pull `settle{value: amountIn}()`.
+    function _runNativeV4Leg(uint256 amountIn) internal {
+        _armNativeCallback(true);
+        vm.deal(address(executor), amountIn);
+
+        vm.prank(address(uniV4Mock));
+        executor.unlockCallback(_nativeUnlockData(amountIn));
+    }
+
+    /// TDD driver for Task 2: pre-fix this reverts (validator rejects
+    /// native tokenIn, or the ERC20-only settle path sends no value).
+    /// Post-fix: `pm.settle{value: amountIn}()` forwards exactly amountIn
+    /// wei and `pm.take` credits the executor with tokenOut (loanToken).
+    function test_nativeEthV4_settles_with_value() public {
+        uint256 amountIn = 5 ether;
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        _runNativeV4Leg(amountIn);
+
+        assertEq(uniV4Mock.settledValue(), amountIn, "must settle native value");
+        assertGt(loanToken.balanceOf(address(executor)), loanBefore, "executor must receive swapped-out tokenOut");
+    }
 }
