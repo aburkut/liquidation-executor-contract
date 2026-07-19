@@ -301,4 +301,156 @@ contract ExecutorNativeV4Test is ExecutorTest {
         ops = new Op[](1);
         ops[0] = op;
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Task 4 (SECURITY-CRITICAL) — native ETH (srcToken == address(0)) as a
+    // valid, CAPPED srcToken in GENERIC_SEQUENCE.
+    //
+    // Cap reasoning under test: the per-srcToken ETH snapshot is taken at
+    // `run()` entry, BEFORE any FLAG_WETH_UNWRAP op credits ETH. The only
+    // ETH this tx legitimately produces is the unwrap of THIS tx's seized
+    // WETH collateral — a post-snapshot CREDIT. A legit native leg therefore
+    // nets >= 0 against the snapshot, so the exact containment bound for
+    // ETH is `allowed = 0`: any net dip below the snapshot is standing /
+    // donated ETH leaving the contract and must revert CollateralOverspent.
+    // (Granting collateralDelta to ETH instead would DOUBLE-COUNT — the
+    // WETH bucket already grants collateralDelta to the unwrap — letting a
+    // compromised operator burn up to collateralDelta of standing ETH per
+    // tx through a crafted V4 pool. test_nativeEth_standingSpend_
+    // withoutUnwrap_reverts pins that leak closed.)
+    // ═══════════════════════════════════════════════════════════════════
+
+    uint32 internal constant FLAG_V4_UNLOCK = 1 << 2;
+
+    /// A native-ETH V4 single-hop exact-out op: srcToken == address(0)
+    /// (native), pays ETH via `settle{value}` inside the unlock callback,
+    /// takes `amountOut` of `tokenOut`. At SWAP_RATE = 1.1e18 the ETH owed
+    /// is amountOut * 1e18 / 1.1e18.
+    function _nativeV4Op(address tokenOut, uint256 amountOut) internal view returns (Op memory op) {
+        op.target = address(uniV4Mock);
+        op.srcToken = address(0); // native ETH
+        op.outToken = tokenOut;
+        op.flags = FLAG_V4_UNLOCK;
+        op.amountIn = amountOut; // reinterpreted: exact-out amountSpec
+        op.callData = abi.encode(address(0), tokenOut, uint24(500), int24(10), address(0));
+    }
+
+    /// Happy path: unwrap 10 WETH collateral -> 10 ETH, then a native V4 op
+    /// spends EXACTLY those 10 ETH (exact-out 11e18 loanToken @ 1.1). The
+    /// sequence must succeed, settle 10 ether native, and leave the
+    /// executor's ETH balance exactly where it started (net delta 0).
+    function test_nativeEth_happyPath_spendsExactlyUnwrappedCollateral() public {
+        _unwrapSetUp();
+
+        uint256 swapAmount = 1000e18; // @1.1 -> 1100e18, covers repay 1001e18
+        uint256 unwrapAmount = 10 ether;
+
+        Op[] memory ops = new Op[](3);
+        ops[0] = _repaySwapOp(swapAmount, 1.1e18);
+        ops[1] = _unwrapOp(unwrapAmount);
+        ops[2] = _nativeV4Op(address(loanToken), 11e18); // owes exactly 10 ether ETH
+
+        bytes memory plan = _wethCollateralPlan(ops, swapAmount + unwrapAmount);
+
+        uint256 ethBefore = address(executor).balance;
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(uniV4Mock.settledValue(), unwrapAmount, "native leg must settle exactly the unwrapped ETH");
+        assertEq(address(executor).balance, ethBefore, "ETH net delta must be zero (unwrap +10, settle -10)");
+    }
+
+    /// MANDATORY SECURITY TEST 1: a native op that settles MORE ETH than the
+    /// unwrap credited (11 ether settled vs 10 unwrapped — the extra wei can
+    /// only come from standing ETH) must revert CollateralOverspent. The
+    /// executor is deliberately given standing ETH headroom so the settle
+    /// itself CAN pay — the containment cap, not an out-of-funds call
+    /// failure, must be what stops the plan.
+    function test_nativeEth_overspend_reverts_CollateralOverspent() public {
+        _unwrapSetUp();
+
+        vm.deal(address(executor), 5 ether); // standing headroom
+
+        uint256 swapAmount = 1000e18;
+        uint256 unwrapAmount = 10 ether;
+
+        Op[] memory ops = new Op[](3);
+        ops[0] = _repaySwapOp(swapAmount, 1.1e18);
+        ops[1] = _unwrapOp(unwrapAmount);
+        ops[2] = _nativeV4Op(address(loanToken), 12.1e18); // owes 11 ether > 10 unwrapped
+
+        bytes memory plan = _wethCollateralPlan(ops, swapAmount + unwrapAmount);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.CollateralOverspent.selector, 1 ether, 0));
+        executor.execute(plan);
+    }
+
+    /// MANDATORY SECURITY TEST 2 (THE KEY TEST): the executor holds large
+    /// STANDING ETH. A legit native sequence spends only its own unwrapped
+    /// collateral; the standing ETH must survive to the wei.
+    function test_nativeEth_cannot_drain_standing_eth() public {
+        _unwrapSetUp();
+
+        uint256 standing = 100 ether;
+        vm.deal(address(executor), standing);
+
+        uint256 swapAmount = 1000e18;
+        uint256 unwrapAmount = 10 ether;
+
+        Op[] memory ops = new Op[](3);
+        ops[0] = _repaySwapOp(swapAmount, 1.1e18);
+        ops[1] = _unwrapOp(unwrapAmount);
+        ops[2] = _nativeV4Op(address(loanToken), 11e18); // owes exactly the 10 unwrapped
+
+        bytes memory plan = _wethCollateralPlan(ops, swapAmount + unwrapAmount);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(uniV4Mock.settledValue(), unwrapAmount, "legit spend = unwrapped collateral only");
+        assertEq(address(executor).balance, standing, "standing ETH must survive untouched");
+    }
+
+    /// ADVERSARIAL PIN of the allowed=0 bound: collateral IS WETH with a huge
+    /// collateralDelta, but the plan runs a native op WITHOUT any unwrap —
+    /// every wei it settles is STANDING ETH. Under a naive
+    /// `allowed = (collateralAsset == weth ? collateralDelta : 0)` cap this
+    /// plan would PASS (10 ether < collateralDelta) and burn standing ETH
+    /// through an operator-crafted V4 pool; the correct allowed=0 bound must
+    /// revert CollateralOverspent(10 ether, 0).
+    function test_nativeEth_standingSpend_withoutUnwrap_reverts() public {
+        _unwrapSetUp();
+
+        vm.deal(address(executor), 100 ether); // standing
+
+        uint256 swapAmount = 1000e18;
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _repaySwapOp(swapAmount, 1.1e18);
+        ops[1] = _nativeV4Op(address(loanToken), 11e18); // owes 10 ether, all standing
+
+        bytes memory plan = _wethCollateralPlan(ops, swapAmount);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.CollateralOverspent.selector, 10 ether, 0));
+        executor.execute(plan);
+    }
+
+    /// MANDATORY SECURITY TEST 3: srcToken == address(0) must ONLY be valid
+    /// on a native-aware (FLAG_V4_UNLOCK) op. A plain direct-call op with
+    /// srcToken == 0 and no native flag must STILL revert InvalidPlan —
+    /// 0x0 can never mean "unset".
+    function test_plainOp_srcTokenZero_still_reverts_InvalidPlan() public {
+        _unwrapSetUp();
+
+        Op memory op = _repaySwapOp(1 ether, 1.1e18); // direct-call shape, flags == 0
+        op.srcToken = address(0);
+        bytes memory plan = _wethCollateralPlan(_oneOp(op), 1 ether);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
 }

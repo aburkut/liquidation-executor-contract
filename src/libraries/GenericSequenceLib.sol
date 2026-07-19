@@ -126,13 +126,16 @@ library GenericSequenceLib {
         // tx produced — collateralDelta for the collateral asset, ZERO for
         // everything else. This keeps a compromised operator from routing out a
         // standing/pre-existing balance of ANY token (accumulated profit
-        // awaiting owner rescue, aToken residue, donations).
+        // awaiting owner rescue, aToken residue, donations). Native ETH
+        // (srcToken == address(0), a FLAG_V4_UNLOCK leg settling raw ETH) is
+        // snapshotted too, via `_balOf` = `address(this).balance` — it gets
+        // its own bucket with allowed spend ZERO (see the post-loop cap for
+        // why zero is exact, not conservative).
         address[] memory snapTok = new address[](n);
         uint256[] memory snapBal = new uint256[](n);
         uint256 nSnap = 0;
         for (uint256 i = 0; i < n; ++i) {
             address t = ops[i].srcToken;
-            if (t == address(0)) continue;
             bool seen = false;
             for (uint256 j = 0; j < nSnap; ++j) {
                 if (snapTok[j] == t) {
@@ -142,7 +145,7 @@ library GenericSequenceLib {
             }
             if (!seen) {
                 snapTok[nSnap] = t;
-                snapBal[nSnap] = IERC20(t).balanceOf(address(this));
+                snapBal[nSnap] = _balOf(t);
                 ++nSnap;
             }
         }
@@ -155,8 +158,14 @@ library GenericSequenceLib {
             // cannot push the executor's ETH to an arbitrary target.
             if (op.value != 0) revert InvalidPlan();
             // Every op must declare the token it spends, so the per-srcToken cap
-            // snapshots it.
-            if (op.srcToken == address(0)) revert InvalidPlan();
+            // snapshots it. srcToken == address(0) means NATIVE ETH and is only
+            // meaningful on a native-aware op — a V4 unlock leg, whose callback
+            // settles raw ETH via `settle{value}`. On any other op shape 0x0
+            // would just mean "unset" (and the direct-call branch would try to
+            // forceApprove address(0)), so it stays rejected. A
+            // FLAG_WETH_UNWRAP op can never ride this exemption: its branch
+            // requires srcToken == weth (nonzero) explicitly.
+            if (op.srcToken == address(0) && op.flags & FLAG_V4_UNLOCK == 0) revert InvalidPlan();
             // Only the direct-call routing flags are supported; any other bit is
             // rejected so a stale plan can never silently mis-execute.
             if (op.flags & ~FLAG_KNOWN_MASK != 0) revert InvalidPlan();
@@ -263,6 +272,11 @@ library GenericSequenceLib {
                 // Direct call into an allowlisted router/aggregator whose calldata
                 // was built offchain. Patch runtime values into the pre-built
                 // calldata (bounds-checked), approve exact input, call, then reset.
+                // srcToken is provably nonzero here (native srcToken == 0x0 is
+                // only admitted with FLAG_V4_UNLOCK, which takes the branch
+                // above), so the forceApprove below never targets address(0) —
+                // native ETH moves exclusively via `settle{value}` inside the
+                // V4 callback, never via allowance.
                 bytes memory data = op.callData;
                 if (op.fromAmountPos != 0) {
                     _patchWord(data, op.fromAmountPos, amount);
@@ -304,12 +318,38 @@ library GenericSequenceLib {
 
         // Per-srcToken containment cap: no token may be net-spent past what this
         // tx produced (collateralDelta for the collateral asset, 0 otherwise).
+        //
+        // NATIVE ETH (snapTok == address(0)): allowed is ZERO, and zero is the
+        // EXACT bound, not a conservative one. The only ETH this tx
+        // legitimately produces is FLAG_WETH_UNWRAP converting THIS tx's
+        // seized WETH collateral — and that credit lands AFTER the snapshot
+        // above, so a legit unwrap-funded native leg nets >= 0 against the
+        // snapshot and passes with allowed = 0. Any net dip below the
+        // snapshot is, by construction, STANDING/DONATED ETH leaving the
+        // contract (there is no other pre-snapshot ETH source: Aave
+        // collateral is always ERC20, never native) and must revert.
+        // Deliberately NOT `collateralDelta` when collateralAsset == weth:
+        // the WETH bucket already grants collateralDelta to the unwrap spend,
+        // so a second collateralDelta grant on the ETH bucket would
+        // double-count and let a compromised operator burn up to
+        // collateralDelta of standing ETH per tx through a crafted V4 pool
+        // (pinned by test_nativeEth_standingSpend_withoutUnwrap_reverts).
+        // The `t != address(0)` guard also keeps a zero collateralAsset from
+        // ever matching the ETH bucket.
         for (uint256 k = 0; k < nSnap; ++k) {
-            uint256 allowed = snapTok[k] == collateralAsset ? collateralDelta : 0;
-            uint256 balAfter = IERC20(snapTok[k]).balanceOf(address(this));
+            address t = snapTok[k];
+            uint256 allowed = (t != address(0) && t == collateralAsset) ? collateralDelta : 0;
+            uint256 balAfter = _balOf(t);
             uint256 spent = snapBal[k] > balAfter ? snapBal[k] - balAfter : 0;
             if (spent > allowed) revert CollateralOverspent(spent, allowed);
         }
+    }
+
+    /// @dev Balance of `token` held by the executor, treating address(0) as
+    /// native ETH — the containment snapshot/cap must see ETH like any other
+    /// spendable asset.
+    function _balOf(address token) private view returns (uint256) {
+        return token == address(0) ? address(this).balance : IERC20(token).balanceOf(address(this));
     }
 
     /// @dev Write a 32-byte `value` into `data` at byte offset `pos`, reverting
