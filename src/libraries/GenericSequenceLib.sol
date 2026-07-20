@@ -74,8 +74,17 @@ library GenericSequenceLib {
     /// spend is still snapshotted and bounded by the per-srcToken containment
     /// cap exactly like any ERC20 op.
     uint32 internal constant FLAG_WETH_UNWRAP = 1 << 3;
+    /// V4 EXACT-IN modifier for a `FLAG_V4_UNLOCK` op: pass a NEGATIVE
+    /// `amountSpec` so `amountIn` is the exact INPUT sold (not the exact output
+    /// bought). Output is whatever the pool gives — the post-op outToken delta
+    /// check requires only a positive delta (never `>= amountIn`), and
+    /// settle/take use the realized swap delta, so the callback needs no change.
+    /// Used by the crash-whale SELL route: sell a fixed unwrapped-ETH amount
+    /// through the deep native pool (no exact-out depth cap), then bridge to the
+    /// debt token. Only meaningful alongside FLAG_V4_UNLOCK.
+    uint32 internal constant FLAG_V4_EXACT_IN = 1 << 4;
     uint32 internal constant FLAG_KNOWN_MASK =
-        FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK | FLAG_WETH_UNWRAP;
+        FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN;
     uint16 internal constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     /// @dev `LiquidationExecutor` storage slots for the V4 unlock arming
@@ -247,8 +256,11 @@ library GenericSequenceLib {
                     sstore(tokenInSlot, or(tokenIn, armedBit))
                 }
 
+                // Positive amountSpec = exact-out (buy `amount`); negative =
+                // exact-in (sell `amount`). Cast is bounded above.
+                int256 amountSpec = (op.flags & FLAG_V4_EXACT_IN != 0) ? -int256(amount) : int256(amount);
                 (bool okV4, bytes memory retV4) =
-                    op.target.call(abi.encodeWithSelector(V4_UNLOCK_SELECTOR, abi.encode(op.callData, int256(amount))));
+                    op.target.call(abi.encodeWithSelector(V4_UNLOCK_SELECTOR, abi.encode(op.callData, amountSpec)));
 
                 // Disarm — the callback CLAIMs tokenIn + the armed bit
                 // itself, but clear both defensively (an unlock that never
