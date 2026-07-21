@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../../src/types/SwapTypes.sol";
 import {LiquidationExecutor} from "../../src/LiquidationExecutor.sol";
 import {SwapMode, SwapLeg, Op} from "../../src/types/SwapTypes.sol";
 
@@ -194,11 +195,11 @@ contract ExecutorForkV4Test is Test {
     }
 
     function _wrapInPlan(LiquidationExecutor.SwapPlan memory sp) internal view returns (bytes memory) {
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](1);
+        actions[0] = Action({
             protocolId: 1,
             data: abi.encode(
-                LiquidationExecutor.AaveV3Action({
+                AaveV3Action({
                     actionType: 4,
                     asset: address(0),
                     amount: 0,
@@ -473,11 +474,11 @@ contract ExecutorForkV4Test is Test {
             "exchange(int128,int128,uint256,uint256)", int128(0), int128(2), uint256(0), loanAmount
         );
 
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](1);
+        actions[0] = Action({
             protocolId: 1,
             data: abi.encode(
-                LiquidationExecutor.AaveV3Action({
+                AaveV3Action({
                     actionType: 4,
                     asset: address(0),
                     amount: 0,

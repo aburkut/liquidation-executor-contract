@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {MarketParams} from "../interfaces/IMorphoBlue.sol";
+
 /// @title Shared swap-leg types
 /// @notice File-scope enum + struct definitions imported by every
 /// swap-related library and by both executor contracts
@@ -105,4 +107,52 @@ struct Op {
     address srcToken; // token spent by this op (approved to target)
     address outToken; // token received (its balance delta = this op's output)
     bytes callData; // selector + args, pre-built offchain
+}
+
+// ─── Liquidation action types ────────────────────────────────────────
+// Moved out of LiquidationExecutor (file scope) so the pure plan
+// validator can live in `SwapValidationLib` and keep the executor under
+// the EIP-170 runtime-size limit. Layout is byte-identical to the prior
+// contract-scoped definitions — the off-chain encoder is unaffected.
+
+/// @dev One protocol action in a Plan (liquidation or internal).
+struct Action {
+    uint8 protocolId;
+    bytes data;
+}
+
+/// @dev Aave V3 target action (actionType == 4 == liquidation only).
+struct AaveV3Action {
+    uint8 actionType; // 4 = liquidation (only supported type)
+    address asset;
+    uint256 amount;
+    uint256 interestRateMode;
+    address onBehalfOf;
+    // Liquidation fields (actionType == 4 only)
+    address collateralAsset;
+    address debtAsset;
+    address user;
+    uint256 debtToCover;
+    bool receiveAToken;
+    address aTokenAddress;
+}
+
+/// @dev Aave V2 liquidation action. receiveAToken=true is unsupported.
+struct AaveV2Liquidation {
+    address collateralAsset;
+    address debtAsset;
+    address user;
+    uint256 debtToCover;
+    bool receiveAToken; // must be false — validated in validateActions
+}
+
+/// @dev Morpho Blue liquidation action (seized-assets mode only).
+struct MorphoLiquidation {
+    MarketParams marketParams;
+    address borrower;
+    uint256 seizedAssets;
+    uint256 repaidShares;
+    /// @dev Max loan-token amount to approve for repayment (loan-token units).
+    /// Must be >= actual assetsRepaid returned by Morpho.
+    uint256 maxRepayAssets;
 }

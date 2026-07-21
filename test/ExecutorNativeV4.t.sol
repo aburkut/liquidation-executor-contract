@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {ExecutorTest} from "./Executor.t.sol";
+import {Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../src/types/SwapTypes.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 import {Op} from "../src/types/SwapTypes.sol";
 import {MockGenericDex} from "./ExecutorGenericSequence.t.sol";
@@ -170,7 +171,7 @@ contract ExecutorNativeV4Test is ExecutorTest {
     /// op-loop, so the repay gate measures the ops' full output).
     function _wethCollateralPlan(Op[] memory ops, uint256 collateralReward) internal returns (bytes memory) {
         aavePool.setLiquidationCollateralReward(collateralReward);
-        LiquidationExecutor.Action[] memory actions = _singleAction(
+        Action[] memory actions = _singleAction(
             1, _buildAaveV3LiquidationAction(address(mockWeth), address(loanToken), address(0x1234), LOAN_AMOUNT, false)
         );
         LiquidationExecutor.SwapPlan memory sp;
@@ -269,7 +270,7 @@ contract ExecutorNativeV4Test is ExecutorTest {
         // Collateral asset is collateralToken (not WETH) this time, so the
         // standing WETH's allowed spend is 0.
         aavePool.setLiquidationCollateralReward(COLLATERAL_REWARD);
-        LiquidationExecutor.Action[] memory actions = _singleAction(
+        Action[] memory actions = _singleAction(
             1,
             _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x1234), LOAN_AMOUNT, false

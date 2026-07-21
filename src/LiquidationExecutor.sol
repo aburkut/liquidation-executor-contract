@@ -22,7 +22,7 @@ import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
 import {SwapValidationLib} from "./libraries/SwapValidationLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
 import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
-import {SwapMode, SwapLeg, Op} from "./types/SwapTypes.sol";
+import {SwapMode, SwapLeg, Op, Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "./types/SwapTypes.sol";
 
 // V10+ refactor: IWETH interface moved into CoinbasePaymentLib
 // (the only consumer of `IWETH.withdraw` after `_payCoinbase` migrated).
@@ -396,11 +396,6 @@ contract LiquidationExecutor is
     // fully supported.) Op flags live in `GenericSequenceLib`.
     uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
-    struct Action {
-        uint8 protocolId;
-        bytes data;
-    }
-
     struct Plan {
         uint8 flashProviderId;
         address loanToken;
@@ -412,42 +407,9 @@ contract LiquidationExecutor is
 
     uint8 private constant MAX_ACTIONS = 10;
 
-    // ─── Aave V3 target action ───────────────────────────────────────
-    struct AaveV3Action {
-        uint8 actionType; // 4 = liquidation (only supported type)
-        address asset;
-        uint256 amount;
-        uint256 interestRateMode;
-        address onBehalfOf;
-        // Liquidation fields (actionType == 4 only)
-        address collateralAsset;
-        address debtAsset;
-        address user;
-        uint256 debtToCover;
-        bool receiveAToken;
-        address aTokenAddress;
-    }
-
-    // ─── Aave V2 liquidation action ──────────────────────────────────
-    /// @dev V2 receiveAToken=true is explicitly unsupported (no canonical on-chain verification).
-    struct AaveV2Liquidation {
-        address collateralAsset;
-        address debtAsset;
-        address user;
-        uint256 debtToCover;
-        bool receiveAToken; // must be false — validated in _validateActions
-    }
-
-    // ─── Morpho Blue liquidation action ─────────────────────────────
-    struct MorphoLiquidation {
-        MarketParams marketParams;
-        address borrower;
-        uint256 seizedAssets;
-        uint256 repaidShares;
-        /// @dev Max loan-token amount to approve for repayment (loan-token units, NOT collateral units).
-        /// Must be >= actual assetsRepaid returned by Morpho. Operator computes this off-chain.
-        uint256 maxRepayAssets;
-    }
+    // Action / AaveV3Action / AaveV2Liquidation / MorphoLiquidation moved to
+    // types/SwapTypes.sol (imported above) so the pure plan validator can live
+    // in SwapValidationLib and keep this contract under the EIP-170 limit.
 
     // ─── Constructor ─────────────────────────────────────────────────
     /// @dev V10+: `morpho_` is constructor-pinned (was post-deploy
@@ -593,99 +555,10 @@ contract LiquidationExecutor is
     /// │ MORPHO_BLUE (2)   │ n/a          │ n/a            │ SUPPORTED                │
     /// │ Other             │ —            │ —              │ REVERTS InvalidProtocolId│
     /// └───────────────────┴──────────────┴────────────────┴──────────────────────────┘
-    function _validateActions(Action[] memory actions, address loanToken)
-        internal
-        pure
-        returns (address collateralAsset, address trackingToken)
-    {
-        uint256 liquidationCount;
-        bool receiveATokenSet;
-        bool receiveAToken;
-        address aTokenAddr;
-
-        for (uint256 i = 0; i < actions.length; ++i) {
-            uint8 protocolId = actions[i].protocolId;
-
-            // Internal actions (e.g. coinbase payment) are not liquidation actions
-            if (protocolId == PROTOCOL_INTERNAL) continue;
-
-            bytes memory data = actions[i].data;
-
-            address actionDebt;
-            address actionCollateral;
-            uint256 actionAmount;
-            bool actionReceiveAToken;
-            address actionATokenAddress;
-
-            if (protocolId == PROTOCOL_AAVE_V3) {
-                AaveV3Action memory a = abi.decode(data, (AaveV3Action));
-                if (a.actionType != 4) revert UnsupportedActionType(a.actionType);
-                if (a.collateralAsset == address(0)) revert InvalidCollateralAsset();
-                actionDebt = a.debtAsset;
-                actionCollateral = a.collateralAsset;
-                actionAmount = a.debtToCover;
-                actionReceiveAToken = a.receiveAToken;
-                actionATokenAddress = a.aTokenAddress;
-            } else if (protocolId == PROTOCOL_AAVE_V2) {
-                AaveV2Liquidation memory a = abi.decode(data, (AaveV2Liquidation));
-                if (a.receiveAToken) revert ReceiveATokenV2Unsupported();
-                if (a.collateralAsset == address(0)) revert InvalidCollateralAsset();
-                actionDebt = a.debtAsset;
-                actionCollateral = a.collateralAsset;
-                actionAmount = a.debtToCover;
-            } else if (protocolId == PROTOCOL_MORPHO_BLUE) {
-                MorphoLiquidation memory a = abi.decode(data, (MorphoLiquidation));
-                if (a.marketParams.loanToken == address(0)) revert MorphoInvalidMarketParams();
-                if (a.marketParams.collateralToken == address(0)) revert MorphoInvalidMarketParams();
-                // Only seized-assets mode is supported. Share mode and mixed mode are rejected.
-                if (a.seizedAssets == 0) revert MorphoShareModeUnsupported();
-                if (a.repaidShares != 0) revert MorphoMixedModeUnsupported();
-                if (a.maxRepayAssets == 0) revert InvalidPlan();
-                actionDebt = a.marketParams.loanToken;
-                actionCollateral = a.marketParams.collateralToken;
-                actionAmount = a.seizedAssets;
-            } else {
-                revert InvalidProtocolId(protocolId);
-            }
-
-            if (actionAmount == 0) revert ZeroActionAmount();
-            if (actionDebt != loanToken) revert DebtAssetMismatch(loanToken, actionDebt);
-
-            if (actionCollateral != address(0)) {
-                if (collateralAsset == address(0)) {
-                    collateralAsset = actionCollateral;
-                } else {
-                    if (actionCollateral != collateralAsset) {
-                        revert CollateralAssetMismatch(collateralAsset, actionCollateral);
-                    }
-                }
-            }
-
-            // receiveAToken consistency check (Aave V3 only — V2 receiveAToken=true is blocked above)
-            if (protocolId == PROTOCOL_AAVE_V3) {
-                if (!receiveATokenSet) {
-                    receiveAToken = actionReceiveAToken;
-                    receiveATokenSet = true;
-                    if (receiveAToken) {
-                        if (actionATokenAddress == address(0)) revert ATokenAddressRequired();
-                        aTokenAddr = actionATokenAddress;
-                    }
-                } else {
-                    if (actionReceiveAToken != receiveAToken) revert MixedReceiveAToken();
-                    if (receiveAToken && actionATokenAddress != aTokenAddr) {
-                        revert CollateralAssetMismatch(aTokenAddr, actionATokenAddress);
-                    }
-                }
-            }
-
-            liquidationCount++;
-        }
-
-        if (liquidationCount == 0) revert NoLiquidationAction();
-
-        // Set trackingToken: aToken when receiveAToken=true, underlying otherwise
-        trackingToken = (receiveAToken && aTokenAddr != address(0)) ? aTokenAddr : collateralAsset;
-    }
+    // _validateActions moved to SwapValidationLib.validateActions (external,
+    // DELEGATECALL) to keep this contract under the EIP-170 runtime-size limit.
+    // Pure plan-shape validation, no storage — identical logic, identical error
+    // selectors. Callers use SwapValidationLib.validateActions(actions, loanToken).
 
     /// @dev Per-leg fail-fast validation. Called once per leg from execute()
     /// BEFORE the flashloan is requested, so malformed plans never burn a
@@ -745,7 +618,8 @@ contract LiquidationExecutor is
         }
 
         // Validate all actions use same debt/collateral assets
-        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
+        (address collateralAsset, address trackingToken) =
+            SwapValidationLib.validateActions(plan.actions, plan.loanToken);
 
         // Collateral linkage: leg1.srcToken must be either the underlying
         // collateral (standard path, contract unwraps aToken after
@@ -1049,7 +923,8 @@ contract LiquidationExecutor is
         if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
         // Derive collateralAsset and trackingToken for delta check and swap plan
-        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
+        (address collateralAsset, address trackingToken) =
+            SwapValidationLib.validateActions(plan.actions, plan.loanToken);
 
         // Verify aToken address against canonical source when receiveAToken=true
         if (trackingToken != address(0) && trackingToken != collateralAsset) {

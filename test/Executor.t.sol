@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../src/types/SwapTypes.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -1089,7 +1090,7 @@ contract ExecutorTest is Test {
         address lToken,
         uint256 loanAmount,
         uint256 maxFlashFee,
-        LiquidationExecutor.Action[] memory actions,
+        Action[] memory actions,
         LiquidationExecutor.SwapPlan memory swapPlan
     ) internal pure returns (bytes memory) {
         return abi.encode(
@@ -1112,7 +1113,7 @@ contract ExecutorTest is Test {
         bool receiveAToken
     ) internal pure returns (bytes memory) {
         return abi.encode(
-            LiquidationExecutor.AaveV3Action({
+            AaveV3Action({
                 actionType: 4,
                 asset: address(0),
                 amount: 0,
@@ -1136,7 +1137,7 @@ contract ExecutorTest is Test {
         address aTokenAddr
     ) internal pure returns (bytes memory) {
         return abi.encode(
-            LiquidationExecutor.AaveV3Action({
+            AaveV3Action({
                 actionType: 4,
                 asset: address(0),
                 amount: 0,
@@ -1160,7 +1161,7 @@ contract ExecutorTest is Test {
         bool receiveAToken
     ) internal pure returns (bytes memory) {
         return abi.encode(
-            LiquidationExecutor.AaveV2Liquidation({
+            AaveV2Liquidation({
                 collateralAsset: collateralAsset,
                 debtAsset: debtAsset,
                 user: user,
@@ -1171,19 +1172,15 @@ contract ExecutorTest is Test {
     }
 
     /// @dev Convenience: wrap a single action into Action[]
-    function _singleAction(uint8 protocolId, bytes memory data)
-        internal
-        pure
-        returns (LiquidationExecutor.Action[] memory)
-    {
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
-        actions[0] = LiquidationExecutor.Action({protocolId: protocolId, data: data});
+    function _singleAction(uint8 protocolId, bytes memory data) internal pure returns (Action[] memory) {
+        Action[] memory actions = new Action[](1);
+        actions[0] = Action({protocolId: protocolId, data: data});
         return actions;
     }
 
     /// @dev Default liquidation action for tests that don't test the action itself.
     /// Uses collateralToken as collateral, loanToken as debt (correct roles).
-    function _defaultLiqAction(uint256 debtToCover) internal view returns (LiquidationExecutor.Action[] memory) {
+    function _defaultLiqAction(uint256 debtToCover) internal view returns (Action[] memory) {
         return _singleAction(
             1,
             _buildAaveV3LiquidationAction(
@@ -1218,10 +1215,10 @@ contract ExecutorTest is Test {
     function _wethLiqActionWithCoinbase(uint256 debtToCover, uint256 coinbaseBps)
         internal
         view
-        returns (LiquidationExecutor.Action[] memory)
+        returns (Action[] memory)
     {
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(mockWeth), address(0x1234), debtToCover, false
@@ -1231,7 +1228,7 @@ contract ExecutorTest is Test {
         return actions;
     }
 
-    function _buildWethPlan(uint8 flashProviderId, LiquidationExecutor.Action[] memory actions, uint256 minProfitAmt)
+    function _buildWethPlan(uint8 flashProviderId, Action[] memory actions, uint256 minProfitAmt)
         internal
         view
         returns (bytes memory)
@@ -1243,12 +1240,8 @@ contract ExecutorTest is Test {
     /// @dev ACTION_PAY_COINBASE amount is interpreted as basis points (0..10000)
     /// against realized on-chain profit. Helper takes bps; contract computes
     /// the actual wei amount at execute time.
-    function _buildCoinbasePaymentAction(uint256 coinbaseBps)
-        internal
-        pure
-        returns (LiquidationExecutor.Action memory)
-    {
-        return LiquidationExecutor.Action({
+    function _buildCoinbasePaymentAction(uint256 coinbaseBps) internal pure returns (Action memory) {
+        return Action({
             protocolId: 100, // PROTOCOL_INTERNAL
             data: abi.encode(uint8(1), coinbaseBps) // ACTION_PAY_COINBASE(bps)
         });
@@ -1418,7 +1411,7 @@ contract ExecutorTest is Test {
         uint256 seizedAssets = 500e18;
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, MIN_PROFIT);
-        LiquidationExecutor.Action[] memory liqAction = _singleAction(
+        Action[] memory liqAction = _singleAction(
             2, // PROTOCOL_MORPHO_BLUE
             _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), seizedAssets)
         );
@@ -1461,7 +1454,7 @@ contract ExecutorTest is Test {
         // plant into _activePlanHash for the hash check to pass.
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0);
-        LiquidationExecutor.Action[] memory liqAction = _singleAction(
+        Action[] memory liqAction = _singleAction(
             2, // PROTOCOL_MORPHO_BLUE
             _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1234), 500e18)
         );
@@ -3553,14 +3546,14 @@ contract ExecutorTest is Test {
         loanToken.mint(address(augustus), 100_000e18);
 
         // Two liquidation actions
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x1111), debtToCover1, false
             )
         });
-        actions[1] = LiquidationExecutor.Action({
+        actions[1] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x2222), debtToCover2, false
@@ -3647,15 +3640,15 @@ contract ExecutorTest is Test {
 
         // First action: valid liquidation
         // Second action: uses invalid protocol ID -> guaranteed revert
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x1111), debtToCover, false
             )
         });
         // Second action uses invalid protocol ID -> guaranteed revert
-        actions[1] = LiquidationExecutor.Action({
+        actions[1] = Action({
             protocolId: 99,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x2222), debtToCover, false
@@ -3708,7 +3701,7 @@ contract ExecutorTest is Test {
     // ═══════════════════════════════════════════════════════════════════
 
     function test_execute_reverts_on_empty_actions() public {
-        LiquidationExecutor.Action[] memory empty = new LiquidationExecutor.Action[](0);
+        Action[] memory empty = new Action[](0);
 
         bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, empty, _defaultSwapPlan());
 
@@ -3718,9 +3711,9 @@ contract ExecutorTest is Test {
     }
 
     function test_execute_reverts_on_too_many_actions() public {
-        LiquidationExecutor.Action[] memory tooMany = new LiquidationExecutor.Action[](11);
+        Action[] memory tooMany = new Action[](11);
         for (uint256 i = 0; i < 11; i++) {
-            tooMany[i] = LiquidationExecutor.Action({
+            tooMany[i] = Action({
                 protocolId: 1,
                 data: _buildAaveV3LiquidationAction(
                     address(collateralToken), address(loanToken), address(0x1234), 100e18, false
@@ -3741,14 +3734,14 @@ contract ExecutorTest is Test {
 
     function test_reverts_on_invalid_debt_asset() public {
         // Two liquidations with DIFFERENT debt assets -> INVALID_DEBT_ASSET
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x1111), 100e18, false
             )
         });
-        actions[1] = LiquidationExecutor.Action({
+        actions[1] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken),
@@ -3776,14 +3769,14 @@ contract ExecutorTest is Test {
     function test_reverts_on_invalid_collateral_asset() public {
         MockERC20 otherToken = new MockERC20("Other", "OTH", 18);
 
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x1111), 100e18, false
             )
         });
-        actions[1] = LiquidationExecutor.Action({
+        actions[1] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(otherToken),
@@ -3865,7 +3858,7 @@ contract ExecutorTest is Test {
     function test_reverts_on_unsupported_action() public {
         // Aave V3 actionType != 4 (e.g. repay=1) -> UnsupportedActionType(1)
         bytes memory repayAction = abi.encode(
-            LiquidationExecutor.AaveV3Action({
+            AaveV3Action({
                 actionType: 1,
                 asset: address(collateralToken),
                 amount: 500e18,
@@ -3986,7 +3979,7 @@ contract ExecutorTest is Test {
 
     function test_internalOnlyPlan_reverts() public {
         // Build a plan with only a PROTOCOL_INTERNAL action (coinbase payment), no liquidation
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
+        Action[] memory actions = new Action[](1);
         actions[0] = _buildCoinbasePaymentAction(100);
 
         bytes memory plan = _buildPlan(2, address(mockWeth), LOAN_AMOUNT, FLASH_FEE, actions, _wethSwapPlan());
@@ -4105,14 +4098,14 @@ contract ExecutorTest is Test {
     }
 
     function test_coinbasePayment_invalidActionTypeReverts() public {
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x1234), 400e18, false
             )
         });
-        actions[1] = LiquidationExecutor.Action({protocolId: 100, data: abi.encode(uint8(99), uint256(0.5 ether))});
+        actions[1] = Action({protocolId: 100, data: abi.encode(uint8(99), uint256(0.5 ether))});
 
         bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, _defaultSwapPlan());
 
@@ -4159,8 +4152,8 @@ contract ExecutorTest is Test {
 
         // Build plan using loanToken as profitToken (not weth); bps value is
         // irrelevant because the requires-weth gate fires first.
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x1234), 400e18, false
@@ -4220,8 +4213,8 @@ contract ExecutorTest is Test {
 
         // Two bps actions each compute against the same realizedProfit snapshot.
         // 100 bps + 200 bps → payments 6.99e18 + 13.98e18 = 20.97e18 total.
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](3);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](3);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
@@ -4244,8 +4237,8 @@ contract ExecutorTest is Test {
         vm.coinbase(address(0xC01B));
         // No pre-funded ETH — forces WETH unwrap
 
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](3);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](3);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
@@ -4394,8 +4387,8 @@ contract ExecutorTest is Test {
         vm.coinbase(coinbase);
         vm.deal(address(executor), 700 ether);
 
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](3);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](3);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
@@ -4417,8 +4410,8 @@ contract ExecutorTest is Test {
         vm.coinbase(address(0xC01B));
         vm.deal(address(executor), 1000 ether);
 
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](3);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](3);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
@@ -4441,8 +4434,8 @@ contract ExecutorTest is Test {
         vm.coinbase(coinbase);
         vm.deal(address(executor), 700 ether);
 
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](4);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](4);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
@@ -4537,7 +4530,7 @@ contract ExecutorTest is Test {
         uint256 maxRepayAssets
     ) internal pure returns (bytes memory) {
         return abi.encode(
-            LiquidationExecutor.MorphoLiquidation({
+            MorphoLiquidation({
                 marketParams: MarketParams({
                     loanToken: debt, collateralToken: collateral, oracle: address(0x1), irm: address(0x2), lltv: 0.8e18
                 }),
@@ -4643,7 +4636,7 @@ contract ExecutorTest is Test {
     function test_receiveAToken_missingATokenAddress_reverts() public {
         // receiveAToken=true but aTokenAddress=address(0)
         bytes memory targetAction = abi.encode(
-            LiquidationExecutor.AaveV3Action({
+            AaveV3Action({
                 actionType: 4,
                 asset: address(0),
                 amount: 0,
@@ -4765,12 +4758,12 @@ contract ExecutorTest is Test {
         // Two Morpho actions with different collateral assets -> CollateralAssetMismatch
         MockERC20 otherToken = new MockERC20("Other", "OTH", 18);
 
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 2,
             data: _buildMorphoLiquidationAction(address(collateralToken), address(loanToken), address(0x1111), 100e18)
         });
-        actions[1] = LiquidationExecutor.Action({
+        actions[1] = Action({
             protocolId: 2,
             data: _buildMorphoLiquidationAction(address(otherToken), address(loanToken), address(0x2222), 100e18)
         });
@@ -4799,7 +4792,7 @@ contract ExecutorTest is Test {
         address fakeAToken = address(new MockERC20("Fake", "FAKE", 18));
 
         bytes memory targetAction = abi.encode(
-            LiquidationExecutor.AaveV3Action({
+            AaveV3Action({
                 actionType: 4,
                 asset: address(0),
                 amount: 0,
@@ -4911,7 +4904,7 @@ contract ExecutorTest is Test {
         loanToken.mint(address(freshExec), LOAN_AMOUNT + FLASH_FEE + 100e18);
 
         bytes memory targetAction = abi.encode(
-            LiquidationExecutor.AaveV3Action({
+            AaveV3Action({
                 actionType: 4,
                 asset: address(0),
                 amount: 0,
@@ -4947,7 +4940,7 @@ contract ExecutorTest is Test {
     /// @notice V2 receiveAToken=true must revert with explicit error
     function test_aaveV2_receiveAToken_true_reverts() public {
         bytes memory targetAction = abi.encode(
-            LiquidationExecutor.AaveV2Liquidation({
+            AaveV2Liquidation({
                 collateralAsset: address(collateralToken),
                 debtAsset: address(loanToken),
                 user: address(0x1234),
@@ -5348,7 +5341,7 @@ contract ExecutorTest is Test {
     /// FIX 3: Zero collateralAsset must revert
     function test_fix3_zeroCollateral_reverts() public {
         bytes memory targetAction = abi.encode(
-            LiquidationExecutor.AaveV3Action({
+            AaveV3Action({
                 actionType: 4,
                 asset: address(0),
                 amount: 0,
@@ -5485,7 +5478,7 @@ contract ExecutorTest is Test {
     /// FIX 2: Morpho seizedAssets > 0, repaidShares > 0 → MorphoMixedModeUnsupported
     function test_morpho_mixedMode_reverts() public {
         bytes memory targetAction = abi.encode(
-            LiquidationExecutor.MorphoLiquidation({
+            MorphoLiquidation({
                 marketParams: MarketParams({
                     loanToken: address(loanToken),
                     collateralToken: address(collateralToken),
@@ -5512,7 +5505,7 @@ contract ExecutorTest is Test {
     /// FIX 2: Morpho seizedAssets == 0, repaidShares > 0 → MorphoShareModeUnsupported (existing)
     function test_morpho_shareModeOnly_reverts() public {
         bytes memory targetAction = abi.encode(
-            LiquidationExecutor.MorphoLiquidation({
+            MorphoLiquidation({
                 marketParams: MarketParams({
                     loanToken: address(loanToken),
                     collateralToken: address(collateralToken),
@@ -6179,7 +6172,7 @@ contract ExecutorTest is Test {
         // "coinbase > profit" guard — operator can no longer encode an
         // over-payment at all, and multi-action overpays are separately
         // caught by CoinbaseExceedsProfit inside _checkProfit.
-        LiquidationExecutor.Action[] memory actions = _wethLiqActionWithCoinbase(400e18, 10_001);
+        Action[] memory actions = _wethLiqActionWithCoinbase(400e18, 10_001);
 
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidCoinbaseBps.selector);
@@ -7941,8 +7934,8 @@ contract ExecutorTest is Test {
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(mockWeth), 0);
 
         // Outer plan: loanToken = mockWeth, plus a coinbase BPS action.
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(mockWeth), address(0x1234), 400e18, false
@@ -8004,8 +7997,8 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildSplitPlan(repayLeg, profitLeg, 5000, address(mockWeth), 0);
 
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x1234), 500e18, false
@@ -8121,8 +8114,8 @@ contract ExecutorTest is Test {
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
 
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](2);
-        actions[0] = LiquidationExecutor.Action({
+        Action[] memory actions = new Action[](2);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(
                 address(collateralToken), address(loanToken), address(0x1234), 500e18, false
@@ -8440,7 +8433,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
         // Same-token action: collateral == debt == loanToken.
         bytes memory action =
             _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), debtToCover, false);
-        LiquidationExecutor.Action[] memory actions = _singleAction(1, action);
+        Action[] memory actions = _singleAction(1, action);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildNoSwapPlan(address(loanToken), MIN_PROFIT);
 
@@ -8468,7 +8461,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
 
         bytes memory action =
             _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0x1234), debtToCover, false);
-        LiquidationExecutor.Action[] memory actions = _singleAction(1, action);
+        Action[] memory actions = _singleAction(1, action);
         LiquidationExecutor.SwapPlan memory swapPlan = _buildNoSwapPlan(address(loanToken), 0);
 
         bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, actions, swapPlan);
@@ -9757,9 +9750,9 @@ contract ExecutorV4SecurityTest is ExecutorTest {
     /// leg with srcToken == repayToken == loanToken passes the
     /// `SrcTokenNotCollateral` guard and reaches the NO_SWAP branch in
     /// `_validateLeg`.
-    function _sameTokenLoanLiqAction() internal view returns (LiquidationExecutor.Action[] memory) {
-        LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
-        actions[0] = LiquidationExecutor.Action({
+    function _sameTokenLoanLiqAction() internal view returns (Action[] memory) {
+        Action[] memory actions = new Action[](1);
+        actions[0] = Action({
             protocolId: 1,
             data: _buildAaveV3LiquidationAction(address(loanToken), address(loanToken), address(0xBA12), 500e18, false)
         });
@@ -10337,8 +10330,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
                 profitToken: address(loanToken),
                 minProfitAmount: 0
             });
-            LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
-            actions[0] = LiquidationExecutor.Action({
+            Action[] memory actions = new Action[](1);
+            actions[0] = Action({
                 protocolId: 1,
                 data: _buildAaveV3LiquidationAction(
                     address(usdt), address(loanToken), address(uint160(uint256(0xDEAD) + round)), 500e18, false
@@ -10412,8 +10405,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
                 profitToken: address(loanToken),
                 minProfitAmount: 0
             });
-            LiquidationExecutor.Action[] memory actions = new LiquidationExecutor.Action[](1);
-            actions[0] = LiquidationExecutor.Action({
+            Action[] memory actions = new Action[](1);
+            actions[0] = Action({
                 protocolId: 1,
                 data: _buildAaveV3LiquidationAction(
                     address(usdt), address(loanToken), address(uint160(uint256(0xBEEF) + round)), 500e18, false
