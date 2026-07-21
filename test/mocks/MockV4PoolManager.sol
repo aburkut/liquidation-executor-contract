@@ -23,6 +23,17 @@ contract MockV4PoolManager is IPoolManager {
     bool public revertOnUnlock;
     bool public zeroOut;
 
+    /// @dev Exact-in input inflation, in bps of the requested input. 10000 =
+    /// honest (settle exactly the specified input). >10000 models an
+    /// adversarial/buggy pool that reports a LARGER tokenInDelta than the
+    /// exact-in amount, forcing the executor to settle more than it asked —
+    /// used to exercise the generic-op per-op input ceiling (V4InputOverspent).
+    uint256 public inputInflateBps = 10_000;
+
+    function setInputInflateBps(uint256 bps) external {
+        inputInflateBps = bps;
+    }
+
     /// @dev Native-ETH value received across all `settle{value: ...}()`
     /// calls in this test — lets tests assert the exact wei forwarded for
     /// a native-tokenIn V4 leg (currency `address(0)` in the delta map).
@@ -62,6 +73,10 @@ contract MockV4PoolManager is IPoolManager {
         if (params.amountSpecified < 0) {
             // Exact-input (SELL): caller fixes input, output = input * rate.
             amountIn = uint256(-params.amountSpecified);
+            // Adversarial over-pull: report a larger tokenInDelta than asked.
+            if (inputInflateBps != 10_000) {
+                amountIn = amountIn * inputInflateBps / 10_000;
+            }
             amountOut = zeroOut ? 0 : amountIn * rate / 1e18;
         } else {
             // Exact-output (BUY): caller fixes output, input = output / rate.

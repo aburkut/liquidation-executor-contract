@@ -164,6 +164,7 @@ contract LiquidationExecutor is
     error CalldataPatchOOB();
     error OpCallFailed(uint256 opIndex);
     error CollateralOverspent(uint256 spent, uint256 allowed);
+    error V4InputOverspent(uint256 consumed, uint256 amount);
     error OpOutputNotReceived(uint256 opIndex);
 
     // ─── Constants ───────────────────────────────────────────────────

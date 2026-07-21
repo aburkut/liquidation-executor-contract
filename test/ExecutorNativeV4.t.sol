@@ -361,6 +361,79 @@ contract ExecutorNativeV4Test is ExecutorTest {
         assertEq(address(executor).balance, ethBefore, "ETH net delta must be zero (unwrap +10, settle -10)");
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // FLAG_V4_EXACT_IN (commit d46c3d9) — was shipped with NO contract test.
+    // These pin the exact-IN native path (sell fixed ETH, variable output)
+    // and its per-op input ceiling.
+    // ═══════════════════════════════════════════════════════════════════
+
+    uint32 internal constant FLAG_V4_EXACT_IN = 1 << 4;
+
+    /// A native-ETH V4 single-hop EXACT-IN op: srcToken == 0 (native), sells
+    /// exactly `ethIn` ETH via `settle{value}`, takes `ethIn * rate` of
+    /// `tokenOut`. `amountIn` is the exact INPUT (negated to a negative
+    /// amountSpec by the lib), unlike the exact-out op where it is the output.
+    function _nativeV4ExactInOp(address tokenOut, uint256 ethIn) internal view returns (Op memory op) {
+        op.target = address(uniV4Mock);
+        op.srcToken = address(0); // native ETH
+        op.outToken = tokenOut;
+        op.flags = FLAG_V4_UNLOCK | FLAG_V4_EXACT_IN;
+        op.amountIn = ethIn; // exact-IN: ETH sold (variable output)
+        op.callData = abi.encode(address(0), tokenOut, uint24(500), int24(10), address(0));
+    }
+
+    /// Happy path (exact-IN): unwrap 10 WETH -> 10 ETH, then sell EXACTLY
+    /// those 10 ETH exact-in through the native pool (rate 1.1 -> 11 loanToken).
+    /// The sequence must succeed, settle exactly 10 ether, and leave the
+    /// executor's ETH balance where it started (unwrap +10, settle -10).
+    function test_nativeEth_exactIn_happyPath_sellsExactlyUnwrappedEth() public {
+        _unwrapSetUp();
+
+        uint256 swapAmount = 1000e18; // WETH->loanToken base repay: 1100 @1.1 covers 1001
+        uint256 unwrapAmount = 10 ether;
+
+        Op[] memory ops = new Op[](3);
+        ops[0] = _repaySwapOp(swapAmount, 1.1e18);
+        ops[1] = _unwrapOp(unwrapAmount);
+        ops[2] = _nativeV4ExactInOp(address(loanToken), unwrapAmount); // sell exactly 10 ETH
+
+        bytes memory plan = _wethCollateralPlan(ops, swapAmount + unwrapAmount);
+
+        uint256 ethBefore = address(executor).balance;
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(uniV4Mock.settledValue(), unwrapAmount, "exact-in must settle exactly the unwrapped ETH");
+        assertEq(address(executor).balance, ethBefore, "ETH net delta must be zero");
+    }
+
+    /// The per-op input ceiling (V4InputOverspent): a buggy/adversarial pool
+    /// that settles MORE ETH than the exact-in `amount` must be caught at the
+    /// op boundary — NOT only by the end-of-sequence containment cap. The
+    /// executor is given standing ETH so the over-pull settle CAN pay; the
+    /// ceiling, not an out-of-funds failure, must stop it.
+    function test_nativeEth_exactIn_overpull_reverts_V4InputOverspent() public {
+        _unwrapSetUp();
+
+        vm.deal(address(executor), 5 ether); // standing headroom for the over-pull
+        uniV4Mock.setInputInflateBps(11_000); // settle 10% more than the 10 ETH asked
+
+        uint256 swapAmount = 1000e18;
+        uint256 unwrapAmount = 10 ether;
+
+        Op[] memory ops = new Op[](3);
+        ops[0] = _repaySwapOp(swapAmount, 1.1e18);
+        ops[1] = _unwrapOp(unwrapAmount);
+        ops[2] = _nativeV4ExactInOp(address(loanToken), unwrapAmount); // asks 10, pool pulls 11
+
+        bytes memory plan = _wethCollateralPlan(ops, swapAmount + unwrapAmount);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.V4InputOverspent.selector, 11 ether, unwrapAmount));
+        executor.execute(plan);
+    }
+
     /// MANDATORY SECURITY TEST 1: a native op that settles MORE ETH than the
     /// unwrap credited (11 ether settled vs 10 unwrapped — the extra wei can
     /// only come from standing ETH) must revert CollateralOverspent. The

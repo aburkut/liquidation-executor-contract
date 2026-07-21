@@ -37,6 +37,7 @@ library GenericSequenceLib {
     error OpOutputNotReceived(uint256 opIndex);
     error InsufficientRepayOutput(uint256 actual, uint256 required);
     error CollateralOverspent(uint256 spent, uint256 allowed);
+    error V4InputOverspent(uint256 consumed, uint256 amount);
 
     /// GENERIC_SEQUENCE op flags — direct-call routing only.
     uint32 internal constant FLAG_USE_FULL_BALANCE = 1 << 0; // inject balanceOf(srcToken) at fromAmountPos
@@ -258,7 +259,18 @@ library GenericSequenceLib {
 
                 // Positive amountSpec = exact-out (buy `amount`); negative =
                 // exact-in (sell `amount`). Cast is bounded above.
-                int256 amountSpec = (op.flags & FLAG_V4_EXACT_IN != 0) ? -int256(amount) : int256(amount);
+                bool exactInV4 = op.flags & FLAG_V4_EXACT_IN != 0;
+                // Per-op input ceiling (parity with `_executeUniV4Leg`'s
+                // `consumed <= amountIn`). For exact-IN, the settle must pull
+                // no more of the input than `amount`; snapshot the input token
+                // (native ETH via `_balOf` = `address(this).balance`, else the
+                // ERC20 balance) to bound a settle over-pull per-op instead of
+                // relying solely on the end-of-sequence containment cap. Skipped
+                // for exact-OUT, where the pool-demanded input legitimately
+                // differs from `amount` (the output) — the containment cap
+                // governs that direction.
+                uint256 v4InBefore = exactInV4 ? _balOf(op.srcToken) : 0;
+                int256 amountSpec = exactInV4 ? -int256(amount) : int256(amount);
                 (bool okV4, bytes memory retV4) =
                     op.target.call(abi.encodeWithSelector(V4_UNLOCK_SELECTOR, abi.encode(op.callData, amountSpec)));
 
@@ -279,6 +291,16 @@ library GenericSequenceLib {
                         }
                     }
                     revert OpCallFailed(i);
+                }
+
+                // Enforce the exact-in input ceiling: consumed input <= amount.
+                // A well-formed exact-in settle pulls exactly `amount`, so this
+                // is tight; anything above (a settle over-pull dipping standing
+                // funds) reverts here rather than only at the containment cap.
+                if (exactInV4) {
+                    uint256 v4InAfter = _balOf(op.srcToken);
+                    uint256 v4Consumed = v4InBefore > v4InAfter ? v4InBefore - v4InAfter : 0;
+                    if (v4Consumed > amount) revert V4InputOverspent(v4Consumed, amount);
                 }
             } else {
                 // Direct call into an allowlisted router/aggregator whose calldata
