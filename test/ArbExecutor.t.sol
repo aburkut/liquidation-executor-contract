@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {ArbExecutor, ArbTypes} from "../src/ArbExecutor.sol";
@@ -379,6 +380,46 @@ contract ArbExecutorTest is Test {
         assertEq(loan.balanceOf(address(exec)), 10e18, "arb profit retained");
     }
 
+    /// Task 8 fix 1: both flash callbacks (`receiveFlashLoan`,
+    /// `onMorphoFlashLoan`) cleared `_activePlanHash` to bytes32(0) (the V10
+    /// re-entry guard) BEFORE calling `_runArbPipeline`, which then read the
+    /// already-zeroed slot for the `ArbExecuted` event — every emitted
+    /// `planHash` topic was bytes32(0) regardless of the real plan. The fix
+    /// captures the hash BEFORE the clear and threads it through explicitly.
+    /// This test pins the REAL plan hash on the emitted event; reverting the
+    /// fix (reading `_activePlanHash` instead of the threaded `planHash` at
+    /// the `emit` site) makes this test fail with planHash == bytes32(0)
+    /// (verified manually — not committed, since bytes32(0) would trivially
+    /// match a same-value comparison and this assertion is the correct way
+    /// to pin the regression).
+    function test_arbExecuted_emits_real_planHash() public {
+        _fundAndAllowlist();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _swapOp(address(loan), 100e18, address(mid), 100e18);
+        ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
+        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 0, 5e18);
+        bytes32 expectedPlanHash = keccak256(planData);
+        // Sanity: the plan hash is non-zero, so a bytes32(0) emission (the
+        // pre-fix bug) would be distinguishable from the expected value.
+        assertTrue(expectedPlanHash != bytes32(0), "sanity: plan hash must be non-zero");
+
+        vm.recordLogs();
+        vm.prank(operatorAddr);
+        exec.execute(planData);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 arbExecutedSig = keccak256("ArbExecuted(bytes32,address,uint256,uint256)");
+        bool found = false;
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].topics.length > 0 && logs[i].topics[0] == arbExecutedSig) {
+                found = true;
+                assertEq(logs[i].topics[1], expectedPlanHash, "ArbExecuted.planHash must equal keccak256(planData)");
+                assertEq(address(uint160(uint256(logs[i].topics[2]))), address(loan), "ArbExecuted.loanToken");
+            }
+        }
+        assertTrue(found, "ArbExecuted event not emitted");
+    }
+
     // ─── Op admission-control reverts (Task 5) ────────────────────────
     // Replaces the old static leg-chain wiring checks (first-leg srcToken /
     // last-leg repayToken / link matching) — those invariants no longer
@@ -417,6 +458,66 @@ contract ArbExecutorTest is Test {
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.TargetNotAllowed.selector);
         exec.execute(plan);
+    }
+
+    /// Task 8 fix 2: the pre-flight allowlist walk exempted ops on
+    /// bit-PRESENCE (`flags & FLAG_WETH_UNWRAP != 0`), so a combined-flag op
+    /// (unwrap bit set ALONGSIDE another flag, here FLAG_V4_UNLOCK) wrongly
+    /// skipped the allowlist check even though it DOES carry an external
+    /// `target` — reused as the V4 PoolManager under FLAG_V4_UNLOCK. This
+    /// combined shape is not a real unwrap by GenericSequenceLib's own
+    /// runtime contract (its exact-match guard `op.flags != FLAG_WETH_UNWRAP`
+    /// would revert InvalidPlan once inside the flash), so pre-fix a plan
+    /// could reach the flashloan/library entirely on the strength of a
+    /// non-allowlisted target that should have been rejected before ever
+    /// borrowing funds. After the fix (exact-equality), this op is NOT
+    /// exempt and TargetNotAllowed fires in the pre-flashloan walk, before
+    /// any flashloan is taken.
+    function test_execute_combinedFlagUnwrapTarget_notExempted_reverts() public {
+        Op[] memory ops = new Op[](1);
+        ops[0].target = address(0xBEEF); // never allowlisted
+        ops[0].srcToken = address(weth);
+        ops[0].outToken = address(tokenB);
+        ops[0].amountIn = 1e18;
+        ops[0].flags = GenericSequenceLib.FLAG_WETH_UNWRAP | GenericSequenceLib.FLAG_V4_UNLOCK;
+        ops[0].callData = abi.encode(address(weth), address(tokenB), uint24(500), int24(10), address(0));
+
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0, 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.TargetNotAllowed.selector);
+        exec.execute(plan);
+    }
+
+    /// Confirms the fix does NOT reject a LEGIT unwrap op: `flags` EXACTLY
+    /// equal to `FLAG_WETH_UNWRAP` must still be exempt from the pre-flight
+    /// allowlist walk (per the library contract, a real unwrap op carries no
+    /// external target). `op.target` is deliberately set to a
+    /// non-allowlisted address to prove the exemption still applies — if the
+    /// walk wrongly started gating pure-unwrap ops too, this would revert
+    /// `TargetNotAllowed` before the flashloan is even taken. Instead it
+    /// proceeds past the pre-flight walk into the flash and fails on an
+    /// UNRELATED guard downstream (repay shortfall — this plan's only op
+    /// spends loanToken without ever converting anything back), proving the
+    /// admission control, not the repay gate, is what's being pinned here.
+    function test_execute_pureUnwrapFlag_stillExempted_preflight() public {
+        Op[] memory ops = new Op[](1);
+        ops[0].target = address(0xBEEF); // irrelevant for a pure unwrap op
+        ops[0].srcToken = address(weth);
+        ops[0].amountIn = 1e18;
+        ops[0].flags = GenericSequenceLib.FLAG_WETH_UNWRAP;
+
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0, 0);
+
+        vm.prank(operatorAddr);
+        try exec.execute(plan) {
+            fail("expected a revert (repay shortfall), but execute() unexpectedly succeeded");
+        } catch (bytes memory reason) {
+            bytes4 selector = bytes4(reason);
+            assertTrue(
+                selector != ArbExecutor.TargetNotAllowed.selector,
+                "pure unwrap op must stay exempt from the pre-flight allowlist walk"
+            );
+        }
     }
 
     function test_revert_ops_repayShortfall() public {

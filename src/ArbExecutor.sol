@@ -291,10 +291,18 @@ contract ArbExecutor is
 
         // Pre-flashloan allowlist walk: every op target must be allowlisted.
         // FLAG_WETH_UNWRAP ops carry no external target (they call the pinned
-        // weth.withdraw), so they are exempt — exactly as the liquidation
-        // pre-flash walk exempts them (LiquidationExecutor:669).
+        // weth.withdraw), so they are exempt. EXACT-equality, not
+        // bit-presence: a combined-flag op (e.g. FLAG_WETH_UNWRAP |
+        // FLAG_V4_UNLOCK) DOES carry an external target (`op.target`, reused
+        // as the V4 leg's PoolManager under the other flag), so bit-presence
+        // would wrongly skip the allowlist check for it. Mirrors
+        // GenericSequenceLib's own runtime guard (`op.flags !=
+        // FLAG_WETH_UNWRAP` → InvalidPlan), which already only treats a
+        // flags word EXACTLY equal to FLAG_WETH_UNWRAP as a real unwrap —
+        // this keeps the pre-flight walk in lockstep with that authority
+        // instead of relying on it as the sole backstop.
         for (uint256 i = 0; i < plan.ops.length; ++i) {
-            if (plan.ops[i].flags & GenericSequenceLib.FLAG_WETH_UNWRAP != 0) continue;
+            if (plan.ops[i].flags == GenericSequenceLib.FLAG_WETH_UNWRAP) continue;
             if (!allowedTargets[plan.ops[i].target]) revert TargetNotAllowed();
         }
 
@@ -340,6 +348,10 @@ contract ArbExecutor is
         if (_activePlanHash == bytes32(0)) revert NoActivePlan();
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) revert InvalidCallbackCaller();
         if (keccak256(userData) != _activePlanHash) revert InvalidPlan();
+        // Capture BEFORE the clear below — the clear zeroes the slot the
+        // event emission used to read from, which made every ArbExecuted
+        // topic bytes32(0) (Task 8 fix 1).
+        bytes32 planHash = _activePlanHash;
         // V10 audit fix: clear plan hash to block callback re-entry
         // within the same flash. The triple-gate (phase + hash + caller)
         // is otherwise stable for the entire flash window — a hostile
@@ -355,7 +367,7 @@ contract ArbExecutor is
         if (feeAmounts[0] > plan.maxFlashFee) revert FlashFeeExceeded(feeAmounts[0], plan.maxFlashFee);
 
         uint256 flashRepay = amounts[0] + feeAmounts[0];
-        _runArbPipeline(plan, flashRepay, msg.sender);
+        _runArbPipeline(plan, flashRepay, msg.sender, planHash);
     }
 
     /// @dev Morpho Blue flashloan callback. Morpho is fee-free; it pulls
@@ -367,6 +379,10 @@ contract ArbExecutor is
         if (_activePlanHash == bytes32(0)) revert NoActivePlan();
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_MORPHO]) revert InvalidCallbackCaller();
         if (keccak256(data) != _activePlanHash) revert InvalidPlan();
+        // Capture BEFORE the clear below — mirror of `receiveFlashLoan`'s
+        // fix (Task 8 fix 1): reading the slot AFTER the clear always
+        // produced bytes32(0) in the emitted event.
+        bytes32 planHash = _activePlanHash;
         // V10 audit fix: clear plan hash to block callback re-entry.
         // Mirror of `receiveFlashLoan`.
         _activePlanHash = bytes32(0);
@@ -375,7 +391,7 @@ contract ArbExecutor is
         if (amount != plan.loanAmount) revert CallbackAmountMismatch();
 
         // Morpho fee = 0
-        _runArbPipeline(plan, amount, address(0));
+        _runArbPipeline(plan, amount, address(0), planHash);
     }
 
     /// @inheritdoc IUnlockCallback
@@ -425,8 +441,13 @@ contract ArbExecutor is
 
     // ─── Pipeline (inside flash) ─────────────────────────────────────
     /// @dev `vault == address(0)` ⇒ approve-only (Morpho pulls).
-    /// `vault != 0` ⇒ push transfer to the vault.
-    function _runArbPipeline(ArbTypes.ArbPlan memory plan, uint256 flashRepay, address vault) internal {
+    /// `vault != 0` ⇒ push transfer to the vault. `planHash` is captured by
+    /// the caller BEFORE it clears `_activePlanHash` (the V10 re-entry
+    /// guard) — reading the storage slot from here would always see the
+    /// already-cleared bytes32(0) (Task 8 fix 1).
+    function _runArbPipeline(ArbTypes.ArbPlan memory plan, uint256 flashRepay, address vault, bytes32 planHash)
+        internal
+    {
         address loanToken = plan.loanToken;
 
         // Verify the flash actually arrived.
@@ -472,6 +493,6 @@ contract ArbExecutor is
 
         CoinbasePaymentLib.checkProfit(realizedProfit, coinbasePaid, plan.minProfitAmount);
 
-        emit ArbExecuted(_activePlanHash, loanToken, realizedProfit, coinbasePaid);
+        emit ArbExecuted(planHash, loanToken, realizedProfit, coinbasePaid);
     }
 }

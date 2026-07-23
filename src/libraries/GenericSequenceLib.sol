@@ -130,6 +130,43 @@ library GenericSequenceLib {
     /// @notice Execute a flat `Op[]` sequence with per-srcToken containment
     /// (liquidation semantics: cap = collateral, delta repay gate). MUST be
     /// invoked via DELEGATECALL so it shares the executor's storage/balances.
+    /// @dev SECURITY NOTE (Task 8 fix 3, accepted-risk — documented, not
+    /// code-changed): nothing in this `external` function enforces that it
+    /// is reached via DELEGATECALL. A direct CALL to this library's own
+    /// deployed address executes the identical logic against the LIBRARY'S
+    /// OWN storage/balances instead of a caller's. This is PRE-EXISTING
+    /// (shared by `LiquidationExecutor.run` + `ArbExecutor.runArb` + the
+    /// `GenericSequenceLibWrapper` test harness, all of which reach this lib
+    /// via DELEGATECALL, where `address(this)` is the CALLER, not the
+    /// library) and NOT introduced by the arb-parity change.
+    /// Harm precondition: tokens must be resting AT THE LIBRARY'S OWN
+    /// ADDRESS — abnormal by design, since normal operation only ever moves
+    /// funds through an executor's delegatecall context and the library
+    /// itself is never a flashloan/liquidation recipient, never holds an
+    /// allowance, and is never the `to` of any transfer in this codebase.
+    /// No standing balance is expected to accumulate there.
+    /// Why no code-level guard: Solidity libraries are STATELESS — no
+    /// constructor, no immutable, no state variable — so the usual
+    /// `require(address(this) != __self)` anti-direct-call pattern (e.g.
+    /// UUPSUpgradeable's `notDelegated`, which relies on a CONTRACT's
+    /// immutable self-address set in a constructor) is not directly
+    /// expressible here. The alternatives considered were rejected as
+    /// riskier than the accepted gap:
+    ///   * Embedding this library's own runtime codehash as a hardcoded
+    ///     constant and comparing `address(this).codehash` against it is
+    ///     self-referential (the constant would need to be computed from a
+    ///     build that already includes the constant) — it requires a
+    ///     fragile two-pass build/CI step where a mismatch would SILENTLY
+    ///     brick the legitimate delegatecall path (false positive), which
+    ///     is a worse outcome than the pre-existing gap on a money contract.
+    ///   * Any check that inspects the caller's storage/interface (e.g.
+    ///     probing for an `owner()`/Ownable slot) couples this SHARED
+    ///     library to assumptions about specific callers' storage layout
+    ///     across two different executor contracts, and a bug in that probe
+    ///     could break the delegatecall path itself.
+    /// If a caller ever needs to hold a standing token balance at rest,
+    /// revisit this note first — reject the funds settling at the library
+    /// address instead of adding the guard here.
     function run(
         Op[] memory ops,
         address loanToken,
@@ -146,6 +183,12 @@ library GenericSequenceLib {
     /// token is `loanToken` (allowed spend = `loanAmount`) and the repay gate
     /// is ABSOLUTE. Every other token keeps allowed-spend 0 (no standing
     /// balance may leave). MUST be invoked via DELEGATECALL.
+    /// @dev SECURITY NOTE (Task 8 fix 3, accepted-risk — documented, not
+    /// code-changed): see the identical note on `run` above — this function
+    /// shares the same unenforced DELEGATECALL-only precondition and the
+    /// same rationale for not adding a guard (libraries are stateless; no
+    /// clean anti-direct-call mechanic is available that doesn't risk the
+    /// `ArbExecutor.execute()` flash pipeline).
     function runArb(Op[] memory ops, address loanToken, uint256 flashRepayAmount, uint256 loanAmount, address weth)
         external
     {
@@ -414,6 +457,34 @@ library GenericSequenceLib {
         // (pinned by test_nativeEth_standingSpend_withoutUnwrap_reverts).
         // The `t != address(0)` guard also keeps a zero collateralAsset from
         // ever matching the ETH bucket.
+        // @dev Task 8 fix 4 — accepted rationale for the loanToken cap
+        // (owner-accepted option (a), NO code change): for `runArb`,
+        // `capToken == loanToken` and `capAmount == loanAmount`, so the
+        // loanToken bucket's allowed spend below is `loanAmount`, NOT zero —
+        // a WEAKER invariant than "no standing loanToken may leave at all"
+        // (which is what every other token bucket enforces). A compromised
+        // operator could in principle route up to `loanAmount` of a
+        // PRE-EXISTING standing loanToken balance out through an op, on top
+        // of the legitimate flash principal, without tripping this cap.
+        // Accepted because:
+        //   (i)   every op `target` is owner-allowlisted (constructor-pinned
+        //         routers + `setAllowedTarget`) — honest routers move funds
+        //         only to the executor per the outToken-delta check, so a
+        //         compromised OPERATOR (not owner) cannot pull-and-return
+        //         dust to an attacker-controlled address through this cap;
+        //   (ii)  the only path that actually extracts value to outside the
+        //         contract at all is the coinbase bribe, which requires the
+        //         operator to ALSO control the block builder receiving
+        //         `block.coinbase` — i.e. builder collusion, not an
+        //         unprivileged operator-only exploit;
+        //   (iii) profit is withdrawn PROMPTLY by the owner in normal
+        //         operation (see `ArbExecutor.withdraw`), so no large
+        //         standing loanToken residual is expected to accumulate and
+        //         sit exposed to this weaker cap for long.
+        // This is an accepted trade-off, not an oversight — do not tighten
+        // the loanToken cap to 0 without re-deriving the repay-gate math
+        // (the flash principal MUST be spendable up to `loanAmount`, or
+        // `runArb`'s own op sequence could never spend the borrowed funds).
         for (uint256 k = 0; k < nSnap; ++k) {
             address t = snapTok[k];
             uint256 allowed = (t != address(0) && t == capToken) ? capAmount : 0;
