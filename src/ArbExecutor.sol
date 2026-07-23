@@ -9,6 +9,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IMorphoBlue, IMorphoFlashLoanCallback} from "./interfaces/IMorphoBlue.sol";
+import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
 import {UniswapLib} from "./libraries/UniswapLib.sol";
 import {CurveV1Lib} from "./libraries/CurveV1Lib.sol";
 import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
@@ -73,7 +74,14 @@ library ArbTypes {
     }
 }
 
-contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecipient, IMorphoFlashLoanCallback {
+contract ArbExecutor is
+    Ownable2Step,
+    Pausable,
+    ReentrancyGuard,
+    IFlashLoanRecipient,
+    IMorphoFlashLoanCallback,
+    IUnlockCallback
+{
     using SafeERC20 for IERC20;
 
     // ─── Errors ──────────────────────────────────────────────────────
@@ -100,6 +108,7 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
     error CoinbasePaymentFailed();
     error CoinbaseExceedsProfit(uint256 coinbase, uint256 profit);
     error InsufficientProfit(uint256 realized, uint256 min);
+    error InvalidV4CallbackHook();
 
     // ─── Events ──────────────────────────────────────────────────────
     event ArbExecuted(
@@ -110,11 +119,13 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
     event Withdraw(address indexed token, address indexed to, uint256 amount);
     // Mirrors CoinbasePaymentLib.CoinbasePaid for tests that pin the topic.
     event CoinbasePaid(address indexed coinbase, uint256 amount);
+    event V4HookAllowedUpdated(address indexed hook, bool allowed);
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_BALANCER = 2;
     uint8 public constant FLASH_PROVIDER_MORPHO = 3;
     uint8 private constant MAX_LEGS = 8;
+    uint256 private constant V4_SWAP_DATA_LENGTH = 160;
 
     // ─── Immutables (constructor-pinned) ─────────────────────────────
     address public immutable operator;
@@ -232,6 +243,18 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
         if (target == address(0)) revert ZeroAddress();
         allowedTargets[target] = allowed;
         emit AllowedTargetUpdated(target, allowed);
+    }
+
+    /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.
+    /// @dev Hooks execute arbitrary logic during `beforeSwap`/`afterSwap` on the
+    /// PoolManager; any non-zero hook that is NOT in this whitelist causes the
+    /// V4 path to revert with `InvalidPlan`. Default is empty — operator
+    /// routes MUST stay on hook-less pools unless the owner explicitly enables
+    /// a hook after review.
+    function setV4HookAllowed(address hook, bool allowed) external onlyOwner {
+        if (hook == address(0)) revert ZeroAddress();
+        allowedV4Hooks[hook] = allowed;
+        emit V4HookAllowedUpdated(hook, allowed);
     }
 
     function pause() external onlyOwner {
@@ -365,6 +388,51 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
 
         // Morpho fee = 0
         _runArbPipeline(plan, amount, address(0));
+    }
+
+    /// @inheritdoc IUnlockCallback
+    /// @notice PRODUCTION SCOPE — this callback implements exactly ONE shape:
+    ///   exact-input single-hop ERC20→ERC20 swap inside the flashloan pipeline.
+    /// @dev Three layers of protection against stray or adversarial calls:
+    ///   1. `ExecutionPhase.FlashLoanActive` — only valid inside execute()
+    ///   2. `_v4Armed`                       — only while a V4 leg is mid-unlock
+    ///   3. `msg.sender == _activeV4PoolManager` — only the pinned PoolManager
+    /// Verbatim port of `LiquidationExecutor.unlockCallback` (line 1509) —
+    /// same guards, same re-entry CLAIM-on-entry discipline, same
+    /// single-hop/multihop dispatch on `inner.length`.
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
+        // tokenIn is read from storage (pinned by the V4 leg arming path)
+        // rather than from `data` — PM controls the data, not storage, so
+        // substitution is impossible by construction. The re-entry guard
+        // is `_v4Armed` (NOT tokenIn != 0 — that collided with native-ETH
+        // legs, where tokenIn == address(0) by design): claiming it
+        // (clearing to false) on entry means a nested unlockCallback from
+        // inside swap() finds `_v4Armed == false` and the combined check
+        // below fails closed, regardless of what tokenIn is. The
+        // msg.sender check covers the not-in-flow case (_activeV4PoolManager
+        // == 0 → msg.sender != 0 = always true).
+        address tokenIn = _activeV4TokenIn;
+        if (!_v4Armed || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
+        _v4Armed = false; // CLAIM — nested unlockCallback finds false and fails closed
+        _activeV4TokenIn = address(0); // CLAIM (hygiene only now — see above)
+
+        // Uniform unlock-data shape for single-hop AND multihop:
+        //   abi.encode(bytes inner, int256 amountSpec)
+        // where `inner` is the leg's `v4SwapData` passed verbatim by the
+        // arming path. inner.length distinguishes the modes:
+        //   == V4_SWAP_DATA_LENGTH (160) → single-hop 5-tuple inside
+        //   >  V4_SWAP_DATA_LENGTH       → multihop V4Hop[] inside
+        (bytes memory inner, int256 amountSpec) = abi.decode(data, (bytes, int256));
+        if (inner.length == V4_SWAP_DATA_LENGTH) {
+            (, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
+                abi.decode(inner, (address, address, uint24, int24, address));
+            if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
+            UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec);
+        } else {
+            UniswapLib.runV4UnlockMultihop(IPoolManager(msg.sender), tokenIn, data);
+        }
+        return "";
     }
 
     // ─── Pipeline (inside flash) ─────────────────────────────────────

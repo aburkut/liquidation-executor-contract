@@ -503,4 +503,22 @@ contract ArbExecutorTest is Test {
     function test_v4UnlockSelectorPin() public pure {
         assertEq(bytes4(keccak256("unlock(bytes)")), bytes4(0x48c89491));
     }
+
+    // ─── unlockCallback + V4 hook allowlist (Task 4 of arb-full-parity) ───
+
+    function test_unlockCallback_whenNotArmed_reverts() public {
+        // Not in flash, not armed → must revert (fail-closed re-entry guard).
+        vm.expectRevert(); // InvalidExecutionPhase or InvalidCallbackCaller
+        exec.unlockCallback(abi.encode(bytes(""), int256(0)));
+    }
+
+    function test_setV4HookAllowed_onlyOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert(); // Ownable: caller is not the owner
+        exec.setV4HookAllowed(address(0x1234), true);
+        // owner path:
+        vm.prank(ownerAddr);
+        exec.setV4HookAllowed(address(0x1234), true);
+        assertTrue(exec.allowedV4Hooks(address(0x1234)));
+    }
 }
