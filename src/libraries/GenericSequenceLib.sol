@@ -29,6 +29,20 @@ interface IWETH {
 library GenericSequenceLib {
     using SafeERC20 for IERC20;
 
+    /// @dev Selects how the post-sequence repay assertion compares the
+    /// executor's loanToken balance against `flashRepayAmount`.
+    ///   * Delta    — liquidation: loanToken was SPENT before the sequence
+    ///                (on liquidationCall), so the sequence must REPRODUCE
+    ///                `flashRepay`; assert `loanAfter - loanBefore >= flashRepay`.
+    ///   * Absolute — arbitrage: the flash principal is present at entry and
+    ///                the sequence both spends AND reproduces loanToken, so the
+    ///                delta gate is short by `loanAmount`; assert the absolute
+    ///                `loanAfter >= flashRepay`.
+    enum RepayGate {
+        Delta,
+        Absolute
+    }
+
     error EmptyOps();
     error TooManyOps();
     error InvalidPlan();
@@ -113,10 +127,9 @@ library GenericSequenceLib {
     /// Mirrors `LiquidationExecutor.V4_SWAP_DATA_LENGTH`.
     uint256 private constant V4_SWAP_DATA_LENGTH = 160;
 
-    /// @notice Execute a flat `Op[]` sequence with per-srcToken containment.
-    /// @dev MUST be invoked via DELEGATECALL (as `GenericSequenceLib.run(...)`)
-    /// so it shares the executor's storage and balances. Targets are assumed
-    /// pre-validated as allowlisted by the caller.
+    /// @notice Execute a flat `Op[]` sequence with per-srcToken containment
+    /// (liquidation semantics: cap = collateral, delta repay gate). MUST be
+    /// invoked via DELEGATECALL so it shares the executor's storage/balances.
     function run(
         Op[] memory ops,
         address loanToken,
@@ -125,6 +138,22 @@ library GenericSequenceLib {
         uint256 collateralDelta,
         address weth
     ) external {
+        _executeOps(ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta, weth, RepayGate.Delta);
+    }
+
+    /// @notice Execute a flat `Op[]` sequence with per-srcToken containment.
+    /// @dev MUST be invoked via DELEGATECALL (as `GenericSequenceLib.run(...)`)
+    /// so it shares the executor's storage and balances. Targets are assumed
+    /// pre-validated as allowlisted by the caller.
+    function _executeOps(
+        Op[] memory ops,
+        address loanToken,
+        uint256 flashRepayAmount,
+        address capToken,
+        uint256 capAmount,
+        address weth,
+        RepayGate repayGate
+    ) internal {
         uint256 n = ops.length;
         if (n == 0) revert EmptyOps();
         if (n > MAX_OPS) revert TooManyOps();
@@ -212,9 +241,9 @@ library GenericSequenceLib {
             // The per-srcToken cap below is the real backstop.
             uint256 amount = op.amountIn;
             if (op.flags & FLAG_USE_FULL_BALANCE != 0) {
-                if (collateralAsset == address(0) || op.srcToken != collateralAsset) revert InvalidPlan();
-                uint256 bal = IERC20(collateralAsset).balanceOf(address(this));
-                amount = bal < collateralDelta ? bal : collateralDelta;
+                if (capToken == address(0) || op.srcToken != capToken) revert InvalidPlan();
+                uint256 bal = IERC20(capToken).balanceOf(address(this));
+                amount = bal < capAmount ? bal : capAmount;
             } else if (op.flags & FLAG_USE_PREV_RETURN != 0) {
                 amount = prevReturn;
             }
@@ -347,8 +376,12 @@ library GenericSequenceLib {
 
         // Repay leg gate (mirrors the split/mixed-split repay assertion).
         uint256 loanAfter = IERC20(loanToken).balanceOf(address(this));
-        uint256 repayDelta = loanAfter > loanBefore ? loanAfter - loanBefore : 0;
-        if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+        if (repayGate == RepayGate.Delta) {
+            uint256 repayDelta = loanAfter > loanBefore ? loanAfter - loanBefore : 0;
+            if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
+        } else {
+            if (loanAfter < flashRepayAmount) revert InsufficientRepayOutput(loanAfter, flashRepayAmount);
+        }
 
         // Per-srcToken containment cap: no token may be net-spent past what this
         // tx produced (collateralDelta for the collateral asset, 0 otherwise).
@@ -372,7 +405,7 @@ library GenericSequenceLib {
         // ever matching the ETH bucket.
         for (uint256 k = 0; k < nSnap; ++k) {
             address t = snapTok[k];
-            uint256 allowed = (t != address(0) && t == collateralAsset) ? collateralDelta : 0;
+            uint256 allowed = (t != address(0) && t == capToken) ? capAmount : 0;
             uint256 balAfter = _balOf(t);
             uint256 spent = snapBal[k] > balAfter ? snapBal[k] - balAfter : 0;
             if (spent > allowed) revert CollateralOverspent(spent, allowed);
