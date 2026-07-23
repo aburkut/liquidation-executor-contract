@@ -56,7 +56,7 @@ Today `ArbExecutor` executes only a **linear chain** of single-venue legs (`legs
   - `execute()` pre-flashloan validation walks `ops[]` and asserts every `op.target ∈ allowedTargets` (mirrors the liquidation pre-flash allowlist walk, incl. the `FLAG_WETH_UNWRAP` exemption which carries no external target).
   - Inside the flash callback, call `GenericSequenceLib.runArb(plan.ops, loanToken, flashRepay, loanAmount, weth)` via DELEGATECALL.
   - Coinbase bribe + `minProfit` guard stay in `_runArbPipeline` around the sequence (unchanged shape — realized profit is `loanAfter − loanBefore − 0`; note the profit computation must account for the arb `loanBefore = loanAmount` baseline, distinct from liquidation).
-- **EIP-170**: adding the V4 callback + generic-sequence path grows the runtime. Measure after each task; if it crosses 24576 bytes, move the incremental logic to a DELEGATECALL library exactly as the native-V4 change did (`SwapValidationLib`/`GenericSequenceLib` already off-loaded). The plan includes a size checkpoint.
+- **EIP-170**: adding the V4 callback + generic-sequence path grows the runtime. **Headroom is large** — measured 2026-07-23, `ArbExecutor` creation bytecode is ~11.3 KB vs `LiquidationExecutor`'s ~25 KB (the liquidation runtime sits near the 24576 limit only because it carries all the Aave/Morpho action logic, which arb has none of). So the port most likely fits without off-loading. Still: measure after each task; if it crosses 24576 bytes, move the incremental logic to a DELEGATECALL library exactly as the native-V4 change did. The plan includes a size checkpoint.
 
 ### 2.3 Off-chain (bot) — `ArbPlan` `Op[]` encoder
 
