@@ -18,6 +18,11 @@ via_ir = true
 # deployed contract comfortably under the EIP-170 24,576-byte limit.
 bytecode_hash = "none"
 cbor_metadata = false
+# Emit storageLayout in build artifacts so `forge inspect <Contract>
+# storageLayout` works — the authoritative offline check that V4 arming
+# fields (GenericSequenceLib's hardcoded V4_PM_SLOT/V4_TOKENIN_SLOT) land at
+# the right slots in both LiquidationExecutor and ArbExecutor.
+extra_output = ["storageLayout"]
 
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",

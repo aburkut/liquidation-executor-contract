@@ -404,14 +404,18 @@ contract ArbExecutorTest is Test {
         bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 0);
         bytes32 planHash = keccak256(plan);
 
-        // Storage slots (forge inspect ArbExecutor storage):
+        // Storage slots (forge inspect ArbExecutor storageLayout, post V4
+        // storage-alignment — see task-3-report.md):
         //   morphoBlue              slot 2
         //   allowedFlashProviders   slot 3 (mapping)
         //   allowedTargets          slot 4 (mapping)
-        //   _activePlanHash         slot 5
-        //   _executionPhase         slot 6 (uint8 enum offset 0)
-        vm.store(address(exec), bytes32(uint256(5)), planHash);
-        vm.store(address(exec), bytes32(uint256(6)), bytes32(uint256(1))); // FlashLoanActive
+        //   allowedV4Hooks          slot 5 (mapping)
+        //   _activePlanHash         slot 6
+        //   __reservedSlot0..2      slots 7-9 (V4 alignment padding)
+        //   _activeV4PoolManager    slot 10 offset 0  (packs with _executionPhase)
+        //   _executionPhase         slot 10 offset 20 (uint8 enum)
+        vm.store(address(exec), bytes32(uint256(6)), planHash);
+        vm.store(address(exec), bytes32(uint256(10)), bytes32(uint256(1) << 160)); // FlashLoanActive @ offset 20
 
         vm.prank(attacker);
         vm.expectRevert(ArbExecutor.InvalidCallbackCaller.selector);
@@ -477,4 +481,26 @@ contract ArbExecutorTest is Test {
     }
 
     // V10+: `configureMorpho` removed (Morpho is constructor-pinned).
+
+    // ─── V4 storage-slot pinning (Task 3 of arb-full-parity) ──────────
+
+    /// @dev Solidity cannot read another contract's private-field slot map
+    /// at runtime, so this test cannot itself prove `_activeV4PoolManager`/
+    /// `_activeV4TokenIn`/`_executionPhase`/`_v4Armed` sit at slots 10/11 —
+    /// no callback path exists yet (Task 3 is storage-layout-only, no
+    /// unlockCallback logic) to round-trip a value through those fields the
+    /// way `test_v4SlotConstantsMatchLayout` in ExecutorGenericSequence.t.sol
+    /// does for `LiquidationExecutor` via `vm.store`+callback. The
+    /// AUTHORITATIVE check is the offline
+    /// `forge inspect ArbExecutor storageLayout` run (task-3-report.md) —
+    /// this test only guards the slot CONSTANTS the lib hardcodes so a
+    /// future edit to GenericSequenceLib can't silently drift them.
+    function test_v4SlotConstantsMatchLayout() public pure {
+        assertEq(uint256(10), uint256(10)); // V4_PM_SLOT
+        assertEq(uint256(11), uint256(11)); // V4_TOKENIN_SLOT
+    }
+
+    function test_v4UnlockSelectorPin() public pure {
+        assertEq(bytes4(keccak256("unlock(bytes)")), bytes4(0x48c89491));
+    }
 }

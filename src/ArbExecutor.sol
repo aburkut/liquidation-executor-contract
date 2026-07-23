@@ -124,6 +124,10 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
     address public immutable uniV3Router;
 
     // ─── Storage ─────────────────────────────────────────────────────
+    // Layout NOTE: the V4 arming fields MUST land at slots 10/11 to match
+    // GenericSequenceLib's pinned V4_PM_SLOT/V4_TOKENIN_SLOT constants (the
+    // lib sstores into them via DELEGATECALL). test_v4SlotConstantsMatchLayout
+    // is the authority — if it fails, adjust the field order/padding below.
     address public morphoBlue;
     mapping(uint8 => address) public allowedFlashProviders;
     /// @dev Generic allowlist for Bebop settlement / future protocol
@@ -131,13 +135,38 @@ contract ArbExecutor is Ownable2Step, Pausable, ReentrancyGuard, IFlashLoanRecip
     /// constructor-immutable; Curve / Balancer pool addresses are
     /// trusted from the bot (sanity-gated inside their libraries).
     mapping(address => bool) public allowedTargets;
+    /// @dev V4 hook allowlist (parity with LiquidationExecutor). Owner-curated;
+    /// the unlockCallback single-hop branch re-checks `allowedV4Hooks[hook]`.
+    mapping(address => bool) public allowedV4Hooks;
 
     bytes32 private _activePlanHash;
+    /// @dev Storage-layout alignment padding (slots 7-9). `ArbExecutor` has
+    /// three fewer pre-V4 storage fields than `LiquidationExecutor`
+    /// (`aavePool`, `paraswapAugustusV6`, `aaveV2LendingPool` are either
+    /// Aave-specific — not applicable to an arb-only executor — or
+    /// constructor-`immutable` here, so they consume no storage slot).
+    /// Without this padding `_activeV4PoolManager`/`_activeV4TokenIn` would
+    /// land at slots 7/8 instead of the 10/11 `GenericSequenceLib` hardcodes
+    /// (`V4_PM_SLOT`/`V4_TOKENIN_SLOT`) and shares with `LiquidationExecutor`
+    /// via the same DELEGATECALL sstore. Reserved, never read/written by
+    /// this contract — `forge inspect ArbExecutor storageLayout` is the
+    /// authority that these three slots land the V4 fields correctly.
+    bytes32 private __reservedSlot0;
+    bytes32 private __reservedSlot1;
+    bytes32 private __reservedSlot2;
+    /// @dev Slot 10 (bytes 0..19) — armed V4 PoolManager. Packs with
+    /// `_executionPhase` (byte 20). Pinned by test_v4SlotConstantsMatchLayout.
+    address private _activeV4PoolManager;
     enum ExecutionPhase {
         Idle,
         FlashLoanActive
     }
     ExecutionPhase private _executionPhase;
+    /// @dev Slot 11 (bytes 0..19) — armed V4 input token. Packs with
+    /// `_v4Armed` (byte 20).
+    address private _activeV4TokenIn;
+    /// @dev Slot 11 byte 20 — the re-entry sentinel unlockCallback gates on.
+    bool private _v4Armed;
 
     // ─── Constructor ─────────────────────────────────────────────────
     /// @dev Both flash providers (Balancer Vault + Morpho Blue) are
