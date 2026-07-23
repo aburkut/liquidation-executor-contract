@@ -141,6 +141,17 @@ library GenericSequenceLib {
         _executeOps(ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta, weth, RepayGate.Delta);
     }
 
+    /// @notice Execute a flat `Op[]` sequence for ARBITRAGE: the flash
+    /// principal `loanAmount` of `loanToken` is present at entry, so the cap
+    /// token is `loanToken` (allowed spend = `loanAmount`) and the repay gate
+    /// is ABSOLUTE. Every other token keeps allowed-spend 0 (no standing
+    /// balance may leave). MUST be invoked via DELEGATECALL.
+    function runArb(Op[] memory ops, address loanToken, uint256 flashRepayAmount, uint256 loanAmount, address weth)
+        external
+    {
+        _executeOps(ops, loanToken, flashRepayAmount, loanToken, loanAmount, weth, RepayGate.Absolute);
+    }
+
     /// @notice Execute a flat `Op[]` sequence with per-srcToken containment.
     /// @dev MUST be invoked via DELEGATECALL (as `GenericSequenceLib.run(...)`)
     /// so it shares the executor's storage and balances. Targets are assumed
