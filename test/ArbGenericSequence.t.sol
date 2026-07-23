@@ -7,15 +7,7 @@ import {Op} from "../src/types/SwapTypes.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {GenericSequenceLibWrapper} from "./support/GenericSequenceLibWrapper.sol";
-
-/// Pulls `amountIn` of `tokenIn` (approved by caller) and mints `amountOut`
-/// of `tokenOut` back to the caller — a stand-in for a real swap router.
-contract MockRouter {
-    function swap(address tokenIn, uint256 amountIn, address tokenOut, uint256 amountOut) external {
-        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
-        MockERC20(tokenOut).mint(msg.sender, amountOut);
-    }
-}
+import {MockRouter} from "./support/Mocks.sol";
 
 /// Delegatecalls runArb so library sstore/balance ops hit THIS contract.
 contract ArbSeqHarness {

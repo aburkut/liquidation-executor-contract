@@ -11,53 +11,48 @@ import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.s
 import {IMorphoBlue, IMorphoFlashLoanCallback} from "./interfaces/IMorphoBlue.sol";
 import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
 import {UniswapLib} from "./libraries/UniswapLib.sol";
-import {CurveV1Lib} from "./libraries/CurveV1Lib.sol";
-import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
-import {SwapLegExecutorLib} from "./libraries/SwapLegExecutorLib.sol";
-import {SwapValidationLib} from "./libraries/SwapValidationLib.sol";
+import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
-import {SwapMode, SwapLeg} from "./types/SwapTypes.sol";
+import {Op} from "./types/SwapTypes.sol";
 
 /// @title ArbExecutor
 /// @notice Flashloan-driven N-hop atomic arbitrage executor. Sister
-/// contract to `LiquidationExecutor`; reuses every per-mode swap
-/// library and the SwapTypes / SwapValidationLib / CoinbasePaymentLib
-/// extracted in the V10 refactor.
+/// contract to `LiquidationExecutor`; shares its `Op` / `GenericSequenceLib`
+/// / `CoinbasePaymentLib` infrastructure.
 ///
 /// SCOPE — pure DEX arbitrage:
 ///   * Flashloan principal from Morpho (fee=0) or Balancer.
-///   * Run a sequential chain of swap legs (`legs[]`): leg1 consumes
-///     the loaned principal; each subsequent leg consumes the previous
-///     leg's output via `useFullBalance` (the typical chain shape).
-///   * Final leg's `repayToken` MUST equal `loanToken` so the contract
-///     can settle the flashloan.
+///   * Run a flat `Op[]` generic sequence (shared with
+///     `LiquidationExecutor` via `GenericSequenceLib`): op1 consumes the
+///     loaned principal; subsequent ops chain off the previous op's
+///     output via `FLAG_USE_PREV_RETURN` (the typical chain shape) or
+///     carry an explicit `amountIn`.
+///   * The sequence must reproduce `loanToken` so the contract can
+///     settle the flashloan — enforced at runtime by
+///     `GenericSequenceLib.runArb`'s ABSOLUTE repay gate
+///     (`loanAfter >= flashRepay`), not by static leg-chain validation.
 ///   * Optional `coinbaseBps` slice of realized profit → `block.coinbase`
 ///     as a builder bribe (only valid when `loanToken == weth`).
 ///   * Remaining loan-token balance stays on the contract until the
 ///     owner calls `withdraw(...)`.
 ///
 /// Out of scope (vs. `LiquidationExecutor`):
-///   * No Aave V3 / V2 / Morpho liquidation actions — `legs[]` is the
+///   * No Aave V3 / V2 / Morpho liquidation actions — `ops[]` is the
 ///     entire payload, no `actions[]` array.
-///   * No V4 swap leg (Uni V4's `unlockCallback` needs storage-coupled
-///     `_activeV4PoolManager` / `_activeV4TokenIn` pins; not worth the
-///     complexity until shadow data shows V4 wins on arb routes).
-///   * No SPLIT / MIXED_SPLIT — those shapes only make sense when
-///     splitting collateral between repay + WETH-bribe legs, which is
-///     liquidation-specific.
 library ArbTypes {
     /// @dev Operator-supplied plan for one arb execution.
     ///
     /// `flashProviderId` selects between Morpho (3, fee=0, preferred)
     /// and Balancer (2, has a `maxFlashFee` cap on the protocol fee).
     ///
-    /// Chain invariants enforced in `execute(...)`:
-    ///   * `legs.length >= 1`
-    ///   * `legs[0].srcToken == loanToken`
-    ///   * `legs[N-1].repayToken == loanToken`  (chain closes; can repay)
-    ///   * `legs[i+1].srcToken == legs[i].repayToken`  (links match)
-    ///   * Each leg validated via `SwapValidationLib.validateNonV4Leg`.
-    ///   * V4 swap modes rejected by the lib's `InvalidSwapMode` revert.
+    /// Invariants enforced in `execute(...)`:
+    ///   * `1 <= ops.length <= GenericSequenceLib.MAX_OPS`
+    ///   * every `ops[i].target` is in `allowedTargets`, UNLESS
+    ///     `ops[i].flags & GenericSequenceLib.FLAG_WETH_UNWRAP != 0`
+    ///     (unwrap ops carry no external target).
+    /// Everything else (per-op containment, chaining, the repay gate)
+    /// is enforced at runtime inside `GenericSequenceLib.runArb`, which
+    /// runs the sequence via DELEGATECALL from the flash callback.
     ///
     /// Coinbase bribe (optional): `coinbaseBps` × realizedProfit /
     /// 10_000 is paid to `block.coinbase`. Caller MUST set
@@ -68,7 +63,7 @@ library ArbTypes {
         address loanToken;
         uint256 loanAmount;
         uint256 maxFlashFee;
-        SwapLeg[] legs;
+        Op[] ops;
         uint256 coinbaseBps;
         uint256 minProfitAmount;
     }
@@ -97,7 +92,6 @@ contract ArbExecutor is
     error BalancerSingleTokenOnly();
     error InvalidFlashLoan();
     error InsufficientRepayBalance(uint256 required, uint256 available);
-    error InvalidSwapMode();
     error TargetNotAllowed();
     error UnauthorizedOperator();
     error CoinbaseRequiresWethLoan();
@@ -124,7 +118,6 @@ contract ArbExecutor is
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_BALANCER = 2;
     uint8 public constant FLASH_PROVIDER_MORPHO = 3;
-    uint8 private constant MAX_LEGS = 8;
     uint256 private constant V4_SWAP_DATA_LENGTH = 160;
 
     // ─── Immutables (constructor-pinned) ─────────────────────────────
@@ -292,22 +285,17 @@ contract ArbExecutor is
         // Plan invariants — fail fast pre-flashloan.
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
-        if (plan.legs.length == 0 || plan.legs.length > MAX_LEGS) revert InvalidPlan();
+        if (plan.ops.length == 0 || plan.ops.length > GenericSequenceLib.MAX_OPS) revert InvalidPlan();
         if (plan.coinbaseBps > 10_000) revert InvalidPlan();
         if (plan.coinbaseBps > 0 && plan.loanToken != weth) revert CoinbaseRequiresWethLoan();
 
-        // Chain wiring: first leg starts at loanToken, each subsequent
-        // leg picks up the previous leg's repayToken, last leg closes
-        // back to loanToken.
-        if (plan.legs[0].srcToken != plan.loanToken) revert InvalidPlan();
-        if (plan.legs[plan.legs.length - 1].repayToken != plan.loanToken) revert InvalidPlan();
-        for (uint256 i = 1; i < plan.legs.length; ++i) {
-            if (plan.legs[i].srcToken != plan.legs[i - 1].repayToken) revert InvalidPlan();
-        }
-
-        // Per-leg field-shape validation (V4 modes rejected here).
-        for (uint256 i = 0; i < plan.legs.length; ++i) {
-            SwapValidationLib.validateNonV4Leg(plan.legs[i]);
+        // Pre-flashloan allowlist walk: every op target must be allowlisted.
+        // FLAG_WETH_UNWRAP ops carry no external target (they call the pinned
+        // weth.withdraw), so they are exempt — exactly as the liquidation
+        // pre-flash walk exempts them (LiquidationExecutor:669).
+        for (uint256 i = 0; i < plan.ops.length; ++i) {
+            if (plan.ops[i].flags & GenericSequenceLib.FLAG_WETH_UNWRAP != 0) continue;
+            if (!allowedTargets[plan.ops[i].target]) revert TargetNotAllowed();
         }
 
         address provider = allowedFlashProviders[plan.flashProviderId];
@@ -444,41 +432,20 @@ contract ArbExecutor is
         // Verify the flash actually arrived.
         if (IERC20(loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
-        // Snapshot loanToken balance AFTER flash arrival (includes
-        // principal). Used by `computeRealizedProfit` to back out the
-        // pre-flash baseline.
+        // Snapshot loanToken BEFORE the sequence runs. For arb the flash
+        // principal has already arrived (checked above), so this baseline
+        // equals `plan.loanAmount` (plus any pre-existing residual balance
+        // the contract was holding from an earlier arb's retained profit).
+        // `computeRealizedProfit` backs `plan.loanAmount` out of this
+        // baseline below, so the residual — if any — cancels out on both
+        // sides and does not distort `realizedProfit` (traced in
+        // task-5-report.md).
         uint256 profitBefore = IERC20(loanToken).balanceOf(address(this));
 
-        // Run the chain. leg[0] consumes `loanAmount`; subsequent legs
-        // either useFullBalance (delta-based, sweeping ONLY tokens
-        // produced by the previous leg — matches `LiquidationExecutor`'s
-        // `hasLeg2` accounting) or carry an explicit `amountIn`.
-        //
-        // V10 audit fix: useFullBalance reads the DELTA produced by the
-        // previous leg (`postLegBal - srcBalBefore`), not the absolute
-        // balance. The pre-leg `srcBalBefore` snapshot freezes any
-        // pre-existing srcToken balance out of the chain so a stray
-        // donation or rescue residue cannot inflate `realizedProfit` and
-        // route into the coinbase bribe.
-        uint256 prevSrcBefore;
-        for (uint256 i = 0; i < plan.legs.length; ++i) {
-            SwapLeg memory leg = plan.legs[i];
-            uint256 amountIn;
-            if (i == 0) {
-                amountIn = plan.loanAmount;
-            } else if (leg.useFullBalance) {
-                uint256 srcBalNow = IERC20(leg.srcToken).balanceOf(address(this));
-                amountIn = srcBalNow > prevSrcBefore ? srcBalNow - prevSrcBefore : 0;
-            } else {
-                amountIn = leg.amountIn;
-            }
-            uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
-            // Snapshot the NEXT leg's srcToken pre-balance BEFORE this
-            // leg runs — `leg.repayToken == legs[i+1].srcToken` by the
-            // chain-wiring invariant enforced in `execute`.
-            prevSrcBefore = outBefore;
-            _dispatchLeg(leg, amountIn, outBefore);
-        }
+        // Op targets were validated allowlisted in execute(); the op loop +
+        // per-srcToken containment (cap = loanToken/loanAmount, absolute
+        // repay gate) run in GenericSequenceLib via DELEGATECALL.
+        GenericSequenceLib.runArb(plan.ops, loanToken, flashRepay, plan.loanAmount, weth);
 
         // Realized profit (loanToken-denominated, net of flash repay).
         uint256 realizedProfit =
@@ -506,30 +473,5 @@ contract ArbExecutor is
         CoinbasePaymentLib.checkProfit(realizedProfit, coinbasePaid, plan.minProfitAmount);
 
         emit ArbExecuted(_activePlanHash, loanToken, realizedProfit, coinbasePaid);
-    }
-
-    /// @dev Mode → library router. V4 is rejected here (no
-    /// `unlockCallback` infrastructure in this contract — V4 legs
-    /// would never validate past `SwapValidationLib.validateNonV4Leg`
-    /// either, but the inline reject is defense-in-depth).
-    function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
-        SwapMode m = leg.mode;
-        if (m == SwapMode.PARASWAP_SINGLE) {
-            SwapLegExecutorLib.executeParaswapLeg(leg, paraswapAugustusV6);
-        } else if (m == SwapMode.BEBOP_MULTI) {
-            SwapLegExecutorLib.executeBebopLeg(leg, outBefore, allowedTargets[leg.bebopTarget]);
-        } else if (m == SwapMode.UNI_V2 || m == SwapMode.UNI_V2_BUY) {
-            UniswapLib.executeUniV2Leg(leg, amountIn, uniV2Router);
-        } else if (m == SwapMode.UNI_V3 || m == SwapMode.UNI_V3_BUY) {
-            UniswapLib.executeUniV3Leg(leg, amountIn, uniV3Router);
-        } else if (m == SwapMode.CURVE_V1 || m == SwapMode.CURVE_V1_BUY) {
-            CurveV1Lib.executeLeg(leg, amountIn);
-        } else if (m == SwapMode.BAL_V2 || m == SwapMode.BAL_V2_BUY) {
-            BalancerV2Lib.executeLeg(leg, amountIn);
-        } else {
-            // NO_SWAP doesn't make sense in arb (no liquidation step to
-            // settle the same-token path); V4 not supported. Reject.
-            revert InvalidSwapMode();
-        }
     }
 }

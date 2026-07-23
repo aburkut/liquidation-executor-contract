@@ -5,9 +5,10 @@ import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {ArbExecutor, ArbTypes} from "../src/ArbExecutor.sol";
-import {SwapMode, SwapLeg} from "../src/types/SwapTypes.sol";
-import {SwapValidationLib} from "../src/libraries/SwapValidationLib.sol";
+import {Op} from "../src/types/SwapTypes.sol";
+import {GenericSequenceLib} from "../src/libraries/GenericSequenceLib.sol";
 import {CoinbasePaymentLib} from "../src/libraries/CoinbasePaymentLib.sol";
+import {IUniV3SwapRouter} from "../src/interfaces/IUniV3SwapRouter.sol";
 
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockUniV2Router} from "./mocks/MockUniV2Router.sol";
@@ -15,6 +16,7 @@ import {MockUniV3Router} from "./mocks/MockUniV3Router.sol";
 import {MockBalancerVault} from "./mocks/MockBalancerVault.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockParaswapAugustus} from "./mocks/MockParaswapAugustus.sol";
+import {MockRouter} from "./support/Mocks.sol";
 
 contract MockWETH is MockERC20 {
     constructor() MockERC20("Wrapped Ether", "WETH", 18) {}
@@ -30,14 +32,21 @@ contract MockWETH is MockERC20 {
 
 /// @title ArbExecutorTest
 /// @notice Focused suite for `ArbExecutor`. The execution pipeline shares
-/// its swap-leg libraries with `LiquidationExecutor` (already covered in
-/// the 10k-line legacy suite), so we don't re-test every per-mode swap
-/// shape here. Coverage instead pins:
-///   * Chain wiring (first/last/link constraints) on top of the lib's
-///     per-leg validation.
+/// its `GenericSequenceLib` op-executor with `LiquidationExecutor` (already
+/// covered in the 10k-line legacy suite + `ArbGenericSequence.t.sol`), so we
+/// don't re-test every containment/repay-gate edge here. Coverage instead
+/// pins:
+///   * Op-sequence admission control (target allowlist walk, MAX_OPS bound)
+///     — this REPLACES the old static leg-chain wiring checks (first-leg
+///     srcToken / last-leg repayToken / link matching), which no longer
+///     exist: `ops[]` chains at runtime via `FLAG_USE_PREV_RETURN`, and the
+///     repay invariant is enforced by `GenericSequenceLib.runArb`'s
+///     ABSOLUTE gate, not by static validation in `execute()`.
 ///   * Flash callback gates (phase + planHash + provider pin).
 ///   * Coinbase gating (`loanToken == weth` precondition).
 ///   * Profit floor + withdraw + admin surface.
+///   * End-to-end op-sequence execution through the real flash callback
+///     (`test_execute_opSequence_arb_profits_and_repays`).
 contract ArbExecutorTest is Test {
     ArbExecutor public exec;
 
@@ -52,6 +61,12 @@ contract ArbExecutorTest is Test {
     MockUniV3Router public uniV3;
     MockParaswapAugustus public augustus; // unused in tests but required by constructor
 
+    // ── Op-sequence e2e fixtures (Task 5) ──────────────────────────────
+    MockERC20 public loan;
+    MockERC20 public mid;
+    MockRouter public router;
+    uint8 constant FLASH_MORPHO = 3;
+
     address public ownerAddr = address(0xA11CE);
     address public operatorAddr = address(0xB0B);
     address public attacker = address(0xDEAD);
@@ -59,6 +74,14 @@ contract ArbExecutorTest is Test {
 
     uint256 constant LOAN_AMOUNT = 1_000e18;
     uint256 constant SWAP_RATE = 1.1e18; // 10% gain per hop in the mocks
+
+    // Uniswap V2 `swapExactTokensForTokens(uint256,uint256,address[],address,uint256)`:
+    // amountIn is the first parameter, right after the 4-byte selector.
+    uint16 constant V2_AMOUNT_POS = 4;
+    // Uniswap V3 `exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))`:
+    // the struct is all-static fields, encoded inline (no offset pointer);
+    // amountIn is the 5th word: selector(4) + tokenIn(32) + tokenOut(32) + fee(32) + recipient(32) = 132.
+    uint16 constant V3_AMOUNT_POS = 132;
 
     function setUp() public {
         tokenA = new MockERC20("A", "A", 18);
@@ -71,6 +94,10 @@ contract ArbExecutorTest is Test {
         uniV2 = new MockUniV2Router(SWAP_RATE);
         uniV3 = new MockUniV3Router(SWAP_RATE);
         augustus = new MockParaswapAugustus(SWAP_RATE);
+
+        loan = new MockERC20("Loan", "LOAN", 18);
+        mid = new MockERC20("Mid", "MID", 18);
+        router = new MockRouter();
 
         address[] memory allowed = new address[](1);
         allowed[0] = address(morpho); // morpho needs to be allowlisted? actually not — flashProvider check is separate. Keep for symmetry.
@@ -112,104 +139,146 @@ contract ArbExecutorTest is Test {
 
     // ─── Helpers ─────────────────────────────────────────────────────
 
-    function _v2Leg(address src, address dst, bool useFullBalance, uint256 amountIn, uint256 minOut)
-        internal
-        view
-        returns (SwapLeg memory leg)
-    {
+    /// Direct-call Op targeting the real `uniV2` router mock.
+    /// `flags == 0` ⇒ explicit `amountIn`; `flags == FLAG_USE_PREV_RETURN`
+    /// ⇒ chains off the previous op's output delta (the ops-model analog of
+    /// the old `SwapLeg.useFullBalance`).
+    function _v2Op(address src, address dst, uint256 amountIn, uint32 flags) internal view returns (Op memory op) {
         address[] memory path = new address[](2);
         path[0] = src;
         path[1] = dst;
-        leg = SwapLeg({
-            mode: SwapMode.UNI_V2,
-            srcToken: src,
-            amountIn: amountIn,
-            useFullBalance: useFullBalance,
-            deadline: block.timestamp + 1 hours,
-            paraswapCalldata: "",
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            v2Path: path,
-            v3Fee: 0,
-            v4PoolManager: address(0),
-            v4SwapData: "",
-            repayToken: dst,
-            minAmountOut: minOut
-        });
+        op.target = address(uniV2);
+        op.srcToken = src;
+        op.outToken = dst;
+        op.amountIn = amountIn;
+        op.flags = flags;
+        op.fromAmountPos = V2_AMOUNT_POS;
+        op.callData = abi.encodeWithSelector(
+            MockUniV2Router.swapExactTokensForTokens.selector,
+            uint256(0), // placeholder — patched at runtime via fromAmountPos
+            uint256(1), // amountOutMin — deterministic-rate mock, loose floor
+            path,
+            address(exec),
+            block.timestamp + 1 hours
+        );
     }
 
-    function _v3Leg(address src, address dst, bool useFullBalance, uint256 amountIn, uint256 minOut)
+    /// Direct-call Op targeting the real `uniV3` router mock (single-hop
+    /// `exactInputSingle`).
+    function _v3Op(address src, address dst, uint256 amountIn, uint32 flags) internal view returns (Op memory op) {
+        op.target = address(uniV3);
+        op.srcToken = src;
+        op.outToken = dst;
+        op.amountIn = amountIn;
+        op.flags = flags;
+        op.fromAmountPos = V3_AMOUNT_POS;
+        op.callData = abi.encodeWithSelector(
+            MockUniV3Router.exactInputSingle.selector,
+            IUniV3SwapRouter.ExactInputSingleParams({
+                tokenIn: src,
+                tokenOut: dst,
+                fee: 500,
+                recipient: address(exec),
+                amountIn: 0, // placeholder — patched at runtime via fromAmountPos
+                amountOutMinimum: 1,
+                sqrtPriceLimitX96: 0
+            })
+        );
+    }
+
+    function _planMorpho(address loanToken, uint256 amount, Op[] memory ops, uint256 minProfit, uint256 coinbaseBps)
         internal
-        view
-        returns (SwapLeg memory leg)
+        pure
+        returns (bytes memory)
     {
-        address[] memory empty = new address[](0);
-        leg = SwapLeg({
-            mode: SwapMode.UNI_V3,
-            srcToken: src,
-            amountIn: amountIn,
-            useFullBalance: useFullBalance,
-            deadline: block.timestamp + 1 hours,
-            paraswapCalldata: "",
-            bebopTarget: address(0),
-            bebopCalldata: "",
-            v2Path: empty,
-            v3Fee: 500,
-            v4PoolManager: address(0),
-            v4SwapData: "",
-            repayToken: dst,
-            minAmountOut: minOut
-        });
-    }
-
-    function _planMorpho(
-        address loanToken,
-        uint256 amount,
-        SwapLeg[] memory legs,
-        uint256 minProfit,
-        uint256 coinbaseBps
-    ) internal pure returns (bytes memory) {
         ArbTypes.ArbPlan memory plan = ArbTypes.ArbPlan({
             flashProviderId: 3, // FLASH_PROVIDER_MORPHO
             loanToken: loanToken,
             loanAmount: amount,
             maxFlashFee: 0,
-            legs: legs,
+            ops: ops,
             coinbaseBps: coinbaseBps,
             minProfitAmount: minProfit
         });
         return abi.encode(plan);
     }
 
-    function _planBalancer(
-        address loanToken,
-        uint256 amount,
-        uint256 maxFlashFee,
-        SwapLeg[] memory legs,
-        uint256 minProfit
-    ) internal pure returns (bytes memory) {
+    function _planBalancer(address loanToken, uint256 amount, uint256 maxFlashFee, Op[] memory ops, uint256 minProfit)
+        internal
+        pure
+        returns (bytes memory)
+    {
         ArbTypes.ArbPlan memory plan = ArbTypes.ArbPlan({
             flashProviderId: 2, // FLASH_PROVIDER_BALANCER
             loanToken: loanToken,
             loanAmount: amount,
             maxFlashFee: maxFlashFee,
-            legs: legs,
+            ops: ops,
             coinbaseBps: 0,
             minProfitAmount: minProfit
         });
         return abi.encode(plan);
     }
 
+    // ─── Op-sequence e2e helpers (Task 5, mock MockRouter — no fork) ──
+
+    function _swapOp(address srcToken, uint256 amountIn, address outToken, uint256 amountOut)
+        internal
+        view
+        returns (Op memory)
+    {
+        bytes memory cd = abi.encodeWithSignature(
+            "swap(address,uint256,address,uint256)", srcToken, amountIn, outToken, amountOut
+        );
+        return Op({
+            target: address(router),
+            value: 0,
+            amountIn: amountIn,
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: 0,
+            srcToken: srcToken,
+            outToken: outToken,
+            callData: cd
+        });
+    }
+
+    function _encodeArbPlan(
+        uint8 flashProviderId,
+        address loanToken,
+        uint256 loanAmount,
+        Op[] memory ops,
+        uint256 coinbaseBps,
+        uint256 minProfit
+    ) internal pure returns (bytes memory) {
+        ArbTypes.ArbPlan memory plan = ArbTypes.ArbPlan({
+            flashProviderId: flashProviderId,
+            loanToken: loanToken,
+            loanAmount: loanAmount,
+            maxFlashFee: 0,
+            ops: ops,
+            coinbaseBps: coinbaseBps,
+            minProfitAmount: minProfit
+        });
+        return abi.encode(plan);
+    }
+
+    function _fundAndAllowlist() internal {
+        loan.mint(address(morpho), 10 * LOAN_AMOUNT);
+        vm.prank(ownerAddr);
+        exec.setAllowedTarget(address(router), true);
+    }
+
     // ─── Happy paths ─────────────────────────────────────────────────
 
-    /// 2-hop A→B→A chain via Morpho flash, V2 router both legs.
+    /// 2-hop A→B→A chain via Morpho flash, V2 router both hops.
     /// rate=1.1 ⇒ 1000 A → 1100 B → 1210 A → repay 1000 → profit 210.
     function test_happy_2hop_morpho_v2() public {
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenA), true, 0, LOAN_AMOUNT); // useFullBalance, minOut = principal
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
 
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 100e18, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18, 0);
 
         uint256 balBefore = tokenA.balanceOf(address(exec));
         vm.prank(operatorAddr);
@@ -225,11 +294,11 @@ contract ArbExecutorTest is Test {
         // Fund Balancer flash source with tokenA.
         tokenA.mint(address(balancerFlash), 10 * LOAN_AMOUNT);
 
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenA), true, 0, LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
 
-        bytes memory plan = _planBalancer(address(tokenA), LOAN_AMOUNT, 0, legs, 100e18);
+        bytes memory plan = _planBalancer(address(tokenA), LOAN_AMOUNT, 0, ops, 100e18);
 
         vm.prank(operatorAddr);
         exec.execute(plan);
@@ -240,12 +309,12 @@ contract ArbExecutorTest is Test {
     /// 3-hop A→B→C→A across V2 and V3 routers.
     /// rate=1.1 each ⇒ 1000 → 1100 → 1210 → 1331; repay 1000 → 331 A profit.
     function test_happy_3hop_v2_v3_v2() public {
-        SwapLeg[] memory legs = new SwapLeg[](3);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v3Leg(address(tokenB), address(tokenC), true, 0, 1);
-        legs[2] = _v2Leg(address(tokenC), address(tokenA), true, 0, LOAN_AMOUNT);
+        Op[] memory ops = new Op[](3);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v3Op(address(tokenB), address(tokenC), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        ops[2] = _v2Op(address(tokenC), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
 
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 100e18, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18, 0);
 
         vm.prank(operatorAddr);
         exec.execute(plan);
@@ -256,11 +325,11 @@ contract ArbExecutorTest is Test {
     /// Coinbase bribe: loanToken = weth, coinbaseBps = 5000 (50%) of the
     /// 210 weth realized profit ⇒ 105 weth = 105 ether goes to coinbase.
     function test_happy_coinbase_50pct_when_loan_is_weth() public {
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(weth), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(weth), true, 0, LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(weth), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(weth), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
 
-        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, legs, 0, 5_000);
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0, 5_000);
 
         address coinbaseAddr = address(0xC0FFEE);
         vm.coinbase(coinbaseAddr);
@@ -277,11 +346,11 @@ contract ArbExecutorTest is Test {
     /// Owner sweep — withdraw the retained profit to a recipient.
     function test_happy_owner_withdraws_profit() public {
         // First run a chain to accumulate profit.
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenA), true, 0, LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
         vm.prank(operatorAddr);
-        exec.execute(_planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 0));
+        exec.execute(_planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0));
 
         uint256 profit = tokenA.balanceOf(address(exec));
         assertEq(profit, 210e18);
@@ -293,64 +362,92 @@ contract ArbExecutorTest is Test {
         assertEq(tokenA.balanceOf(address(exec)), 0, "executor swept clean");
     }
 
-    // ─── Chain wiring reverts ────────────────────────────────────────
+    // ─── End-to-end Op-sequence arb (Task 5) ──────────────────────────
 
-    function test_revert_legs_empty() public {
-        SwapLeg[] memory legs = new SwapLeg[](0);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 0);
+    /// Profitable 2-op arb through the full execute() → flash → runArb
+    /// path, using a mock Morpho flash provider + a mock router (no fork).
+    /// ops: 100 LOAN -> 100 MID -> 110 LOAN. minProfit 5, coinbaseBps 0.
+    function test_execute_opSequence_arb_profits_and_repays() public {
+        _fundAndAllowlist();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _swapOp(address(loan), 100e18, address(mid), 100e18);
+        ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
+        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 0, 5e18);
+
+        vm.prank(operatorAddr);
+        exec.execute(planData);
+        assertEq(loan.balanceOf(address(exec)), 10e18, "arb profit retained");
+    }
+
+    // ─── Op admission-control reverts (Task 5) ────────────────────────
+    // Replaces the old static leg-chain wiring checks (first-leg srcToken /
+    // last-leg repayToken / link matching) — those invariants no longer
+    // exist in the ops[] model. `execute()` now only pre-flash-validates
+    // ops.length (1..MAX_OPS) and the target allowlist; chaining + the repay
+    // gate are enforced at RUNTIME inside GenericSequenceLib.runArb (already
+    // unit-tested in ArbGenericSequence.t.sol at the library level). These
+    // tests pin the NEW invariants end-to-end through ArbExecutor.execute().
+
+    function test_revert_ops_empty() public {
+        Op[] memory ops = new Op[](0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.InvalidPlan.selector);
         exec.execute(plan);
     }
 
-    function test_revert_legs_first_src_mismatch_loanToken() public {
-        // leg[0].srcToken = tokenB but loanToken = tokenA — chain doesn't open.
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenB), address(tokenC), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenC), address(tokenA), true, 0, LOAN_AMOUNT);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 0);
+    function test_revert_ops_tooMany() public {
+        // MAX_OPS = 32; 33 ops (content irrelevant — length check reverts
+        // before the allowlist walk).
+        Op[] memory ops = new Op[](33);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.InvalidPlan.selector);
         exec.execute(plan);
     }
 
-    function test_revert_legs_last_repay_mismatch_loanToken() public {
-        // Last leg leaves chain in tokenB, not loanToken — can't repay.
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenC), true, 0, 1);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 0);
+    function test_revert_ops_targetNotAllowlisted() public {
+        // op[0].target is a bare address never allowlisted (not a
+        // constructor-seeded router, not owner-added) → TargetNotAllowed
+        // in the pre-flashloan walk, before any flashloan is even taken.
+        Op[] memory ops = new Op[](1);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[0].target = address(0xBEEF);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
         vm.prank(operatorAddr);
-        vm.expectRevert(ArbExecutor.InvalidPlan.selector);
+        vm.expectRevert(ArbExecutor.TargetNotAllowed.selector);
         exec.execute(plan);
     }
 
-    function test_revert_legs_link_mismatch() public {
-        // leg[1].srcToken = tokenC but leg[0].repayToken = tokenB.
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenC), address(tokenA), true, 0, LOAN_AMOUNT);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 0);
+    function test_revert_ops_repayShortfall() public {
+        // Sequence under-produces loanToken: 1000 A -> 900 B (rate < 1),
+        // never converts back — loanAfter (0) < flashRepay (1000).
+        // GenericSequenceLib's ABSOLUTE repay gate reverts INSIDE the flash
+        // callback, bubbling InsufficientRepayOutput up through execute().
+        uniV2.setRate(0.9e18);
+        Op[] memory ops = new Op[](1);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
         vm.prank(operatorAddr);
-        vm.expectRevert(ArbExecutor.InvalidPlan.selector);
+        vm.expectRevert(abi.encodeWithSelector(GenericSequenceLib.InsufficientRepayOutput.selector, 0, LOAN_AMOUNT));
         exec.execute(plan);
     }
 
     function test_revert_coinbase_bps_over_cap() public {
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(weth), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(weth), true, 0, LOAN_AMOUNT);
-        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, legs, 0, 10_001);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(weth), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(weth), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0, 10_001);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.InvalidPlan.selector);
         exec.execute(plan);
     }
 
     function test_revert_coinbase_requires_weth_loan() public {
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenA), true, 0, LOAN_AMOUNT);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 5_000);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 5_000);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.CoinbaseRequiresWethLoan.selector);
         exec.execute(plan);
@@ -358,25 +455,25 @@ contract ArbExecutorTest is Test {
 
     function test_revert_minProfitAmount_floor_unmet() public {
         // 210 A realized profit; require 500 → InsufficientProfit.
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenA), true, 0, LOAN_AMOUNT);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 500e18, 0);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 500e18, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(CoinbasePaymentLib.InsufficientProfit.selector, 210e18, 500e18));
         exec.execute(plan);
     }
 
     function test_revert_invalid_flash_provider() public {
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenA), true, 0, LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
         ArbTypes.ArbPlan memory plan = ArbTypes.ArbPlan({
             flashProviderId: 99, // not configured
             loanToken: address(tokenA),
             loanAmount: LOAN_AMOUNT,
             maxFlashFee: 0,
-            legs: legs,
+            ops: ops,
             coinbaseBps: 0,
             minProfitAmount: 0
         });
@@ -398,10 +495,10 @@ contract ArbExecutorTest is Test {
     function test_revert_morphoCallbackWrongCaller_evenInsidePhase() public {
         // Plant `_executionPhase = FlashLoanActive` and `_activePlanHash`
         // matching `data` — only the caller check should reject.
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenA), true, 0, LOAN_AMOUNT);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 0);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
         bytes32 planHash = keccak256(plan);
 
         // Storage slots (forge inspect ArbExecutor storageLayout, post V4
@@ -438,10 +535,10 @@ contract ArbExecutorTest is Test {
     // ─── Admin gates ─────────────────────────────────────────────────
 
     function test_revert_executeFromNonOperator() public {
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenA), true, 0, LOAN_AMOUNT);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 0);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
         vm.prank(attacker);
         vm.expectRevert(ArbExecutor.UnauthorizedOperator.selector);
         exec.execute(plan);
@@ -451,10 +548,10 @@ contract ArbExecutorTest is Test {
         vm.prank(ownerAddr);
         exec.pause();
 
-        SwapLeg[] memory legs = new SwapLeg[](2);
-        legs[0] = _v2Leg(address(tokenA), address(tokenB), false, LOAN_AMOUNT, 1);
-        legs[1] = _v2Leg(address(tokenB), address(tokenA), true, 0, LOAN_AMOUNT);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, legs, 0, 0);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
 
         vm.prank(operatorAddr);
         vm.expectRevert();
