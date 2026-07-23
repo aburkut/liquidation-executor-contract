@@ -25,18 +25,17 @@ import {IUniV3SwapRouter} from "../src/interfaces/IUniV3SwapRouter.sol";
 /// contract's EIP-170 sizing and must stay untouched — this flag only
 /// overrides the runtime spec `forge test` uses to execute the fork, not
 /// what gets compiled/deployed. Omitting it does not fail closed the same
-/// way every time: it was observed to make the real V4 PoolManager's
-/// `unlock()` halt with a raw `NotActivated` EVM error (zero-length revert,
-/// occurring before `unlockCallback` is ever entered) on a freshly-built
-/// artifact, while a same-session recompile of an otherwise byte-identical
-/// call sequence in a scratch file picked up a Cancun-capable spec and
-/// passed — i.e. an artifact-caching-dependent spec resolution on this
-/// Foundry nightly build, not a bug in `ArbExecutor`/`GenericSequenceLib`
-/// (see task-6-report.md for the full isolation trace: identical calldata,
-/// identical target, proven to succeed via `onMorphoFlashLoan` invoked
-/// directly and via a real Balancer flash, isolating the fault to spec
-/// resolution rather than contract logic). Always pass `--evm-version
-/// cancun` explicitly for this file to avoid depending on that resolution.
+/// way every time: on some compiled-artifact states, the real V4
+/// PoolManager's `unlock()` halts with a raw `NotActivated` EVM error
+/// (zero-length revert, occurring before `unlockCallback` is ever entered)
+/// — an artifact-caching-dependent runtime-spec resolution on this Foundry
+/// nightly build, NOT a bug in `ArbExecutor`/`GenericSequenceLib`. Confirmed
+/// by direct control test: the native-V4 leg through the REAL, production-
+/// preferred Morpho flash provider (`FLASH_PROVIDER_MORPHO`, fee=0) via the
+/// real `execute()` entrypoint passes cleanly once `--evm-version cancun` is
+/// set — there is no Morpho-specific interaction bug (see task-6-report.md
+/// for the full isolation trace and the corrected finding). Always pass
+/// `--evm-version cancun` explicitly for this file.
 ///
 /// SCOPE / WHAT THESE PROVE: repay (the flash is always fully repaid) +
 /// containment (no token is net-spent beyond what the sequence produced),
@@ -358,19 +357,14 @@ contract ArbExecutorForkTest is Test {
     /// unlock mechanism through the REAL PoolManager; asserts repay AND that
     /// no `V4InputOverspent` fires (the per-op exact-in input ceiling holds).
     ///
-    /// Flash provider: Balancer (not Morpho, unlike tests 1/2). Both are
-    /// real, constructor-pinned production paths on `ArbExecutor` — Morpho's
-    /// pull-repay flashLoan reproducibly hit an opcode-level EVM halt
-    /// (`NotActivated`, zero-length revert data) INSIDE the real V4
-    /// PoolManager's `unlock()` prologue specifically when nested under
-    /// Morpho's real flashLoan on this Foundry nightly build; isolated via
-    /// component probes to be a tooling interaction (Morpho's flash + this
-    /// exact V4 pool's transient-storage lock under this revm build), not a
-    /// contract bug: the identical op sequence, armed through the identical
-    /// `ArbExecutor.unlockCallback`, succeeds byte-for-byte (i) invoked
-    /// directly (bypassing Morpho) and (ii) invoked through the real
-    /// Balancer flashLoan via the real `execute()` entrypoint. See
-    /// task-6-report.md for the full isolation trace.
+    /// Flash provider: Morpho (fee=0, the production-preferred provider —
+    /// same as tests 1/2). An earlier pass of this test used Balancer after
+    /// an `--evm-version cancun`-less run made Morpho's real flashLoan appear
+    /// to interact badly with the real V4 `unlock()`; a direct control test
+    /// (real Morpho flashLoan -> real `execute()` -> this exact op sequence,
+    /// WITH `--evm-version cancun`) passes cleanly, proving that was the
+    /// missing flag, not a Morpho-specific bug — see task-6-report.md for the
+    /// corrected isolation trace and the control-test output.
     function test_fork_v4_nativeLeg_arbCycle() public forkOnly {
         uint256 loanAmount = 2e18; // 2 WETH
         uint256 unwrapAmount = 1e18; // 1 WETH round-trips through native V4 + V3
@@ -418,14 +412,14 @@ contract ArbExecutorForkTest is Test {
             callData: _v3ExactInSingle(DAI, WETH, 3000, 0, address(exec))
         });
 
-        // Balancer's flashLoan fee is currently 0 on mainnet; maxFlashFee=0
-        // in the plan means a nonzero fee would revert in receiveFlashLoan
-        // before any of this runs. A non-reverting execute() is the repay +
-        // containment proof (see test 1/2 comments) — Balancer's Vault gets
-        // pushed the repayment via `safeTransfer` before `execute()` returns,
-        // so, as with Morpho, what remains afterward is realized P&L against
-        // the pre-funded buffer, not the internal pre-repay balance.
-        _runArb(ops, WETH, loanAmount, FLASH_PROVIDER_BALANCER);
+        // Morpho fee=0. A non-reverting execute() is the repay + containment
+        // proof (see test 1/2 comments): GenericSequenceLib's ABSOLUTE repay
+        // gate and the per-srcToken containment cap are hard reverts inside
+        // the flash callback, and Morpho pulls the flash principal back via
+        // `transferFrom` before `execute()` returns, so what remains
+        // afterward is realized P&L against the pre-funded buffer, not the
+        // internal pre-repay balance.
+        _runArb(ops, WETH, loanAmount, FLASH_PROVIDER_MORPHO);
 
         // Exact-in on a real pool consumes UP TO `amount`, bounded by the
         // per-op input ceiling (`V4InputOverspent` would have reverted
