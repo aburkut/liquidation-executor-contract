@@ -24,6 +24,17 @@ contract MockGenericDex {
     }
 }
 
+/// @dev A native-IN payable router: takes `msg.value` ETH, mints `amountOut`
+/// of `outToken` back to the caller. Same test double as
+/// `ArbGenericSequence.t.sol`'s `MockPayableRouter` — proves a `FLAG_NATIVE_IN`
+/// op's forwarded value actually reaches `op.target` as `msg.value` (not just
+/// patched into calldata) on the LIQUIDATION (`run()`/Delta-gate) path too.
+contract MockPayableRouter {
+    function swapNative(address outToken, uint256 amountOut) external payable {
+        MockERC20(outToken).mint(msg.sender, amountOut);
+    }
+}
+
 /// Phase 1 GENERIC_SEQUENCE coverage.
 ///   * validation gates (revert before flashloan) — no DEX needed.
 ///   * runtime gates (revert inside _runGenericSequence / outer pipeline) —
@@ -438,6 +449,168 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidV4CallbackHook.selector);
+        executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // FLAG_NATIVE_IN on the LIQUIDATION path — Delta gate + collateral cap
+    // (both-executor coherence: FLAG_NATIVE_IN was proven on runArb's
+    // Absolute gate / loanToken cap in ArbGenericSequence.t.sol; these tests
+    // prove the SAME shared-lib code works unchanged on run()'s Delta gate /
+    // collateral-cap model, where the native ETH comes from unwrapping
+    // SEIZED WETH collateral, not the flash principal.)
+    // ═══════════════════════════════════════════════════════════════
+
+    uint32 internal constant FLAG_WETH_UNWRAP = 1 << 3;
+    uint32 internal constant FLAG_NATIVE_IN = 1 << 5;
+
+    /// Happy path: collateralAsset == mockWeth (WETH seized as collateral).
+    /// op0 unwraps the full COLLATERAL_REWARD delta to native ETH
+    /// (FLAG_WETH_UNWRAP); op1 forwards that ETH via FLAG_NATIVE_IN to a
+    /// payable-only router that mints loanToken back. Proves: (a) native
+    /// forwarding actually reaches the router (router's own ETH balance),
+    /// (b) the delta repay gate is satisfied from the router's loanToken
+    /// output (execute() not reverting proves `loanAfter - loanBefore >=
+    /// flashRepay` held inside GenericSequenceLib.run), and (c) the unwrap
+    /// consumed EXACTLY the collateral delta — the executor's WETH balance
+    /// returns to its pre-liquidation standing level, untouched beyond that.
+    function test_GenericSequence_NativeIn_LiquidationPath_Happy() public {
+        MockPayableRouter payableRouter = new MockPayableRouter();
+        vm.prank(owner);
+        executor.setAllowedTarget(address(payableRouter), true);
+
+        uint256 debtToCover = 500e18;
+        uint256 Y = 1100e18; // router-minted loanToken, same 1.1x margin as SWAP_RATE elsewhere
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = Op({
+            target: address(0),
+            value: 0,
+            amountIn: COLLATERAL_REWARD, // exactly the WETH delta this tx produces
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: FLAG_WETH_UNWRAP,
+            srcToken: address(mockWeth),
+            outToken: address(0),
+            callData: ""
+        });
+        ops[1] = Op({
+            target: address(payableRouter),
+            value: 0,
+            amountIn: COLLATERAL_REWARD,
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: FLAG_NATIVE_IN,
+            srcToken: address(0),
+            outToken: address(loanToken),
+            callData: abi.encodeWithSelector(MockPayableRouter.swapNative.selector, address(loanToken), Y)
+        });
+
+        LiquidationExecutor.SwapPlan memory sp;
+        sp.hasGenericSequence = true;
+        sp.ops = ops;
+        sp.profitToken = address(loanToken);
+        sp.minProfitAmount = 0;
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _singleAction(
+                1,
+                _buildAaveV3LiquidationAction(
+                    address(mockWeth), address(loanToken), address(0x1234), debtToCover, false
+                )
+            ),
+            sp
+        );
+
+        uint256 wethBefore = mockWeth.balanceOf(address(executor)); // standing (pre-liq) WETH
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(address(payableRouter).balance, COLLATERAL_REWARD, "native ETH actually forwarded to the router");
+        assertEq(address(executor).balance, 0, "no dangling ETH left at the executor");
+        assertEq(
+            mockWeth.balanceOf(address(executor)),
+            wethBefore,
+            "unwrap spent exactly the collateral delta; standing WETH balance intact"
+        );
+        // External net delta = Y (router output) - debtToCover (paid to Aave)
+        // - FLASH_FEE (paid to the flash vault, since only LOAN_AMOUNT itself
+        // is borrowed-and-repaid net-zero): 1100e18 - 500e18 - 1e18 = 599e18.
+        assertEq(
+            loanToken.balanceOf(address(executor)),
+            loanBefore + 599e18,
+            "loanToken net delta matches router output minus debtToCover minus flash fee"
+        );
+    }
+
+    /// Containment cap still binds on the collateral model: standing/donated
+    /// native ETH (vm.deal, NOT produced by this tx's unwrap) must remain
+    /// unspendable. op0 legitimately unwraps COLLATERAL_REWARD WETH to ETH;
+    /// op1's FLAG_NATIVE_IN declares `amount = COLLATERAL_REWARD + donation`,
+    /// so it forwards the unwrap output AND the donated 1 ether standing ETH
+    /// in the same call (the per-op ceiling doesn't catch this — the call
+    /// legitimately consumes what it declares) — only the end-of-sequence
+    /// per-srcToken containment cap catches the standing dip, reverting
+    /// `CollateralOverspent(donation, 0)`. The mockWeth bucket passes (spent
+    /// == collateralDelta), isolating the native-ETH bucket's zero-allowed
+    /// cap as the one that fires — the same cap `runArb` enforces via the `t
+    /// != address(0)` guard, now proven under the Delta/collateral gate too.
+    function test_GenericSequence_NativeIn_LiquidationPath_StandingEth_Reverts() public {
+        MockPayableRouter payableRouter = new MockPayableRouter();
+        vm.prank(owner);
+        executor.setAllowedTarget(address(payableRouter), true);
+
+        uint256 donation = 1 ether; // standing ETH, NOT produced by this tx's unwrap
+        vm.deal(address(executor), donation);
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = Op({
+            target: address(0),
+            value: 0,
+            amountIn: COLLATERAL_REWARD,
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: FLAG_WETH_UNWRAP,
+            srcToken: address(mockWeth),
+            outToken: address(0),
+            callData: ""
+        });
+        uint256 forwardAmt = COLLATERAL_REWARD + donation; // dips into the donated standing ETH too
+        ops[1] = Op({
+            target: address(payableRouter),
+            value: 0,
+            amountIn: forwardAmt,
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: FLAG_NATIVE_IN,
+            srcToken: address(0),
+            outToken: address(loanToken),
+            callData: abi.encodeWithSelector(MockPayableRouter.swapNative.selector, address(loanToken), 1100e18)
+        });
+
+        LiquidationExecutor.SwapPlan memory sp;
+        sp.hasGenericSequence = true;
+        sp.ops = ops;
+        sp.profitToken = address(loanToken);
+        sp.minProfitAmount = 0;
+        bytes memory plan = _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _singleAction(
+                1, _buildAaveV3LiquidationAction(address(mockWeth), address(loanToken), address(0x1234), 500e18, false)
+            ),
+            sp
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.CollateralOverspent.selector, donation, 0));
         executor.execute(plan);
     }
 }
