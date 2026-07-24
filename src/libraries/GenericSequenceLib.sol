@@ -302,7 +302,7 @@ library GenericSequenceLib {
                 amount = prevReturn;
             }
 
-            uint256 outBefore = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
+            uint256 outBefore = _balOf(op.outToken);
 
             if (op.flags & FLAG_V4_UNLOCK != 0) {
                 // ── V4 single-hop exact-out via PoolManager unlock ──
@@ -422,7 +422,7 @@ library GenericSequenceLib {
             // this contract. An op whose raw calldata routed output elsewhere
             // produces a zero delta and is rejected. Saturating delta matches
             // the codebase idiom (clean revert instead of a Panic underflow).
-            uint256 outBal = op.outToken == address(0) ? 0 : IERC20(op.outToken).balanceOf(address(this));
+            uint256 outBal = _balOf(op.outToken);
             uint256 outDelta = outBal > outBefore ? outBal - outBefore : 0;
             if (outDelta == 0) revert OpOutputNotReceived(i);
             prevReturn = outDelta;

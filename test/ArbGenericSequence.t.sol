@@ -9,6 +9,22 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 import {GenericSequenceLibWrapper} from "./support/GenericSequenceLibWrapper.sol";
 import {MockRouter} from "./support/Mocks.sol";
 
+/// @dev Test double for a router that outputs NATIVE ETH instead of an
+/// ERC20 — pulls `amountIn` of `srcToken` (transferFrom, so the caller must
+/// have approved it — the same op-driven approve every direct-call op
+/// does) and sends `amountOut` wei of native ETH back to the caller. Proves
+/// an op's `outToken == address(0)` leg is credited via `_balOf`
+/// (`address(this).balance`), not the hardcoded-0 delta.
+contract MockNativeRouter {
+    function swap(address srcToken, uint256 amountIn, uint256 amountOut) external {
+        IERC20(srcToken).transferFrom(msg.sender, address(this), amountIn);
+        (bool ok,) = msg.sender.call{value: amountOut}("");
+        require(ok, "eth send");
+    }
+
+    receive() external payable {}
+}
+
 /// Delegatecalls runArb so library sstore/balance ops hit THIS contract.
 contract ArbSeqHarness {
     function exec(address lib, Op[] memory ops, address loanToken, uint256 flashRepay, uint256 loanAmount, address weth)
@@ -30,6 +46,10 @@ contract ArbSeqHarness {
             }
         }
     }
+
+    /// Accepts native ETH sent back by a native-output op (e.g.
+    /// `MockNativeRouter.swap`) — the executor's own `receive()` equivalent.
+    receive() external payable {}
 }
 
 contract ArbGenericSequenceTest is Test {
@@ -101,5 +121,43 @@ contract ArbGenericSequenceTest is Test {
         ops[1] = _swapOp(address(mid), 100e18, address(loan), 90e18); // under-produces
         vm.expectRevert(abi.encodeWithSelector(GenericSequenceLib.InsufficientRepayOutput.selector, 90e18, 100e18));
         harness.exec(libAddr, ops, address(loan), 100e18, 100e18, address(0));
+    }
+
+    /// A single op whose `outToken == address(0)` (native ETH) must be
+    /// credited via `_balOf` (`address(this).balance`), not the
+    /// hardcoded-0 delta that unconditionally rejects native output with
+    /// `OpOutputNotReceived`. Op0 spends only PART of the flash principal
+    /// (20 of 100 LOAN) to buy native ETH from `MockNativeRouter`; the
+    /// UNSPENT remainder (80 LOAN) alone satisfies the ABSOLUTE repay gate
+    /// (`loanAfter >= flashRepay`) — by design, per `RepayGate.Absolute`'s
+    /// own doc, the flash principal is present at entry and the gate is
+    /// absolute, not "must increase" — so no second (reconverging) op is
+    /// needed to isolate the native-output delta path under test. Before
+    /// the `_balOf` fix this reverts `OpOutputNotReceived(0)` regardless of
+    /// the real ETH credit, because both `outBefore` and `outBal` are
+    /// hardcoded to 0 for `outToken == address(0)`.
+    function test_nativeOutput_singleOp_creditsViaBalOf() public {
+        MockNativeRouter nativeRouter = new MockNativeRouter();
+        vm.deal(address(nativeRouter), 1 ether);
+
+        loan.mint(address(harness), 100e18); // flash principal present
+        Op[] memory ops = new Op[](1);
+        ops[0] = Op({
+            target: address(nativeRouter),
+            value: 0,
+            amountIn: 20e18,
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: 0,
+            srcToken: address(loan),
+            outToken: address(0), // native ETH output
+            callData: abi.encodeWithSignature("swap(address,uint256,uint256)", address(loan), 20e18, 1 ether)
+        });
+
+        assertEq(address(harness).balance, 0, "starts with no ETH");
+        // loanAfter = 100e18 - 20e18 = 80e18 >= flashRepay 80e18 — ABSOLUTE
+        // gate satisfied by the unspent remainder alone.
+        harness.exec(libAddr, ops, address(loan), 80e18, 100e18, address(0));
+        assertEq(address(harness).balance, 1 ether, "native output credited to executor via _balOf");
     }
 }
