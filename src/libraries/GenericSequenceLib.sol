@@ -98,8 +98,28 @@ library GenericSequenceLib {
     /// through the deep native pool (no exact-out depth cap), then bridge to the
     /// debt token. Only meaningful alongside FLAG_V4_UNLOCK.
     uint32 internal constant FLAG_V4_EXACT_IN = 1 << 4;
-    uint32 internal constant FLAG_KNOWN_MASK =
-        FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN;
+    /// Native-ETH input for a plain payable DEX call:
+    /// `target.call{value: amount}(patchedCalldata)`. `srcToken` MUST be
+    /// address(0). The forwarded ETH is bounded by TWO independent limits:
+    ///   (1) the per-srcToken containment cap on the address(0) bucket —
+    ///       standing/donated ETH keeps allowed-spend ZERO (unchanged from
+    ///       the existing V4-native-leg bucket), so this op can only ever
+    ///       spend ETH PRODUCED THIS SEQUENCE (a preceding
+    ///       `FLAG_WETH_UNWRAP` or a preceding native-output op's credit);
+    ///   (2) a per-op ceiling (below) bounding what the CALL ITSELF can
+    ///       consume to `amount`, reusing `V4InputOverspent` — the same
+    ///       ceiling shape `FLAG_V4_UNLOCK`'s exact-in leg already enforces.
+    /// Mutually exclusive with `FLAG_V4_UNLOCK` / `FLAG_WETH_UNWRAP` /
+    /// `FLAG_USE_FULL_BALANCE` (enforced immediately below, BEFORE the
+    /// direct-call dispatch — not inside the branch itself, since
+    /// `FLAG_V4_UNLOCK` is checked first in that if/else-if chain and a
+    /// check embedded only in the `FLAG_NATIVE_IN` branch would never fire
+    /// for a `NATIVE_IN|V4_UNLOCK` combo). MAY carry `FLAG_USE_PREV_RETURN`
+    /// for input sizing — `amount` is resolved from it above the branch,
+    /// same as any other op.
+    uint32 internal constant FLAG_NATIVE_IN = 1 << 5;
+    uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK
+        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN;
     uint16 internal constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     /// @dev `LiquidationExecutor` storage slots for the V4 unlock arming
@@ -247,21 +267,40 @@ library GenericSequenceLib {
 
         for (uint256 i = 0; i < n; ++i) {
             Op memory op = ops[i];
-            // No native value is ever needed to swap tokens; forbid it so an op
-            // cannot push the executor's ETH to an arbitrary target.
+            // The raw `op.value` struct field stays hard-0 for EVERY op,
+            // including `FLAG_NATIVE_IN` ones — that flag forwards value via
+            // `amount` (the same field every op already uses for its input
+            // size), never via `op.value`. This keeps a single, uniform
+            // "value forwarding is expressed only through the flag + amount"
+            // rule and forbids an op from pushing the executor's ETH to an
+            // arbitrary target through this unrelated field.
             if (op.value != 0) revert InvalidPlan();
             // Every op must declare the token it spends, so the per-srcToken cap
             // snapshots it. srcToken == address(0) means NATIVE ETH and is only
-            // meaningful on a native-aware op — a V4 unlock leg, whose callback
-            // settles raw ETH via `settle{value}`. On any other op shape 0x0
-            // would just mean "unset" (and the direct-call branch would try to
+            // meaningful on a native-aware op — a V4 unlock leg (whose callback
+            // settles raw ETH via `settle{value}`) or a FLAG_NATIVE_IN leg
+            // (`target.call{value: amount}`). On any other op shape 0x0 would
+            // just mean "unset" (and the direct-call branch would try to
             // forceApprove address(0)), so it stays rejected. A
             // FLAG_WETH_UNWRAP op can never ride this exemption: its branch
             // requires srcToken == weth (nonzero) explicitly.
-            if (op.srcToken == address(0) && op.flags & FLAG_V4_UNLOCK == 0) revert InvalidPlan();
+            if (op.srcToken == address(0) && op.flags & (FLAG_V4_UNLOCK | FLAG_NATIVE_IN) == 0) revert InvalidPlan();
             // Only the direct-call routing flags are supported; any other bit is
             // rejected so a stale plan can never silently mis-execute.
             if (op.flags & ~FLAG_KNOWN_MASK != 0) revert InvalidPlan();
+            // FLAG_NATIVE_IN admission + exclusivity, checked up front (not
+            // inside the branch below) so a NATIVE_IN|V4_UNLOCK combo can
+            // never silently fall through into the V4_UNLOCK branch and
+            // execute as a V4 unlock with the NATIVE_IN bit just ignored.
+            // srcToken must be native; FULL_BALANCE/V4_UNLOCK/WETH_UNWRAP
+            // would each reinterpret `amount` or the op shape incompatibly
+            // with a plain forwarded-value call, so reject the combination
+            // outright. PREV_RETURN is fine — it only affects `amount`
+            // sizing, resolved above the direct-call dispatch below.
+            if (op.flags & FLAG_NATIVE_IN != 0) {
+                if (op.srcToken != address(0)) revert InvalidPlan();
+                if (op.flags & (FLAG_V4_UNLOCK | FLAG_WETH_UNWRAP | FLAG_USE_FULL_BALANCE) != 0) revert InvalidPlan();
+            }
 
             if (op.flags & FLAG_WETH_UNWRAP != 0) {
                 // ── WETH → native-ETH unwrap ──
@@ -385,15 +424,49 @@ library GenericSequenceLib {
                     uint256 v4Consumed = v4InBefore > v4InAfter ? v4InBefore - v4InAfter : 0;
                     if (v4Consumed > amount) revert V4InputOverspent(v4Consumed, amount);
                 }
+            } else if (op.flags & FLAG_NATIVE_IN != 0) {
+                // ── Native-ETH input to a plain payable DEX call ──
+                // srcToken==address(0) and flag-exclusivity are already
+                // enforced above (before this dispatch), so `op.target` is
+                // called with `amount` wei attached directly — no allowance
+                // is granted (there is nothing to approve for native value).
+                bytes memory ndata = op.callData;
+                if (op.fromAmountPos != 0) {
+                    _patchWord(ndata, op.fromAmountPos, amount);
+                }
+                if (op.returnAmountPos != 0) {
+                    _patchWord(ndata, op.returnAmountPos, prevReturn);
+                }
+
+                // Per-op ceiling (parity with the V4 exact-in leg above):
+                // snapshot the executor's own ETH balance around the call so
+                // a target that net-pulls more than `amount` (e.g. via
+                // reentrancy) reverts here instead of only at the
+                // end-of-sequence containment cap.
+                uint256 nBefore = address(this).balance;
+                (bool okN, bytes memory retN) = op.target.call{value: amount}(ndata);
+                if (!okN) {
+                    if (retN.length > 0) {
+                        assembly {
+                            revert(add(retN, 0x20), mload(retN))
+                        }
+                    }
+                    revert OpCallFailed(i);
+                }
+                uint256 nAfter = address(this).balance;
+                uint256 nConsumed = nBefore > nAfter ? nBefore - nAfter : 0;
+                if (nConsumed > amount) revert V4InputOverspent(nConsumed, amount);
             } else {
                 // Direct call into an allowlisted router/aggregator whose calldata
                 // was built offchain. Patch runtime values into the pre-built
                 // calldata (bounds-checked), approve exact input, call, then reset.
                 // srcToken is provably nonzero here (native srcToken == 0x0 is
-                // only admitted with FLAG_V4_UNLOCK, which takes the branch
-                // above), so the forceApprove below never targets address(0) —
-                // native ETH moves exclusively via `settle{value}` inside the
-                // V4 callback, never via allowance.
+                // only admitted with FLAG_V4_UNLOCK or FLAG_NATIVE_IN, both of
+                // which take their own branch above), so the forceApprove
+                // below never targets address(0) — native ETH moves
+                // exclusively via `settle{value}` inside the V4 callback or
+                // via the FLAG_NATIVE_IN `call{value}` above, never via
+                // allowance.
                 bytes memory data = op.callData;
                 if (op.fromAmountPos != 0) {
                     _patchWord(data, op.fromAmountPos, amount);
