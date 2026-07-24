@@ -124,6 +124,7 @@ contract ArbGenericSequenceTest is Test {
     uint32 internal constant FLAG_USE_FULL_BALANCE = 1 << 0;
     uint32 internal constant FLAG_V4_UNLOCK = 1 << 2;
     uint32 internal constant FLAG_WETH_UNWRAP = 1 << 3;
+    uint32 internal constant FLAG_V4_EXACT_IN = 1 << 4;
     uint32 internal constant FLAG_NATIVE_IN = 1 << 5;
 
     MockERC20 loan;
@@ -369,14 +370,20 @@ contract ArbGenericSequenceTest is Test {
     }
 
     /// FLAG_NATIVE_IN must reject every combination with FLAG_V4_UNLOCK,
-    /// FLAG_WETH_UNWRAP, and FLAG_USE_FULL_BALANCE with InvalidPlan —
+    /// FLAG_WETH_UNWRAP, FLAG_USE_FULL_BALANCE, and FLAG_V4_EXACT_IN
+    /// (N-Task 5 fix 2 — the last was omitted pre-fix, so a
+    /// NATIVE_IN|V4_EXACT_IN op silently ran as plain NATIVE_IN with the
+    /// V4_EXACT_IN bit ignored) with InvalidPlan —
     /// REGARDLESS of callData shape (e.g. NATIVE_IN|V4_UNLOCK must not fall
     /// through into the V4_UNLOCK branch and revert only incidentally on the
     /// 160-byte v4SwapData length check).
     function test_runArb_nativeIn_flagCombo_reverts() public {
         MockPayableRouter payableRouter = new MockPayableRouter();
-        uint32[3] memory combos = [
-            FLAG_NATIVE_IN | FLAG_V4_UNLOCK, FLAG_NATIVE_IN | FLAG_WETH_UNWRAP, FLAG_NATIVE_IN | FLAG_USE_FULL_BALANCE
+        uint32[4] memory combos = [
+            FLAG_NATIVE_IN | FLAG_V4_UNLOCK,
+            FLAG_NATIVE_IN | FLAG_WETH_UNWRAP,
+            FLAG_NATIVE_IN | FLAG_USE_FULL_BALANCE,
+            FLAG_NATIVE_IN | FLAG_V4_EXACT_IN
         ];
         for (uint256 i = 0; i < combos.length; ++i) {
             vm.deal(address(harness), 1 ether);

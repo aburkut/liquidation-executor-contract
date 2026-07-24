@@ -209,8 +209,18 @@ contract ArbExecutor is
         allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho_;
         // Seed allowedTargets with the routers + Paraswap so Bebop
         // dispatch can re-check `allowedTargets[bebopTarget]` if used.
+        // Balancer Vault is ALSO seeded here because it doubles as a
+        // legitimate swap venue in the cross-venue routing (not just a
+        // flash-loan source), so a generic `Op` may legitimately target it.
+        // Morpho Blue is deliberately NOT seeded here (audit fix, N-Task 5
+        // fix 1): the flash-repay path never needs `allowedTargets` — it is
+        // reached exclusively via `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`,
+        // and repayment is a `forceApprove(msg.sender=Morpho, flashRepay)`
+        // that bypasses this mapping entirely. Seeding it here would only
+        // expose Morpho Blue's full function surface as a generic `Op`
+        // target, contradicting this contract's own "no liquidation
+        // actions" scope (see the contract NatSpec above).
         allowedTargets[balancerVault_] = true;
-        allowedTargets[morpho_] = true;
         allowedTargets[paraswapAugustus_] = true;
         allowedTargets[uniV2Router_] = true;
         allowedTargets[uniV3Router_] = true;

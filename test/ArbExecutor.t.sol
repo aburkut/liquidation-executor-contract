@@ -100,8 +100,11 @@ contract ArbExecutorTest is Test {
         mid = new MockERC20("Mid", "MID", 18);
         router = new MockRouter();
 
-        address[] memory allowed = new address[](1);
-        allowed[0] = address(morpho); // morpho needs to be allowlisted? actually not — flashProvider check is separate. Keep for symmetry.
+        // No extra targets: morpho is deliberately NOT allowlisted here (nor
+        // seeded by the constructor, N-Task 5 fix 1) — the flash-repay path
+        // reaches Morpho exclusively via `allowedFlashProviders`, never via
+        // `allowedTargets`. See `test_execute_morphoAsGenericOpTarget_reverts`.
+        address[] memory allowed = new address[](0);
 
         vm.prank(ownerAddr);
         exec = new ArbExecutor(
@@ -454,6 +457,28 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](1);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[0].target = address(0xBEEF);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.TargetNotAllowed.selector);
+        exec.execute(plan);
+    }
+
+    /// N-Task 5 fix 1: `morphoBlue` is deliberately NOT seeded into
+    /// `allowedTargets` by the constructor (nor by this test's `setUp`,
+    /// which passes an empty extra-allowlist). A generic `Op` targeting
+    /// Morpho Blue directly must be rejected at the pre-flashloan allowlist
+    /// walk, closing the scope-creep the audit found: pre-fix, an operator
+    /// could target Morpho Blue's full function surface as a generic op,
+    /// contradicting the contract's "no liquidation actions" NatSpec. The
+    /// flash-repay path does NOT need this entry — it is reached solely via
+    /// `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`, and repayment is a
+    /// `forceApprove(msg.sender=Morpho, flashRepay)` that never consults
+    /// `allowedTargets` at all (proven separately by every other
+    /// Morpho-flash test in this suite still passing unmodified).
+    function test_execute_morphoAsGenericOpTarget_reverts() public {
+        Op[] memory ops = new Op[](1);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[0].target = address(morpho); // generic op aimed at Morpho Blue itself
         bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.TargetNotAllowed.selector);

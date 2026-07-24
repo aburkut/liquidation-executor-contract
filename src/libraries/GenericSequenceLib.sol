@@ -110,11 +110,15 @@ library GenericSequenceLib {
     ///       consume to `amount`, reusing `V4InputOverspent` — the same
     ///       ceiling shape `FLAG_V4_UNLOCK`'s exact-in leg already enforces.
     /// Mutually exclusive with `FLAG_V4_UNLOCK` / `FLAG_WETH_UNWRAP` /
-    /// `FLAG_USE_FULL_BALANCE` (enforced immediately below, BEFORE the
-    /// direct-call dispatch — not inside the branch itself, since
-    /// `FLAG_V4_UNLOCK` is checked first in that if/else-if chain and a
-    /// check embedded only in the `FLAG_NATIVE_IN` branch would never fire
-    /// for a `NATIVE_IN|V4_UNLOCK` combo). MAY carry `FLAG_USE_PREV_RETURN`
+    /// `FLAG_USE_FULL_BALANCE` / `FLAG_V4_EXACT_IN` (enforced immediately
+    /// below, BEFORE the direct-call dispatch — not inside the branch
+    /// itself, since `FLAG_V4_UNLOCK` is checked first in that if/else-if
+    /// chain and a check embedded only in the `FLAG_NATIVE_IN` branch would
+    /// never fire for a `NATIVE_IN|V4_UNLOCK` combo). `FLAG_V4_EXACT_IN` is
+    /// only meaningful alongside `FLAG_V4_UNLOCK`, so a `NATIVE_IN|V4_EXACT_IN`
+    /// combo is meaningless too — without this reject it silently ran as
+    /// plain NATIVE_IN with the V4_EXACT_IN bit ignored (harmless — containment
+    /// + ceiling still bind — but sloppy; N-Task 5 fix 2). MAY carry `FLAG_USE_PREV_RETURN`
     /// for input sizing — `amount` is resolved from it above the branch,
     /// same as any other op.
     uint32 internal constant FLAG_NATIVE_IN = 1 << 5;
@@ -292,14 +296,18 @@ library GenericSequenceLib {
             // inside the branch below) so a NATIVE_IN|V4_UNLOCK combo can
             // never silently fall through into the V4_UNLOCK branch and
             // execute as a V4 unlock with the NATIVE_IN bit just ignored.
-            // srcToken must be native; FULL_BALANCE/V4_UNLOCK/WETH_UNWRAP
-            // would each reinterpret `amount` or the op shape incompatibly
-            // with a plain forwarded-value call, so reject the combination
-            // outright. PREV_RETURN is fine — it only affects `amount`
-            // sizing, resolved above the direct-call dispatch below.
+            // srcToken must be native; FULL_BALANCE/V4_UNLOCK/WETH_UNWRAP/
+            // V4_EXACT_IN would each reinterpret `amount` or the op shape
+            // incompatibly with a plain forwarded-value call (V4_EXACT_IN is
+            // only meaningful alongside V4_UNLOCK, so it's meaningless here
+            // too), so reject the combination outright. PREV_RETURN is fine
+            // — it only affects `amount` sizing, resolved above the
+            // direct-call dispatch below.
             if (op.flags & FLAG_NATIVE_IN != 0) {
                 if (op.srcToken != address(0)) revert InvalidPlan();
-                if (op.flags & (FLAG_V4_UNLOCK | FLAG_WETH_UNWRAP | FLAG_USE_FULL_BALANCE) != 0) revert InvalidPlan();
+                if (op.flags & (FLAG_V4_UNLOCK | FLAG_WETH_UNWRAP | FLAG_USE_FULL_BALANCE | FLAG_V4_EXACT_IN) != 0) {
+                    revert InvalidPlan();
+                }
             }
 
             if (op.flags & FLAG_WETH_UNWRAP != 0) {
@@ -531,33 +539,43 @@ library GenericSequenceLib {
         // The `t != address(0)` guard also keeps a zero collateralAsset from
         // ever matching the ETH bucket.
         // @dev Task 8 fix 4 — accepted rationale for the loanToken cap
-        // (owner-accepted option (a), NO code change): for `runArb`,
-        // `capToken == loanToken` and `capAmount == loanAmount`, so the
-        // loanToken bucket's allowed spend below is `loanAmount`, NOT zero —
-        // a WEAKER invariant than "no standing loanToken may leave at all"
-        // (which is what every other token bucket enforces). A compromised
-        // operator could in principle route up to `loanAmount` of a
-        // PRE-EXISTING standing loanToken balance out through an op, on top
-        // of the legitimate flash principal, without tripping this cap.
-        // Accepted because:
-        //   (i)   every op `target` is owner-allowlisted (constructor-pinned
-        //         routers + `setAllowedTarget`) — honest routers move funds
-        //         only to the executor per the outToken-delta check, so a
-        //         compromised OPERATOR (not owner) cannot pull-and-return
-        //         dust to an attacker-controlled address through this cap;
-        //   (ii)  the only path that actually extracts value to outside the
-        //         contract at all is the coinbase bribe, which requires the
-        //         operator to ALSO control the block builder receiving
-        //         `block.coinbase` — i.e. builder collusion, not an
-        //         unprivileged operator-only exploit;
-        //   (iii) profit is withdrawn PROMPTLY by the owner in normal
-        //         operation (see `ArbExecutor.withdraw`), so no large
-        //         standing loanToken residual is expected to accumulate and
-        //         sit exposed to this weaker cap for long.
-        // This is an accepted trade-off, not an oversight — do not tighten
+        // (owner-accepted option (a), NO code change; rationale CORRECTED by
+        // the N-Task 5 audit — see below): for `runArb`, `capToken ==
+        // loanToken` and `capAmount == loanAmount`, so the loanToken bucket's
+        // allowed spend below is `loanAmount`, NOT zero — a WEAKER invariant
+        // than "no standing loanToken may leave at all" (which is what every
+        // other token bucket enforces). A compromised operator could in
+        // principle route up to `loanAmount` of a PRE-EXISTING standing
+        // loanToken balance out through an op, on top of the legitimate
+        // flash principal, without tripping this cap.
+        //
+        // CORRECTED rationale: an earlier version of this note argued the
+        // owner's `allowedTargets` router allowlist itself prevented
+        // extraction without builder collusion ("honest routers move funds
+        // only to the executor"). That argument is FALSE and has been
+        // retracted — allowlisting a ROUTER does not constrain which POOL it
+        // routes into, and pools are permissionlessly creatable (a UniV2/V3
+        // factory pair, or a hookless V4 pool) by anyone, including a
+        // compromised operator. Such an operator can route the flash
+        // principal through an adversarial thin pool THEY created and drain
+        // up to `loanAmount` of standing loanToken per tx, with NO builder
+        // collusion and NO owner action required.
+        //
+        // The ONLY real protection against this gap is operational, not
+        // on-chain: the owner's WITHDRAW-PROMPTLY policy (see
+        // `ArbExecutor.withdraw`) keeps the standing loanToken residual on
+        // the contract at all times close to zero, so there is nothing of
+        // value for a compromised operator to route out through this cap.
+        // Owner has accepted this on the corrected basis. This is an
+        // accepted operational trade-off, not an oversight — do not tighten
         // the loanToken cap to 0 without re-deriving the repay-gate math
         // (the flash principal MUST be spendable up to `loanAmount`, or
         // `runArb`'s own op sequence could never spend the borrowed funds).
+        // Available hardening if a future owner wants to close this gap
+        // on-chain instead of relying on the withdraw-promptly policy:
+        // option (b), an output-token allowlist constraining which token an
+        // op may legitimately swap INTO — deferred, separate task, not part
+        // of this fix wave.
         for (uint256 k = 0; k < nSnap; ++k) {
             address t = snapTok[k];
             uint256 allowed = (t != address(0) && t == capToken) ? capAmount : 0;
