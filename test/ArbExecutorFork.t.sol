@@ -86,6 +86,12 @@ contract ArbExecutorForkTest is Test {
     /// token1 = native ETH (Fluid's own 0xEeee…EEeE sentinel) — confirmed
     /// via the real `DexReservesResolver.getAllPoolsReservesAdjusted()`
     /// (0xC93876C0EEd99645DD53937b25433e311881A27C) at FORK_BLOCK.
+    /// SUBSTITUTION: the other real USDC/ETH Fluid pool from the same
+    /// resolver listing, `0x2886a01a0645390872a9eb99dAe1283664b0c524`, was
+    /// tried first and reverted with `FluidDexError(51043)` =
+    /// `DexT1__SwapAndArbitragePaused` — a genuine on-chain per-pool
+    /// governance pause bit set on THAT pool at FORK_BLOCK (not a
+    /// calldata/ABI bug). This pool is not paused and routes cleanly.
     address constant FLUID_USDC_ETH_POOL = 0x836951EB21F3Df98273517B7249dCEFF270d34bf;
     /// Uniswap Universal Router (current V4-aware deployment) — same
     /// address the bot's `decode.rs` pins as `UNI_V4_UNIVERSAL_ROUTER`.
@@ -719,7 +725,7 @@ contract ArbExecutorForkTest is Test {
         assertGe(residual, buffer / 2, "round-trip lost more than expected (repay/containment may have masked a bug)");
         assertLe(
             residual,
-            buffer * 2,
+            buffer * 12 / 10,
             "residual far exceeds pre-funded buffer (accounting bug, not just cross-venue price gain)"
         );
     }
