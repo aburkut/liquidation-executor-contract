@@ -291,14 +291,14 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     /// lib, so restated here as literals — the library doc comment claims
     /// they are pinned by this test's name). Confirmed against
     /// `forge inspect LiquidationExecutor storagelayout`:
-    ///   slot 10, offset 0  (bytes 0..19) = _activeV4PoolManager (address)
-    ///   slot 10, offset 20 (byte 20)     = _executionPhase (enum, FlashLoanActive=1)
-    ///   slot 11, offset 0  (bytes 0..19) = _activeV4TokenIn (address)
-    ///   slot 11, offset 20 (byte 20)     = _v4Armed (bool) == bit 160
+    ///   slot 11, offset 0  (bytes 0..19) = _activeV4PoolManager (address)
+    ///   slot 11, offset 20 (byte 20)     = _executionPhase (enum, FlashLoanActive=1)
+    ///   slot 12, offset 0  (bytes 0..19) = _activeV4TokenIn (address)
+    ///   slot 12, offset 20 (byte 20)     = _v4Armed (bool) == bit 160
     /// Two independent, non-vacuous probes — either drifting fails the test:
     ///   (1) a raw storage poke at these exact slot/offsets, followed by a
     ///       DIRECT call to the real `unlockCallback`, must swap using the
-    ///       literal `loanToken` ADDRESS decoded from slot 11 (not merely the
+    ///       literal `loanToken` ADDRESS decoded from the tokenIn slot (not merely the
     ///       armed bit — the existing native-ETH pin test uses tokenIn == 0,
     ///       which can't distinguish a correct address decode from garbage).
     ///       This pins LiquidationExecutor's COMPILED layout to the literals.
@@ -308,16 +308,16 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     ///       diverge from this layout, this half fails even though (1) alone
     ///       would not catch it (probe 1 never invokes the lib).
     function test_v4SlotConstantsMatchLayout() public {
-        uint256 V4_PM_SLOT = 10;
-        uint256 V4_TOKENIN_SLOT = 11;
+        uint256 V4_PM_SLOT = 11;
+        uint256 V4_TOKENIN_SLOT = 12;
         uint256 V4_ARMED_BIT = 1 << 160;
         uint256 PHASE_FLASHLOAN_ACTIVE = 1;
 
         // ── Probe 1: direct field round-trip via unlockCallback ──
-        bytes32 slot10 = bytes32(uint256(uint160(address(uniV4Mock)))) | bytes32(PHASE_FLASHLOAN_ACTIVE << 160);
-        vm.store(address(executor), bytes32(V4_PM_SLOT), slot10);
-        bytes32 slot11 = bytes32(uint256(uint160(address(loanToken)))) | bytes32(V4_ARMED_BIT);
-        vm.store(address(executor), bytes32(V4_TOKENIN_SLOT), slot11);
+        bytes32 pmSlotWord = bytes32(uint256(uint160(address(uniV4Mock)))) | bytes32(PHASE_FLASHLOAN_ACTIVE << 160);
+        vm.store(address(executor), bytes32(V4_PM_SLOT), pmSlotWord);
+        bytes32 tokenInSlotWord = bytes32(uint256(uint160(address(loanToken)))) | bytes32(V4_ARMED_BIT);
+        vm.store(address(executor), bytes32(V4_TOKENIN_SLOT), tokenInSlotWord);
 
         uint256 execLoanBefore = loanToken.balanceOf(address(executor));
         uint256 execCollBefore = collateralToken.balanceOf(address(executor));
@@ -328,12 +328,12 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         bytes memory data = abi.encode(inner, int256(-1e18)); // sell 1e18 tokenIn, exact-in
 
         vm.prank(address(uniV4Mock));
-        executor.unlockCallback(data); // must NOT revert — proves slot 10/11 decode exactly right
+        executor.unlockCallback(data); // must NOT revert — proves the V4 PM/tokenIn slots decode exactly right
 
         assertEq(
             loanToken.balanceOf(address(executor)),
             execLoanBefore - 1e18,
-            "tokenIn must decode to the loanToken address planted at slot 11, not garbage"
+            "tokenIn must decode to the loanToken address planted at the V4 tokenIn slot, not garbage"
         );
         assertGt(collateralToken.balanceOf(address(executor)), execCollBefore, "swap must have paid out tokenOut");
 
@@ -342,15 +342,15 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         assertEq(
             vm.load(address(executor), bytes32(V4_TOKENIN_SLOT)),
             bytes32(0),
-            "slot 11 must be fully cleared post-callback"
+            "V4 tokenIn slot must be fully cleared post-callback"
         );
-        // unlockCallback doesn't touch the PM half of slot 10 — only the
+        // unlockCallback does not touch the PM half of that slot — only the
         // outer `_executeUniV4Leg` disarms it — so the phase byte we poked
         // must still read back untouched at the same byte offset.
         assertEq(
             vm.load(address(executor), bytes32(V4_PM_SLOT)) & bytes32(~uint256(type(uint160).max)),
             bytes32(PHASE_FLASHLOAN_ACTIVE << 160),
-            "phase byte at slot 10 offset 20 must be untouched"
+            "phase byte at the V4 PM slot offset 20 must be untouched"
         );
 
         // ── Probe 2: the real GenericSequenceLib arming path, end to end ──
@@ -381,7 +381,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     /// storage slots — wrong slot constants revert InvalidCallbackCaller.
     function test_GenericSequence_V4UnlockOp_ExactOut_HappyPath() public {
         uint256 repay = LOAN_AMOUNT + FLASH_FEE; // 1001e18 exact-out
-        bytes32 slot10Before = vm.load(address(executor), bytes32(uint256(10)));
+        bytes32 pmSlotBefore = vm.load(address(executor), bytes32(uint256(11)));
 
         Op memory op = _v4Op(address(collateralToken), address(loanToken), repay);
         bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 1e18);
@@ -389,12 +389,12 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         vm.prank(operatorAddr);
         executor.execute(plan);
 
-        // Disarm proof: slot 10 (PM address bytes 0..19, packed with
+        // Disarm proof: the PM slot (address bytes 0..19, packed with
         // _executionPhase at byte 20) is bit-identical to pre-execute — the
-        // arm preserved the phase byte and the disarm cleared the PM. Slot 11
-        // (tokenIn) is zero (CLAIMed by the callback, re-cleared by the lib).
-        assertEq(vm.load(address(executor), bytes32(uint256(10))), slot10Before, "slot 10 must round-trip (PM + phase)");
-        assertEq(vm.load(address(executor), bytes32(uint256(11))), bytes32(0), "tokenIn slot must be cleared");
+        // arm preserved the phase byte and the disarm cleared the PM. The
+        // tokenIn slot is zero (CLAIMed by the callback, re-cleared by the lib).
+        assertEq(vm.load(address(executor), bytes32(uint256(11))), pmSlotBefore, "PM slot must round-trip (PM + phase)");
+        assertEq(vm.load(address(executor), bytes32(uint256(12))), bytes32(0), "tokenIn slot must be cleared");
     }
 
     /// Multihop v4SwapData (> 160 bytes) is forbidden on the op path — its

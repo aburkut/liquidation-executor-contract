@@ -114,6 +114,7 @@ contract ArbExecutor is
     // Mirrors CoinbasePaymentLib.CoinbasePaid for tests that pin the topic.
     event CoinbasePaid(address indexed coinbase, uint256 amount);
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
+    event OperatorUpdated(address indexed operator, bool allowed);
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_BALANCER = 2;
@@ -121,14 +122,13 @@ contract ArbExecutor is
     uint256 private constant V4_SWAP_DATA_LENGTH = 160;
 
     // ─── Immutables (constructor-pinned) ─────────────────────────────
-    address public immutable operator;
     address public immutable weth;
     address public immutable paraswapAugustusV6;
     address public immutable uniV2Router;
     address public immutable uniV3Router;
 
     // ─── Storage ─────────────────────────────────────────────────────
-    // Layout NOTE: the V4 arming fields MUST land at slots 10/11 to match
+    // Layout NOTE: the V4 arming fields MUST land at slots 11/12 to match
     // GenericSequenceLib's pinned V4_PM_SLOT/V4_TOKENIN_SLOT constants (the
     // lib sstores into them via DELEGATECALL). test_v4SlotConstantsMatchLayout
     // is the authority — if it fails, adjust the field order/padding below.
@@ -142,15 +142,22 @@ contract ArbExecutor is
     /// @dev V4 hook allowlist (parity with LiquidationExecutor). Owner-curated;
     /// the unlockCallback single-hop branch re-checks `allowedV4Hooks[hook]`.
     mapping(address => bool) public allowedV4Hooks;
+    /// @dev Operator allowlist. Several operator EOAs may drive ONE executor
+    /// so sends spread over independent nonce streams — one stuck tx then
+    /// cannot jam the others, and same-nonce bid fan-out does not have to
+    /// fight its own replacements. Seeded with the constructor's `operator_`.
+    /// Owner-curated: an operator key is hot, so it may only SPEND under the
+    /// containment caps, never move standing funds (`withdraw` is onlyOwner).
+    mapping(address => bool) public operators;
 
     bytes32 private _activePlanHash;
-    /// @dev Storage-layout alignment padding (slots 7-9). `ArbExecutor` has
+    /// @dev Storage-layout alignment padding (slots 8-10). `ArbExecutor` has
     /// three fewer pre-V4 storage fields than `LiquidationExecutor`
     /// (`aavePool`, `paraswapAugustusV6`, `aaveV2LendingPool` are either
     /// Aave-specific — not applicable to an arb-only executor — or
     /// constructor-`immutable` here, so they consume no storage slot).
     /// Without this padding `_activeV4PoolManager`/`_activeV4TokenIn` would
-    /// land at slots 7/8 instead of the 10/11 `GenericSequenceLib` hardcodes
+    /// land at slots 8/9 instead of the 11/12 `GenericSequenceLib` hardcodes
     /// (`V4_PM_SLOT`/`V4_TOKENIN_SLOT`) and shares with `LiquidationExecutor`
     /// via the same DELEGATECALL sstore. Reserved, never read/written by
     /// this contract — `forge inspect ArbExecutor storageLayout` is the
@@ -158,7 +165,7 @@ contract ArbExecutor is
     bytes32 private __reservedSlot0;
     bytes32 private __reservedSlot1;
     bytes32 private __reservedSlot2;
-    /// @dev Slot 10 (bytes 0..19) — armed V4 PoolManager. Packs with
+    /// @dev Slot 11 (bytes 0..19) — armed V4 PoolManager. Packs with
     /// `_executionPhase` (byte 20). Pinned by test_v4SlotConstantsMatchLayout.
     address private _activeV4PoolManager;
     enum ExecutionPhase {
@@ -166,10 +173,10 @@ contract ArbExecutor is
         FlashLoanActive
     }
     ExecutionPhase private _executionPhase;
-    /// @dev Slot 11 (bytes 0..19) — armed V4 input token. Packs with
+    /// @dev Slot 12 (bytes 0..19) — armed V4 input token. Packs with
     /// `_v4Armed` (byte 20).
     address private _activeV4TokenIn;
-    /// @dev Slot 11 byte 20 — the re-entry sentinel unlockCallback gates on.
+    /// @dev Slot 12 byte 20 — the re-entry sentinel unlockCallback gates on.
     bool private _v4Armed;
 
     // ─── Constructor ─────────────────────────────────────────────────
@@ -198,7 +205,8 @@ contract ArbExecutor is
         if (uniV2Router_ == address(0)) revert ZeroAddress();
         if (uniV3Router_ == address(0)) revert ZeroAddress();
 
-        operator = operator_;
+        operators[operator_] = true;
+        emit OperatorUpdated(operator_, true);
         weth = weth_;
         paraswapAugustusV6 = paraswapAugustus_;
         uniV2Router = uniV2Router_;
@@ -233,7 +241,7 @@ contract ArbExecutor is
 
     // ─── Modifiers ───────────────────────────────────────────────────
     modifier onlyOperator() {
-        if (msg.sender != operator) revert UnauthorizedOperator();
+        if (!operators[msg.sender]) revert UnauthorizedOperator();
         _;
     }
 
@@ -246,6 +254,18 @@ contract ArbExecutor is
         if (target == address(0)) revert ZeroAddress();
         allowedTargets[target] = allowed;
         emit AllowedTargetUpdated(target, allowed);
+    }
+
+    /// @notice Add or remove an operator EOA authorised to call `execute`.
+    /// @dev Deliberately NOT self-service: only the owner may rotate keys.
+    /// Revoking is immediate, which is the kill-switch for a leaked hot key
+    /// (`pause()` remains the blanket stop). The owner can revoke every
+    /// operator, leaving the executor callable by nobody — intended, and
+    /// symmetric with `pause()`.
+    function setOperator(address operator_, bool allowed) external onlyOwner {
+        if (operator_ == address(0)) revert ZeroAddress();
+        operators[operator_] = allowed;
+        emit OperatorUpdated(operator_, allowed);
     }
 
     /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.

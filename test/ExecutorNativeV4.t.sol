@@ -21,10 +21,13 @@ import {MockGenericDex} from "./ExecutorGenericSequence.t.sol";
 /// longer bounces off `InvalidCallbackCaller` merely because tokenIn == 0.
 contract ExecutorNativeV4Test is ExecutorTest {
     // Storage layout (forge inspect LiquidationExecutor storage-layout):
-    //   slot 10 = _activeV4PoolManager (address, offset 0) | _executionPhase (uint8, offset 20)
-    //   slot 11 = _activeV4TokenIn     (address, offset 0) | _v4Armed        (bool,   offset 20)
-    uint256 constant V4_PM_PHASE_SLOT = 10;
-    uint256 constant V4_TOKENIN_ARMED_SLOT = 11;
+    //   slot 11 = _activeV4PoolManager (address, offset 0) | _executionPhase (uint8, offset 20)
+    //   slot 12 = _activeV4TokenIn     (address, offset 0) | _v4Armed        (bool,   offset 20)
+    // Shifted +1 by the `operators` mapping that replaced the immutable
+    // single `operator`; must stay in lockstep with GenericSequenceLib's
+    // V4_PM_SLOT / V4_TOKENIN_SLOT.
+    uint256 constant V4_PM_PHASE_SLOT = 11;
+    uint256 constant V4_TOKENIN_ARMED_SLOT = 12;
     uint256 constant PHASE_FLASHLOAN_ACTIVE = 1; // ExecutionPhase.FlashLoanActive
 
     /// Prime storage as if `_executeUniV4Leg` were mid-unlock for a

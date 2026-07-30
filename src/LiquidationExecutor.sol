@@ -196,7 +196,6 @@ contract LiquidationExecutor is
     // constants, decoder shapes, and bounds-check commentary.
 
     // ─── State ───────────────────────────────────────────────────────
-    address public immutable operator;
     address public immutable weth;
     address public aavePool;
     address public morphoBlue;
@@ -220,6 +219,17 @@ contract LiquidationExecutor is
     /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
+    /// @dev Operator allowlist. Several operator EOAs may drive ONE executor
+    /// so sends spread over independent nonce streams — one stuck tx then
+    /// cannot jam the others, and same-nonce bid fan-out does not have to
+    /// fight its own replacements. Seeded with the constructor's `operator_`.
+    /// Owner-curated: an operator key is hot, so it may only SPEND under the
+    /// containment caps, never move standing funds (`withdraw` is onlyOwner).
+    /// LAYOUT: this mapping occupies slot 10, which pushes the V4 arming
+    /// fields to slots 11/12 — matching `GenericSequenceLib`'s pinned
+    /// V4_PM_SLOT/V4_TOKENIN_SLOT. `test_v4SlotConstantsMatchLayout` is the
+    /// authority; do not reorder without re-running it.
+    mapping(address => bool) public operators;
     // V10+ refactor: the dedicated `allowedExtSwapTargets` allowlist
     // for Curve V1 / Balancer V2 pool targets was removed. Fund safety
     // for an operator-supplied pool does NOT rest on "zero balance" —
@@ -333,6 +343,7 @@ contract LiquidationExecutor is
     /// `configureMorpho`) when the old provider's allowlist entry is
     /// cleared on rotation.
     event AllowedTargetUpdated(address indexed target, bool allowed);
+    event OperatorUpdated(address indexed operator, bool allowed);
 
     // SwapMode + SwapLeg sourced from `./types/SwapTypes.sol` (V10+).
     // See that file for the per-mode field-usage documentation.
@@ -405,7 +416,15 @@ contract LiquidationExecutor is
         SwapPlan swapPlan;
     }
 
-    uint8 private constant MAX_ACTIONS = 10;
+    /// @dev Gas-grief bound on the action list. Sized from measurement, not
+    /// taste: a liquidation cascade batches many users into ONE tx, and the
+    /// top competitor's executor was observed running up to 16
+    /// `LiquidationCall`s per tx (5 such txs in a 3-month window, carrying
+    /// 16.2% of his liquidation profit) — all of which the previous bound of
+    /// 10 would have rejected. 20 leaves headroom above the observed ceiling
+    /// while keeping the per-tx gas well inside a block: the largest observed
+    /// batch (16 liqs + 50 swap ops) burned ~8.1M gas.
+    uint8 private constant MAX_ACTIONS = 20;
 
     // Action / AaveV3Action / AaveV2Liquidation / MorphoLiquidation moved to
     // types/SwapTypes.sol (imported above) so the pure plan validator can live
@@ -444,7 +463,8 @@ contract LiquidationExecutor is
         if (uniV2Router_ == address(0)) revert ZeroAddress();
         if (uniV3Router_ == address(0)) revert ZeroAddress();
 
-        operator = operator_;
+        operators[operator_] = true;
+        emit OperatorUpdated(operator_, true);
         weth = weth_;
         uniV2Router = uniV2Router_;
         uniV3Router = uniV3Router_;
@@ -470,7 +490,7 @@ contract LiquidationExecutor is
 
     // ─── Modifiers ───────────────────────────────────────────────────
     modifier onlyOperator() {
-        if (msg.sender != operator) revert Unauthorized();
+        if (!operators[msg.sender]) revert Unauthorized();
         _;
     }
 
@@ -483,6 +503,18 @@ contract LiquidationExecutor is
     // removing the single-slot setter eliminates the desync window
     // entirely and forces all Morpho re-configuration through the
     // atomic path.
+
+    /// @notice Add or remove an operator EOA authorised to call `execute`.
+    /// @dev Deliberately NOT self-service: only the owner may rotate keys.
+    /// Revoking is immediate, which is the kill-switch for a leaked hot key
+    /// (`pause()` remains the blanket stop). The owner can revoke every
+    /// operator, leaving the executor callable by nobody — intended, and
+    /// symmetric with `pause()`.
+    function setOperator(address operator_, bool allowed) external onlyOwner {
+        if (operator_ == address(0)) revert ZeroAddress();
+        operators[operator_] = allowed;
+        emit OperatorUpdated(operator_, allowed);
+    }
 
     function setAaveV2LendingPool(address pool) external onlyOwner {
         if (pool == address(0)) revert ZeroAddress();

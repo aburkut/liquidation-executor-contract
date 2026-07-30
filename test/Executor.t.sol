@@ -1289,6 +1289,51 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
+    // ─── Multi-operator (parallel nonce streams) ──────────────────────
+    // See the matching block in ArbExecutor.t.sol for the rationale: a
+    // single immutable operator = a single nonce stream = the structural
+    // jam. Fixable only at deploy time, so it lands before first deploy.
+
+    function test_setOperator_constructorOperatorSeeded() public view {
+        assertTrue(executor.operators(operatorAddr), "constructor operator seeded");
+    }
+
+    function test_setOperator_secondOperatorCanExecute() public {
+        address operator2 = address(0xB0B2);
+        vm.prank(owner);
+        executor.setOperator(operator2, true);
+        assertTrue(executor.operators(operator2), "operator2 registered");
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
+        vm.prank(operator2);
+        executor.execute(plan);
+    }
+
+    function test_setOperator_revokedOperatorReverts() public {
+        vm.prank(owner);
+        executor.setOperator(operatorAddr, false);
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.Unauthorized.selector);
+        executor.execute(plan);
+    }
+
+    function test_setOperator_onlyOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert(); // Ownable: caller is not the owner
+        executor.setOperator(attacker, true);
+        assertFalse(executor.operators(attacker), "attacker must not self-register");
+    }
+
+    function test_setOperator_zeroAddressReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.setOperator(address(0), true);
+    }
+
     function test_ownable2Step() public {
         address newOwner = address(0xBEEF);
         vm.prank(owner);
@@ -1462,16 +1507,18 @@ contract ExecutorTest is Test {
         bytes32 planHash = keccak256(planBytes);
 
         // Storage layout (forge inspect LiquidationExecutor storage):
-        //   slot 9  = _activePlanHash       (bytes32)
-        //   slot 10 = _activeV4PoolManager  (address, offset 0)
+        //   slot 9  = operators             (mapping)
+        //   slot 10 = _activePlanHash       (bytes32)
+        //   slot 11 = _activeV4PoolManager  (address, offset 0)
         //            _executionPhase        (uint8 enum, offset 20)
-        // (Slots shifted -1 in V10 refactor after removing the
-        // `allowedExtSwapTargets` mapping; previously shifted -1 by the
-        // re-audit `balancerVault` removal.) Force both into the
-        // "during flashloan" state so neither guard short-circuits.
+        // (Slots shifted +1 when the `operators` mapping replaced the
+        // immutable single `operator`; previously shifted -1 by the V10
+        // `allowedExtSwapTargets` removal and -1 again by the re-audit
+        // `balancerVault` removal.) Force both into the "during flashloan"
+        // state so neither guard short-circuits.
         // Byte at offset 20 (Solidity) corresponds to bit 160 of the uint256 slot.
-        vm.store(address(executor), bytes32(uint256(9)), planHash);
-        vm.store(address(executor), bytes32(uint256(10)), bytes32(uint256(1) << 160)); // FlashLoanActive
+        vm.store(address(executor), bytes32(uint256(10)), planHash);
+        vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive
 
         // Attacker (not the registered Morpho provider) hits the callback. The phase
         // and hash gates pass; only the caller check should reject.
@@ -3710,9 +3757,42 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
+    /// @dev A cascade batches MANY users into ONE tx. The measured ceiling
+    /// on the top competitor's executor is 16 `LiquidationCall`s in a single
+    /// tx (5 such txs over a 3-month window, carrying 16.2% of all his
+    /// liquidation profit) — every one of which the old MAX_ACTIONS == 10
+    /// would have rejected outright. This pins that a 16-liquidation batch
+    /// executes end-to-end, not merely that the count check passes.
+    function test_execute_acceptsSixteenLiquidationBatch() public {
+        uint256 n = 16;
+        uint256 debtEach = 50e18; // 16 × 50 = 800e18 <= LOAN_AMOUNT
+        // Split the SAME total collateral reward across the batch so the
+        // default swap plan (swaps DEFAULT_SWAP_AMOUNT) still covers repay.
+        aavePool.setLiquidationCollateralReward(COLLATERAL_REWARD / n);
+
+        Action[] memory batch = new Action[](n);
+        for (uint256 i = 0; i < n; i++) {
+            batch[i] = Action({
+                protocolId: 1,
+                data: _buildAaveV3LiquidationAction(
+                    address(collateralToken),
+                    address(loanToken),
+                    address(uint160(0x1234 + i)), // distinct users, as in a real cascade
+                    debtEach,
+                    false
+                )
+            });
+        }
+
+        bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, batch, _defaultSwapPlan());
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+    }
+
     function test_execute_reverts_on_too_many_actions() public {
-        Action[] memory tooMany = new Action[](11);
-        for (uint256 i = 0; i < 11; i++) {
+        Action[] memory tooMany = new Action[](21);
+        for (uint256 i = 0; i < 21; i++) {
             tooMany[i] = Action({
                 protocolId: 1,
                 data: _buildAaveV3LiquidationAction(
@@ -3724,7 +3804,7 @@ contract ExecutorTest is Test {
         bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, tooMany, _defaultSwapPlan());
 
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TooManyActions.selector, 11));
+        vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.TooManyActions.selector, 21));
         executor.execute(plan);
     }
 

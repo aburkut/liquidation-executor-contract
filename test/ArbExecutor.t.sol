@@ -633,12 +633,13 @@ contract ArbExecutorTest is Test {
         //   allowedFlashProviders   slot 3 (mapping)
         //   allowedTargets          slot 4 (mapping)
         //   allowedV4Hooks          slot 5 (mapping)
-        //   _activePlanHash         slot 6
-        //   __reservedSlot0..2      slots 7-9 (V4 alignment padding)
-        //   _activeV4PoolManager    slot 10 offset 0  (packs with _executionPhase)
-        //   _executionPhase         slot 10 offset 20 (uint8 enum)
-        vm.store(address(exec), bytes32(uint256(6)), planHash);
-        vm.store(address(exec), bytes32(uint256(10)), bytes32(uint256(1) << 160)); // FlashLoanActive @ offset 20
+        //   operators               slot 6 (mapping)
+        //   _activePlanHash         slot 7
+        //   __reservedSlot0..2      slots 8-10 (V4 alignment padding)
+        //   _activeV4PoolManager    slot 11 offset 0  (packs with _executionPhase)
+        //   _executionPhase         slot 11 offset 20 (uint8 enum)
+        vm.store(address(exec), bytes32(uint256(7)), planHash);
+        vm.store(address(exec), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive @ offset 20
 
         vm.prank(attacker);
         vm.expectRevert(ArbExecutor.InvalidCallbackCaller.selector);
@@ -707,20 +708,52 @@ contract ArbExecutorTest is Test {
 
     // ─── V4 storage-slot pinning (Task 3 of arb-full-parity) ──────────
 
-    /// @dev Solidity cannot read another contract's private-field slot map
-    /// at runtime, so this test cannot itself prove `_activeV4PoolManager`/
-    /// `_activeV4TokenIn`/`_executionPhase`/`_v4Armed` sit at slots 10/11 —
-    /// no callback path exists yet (Task 3 is storage-layout-only, no
-    /// unlockCallback logic) to round-trip a value through those fields the
-    /// way `test_v4SlotConstantsMatchLayout` in ExecutorGenericSequence.t.sol
-    /// does for `LiquidationExecutor` via `vm.store`+callback. The
-    /// AUTHORITATIVE check is the offline
-    /// `forge inspect ArbExecutor storageLayout` run (task-3-report.md) —
-    /// this test only guards the slot CONSTANTS the lib hardcodes so a
-    /// future edit to GenericSequenceLib can't silently drift them.
-    function test_v4SlotConstantsMatchLayout() public pure {
-        assertEq(uint256(10), uint256(10)); // V4_PM_SLOT
-        assertEq(uint256(11), uint256(11)); // V4_TOKENIN_SLOT
+    /// @dev Solidity cannot read another contract's private-field slot map at
+    /// runtime, so this cannot name `_activeV4PoolManager`/`_activeV4TokenIn`
+    /// directly. It proves the property that actually matters: slots 11/12 —
+    /// the ones `GenericSequenceLib` raw-`sstore`s into under DELEGATECALL —
+    /// are NOT occupied by any live field of this contract, and the alignment
+    /// padding below them is genuinely dead space.
+    ///
+    /// This REPLACES a tautological `assertEq(10, 10)` that asserted nothing
+    /// and would have sat green through the `operators`-mapping insertion that
+    /// moved these fields from 10/11 to 11/12. The offline
+    /// `forge inspect ArbExecutor storageLayout` remains the authority on the
+    /// exact field names; this is the guard that fails in CI when they drift.
+    function test_v4SlotConstantsMatchLayout() public {
+        uint256 V4_PM_SLOT = 11;
+        uint256 V4_TOKENIN_SLOT = 12;
+
+        // Padding slots between `_activePlanHash` and the V4 fields must be
+        // untouched dead space — if a real field ever lands there, the V4
+        // fields have shifted and the lib would corrupt live state.
+        assertEq(vm.load(address(exec), bytes32(uint256(8))), bytes32(0), "slot 8 must be reserved padding");
+        assertEq(vm.load(address(exec), bytes32(uint256(9))), bytes32(0), "slot 9 must be reserved padding");
+        assertEq(vm.load(address(exec), bytes32(uint256(10))), bytes32(0), "slot 10 must be reserved padding");
+
+        // Snapshot every live field reachable through a public getter.
+        address ownerBefore = exec.owner();
+        address morphoBefore = exec.morphoBlue();
+        bool pausedBefore = exec.paused();
+        bool operatorBefore = exec.operators(operatorAddr);
+        bool targetBefore = exec.allowedTargets(address(uniV2));
+        address balProviderBefore = exec.allowedFlashProviders(exec.FLASH_PROVIDER_BALANCER());
+
+        // Poke the slots the lib arms. If either collided with a live field,
+        // one of the assertions below flips.
+        vm.store(address(exec), bytes32(V4_PM_SLOT), bytes32(type(uint256).max));
+        vm.store(address(exec), bytes32(V4_TOKENIN_SLOT), bytes32(type(uint256).max));
+
+        assertEq(exec.owner(), ownerBefore, "owner must not live at slot 11/12");
+        assertEq(exec.morphoBlue(), morphoBefore, "morphoBlue must not live at slot 11/12");
+        assertEq(exec.paused(), pausedBefore, "paused must not live at slot 11/12");
+        assertEq(exec.operators(operatorAddr), operatorBefore, "operators must not live at slot 11/12");
+        assertEq(exec.allowedTargets(address(uniV2)), targetBefore, "allowedTargets must not live at slot 11/12");
+        assertEq(
+            exec.allowedFlashProviders(exec.FLASH_PROVIDER_BALANCER()),
+            balProviderBefore,
+            "allowedFlashProviders must not live at slot 11/12"
+        );
     }
 
     function test_v4UnlockSelectorPin() public pure {
@@ -743,5 +776,64 @@ contract ArbExecutorTest is Test {
         vm.prank(ownerAddr);
         exec.setV4HookAllowed(address(0x1234), true);
         assertTrue(exec.allowedV4Hooks(address(0x1234)));
+    }
+
+    // ─── Multi-operator (parallel nonce streams) ──────────────────────
+    //
+    // A SINGLE immutable operator forces every send through one nonce
+    // stream: one stuck tx jams the queue, and the same-nonce bid fan-out
+    // has to fight its own replacements. The top competitor runs NINE
+    // rotating operator EOAs against one executor for exactly this reason
+    // (measured on-chain, 3-month window). `operator` was immutable, so
+    // this is only fixable at deploy time — hence before the first deploy.
+
+    function test_setOperator_secondOperatorCanExecute() public {
+        address operator2 = address(0xB0B2);
+        _fundAndAllowlist();
+
+        vm.prank(ownerAddr);
+        exec.setOperator(operator2, true);
+        assertTrue(exec.operators(operator2), "operator2 registered");
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _swapOp(address(loan), 100e18, address(mid), 100e18);
+        ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
+        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 0, 5e18);
+
+        vm.prank(operator2);
+        exec.execute(planData);
+        assertEq(loan.balanceOf(address(exec)), 10e18, "arb profit retained via second operator");
+    }
+
+    function test_setOperator_constructorOperatorStillAuthorized() public view {
+        assertTrue(exec.operators(operatorAddr), "constructor operator seeded");
+    }
+
+    function test_setOperator_revokedOperatorReverts() public {
+        _fundAndAllowlist();
+        vm.prank(ownerAddr);
+        exec.setOperator(operatorAddr, false);
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _swapOp(address(loan), 100e18, address(mid), 100e18);
+        ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
+        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 0, 5e18);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.UnauthorizedOperator.selector);
+        exec.execute(planData);
+    }
+
+    function test_setOperator_onlyOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert(); // Ownable: caller is not the owner
+        exec.setOperator(attacker, true);
+        assertFalse(exec.operators(attacker), "attacker must not self-register");
+    }
+
+    function test_setOperator_zeroAddressReverts() public {
+        vm.prank(ownerAddr);
+        vm.expectRevert(ArbExecutor.ZeroAddress.selector);
+        exec.setOperator(address(0), true);
     }
 }
