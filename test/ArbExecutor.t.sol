@@ -139,6 +139,9 @@ contract ArbExecutorTest is Test {
         // to draw from when the executor holds WETH. Sized > the
         // maximum unwrap amount any single test would request.
         vm.deal(address(weth), 1_000 ether);
+        // The bid rides in `msg.value` (wei == bps), so the operator needs a
+        // balance to send it from. Bids are <= 10_000 wei — dust by design.
+        vm.deal(operatorAddr, 1 ether);
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────
@@ -190,7 +193,7 @@ contract ArbExecutorTest is Test {
         );
     }
 
-    function _planMorpho(address loanToken, uint256 amount, Op[] memory ops, uint256 minProfit, uint256 coinbaseBps)
+    function _planMorpho(address loanToken, uint256 amount, Op[] memory ops, uint256 minProfit)
         internal
         pure
         returns (bytes memory)
@@ -201,7 +204,6 @@ contract ArbExecutorTest is Test {
             loanAmount: amount,
             maxFlashFee: 0,
             ops: ops,
-            coinbaseBps: coinbaseBps,
             minProfitAmount: minProfit
         });
         return abi.encode(plan);
@@ -218,7 +220,6 @@ contract ArbExecutorTest is Test {
             loanAmount: amount,
             maxFlashFee: maxFlashFee,
             ops: ops,
-            coinbaseBps: 0,
             minProfitAmount: minProfit
         });
         return abi.encode(plan);
@@ -252,7 +253,6 @@ contract ArbExecutorTest is Test {
         address loanToken,
         uint256 loanAmount,
         Op[] memory ops,
-        uint256 coinbaseBps,
         uint256 minProfit
     ) internal pure returns (bytes memory) {
         ArbTypes.ArbPlan memory plan = ArbTypes.ArbPlan({
@@ -261,7 +261,6 @@ contract ArbExecutorTest is Test {
             loanAmount: loanAmount,
             maxFlashFee: 0,
             ops: ops,
-            coinbaseBps: coinbaseBps,
             minProfitAmount: minProfit
         });
         return abi.encode(plan);
@@ -282,7 +281,7 @@ contract ArbExecutorTest is Test {
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
 
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
 
         uint256 balBefore = tokenA.balanceOf(address(exec));
         vm.prank(operatorAddr);
@@ -318,7 +317,7 @@ contract ArbExecutorTest is Test {
         ops[1] = _v3Op(address(tokenB), address(tokenC), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
         ops[2] = _v2Op(address(tokenC), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
 
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
 
         vm.prank(operatorAddr);
         exec.execute(plan);
@@ -326,25 +325,118 @@ contract ArbExecutorTest is Test {
         assertEq(tokenA.balanceOf(address(exec)), 331e18, "3-hop profit retained");
     }
 
-    /// Coinbase bribe: loanToken = weth, coinbaseBps = 5000 (50%) of the
-    /// 210 weth realized profit ⇒ 105 weth = 105 ether goes to coinbase.
-    function test_happy_coinbase_50pct_when_loan_is_weth() public {
-        Op[] memory ops = new Op[](2);
-        ops[0] = _v2Op(address(weth), address(tokenB), LOAN_AMOUNT, 0);
-        ops[1] = _v2Op(address(tokenB), address(weth), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+    // ─── Bid via msg.value (competitor's encoding, in bps) ────────────
+    //
+    // The bid moves OUT of the ABI-encoded plan and into the tx `value`
+    // field, in wei == basis points. Measured on the top competitor's
+    // executor: `bribe = (value / 1000) × realized profit`, 25/25 large txs
+    // (he uses permille; we keep our 10_000 scale for the finer resolution).
+    //
+    // The point is NOT the ~500 gas saved on a calldata word. It is that
+    // identical plan bytes — and therefore an identical plan HASH — can be
+    // re-bid by patching only the 32-byte value field, so a pre-built tx
+    // skeleton does not have to re-ABI-encode a large Op[] to change
+    // aggression. That is the pre-signing lever from the earnings roadmap.
 
-        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0, 5_000);
+    /// The property the whole change exists for: ONE plan blob, two bids.
+    function test_bidViaMsgValue_samePlanBytes_differentBids() public {
+        bytes memory plan = _wethCycplePlan();
 
+        address coinbaseAddr = address(0xC0FFEE);
+        vm.coinbase(coinbaseAddr);
+
+        uint256 before1 = coinbaseAddr.balance;
+        vm.prank(operatorAddr);
+        exec.execute{value: 2_500}(plan); // 25%
+        uint256 paid1 = coinbaseAddr.balance - before1;
+
+        // Re-fund the executor's counterparties and run the SAME bytes again.
+        uint256 before2 = coinbaseAddr.balance;
+        vm.prank(operatorAddr);
+        exec.execute{value: 7_500}(plan); // 75% — same calldata, richer bid
+        uint256 paid2 = coinbaseAddr.balance - before2;
+
+        assertEq(paid1, 52.5e18, "25% of 210 weth profit");
+        assertEq(paid2, 157.5e18, "75% of the same profit, same plan bytes");
+        assertEq(keccak256(plan), keccak256(plan), "plan bytes identical across bids");
+    }
+
+    function test_bidViaMsgValue_paysShareOfRealizedProfit() public {
         address coinbaseAddr = address(0xC0FFEE);
         vm.coinbase(coinbaseAddr);
         uint256 coinbaseBefore = coinbaseAddr.balance;
 
         vm.prank(operatorAddr);
-        exec.execute(plan);
+        exec.execute{value: 5_000}(_wethCycplePlan());
 
         assertEq(coinbaseAddr.balance - coinbaseBefore, 105e18, "50% of 210 weth profit bribed");
-        // Residual 105 weth stays on the executor.
-        assertEq(weth.balanceOf(address(exec)), 105e18, "residual weth retained");
+        // The bid wei is not stranded: `payCoinbase` unwraps only the DEFICIT
+        // (`amount - address(this).balance`), and the 5_000 wei that arrived as
+        // `msg.value` is already native ETH on the contract. So it is spent as
+        // part of the bribe and exactly that much WETH is left unwrapped —
+        // residual = 105e18 + bid. Economically a wash (the operator paid the
+        // dust, the contract kept its WETH equivalent), and it means bid dust
+        // never accumulates as stranded ETH.
+        assertEq(
+            weth.balanceOf(address(exec)),
+            105e18 + 5_000,
+            "residual weth = profit share + unspent-unwrap of the bid dust"
+        );
+        assertEq(address(exec).balance, 0, "no bid dust stranded as native ETH");
+    }
+
+    function test_bidViaMsgValue_zeroValue_paysNothing() public {
+        address coinbaseAddr = address(0xC0FFEE);
+        vm.coinbase(coinbaseAddr);
+        uint256 coinbaseBefore = coinbaseAddr.balance;
+
+        vm.prank(operatorAddr);
+        exec.execute(_wethCycplePlan()); // no value
+
+        assertEq(coinbaseAddr.balance, coinbaseBefore, "no bid means no bribe");
+    }
+
+    /// Transient storage survives the WHOLE tx, not just one call frame. A
+    /// second `execute` in the same tx must NOT inherit the first one's bid —
+    /// the slot has to be written unconditionally, including with zero.
+    function test_bidViaMsgValue_doesNotLeakIntoNextCallInSameTx() public {
+        address coinbaseAddr = address(0xC0FFEE);
+        vm.coinbase(coinbaseAddr);
+
+        vm.prank(operatorAddr);
+        exec.execute{value: 10_000}(_wethCycplePlan());
+
+        uint256 between = coinbaseAddr.balance;
+        vm.prank(operatorAddr);
+        exec.execute(_wethCycplePlan()); // no value — must pay ZERO
+
+        assertEq(coinbaseAddr.balance, between, "stale bid must not carry into the next call");
+    }
+
+    function test_bidViaMsgValue_overCapReverts() public {
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.InvalidPlan.selector);
+        exec.execute{value: 10_001}(_wethCycplePlan());
+    }
+
+    function test_bidViaMsgValue_requiresWethLoan() public {
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.CoinbaseRequiresWethLoan.selector);
+        exec.execute{value: 5_000}(plan);
+    }
+
+    /// WETH → tokenB → WETH at the mock's 1.1× per hop: 1000 in, 1210 out,
+    /// 210 weth realized profit. Shared by the bid tests above.
+    function _wethCycplePlan() internal view returns (bytes memory) {
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(weth), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(weth), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        return _planMorpho(address(weth), LOAN_AMOUNT, ops, 0);
     }
 
     /// Owner sweep — withdraw the retained profit to a recipient.
@@ -354,7 +446,7 @@ contract ArbExecutorTest is Test {
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
         vm.prank(operatorAddr);
-        exec.execute(_planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0));
+        exec.execute(_planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0));
 
         uint256 profit = tokenA.balanceOf(address(exec));
         assertEq(profit, 210e18);
@@ -370,13 +462,13 @@ contract ArbExecutorTest is Test {
 
     /// Profitable 2-op arb through the full execute() → flash → runArb
     /// path, using a mock Morpho flash provider + a mock router (no fork).
-    /// ops: 100 LOAN -> 100 MID -> 110 LOAN. minProfit 5, coinbaseBps 0.
+    /// ops: 100 LOAN -> 100 MID -> 110 LOAN. minProfit 5, no bid.
     function test_execute_opSequence_arb_profits_and_repays() public {
         _fundAndAllowlist();
         Op[] memory ops = new Op[](2);
         ops[0] = _swapOp(address(loan), 100e18, address(mid), 100e18);
         ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
-        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 0, 5e18);
+        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 5e18);
 
         vm.prank(operatorAddr);
         exec.execute(planData);
@@ -400,7 +492,7 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](2);
         ops[0] = _swapOp(address(loan), 100e18, address(mid), 100e18);
         ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
-        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 0, 5e18);
+        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 5e18);
         bytes32 expectedPlanHash = keccak256(planData);
         // Sanity: the plan hash is non-zero, so a bytes32(0) emission (the
         // pre-fix bug) would be distinguishable from the expected value.
@@ -434,7 +526,7 @@ contract ArbExecutorTest is Test {
 
     function test_revert_ops_empty() public {
         Op[] memory ops = new Op[](0);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.InvalidPlan.selector);
         exec.execute(plan);
@@ -444,7 +536,7 @@ contract ArbExecutorTest is Test {
         // MAX_OPS = 32; 33 ops (content irrelevant — length check reverts
         // before the allowlist walk).
         Op[] memory ops = new Op[](33);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.InvalidPlan.selector);
         exec.execute(plan);
@@ -457,7 +549,7 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](1);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[0].target = address(0xBEEF);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.TargetNotAllowed.selector);
         exec.execute(plan);
@@ -479,7 +571,7 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](1);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[0].target = address(morpho); // generic op aimed at Morpho Blue itself
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.TargetNotAllowed.selector);
         exec.execute(plan);
@@ -507,7 +599,7 @@ contract ArbExecutorTest is Test {
         ops[0].flags = GenericSequenceLib.FLAG_WETH_UNWRAP | GenericSequenceLib.FLAG_V4_UNLOCK;
         ops[0].callData = abi.encode(address(weth), address(tokenB), uint24(500), int24(10), address(0));
 
-        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.TargetNotAllowed.selector);
         exec.execute(plan);
@@ -531,7 +623,7 @@ contract ArbExecutorTest is Test {
         ops[0].amountIn = 1e18;
         ops[0].flags = GenericSequenceLib.FLAG_WETH_UNWRAP;
 
-        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0);
 
         vm.prank(operatorAddr);
         try exec.execute(plan) {
@@ -553,29 +645,9 @@ contract ArbExecutorTest is Test {
         uniV2.setRate(0.9e18);
         Op[] memory ops = new Op[](1);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(GenericSequenceLib.InsufficientRepayOutput.selector, 0, LOAN_AMOUNT));
-        exec.execute(plan);
-    }
-
-    function test_revert_coinbase_bps_over_cap() public {
-        Op[] memory ops = new Op[](2);
-        ops[0] = _v2Op(address(weth), address(tokenB), LOAN_AMOUNT, 0);
-        ops[1] = _v2Op(address(tokenB), address(weth), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
-        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0, 10_001);
-        vm.prank(operatorAddr);
-        vm.expectRevert(ArbExecutor.InvalidPlan.selector);
-        exec.execute(plan);
-    }
-
-    function test_revert_coinbase_requires_weth_loan() public {
-        Op[] memory ops = new Op[](2);
-        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
-        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 5_000);
-        vm.prank(operatorAddr);
-        vm.expectRevert(ArbExecutor.CoinbaseRequiresWethLoan.selector);
         exec.execute(plan);
     }
 
@@ -584,7 +656,7 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](2);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 500e18, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 500e18);
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(CoinbasePaymentLib.InsufficientProfit.selector, 210e18, 500e18));
         exec.execute(plan);
@@ -600,7 +672,6 @@ contract ArbExecutorTest is Test {
             loanAmount: LOAN_AMOUNT,
             maxFlashFee: 0,
             ops: ops,
-            coinbaseBps: 0,
             minProfitAmount: 0
         });
         vm.prank(operatorAddr);
@@ -624,7 +695,7 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](2);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
         bytes32 planHash = keccak256(plan);
 
         // Storage slots (forge inspect ArbExecutor storageLayout, post V4
@@ -665,7 +736,7 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](2);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
         vm.prank(attacker);
         vm.expectRevert(ArbExecutor.UnauthorizedOperator.selector);
         exec.execute(plan);
@@ -678,7 +749,7 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](2);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
 
         vm.prank(operatorAddr);
         vm.expectRevert();
@@ -798,7 +869,7 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](2);
         ops[0] = _swapOp(address(loan), 100e18, address(mid), 100e18);
         ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
-        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 0, 5e18);
+        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 5e18);
 
         vm.prank(operator2);
         exec.execute(planData);
@@ -817,7 +888,7 @@ contract ArbExecutorTest is Test {
         Op[] memory ops = new Op[](2);
         ops[0] = _swapOp(address(loan), 100e18, address(mid), 100e18);
         ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
-        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 0, 5e18);
+        bytes memory planData = _encodeArbPlan(FLASH_MORPHO, address(loan), 100e18, ops, 5e18);
 
         vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.UnauthorizedOperator.selector);

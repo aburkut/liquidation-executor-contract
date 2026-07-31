@@ -157,7 +157,7 @@ contract ArbExecutorSecurityTest is Test {
         op.callData = abi.encode(address(0), tokenOut, uint24(500), int24(10), address(0));
     }
 
-    function _planMorpho(address loanToken, uint256 amount, Op[] memory ops, uint256 minProfit, uint256 coinbaseBps)
+    function _planMorpho(address loanToken, uint256 amount, Op[] memory ops, uint256 minProfit)
         internal
         pure
         returns (bytes memory)
@@ -168,7 +168,6 @@ contract ArbExecutorSecurityTest is Test {
             loanAmount: amount,
             maxFlashFee: 0,
             ops: ops,
-            coinbaseBps: coinbaseBps,
             minProfitAmount: minProfit
         });
         return abi.encode(plan);
@@ -197,7 +196,7 @@ contract ArbExecutorSecurityTest is Test {
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT + donation, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 1_000e18, 0);
 
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
 
         // spent = snapshot(4000) - final(1100) = 2900; allowed = loanAmount = 1000.
         vm.prank(operatorAddr);
@@ -230,7 +229,7 @@ contract ArbExecutorSecurityTest is Test {
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
         ops[2] = _nativeV4Op(address(tokenC), 11e18); // owes exactly 10 ether, all standing
 
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
 
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(GenericSequenceLib.CollateralOverspent.selector, 10 ether, 0));
@@ -258,7 +257,7 @@ contract ArbExecutorSecurityTest is Test {
         ops[0] = _unwrapOp(unwrapAmount);
         ops[1] = _nativeV4ExactInOp(address(tokenC), unwrapAmount); // asks 10, pool pulls 11
 
-        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0);
 
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(GenericSequenceLib.V4InputOverspent.selector, 11 ether, unwrapAmount));
@@ -283,7 +282,7 @@ contract ArbExecutorSecurityTest is Test {
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
 
-        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0, 0);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
 
         vm.prank(operatorAddr);
         vm.expectRevert(

@@ -54,17 +54,18 @@ library ArbTypes {
     /// is enforced at runtime inside `GenericSequenceLib.runArb`, which
     /// runs the sequence via DELEGATECALL from the flash callback.
     ///
-    /// Coinbase bribe (optional): `coinbaseBps` × realizedProfit /
-    /// 10_000 is paid to `block.coinbase`. Caller MUST set
-    /// `coinbaseBps == 0` when `loanToken != weth` (chain doesn't land
-    /// in WETH so coinbase auto-unwrap has nothing to convert).
+    /// Coinbase bribe: NOT a plan field. The bid rides in `msg.value`
+    /// (wei == basis points) — see `ArbExecutor.execute`. Keeping it out of
+    /// the plan is the point: identical plan bytes, and therefore an
+    /// identical plan hash, can be re-bid by patching only the tx value.
+    /// The bid still requires `loanToken == weth` (the chain must land in
+    /// WETH for the coinbase auto-unwrap to have something to convert).
     struct ArbPlan {
         uint8 flashProviderId;
         address loanToken;
         uint256 loanAmount;
         uint256 maxFlashFee;
         Op[] ops;
-        uint256 coinbaseBps;
         uint256 minProfitAmount;
     }
 }
@@ -120,6 +121,15 @@ contract ArbExecutor is
     uint8 public constant FLASH_PROVIDER_BALANCER = 2;
     uint8 public constant FLASH_PROVIDER_MORPHO = 3;
     uint256 private constant V4_SWAP_DATA_LENGTH = 160;
+    /// @dev TRANSIENT-storage slot (EIP-1153) holding this tx's coinbase bid
+    /// in basis points, captured from `msg.value` in `execute` and read back
+    /// inside the flash callback. Transient, not storage, for two reasons: a
+    /// real slot would shift the V4 arming fields `GenericSequenceLib`
+    /// raw-`sstore`s at pinned numbers, and transient storage self-clears at
+    /// end of tx so a stale bid can never leak into a later one. Transient
+    /// and persistent storage have SEPARATE address spaces — slot 0 here does
+    /// not alias `_owner`.
+    uint256 private constant BID_BPS_TSLOT = 0;
 
     // ─── Immutables (constructor-pinned) ─────────────────────────────
     address public immutable weth;
@@ -309,15 +319,39 @@ contract ArbExecutor is
     /// borrow `loanAmount` of `loanToken` from the chosen flash
     /// provider. Chain execution + repay + coinbase + profit guard run
     /// inside the provider's callback.
-    function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
+    /// @notice Execute an arb plan. **The coinbase bid rides in `msg.value`**,
+    /// denominated in BASIS POINTS (wei == bps, so 9_850 wei ⇒ 98.50% of
+    /// realized profit to `block.coinbase`); the wei itself is dust that stays
+    /// on the contract, it is a parameter and not the payment.
+    ///
+    /// Why not a calldata field: the bid is then OUTSIDE the ABI-encoded plan
+    /// and outside its hash, so one pre-built plan blob can be re-bid by
+    /// patching only the 32-byte value field — no re-encoding of a large
+    /// `Op[]` to change aggression. (Saving ~500 gas of calldata is the minor
+    /// benefit; not re-encoding on the hot path is the real one.) Copied from
+    /// the top competitor's executor, which encodes the same thing in permille
+    /// — we keep the 10_000 scale for the finer resolution.
+    ///
+    /// The bid is stashed in TRANSIENT storage because it must survive into
+    /// the flash-callback frame, where `msg.value` is 0 (the callback is a
+    /// fresh call from the flash provider, not from the operator).
+    function execute(bytes calldata planData) external payable onlyOperator whenNotPaused nonReentrant {
         ArbTypes.ArbPlan memory plan = abi.decode(planData, (ArbTypes.ArbPlan));
 
         // Plan invariants — fail fast pre-flashloan.
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
         if (plan.ops.length == 0 || plan.ops.length > GenericSequenceLib.MAX_OPS) revert InvalidPlan();
-        if (plan.coinbaseBps > 10_000) revert InvalidPlan();
-        if (plan.coinbaseBps > 0 && plan.loanToken != weth) revert CoinbaseRequiresWethLoan();
+
+        uint256 bidBps = msg.value;
+        if (bidBps > 10_000) revert InvalidPlan();
+        if (bidBps > 0 && plan.loanToken != weth) revert CoinbaseRequiresWethLoan();
+        // Written UNCONDITIONALLY, zero included: transient storage lives for
+        // the whole TRANSACTION, not one call frame, so a second `execute` in
+        // the same tx would otherwise inherit the previous call's bid.
+        assembly ("memory-safe") {
+            tstore(BID_BPS_TSLOT, bidBps)
+        }
 
         // Pre-flashloan allowlist walk: every op target must be allowlisted.
         // FLAG_WETH_UNWRAP ops carry no external target (they call the pinned
@@ -502,10 +536,16 @@ contract ArbExecutor is
         uint256 realizedProfit =
             CoinbasePaymentLib.computeRealizedProfit(loanToken, loanToken, profitBefore, plan.loanAmount, flashRepay);
 
-        // Optional coinbase bribe.
+        // Coinbase bribe — bid read back from transient storage (`execute`
+        // captured `msg.value`; this frame's own `msg.value` is 0, it was
+        // entered from the flash provider).
+        uint256 bidBps;
+        assembly ("memory-safe") {
+            bidBps := tload(BID_BPS_TSLOT)
+        }
         uint256 coinbasePaid;
-        if (plan.coinbaseBps > 0) {
-            coinbasePaid = realizedProfit * plan.coinbaseBps / 10_000;
+        if (bidBps > 0) {
+            coinbasePaid = realizedProfit * bidBps / 10_000;
             if (coinbasePaid > 0) {
                 CoinbasePaymentLib.payCoinbase(coinbasePaid, weth);
             }

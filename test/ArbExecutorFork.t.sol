@@ -20,23 +20,24 @@ import {PoolKey} from "../src/interfaces/IPoolManager.sol";
 /// absent RPC → silent `vm.skip`, matching `test/fork/ExecutorForkV4.t.sol`'s
 /// gating idiom.
 ///
-/// REQUIRES `--evm-version cancun` on the `forge test` invocation (real V4
-/// PoolManager uses EIP-1153 transient storage). `foundry.toml`'s project
-/// default (`evm_version = "shanghai"`) is intentional for the DEPLOYED
-/// contract's EIP-170 sizing and must stay untouched — this flag only
-/// overrides the runtime spec `forge test` uses to execute the fork, not
-/// what gets compiled/deployed. Omitting it does not fail closed the same
-/// way every time: on some compiled-artifact states, the real V4
-/// PoolManager's `unlock()` halts with a raw `NotActivated` EVM error
-/// (zero-length revert, occurring before `unlockCallback` is ever entered)
-/// — an artifact-caching-dependent runtime-spec resolution on this Foundry
-/// nightly build, NOT a bug in `ArbExecutor`/`GenericSequenceLib`. Confirmed
-/// by direct control test: the native-V4 leg through the REAL, production-
-/// preferred Morpho flash provider (`FLASH_PROVIDER_MORPHO`, fee=0) via the
-/// real `execute()` entrypoint passes cleanly once `--evm-version cancun` is
-/// set — there is no Morpho-specific interaction bug (see task-6-report.md
-/// for the full isolation trace and the corrected finding). Always pass
-/// `--evm-version cancun` explicitly for this file.
+/// NEEDS the cancun runtime spec (the real V4 PoolManager uses EIP-1153
+/// transient storage). This is now the PROJECT DEFAULT — `foundry.toml` sets
+/// `evm_version = "cancun"` because `ArbExecutor` itself uses transient
+/// storage to carry the coinbase bid from `execute()` into the flash-callback
+/// frame — so `--evm-version cancun` no longer has to be passed by hand.
+/// Verified: the whole fork suite passes on a bare `forge test`.
+///
+/// Keep this in mind if the project default is ever lowered again: WITHOUT
+/// the cancun spec these tests do not fail closed the same way every time. On
+/// some compiled-artifact states the real V4 PoolManager's `unlock()` halts
+/// with a raw `NotActivated` EVM error (zero-length revert, before
+/// `unlockCallback` is ever entered) — an artifact-caching-dependent
+/// runtime-spec resolution on this Foundry nightly, NOT a bug in
+/// `ArbExecutor`/`GenericSequenceLib`. Confirmed by control test: the
+/// native-V4 leg through the REAL, production-preferred Morpho flash provider
+/// (`FLASH_PROVIDER_MORPHO`, fee=0) via the real `execute()` entrypoint passes
+/// cleanly under cancun — there is no Morpho-specific interaction bug (see
+/// task-6-report.md for the full isolation trace and the corrected finding).
 ///
 /// SCOPE / WHAT THESE PROVE: repay (the flash is always fully repaid) +
 /// containment (no token is net-spent beyond what the sequence produced),
@@ -289,7 +290,6 @@ contract ArbExecutorForkTest is Test {
             loanAmount: loanAmount,
             maxFlashFee: 0,
             ops: ops,
-            coinbaseBps: 0,
             minProfitAmount: 0
         });
         bytes memory planData = abi.encode(plan);
@@ -479,13 +479,13 @@ contract ArbExecutorForkTest is Test {
     /// no `V4InputOverspent` fires (the per-op exact-in input ceiling holds).
     ///
     /// Flash provider: Morpho (fee=0, the production-preferred provider —
-    /// same as tests 1/2). An earlier pass of this test used Balancer after
-    /// an `--evm-version cancun`-less run made Morpho's real flashLoan appear
-    /// to interact badly with the real V4 `unlock()`; a direct control test
-    /// (real Morpho flashLoan -> real `execute()` -> this exact op sequence,
-    /// WITH `--evm-version cancun`) passes cleanly, proving that was the
-    /// missing flag, not a Morpho-specific bug — see task-6-report.md for the
-    /// corrected isolation trace and the control-test output.
+    /// same as tests 1/2). An earlier pass of this test used Balancer after a
+    /// run on a pre-cancun runtime spec made Morpho's real flashLoan appear to
+    /// interact badly with the real V4 `unlock()`; a direct control test (real
+    /// Morpho flashLoan -> real `execute()` -> this exact op sequence, under
+    /// cancun) passes cleanly, proving that was the runtime spec, not a
+    /// Morpho-specific bug — see task-6-report.md for the corrected isolation
+    /// trace and the control-test output. Cancun is now the project default.
     function test_fork_v4_nativeLeg_arbCycle() public forkOnly {
         uint256 loanAmount = 2e18; // 2 WETH
         uint256 unwrapAmount = 1e18; // 1 WETH round-trips through native V4 + V3
