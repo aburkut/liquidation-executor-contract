@@ -54,7 +54,6 @@ library SwapValidationLib {
     uint8 internal constant PROTOCOL_AAVE_V3 = 1;
     uint8 internal constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 internal constant PROTOCOL_AAVE_V2 = 3;
-    uint8 internal constant PROTOCOL_INTERNAL = 100;
 
     /// @notice Pure plan-shape validation, moved out of LiquidationExecutor to
     /// keep the executor under the EIP-170 runtime-size limit. Called via
@@ -74,9 +73,6 @@ library SwapValidationLib {
 
         for (uint256 i = 0; i < actions.length; ++i) {
             uint8 protocolId = actions[i].protocolId;
-
-            // Internal actions (e.g. coinbase payment) are not liquidation actions
-            if (protocolId == PROTOCOL_INTERNAL) continue;
 
             bytes memory data = actions[i].data;
 

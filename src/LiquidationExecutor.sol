@@ -52,7 +52,6 @@ contract LiquidationExecutor is
     error InvalidCallbackCaller();
     error InvalidInitiator();
     error InvalidProtocolId(uint8 id);
-    error InvalidAction(uint8 actionType);
     error RescueFailed();
     error CallbackAssetMismatch();
     error CallbackAmountMismatch();
@@ -176,9 +175,24 @@ contract LiquidationExecutor is
     uint8 public constant PROTOCOL_AAVE_V3 = 1;
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 public constant PROTOCOL_AAVE_V2 = 3;
-    uint8 public constant PROTOCOL_INTERNAL = 100;
+    // `PROTOCOL_INTERNAL = 100` / `ACTION_PAY_COINBASE = 1` REMOVED: the
+    // coinbase bid no longer travels as an action. It rides in `msg.value`
+    // (wei == bps) — see `execute`. Its position in `actions[]` never
+    // determined WHEN it was paid (a dedicated post-swap loop did), so the
+    // action carried no information the value field cannot. Dropping it also
+    // frees an `actions[]` slot for a real liquidation and removes the
+    // accidental "several PAY_COINBASE actions sum" behaviour. A stale plan
+    // still carrying protocolId 100 now fails LOUDLY in the validator rather
+    // than silently bidding zero.
 
-    uint8 public constant ACTION_PAY_COINBASE = 1;
+    /// @dev TRANSIENT-storage slot (EIP-1153) holding this tx's coinbase bid
+    /// in basis points, captured from `msg.value` in `execute` and read back
+    /// after the swap. Transient, not storage: a real slot would shift the V4
+    /// arming fields `GenericSequenceLib` raw-`sstore`s at pinned numbers, and
+    /// transient self-clears at end of tx so a stale bid cannot leak forward.
+    /// Transient and persistent storage are SEPARATE address spaces — slot 0
+    /// here does not alias `_owner`. Mirrors `ArbExecutor`.
+    uint256 private constant BID_BPS_TSLOT = 0;
 
     // V10+ refactor: COINBASE_CALL_GAS moved to CoinbasePaymentLib
     // (constant lives next to the only function that reads it).
@@ -624,7 +638,14 @@ contract LiquidationExecutor is
     }
 
     // ─── Core Execute ────────────────────────────────────────────────
-    function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
+    /// @notice Execute a liquidation plan. **The coinbase bid rides in
+    /// `msg.value`**, denominated in BASIS POINTS (wei == bps, so 9_850 wei
+    /// means 98.50% of realized profit to `block.coinbase`); the wei itself is
+    /// dust that is spent into the bribe, it is a parameter and not the
+    /// payment. Keeping the bid out of the ABI-encoded plan means one
+    /// pre-built blob — same bytes, same plan hash — can be re-bid by patching
+    /// only the 32-byte value field, with no re-encoding.
+    function execute(bytes calldata planData) external payable onlyOperator whenNotPaused nonReentrant {
         Plan memory plan = abi.decode(planData, (Plan));
 
         // Deadline check is hoisted into `_validateLeg` (after the NO_SWAP
@@ -637,6 +658,19 @@ contract LiquidationExecutor is
         if (plan.swapPlan.profitToken == address(0)) revert ZeroAddress();
         if (plan.actions.length == 0) revert NoActions();
         if (plan.actions.length > MAX_ACTIONS) revert TooManyActions(plan.actions.length);
+
+        // Coinbase bid (wei == bps). Both gates fire BEFORE the flashloan is
+        // taken — the old action-time check only rejected a non-WETH profit
+        // token after the swap had already run.
+        uint256 bidBps = msg.value;
+        if (bidBps > 10_000) revert InvalidCoinbaseBps();
+        if (bidBps > 0 && plan.swapPlan.profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
+        // Written UNCONDITIONALLY, zero included: transient storage lives for
+        // the whole TRANSACTION, so a second `execute` in the same tx would
+        // otherwise inherit this call's bid.
+        assembly ("memory-safe") {
+            tstore(BID_BPS_TSLOT, bidBps)
+        }
 
         // Final-leg repayToken MUST equal outer loanToken. For hasSplit, leg1
         // IS the repay leg (collateral → loanToken), matching the single-leg
@@ -978,11 +1012,10 @@ contract LiquidationExecutor is
             collateralAssetBefore = IERC20(collateralAsset).balanceOf(address(this));
         }
 
-        // Execute protocol actions (liquidations), skip INTERNAL
+        // Execute protocol actions (liquidations). Every action is a protocol
+        // action now — the coinbase bid is no longer an action at all.
         for (uint256 i = 0; i < plan.actions.length; ++i) {
-            if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
-                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
-            }
+            _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
         }
 
         // Post-action: verify liquidation produced collateral AND
@@ -1035,19 +1068,23 @@ contract LiquidationExecutor is
         _executeSwapPlan(plan.swapPlan, flashRepayAmount, flashFee, collateralAsset, collateralDelta, plan.loanToken);
 
         // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
-        // BEFORE flash repay. This is the authoritative base that ACTION_PAY_COINBASE
-        // basis-points arithmetic multiplies against.
+        // BEFORE flash repay. This is the authoritative base the `msg.value`
+        // basis-points bid multiplies against.
         realizedProfit = CoinbasePaymentLib.computeRealizedProfit(
             plan.loanToken, plan.swapPlan.profitToken, profitBefore, plan.loanAmount, flashRepayAmount
         );
 
-        // Execute internal actions (coinbase bps payments) now that realized profit
-        // is known. Per-action bps is validated and multiplied against realizedProfit.
-        for (uint256 i = 0; i < plan.actions.length; ++i) {
-            if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
-                totalCoinbasePayment += _executeInternalAction(
-                    plan.actions[i].data, plan.swapPlan.profitToken, realizedProfit
-                );
+        // Coinbase bribe — bid read back from transient storage (`execute`
+        // captured `msg.value`). Bounds and the WETH-profit precondition were
+        // already enforced there, pre-flashloan.
+        uint256 bidBps;
+        assembly ("memory-safe") {
+            bidBps := tload(BID_BPS_TSLOT)
+        }
+        if (bidBps > 0 && realizedProfit > 0) {
+            totalCoinbasePayment = realizedProfit * bidBps / 10_000;
+            if (totalCoinbasePayment > 0) {
+                CoinbasePaymentLib.payCoinbase(totalCoinbasePayment, weth);
             }
         }
     }
@@ -1707,41 +1744,6 @@ contract LiquidationExecutor is
     }
 
     // ─── Internal: Execute Internal Action ──────────────────────────
-    /// @dev Centralized dispatch for PROTOCOL_INTERNAL actions. Only
-    /// ACTION_PAY_COINBASE is defined.
-    ///
-    /// ACTION_PAY_COINBASE amount is interpreted as basis points (0..10000)
-    /// over realized on-chain profit, not as an absolute payment amount.
-    /// The operator specifies a percentage; the contract sizes the actual
-    /// bid from the on-chain-computed `realizedProfit` snapshot taken
-    /// between swap completion and any coinbase payment.
-    ///
-    /// No-ops (returns 0, no transfer) when `realizedProfit == 0` or
-    /// `coinbaseBps == 0` — consistent behaviour in both degenerate cases.
-    function _executeInternalAction(bytes memory actionData, address profitToken, uint256 realizedProfit)
-        internal
-        returns (uint256 coinbasePaid)
-    {
-        uint8 actionType = abi.decode(actionData, (uint8));
-
-        if (actionType == ACTION_PAY_COINBASE) {
-            // Coinbase payment is ETH-denominated — only valid when profit is in WETH
-            if (profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
-
-            (, uint256 coinbaseBps) = abi.decode(actionData, (uint8, uint256));
-            if (coinbaseBps > 10_000) revert InvalidCoinbaseBps();
-
-            if (realizedProfit == 0 || coinbaseBps == 0) return 0;
-
-            coinbasePaid = realizedProfit * coinbaseBps / 10_000;
-            if (coinbasePaid > 0) {
-                CoinbasePaymentLib.payCoinbase(coinbasePaid, weth);
-            }
-        } else {
-            revert InvalidAction(actionType);
-        }
-    }
-
     // V10+ refactor: `_payCoinbase` moved to
     // `CoinbasePaymentLib.payCoinbase(amount, weth)`. The library
     // takes `weth` as a parameter (libs cannot read another contract's
