@@ -23,9 +23,10 @@ import {ArbExecutor} from "../src/ArbExecutor.sol";
 /// gap: `FLUID_POOL_COUNT` is asserted so a drift is caught the next time this
 /// script runs.
 ///
-/// PANCAKE is deliberately absent. The bot quotes Pancake but has no router
-/// address for it and never emits ops against it; inventing an address to
-/// allowlist would be worse than leaving the venue unroutable.
+/// PANCAKE is included. Its router was not in the bot's config, so an earlier
+/// draft of this script left the venue out entirely — but the address is
+/// derivable rather than unknowable, and leaving a venue we already quote
+/// unroutable is a worse default than looking it up.
 ///
 /// Usage:
 ///   PRIVATE_KEY=<owner> forge script script/DeployArb.s.sol:DeployArb \
@@ -55,6 +56,11 @@ contract DeployArb is Script {
     address constant BEBOP_SETTLEMENT = 0xbbbbbBB520d69a9775E85b458C58c648259FAD5F;
     /// The V3 SwapRouter the sequence generator emits `exactInputSingle` against.
     address constant UNI_V3_SWAP_ROUTER_01 = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    /// PancakeSwap V3's SwapRouter. Verified on-chain rather than recalled: it
+    /// returns Pancake's own pool deployer and factory, and its bytecode
+    /// carries selector 0x414bf389 — the deadline-carrying `exactInputSingle`,
+    /// so the bot encodes it exactly like Uniswap V3.
+    address constant PANCAKE_V3_SWAP_ROUTER = 0x1b81D678ffb9C0263b24A97847620C99d213eB14;
 
     /// Fluid pools read from `DexReservesResolver.getAllPoolAddresses()` at
     /// block 25_718_394. Asserted below so a changed set is loud.
@@ -114,13 +120,14 @@ contract DeployArb is Script {
         // Non-Fluid targets. Balancer Vault, Paraswap, the V2 router and the
         // V3 router are seeded by the constructor itself, so they are absent
         // here and asserted below all the same.
-        address[] memory extra = new address[](6);
+        address[] memory extra = new address[](7);
         extra[0] = WETH; // FLAG_NATIVE_IN closes a native cycle via WETH9.deposit
         extra[1] = UNI_V4_POOL_MANAGER;
         extra[2] = V4_UNIVERSAL_ROUTER;
         extra[3] = CURVE_ROUTER_NG;
         extra[4] = BEBOP_SETTLEMENT;
         extra[5] = UNI_V3_SWAP_ROUTER_01;
+        extra[6] = PANCAKE_V3_SWAP_ROUTER;
 
         address[] memory allowed = new address[](extra.length + FLUID_POOL_COUNT);
         for (uint256 i = 0; i < extra.length; ++i) {
