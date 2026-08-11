@@ -137,7 +137,11 @@ contract DeployArb is Script {
             allowed[extra.length + i] = fluid[i];
         }
 
-        vm.startBroadcast();
+        // Broadcast with the key from the environment, which is what the usage
+        // note above already promised. A bare `vm.startBroadcast()` ignores
+        // PRIVATE_KEY and falls back to Foundry's default sender, so the
+        // documented invocation simulated fine and then refused to broadcast.
+        vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
         ArbExecutor exec = new ArbExecutor(
             OWNER, OPERATOR, WETH, BALANCER_VAULT, MORPHO_BLUE, PARASWAP_AUGUSTUS, UNI_V2_ROUTER, UNI_V3_ROUTER, allowed
         );
