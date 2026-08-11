@@ -266,6 +266,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     // ── FLAG_V4_UNLOCK ops (V4 single-hop exact-out via PoolManager) ──
 
     uint32 internal constant FLAG_V4_UNLOCK = 1 << 2;
+    uint32 internal constant FLAG_V4_EXACT_IN = 1 << 4;
 
     /// Build a V4 unlock op: exact-out `amountOut` of `tokenOut` paid from
     /// `tokenIn` through the mock PoolManager. callData is the RAW 160-byte
@@ -418,6 +419,37 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// PREV_RETURN on an exact-OUT V4 op still injects an INPUT amount where an
+    /// output spec belongs — the original reason for the guard, unchanged.
+    function test_GenericSequence_V4UnlockOp_PrevReturnWithoutExactIn_Reverts() public {
+        Op memory op = _v4Op(address(collateralToken), address(loanToken), LOAN_AMOUNT + FLASH_FEE);
+        op.flags = FLAG_V4_UNLOCK | FLAG_PREV_RETURN;
+        bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+    }
+
+    /// Under FLAG_V4_EXACT_IN the op's `amount` IS the input sold, so
+    /// PREV_RETURN is exactly the right thing to inject. The blanket guard used
+    /// to reject this, which barred V4 from every step of a sequence but the
+    /// first — each later leg must spend the previous leg's output.
+    function test_GenericSequence_V4UnlockOp_PrevReturnWithExactIn_Allowed() public {
+        // Two ops, because PREV_RETURN only means anything after a first op has
+        // produced something: op0 sells the collateral for the intermediate,
+        // op1 is a V4 exact-IN hop spending exactly what op0 returned. This is
+        // the shape every arb cycle needs and the one the blanket guard used to
+        // make impossible.
+        Op[] memory ops = new Op[](2);
+        ops[0] = _swapOp(address(collateralToken), address(interToken), 1e18, FLAG_FULL_BALANCE);
+        ops[1] = _v4Op(address(interToken), address(loanToken), 0);
+        ops[1].flags = FLAG_V4_UNLOCK | FLAG_V4_EXACT_IN | FLAG_PREV_RETURN;
+        bytes memory plan = _genericPlan(ops, address(loanToken), 0);
+
+        vm.prank(operatorAddr);
         executor.execute(plan);
     }
 
