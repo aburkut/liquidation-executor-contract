@@ -54,3 +54,46 @@ contract MockBebopSettlement {
 
     receive() external payable {}
 }
+
+/// @dev Bebop settlement that honours a partial fill, the way the real one
+/// does: the taker amount is read from a word inside the calldata rather than
+/// from the signed order, and the output is pro-rated to it.
+///
+/// The plain `MockBebopSettlement` above ignores calldata entirely, so it
+/// cannot tell a patched order from an unpatched one — which is exactly the
+/// bug this exists to catch.
+contract MockBebopPartialFillSettlement {
+    using SafeERC20 for IERC20;
+
+    address public immutable sellToken;
+    address public immutable buyToken;
+    /// Amount the order was signed for, and what it pays at that size.
+    uint256 public immutable signedSell;
+    uint256 public immutable signedBuy;
+    /// Word index (after the selector) carrying the taker's chosen amount.
+    uint256 public immutable fillWord;
+
+    constructor(address sell_, address buy_, uint256 signedSell_, uint256 signedBuy_, uint256 fillWord_) {
+        sellToken = sell_;
+        buyToken = buy_;
+        signedSell = signedSell_;
+        signedBuy = signedBuy_;
+        fillWord = fillWord_;
+    }
+
+    fallback() external {
+        uint256 at = 4 + fillWord * 32;
+        require(msg.data.length >= at + 32, "MockBebop: short calldata");
+        uint256 requested;
+        assembly {
+            requested := calldataload(at)
+        }
+        // Zero means "fill the whole signed order" — the real contract's
+        // convention, and the value a quote arrives with.
+        uint256 fill = requested == 0 ? signedSell : requested;
+        require(fill <= signedSell, "MockBebop: over-fill");
+
+        IERC20(sellToken).safeTransferFrom(msg.sender, address(this), fill);
+        IERC20(buyToken).safeTransfer(msg.sender, (signedBuy * fill) / signedSell);
+    }
+}

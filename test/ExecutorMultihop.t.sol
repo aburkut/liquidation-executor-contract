@@ -97,7 +97,8 @@ contract ExecutorMultihopTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: minAmountOut
+            minAmountOut: minAmountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -204,7 +205,8 @@ contract ExecutorMultihopTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: minAmountOut
+            minAmountOut: minAmountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -1208,7 +1210,8 @@ contract ExecutorMultihopTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dst,
-            minAmountOut: minOut
+            minAmountOut: minOut,
+            bebopPartialFillOffset: 0
         });
     }
 }

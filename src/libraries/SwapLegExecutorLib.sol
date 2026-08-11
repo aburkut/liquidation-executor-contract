@@ -49,6 +49,9 @@ library SwapLegExecutorLib {
     // Bebop
     error BebopTargetNotContract();
     error BebopSwapFailed();
+    /// @dev The quote's `partialFillOffset` does not address a whole word
+    /// inside its own calldata. Fail closed rather than write out of bounds.
+    error BebopPartialFillOffsetOutOfRange();
     error TargetNotAllowed();
 
     // ─── Events (match LiquidationExecutor signatures; emitted under DELEGATECALL) ──
@@ -128,9 +131,23 @@ library SwapLegExecutorLib {
         if (!isTargetAllowed) revert TargetNotAllowed();
 
         uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
-        if (srcBal < leg.amountIn) revert InsufficientSrcBalance(leg.amountIn, srcBal);
 
-        IERC20(leg.srcToken).forceApprove(target, leg.amountIn);
+        // A signed RFQ order is written for an exact amount, but a
+        // liquidation's realised collateral is only known on-chain and moves
+        // with the block. When we hold less than the quote was written for,
+        // Bebop lets the taker fill part of it by writing the amount at the
+        // word its quote names — the alternative is the settlement rejecting
+        // the order outright, which is what used to happen.
+        uint256 fill = leg.amountIn;
+        if (srcBal < fill) {
+            if (leg.bebopPartialFillOffset == 0) {
+                revert InsufficientSrcBalance(leg.amountIn, srcBal);
+            }
+            fill = srcBal;
+            _writeBebopFill(leg.bebopCalldata, leg.bebopPartialFillOffset, fill);
+        }
+
+        IERC20(leg.srcToken).forceApprove(target, fill);
         (bool ok,) = target.call(leg.bebopCalldata);
         IERC20(leg.srcToken).forceApprove(target, 0);
 
@@ -140,6 +157,22 @@ library SwapLegExecutorLib {
         uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
         if (repayDelta < leg.minAmountOut) revert InsufficientRepayOutput(repayDelta, leg.minAmountOut);
 
-        emit BebopSwapExecuted(target, leg.srcToken, leg.amountIn, repayDelta, 0);
+        emit BebopSwapExecuted(target, leg.srcToken, fill, repayDelta, 0);
+    }
+
+    /// @dev Overwrite the taker amount inside a signed Bebop order.
+    ///
+    /// `wordIndex` counts 32-byte words AFTER the 4-byte selector, which is
+    /// how Bebop reports `partialFillOffset`. The bounds check is the whole
+    /// safety story here: an offset past the end would otherwise write into
+    /// memory beyond the array, and an offset supplied by a malformed quote
+    /// must not be able to do that.
+    function _writeBebopFill(bytes memory data, uint256 wordIndex, uint256 amount) private pure {
+        uint256 at = 4 + wordIndex * 32;
+        if (at + 32 > data.length) revert BebopPartialFillOffsetOutOfRange();
+        assembly {
+            // `data` points at the length word; payload starts one word later.
+            mstore(add(add(data, 32), at), amount)
+        }
     }
 }
