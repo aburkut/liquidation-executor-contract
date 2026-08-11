@@ -22,7 +22,7 @@ import {BalancerV2Lib} from "./libraries/BalancerV2Lib.sol";
 import {SwapValidationLib} from "./libraries/SwapValidationLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
 import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
-import {SwapMode, SwapLeg, Op} from "./types/SwapTypes.sol";
+import {SwapMode, SwapLeg, Op, Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "./types/SwapTypes.sol";
 
 // V10+ refactor: IWETH interface moved into CoinbasePaymentLib
 // (the only consumer of `IWETH.withdraw` after `_payCoinbase` migrated).
@@ -52,7 +52,6 @@ contract LiquidationExecutor is
     error InvalidCallbackCaller();
     error InvalidInitiator();
     error InvalidProtocolId(uint8 id);
-    error InvalidAction(uint8 actionType);
     error RescueFailed();
     error CallbackAssetMismatch();
     error CallbackAmountMismatch();
@@ -164,6 +163,7 @@ contract LiquidationExecutor is
     error CalldataPatchOOB();
     error OpCallFailed(uint256 opIndex);
     error CollateralOverspent(uint256 spent, uint256 allowed);
+    error V4InputOverspent(uint256 consumed, uint256 amount);
     error OpOutputNotReceived(uint256 opIndex);
 
     // ─── Constants ───────────────────────────────────────────────────
@@ -175,9 +175,24 @@ contract LiquidationExecutor is
     uint8 public constant PROTOCOL_AAVE_V3 = 1;
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 public constant PROTOCOL_AAVE_V2 = 3;
-    uint8 public constant PROTOCOL_INTERNAL = 100;
+    // `PROTOCOL_INTERNAL = 100` / `ACTION_PAY_COINBASE = 1` REMOVED: the
+    // coinbase bid no longer travels as an action. It rides in `msg.value`
+    // (wei == bps) — see `execute`. Its position in `actions[]` never
+    // determined WHEN it was paid (a dedicated post-swap loop did), so the
+    // action carried no information the value field cannot. Dropping it also
+    // frees an `actions[]` slot for a real liquidation and removes the
+    // accidental "several PAY_COINBASE actions sum" behaviour. A stale plan
+    // still carrying protocolId 100 now fails LOUDLY in the validator rather
+    // than silently bidding zero.
 
-    uint8 public constant ACTION_PAY_COINBASE = 1;
+    /// @dev TRANSIENT-storage slot (EIP-1153) holding this tx's coinbase bid
+    /// in basis points, captured from `msg.value` in `execute` and read back
+    /// after the swap. Transient, not storage: a real slot would shift the V4
+    /// arming fields `GenericSequenceLib` raw-`sstore`s at pinned numbers, and
+    /// transient self-clears at end of tx so a stale bid cannot leak forward.
+    /// Transient and persistent storage are SEPARATE address spaces — slot 0
+    /// here does not alias `_owner`. Mirrors `ArbExecutor`.
+    uint256 private constant BID_BPS_TSLOT = 0;
 
     // V10+ refactor: COINBASE_CALL_GAS moved to CoinbasePaymentLib
     // (constant lives next to the only function that reads it).
@@ -195,7 +210,6 @@ contract LiquidationExecutor is
     // constants, decoder shapes, and bounds-check commentary.
 
     // ─── State ───────────────────────────────────────────────────────
-    address public immutable operator;
     address public immutable weth;
     address public aavePool;
     address public morphoBlue;
@@ -219,6 +233,17 @@ contract LiquidationExecutor is
     /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
     /// hook has been audited is the intended default.
     mapping(address => bool) public allowedV4Hooks;
+    /// @dev Operator allowlist. Several operator EOAs may drive ONE executor
+    /// so sends spread over independent nonce streams — one stuck tx then
+    /// cannot jam the others, and same-nonce bid fan-out does not have to
+    /// fight its own replacements. Seeded with the constructor's `operator_`.
+    /// Owner-curated: an operator key is hot, so it may only SPEND under the
+    /// containment caps, never move standing funds (`withdraw` is onlyOwner).
+    /// LAYOUT: this mapping occupies slot 10, which pushes the V4 arming
+    /// fields to slots 11/12 — matching `GenericSequenceLib`'s pinned
+    /// V4_PM_SLOT/V4_TOKENIN_SLOT. `test_v4SlotConstantsMatchLayout` is the
+    /// authority; do not reorder without re-running it.
+    mapping(address => bool) public operators;
     // V10+ refactor: the dedicated `allowedExtSwapTargets` allowlist
     // for Curve V1 / Balancer V2 pool targets was removed. Fund safety
     // for an operator-supplied pool does NOT rest on "zero balance" —
@@ -252,15 +277,30 @@ contract LiquidationExecutor is
 
     /// @dev tokenIn pinned for the active V4 unlock. Set by
     /// `_executeUniV4Leg` BEFORE `unlock()`, CLEARED to address(0) by
-    /// `unlockCallback` on entry. The clear-on-entry semantics double as
-    /// a re-entry guard: a nested `unlockCallback` (e.g. from a malicious
-    /// hook calling `pm.unlock()` mid-swap) would see `_activeV4TokenIn
-    /// == 0` and the entry guard rejects it. Reading tokenIn from
-    /// storage (rather than decoding from `data`) also closes the
-    /// substitution drain — `pm` cannot influence storage, only the
-    /// callback payload. Declared AFTER `_executionPhase` so the legacy
-    /// slot 11 packing (read by storage-poking tests) stays untouched.
+    /// `unlockCallback` on entry (hygiene — no stale address left in
+    /// storage — but no longer the re-entry sentinel itself; see
+    /// `_v4Armed`). Reading tokenIn from storage (rather than decoding
+    /// from `data`) closes the substitution drain — `pm` cannot
+    /// influence storage, only the callback payload. Declared AFTER
+    /// `_executionPhase` so the legacy slot 11 packing (read by
+    /// storage-poking tests) stays untouched.
     address private _activeV4TokenIn;
+
+    /// @dev Dedicated re-entry/arming sentinel for the V4 unlock-callback
+    /// flow, decoupled from `_activeV4TokenIn`. Before this flag, the
+    /// sentinel WAS `_activeV4TokenIn != 0`, which collided with a
+    /// native-ETH leg (tokenIn == address(0)) — an armed native swap was
+    /// indistinguishable from "not armed". Set `true` by `_executeUniV4Leg`
+    /// immediately before `unlock()`, CLAIMed (set back to `false`) by
+    /// `unlockCallback` on entry — the clear-on-entry semantics double as
+    /// the re-entry guard: a nested `unlockCallback` (e.g. from a
+    /// malicious hook calling `pm.unlock()` mid-swap) sees `_v4Armed ==
+    /// false` and the entry guard rejects it, regardless of what tokenIn
+    /// happens to be. Declared directly after `_activeV4TokenIn` so both
+    /// pack into the same slot (slot 11) — the existing slot 10/11
+    /// storage-poking tests are unaffected since neither touches byte
+    /// offset 20 of slot 11.
+    bool private _v4Armed;
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
@@ -317,6 +357,7 @@ contract LiquidationExecutor is
     /// `configureMorpho`) when the old provider's allowlist entry is
     /// cleared on rotation.
     event AllowedTargetUpdated(address indexed target, bool allowed);
+    event OperatorUpdated(address indexed operator, bool allowed);
 
     // SwapMode + SwapLeg sourced from `./types/SwapTypes.sol` (V10+).
     // See that file for the per-mode field-usage documentation.
@@ -380,11 +421,6 @@ contract LiquidationExecutor is
     // fully supported.) Op flags live in `GenericSequenceLib`.
     uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
-    struct Action {
-        uint8 protocolId;
-        bytes data;
-    }
-
     struct Plan {
         uint8 flashProviderId;
         address loanToken;
@@ -394,44 +430,19 @@ contract LiquidationExecutor is
         SwapPlan swapPlan;
     }
 
-    uint8 private constant MAX_ACTIONS = 10;
+    /// @dev Gas-grief bound on the action list. Sized from measurement, not
+    /// taste: a liquidation cascade batches many users into ONE tx, and the
+    /// top competitor's executor was observed running up to 16
+    /// `LiquidationCall`s per tx (5 such txs in a 3-month window, carrying
+    /// 16.2% of his liquidation profit) — all of which the previous bound of
+    /// 10 would have rejected. 20 leaves headroom above the observed ceiling
+    /// while keeping the per-tx gas well inside a block: the largest observed
+    /// batch (16 liqs + 50 swap ops) burned ~8.1M gas.
+    uint8 private constant MAX_ACTIONS = 20;
 
-    // ─── Aave V3 target action ───────────────────────────────────────
-    struct AaveV3Action {
-        uint8 actionType; // 4 = liquidation (only supported type)
-        address asset;
-        uint256 amount;
-        uint256 interestRateMode;
-        address onBehalfOf;
-        // Liquidation fields (actionType == 4 only)
-        address collateralAsset;
-        address debtAsset;
-        address user;
-        uint256 debtToCover;
-        bool receiveAToken;
-        address aTokenAddress;
-    }
-
-    // ─── Aave V2 liquidation action ──────────────────────────────────
-    /// @dev V2 receiveAToken=true is explicitly unsupported (no canonical on-chain verification).
-    struct AaveV2Liquidation {
-        address collateralAsset;
-        address debtAsset;
-        address user;
-        uint256 debtToCover;
-        bool receiveAToken; // must be false — validated in _validateActions
-    }
-
-    // ─── Morpho Blue liquidation action ─────────────────────────────
-    struct MorphoLiquidation {
-        MarketParams marketParams;
-        address borrower;
-        uint256 seizedAssets;
-        uint256 repaidShares;
-        /// @dev Max loan-token amount to approve for repayment (loan-token units, NOT collateral units).
-        /// Must be >= actual assetsRepaid returned by Morpho. Operator computes this off-chain.
-        uint256 maxRepayAssets;
-    }
+    // Action / AaveV3Action / AaveV2Liquidation / MorphoLiquidation moved to
+    // types/SwapTypes.sol (imported above) so the pure plan validator can live
+    // in SwapValidationLib and keep this contract under the EIP-170 limit.
 
     // ─── Constructor ─────────────────────────────────────────────────
     /// @dev V10+: `morpho_` is constructor-pinned (was post-deploy
@@ -466,7 +477,8 @@ contract LiquidationExecutor is
         if (uniV2Router_ == address(0)) revert ZeroAddress();
         if (uniV3Router_ == address(0)) revert ZeroAddress();
 
-        operator = operator_;
+        operators[operator_] = true;
+        emit OperatorUpdated(operator_, true);
         weth = weth_;
         uniV2Router = uniV2Router_;
         uniV3Router = uniV3Router_;
@@ -492,7 +504,7 @@ contract LiquidationExecutor is
 
     // ─── Modifiers ───────────────────────────────────────────────────
     modifier onlyOperator() {
-        if (msg.sender != operator) revert Unauthorized();
+        if (!operators[msg.sender]) revert Unauthorized();
         _;
     }
 
@@ -505,6 +517,18 @@ contract LiquidationExecutor is
     // removing the single-slot setter eliminates the desync window
     // entirely and forces all Morpho re-configuration through the
     // atomic path.
+
+    /// @notice Add or remove an operator EOA authorised to call `execute`.
+    /// @dev Deliberately NOT self-service: only the owner may rotate keys.
+    /// Revoking is immediate, which is the kill-switch for a leaked hot key
+    /// (`pause()` remains the blanket stop). The owner can revoke every
+    /// operator, leaving the executor callable by nobody — intended, and
+    /// symmetric with `pause()`.
+    function setOperator(address operator_, bool allowed) external onlyOwner {
+        if (operator_ == address(0)) revert ZeroAddress();
+        operators[operator_] = allowed;
+        emit OperatorUpdated(operator_, allowed);
+    }
 
     function setAaveV2LendingPool(address pool) external onlyOwner {
         if (pool == address(0)) revert ZeroAddress();
@@ -577,99 +601,10 @@ contract LiquidationExecutor is
     /// │ MORPHO_BLUE (2)   │ n/a          │ n/a            │ SUPPORTED                │
     /// │ Other             │ —            │ —              │ REVERTS InvalidProtocolId│
     /// └───────────────────┴──────────────┴────────────────┴──────────────────────────┘
-    function _validateActions(Action[] memory actions, address loanToken)
-        internal
-        pure
-        returns (address collateralAsset, address trackingToken)
-    {
-        uint256 liquidationCount;
-        bool receiveATokenSet;
-        bool receiveAToken;
-        address aTokenAddr;
-
-        for (uint256 i = 0; i < actions.length; ++i) {
-            uint8 protocolId = actions[i].protocolId;
-
-            // Internal actions (e.g. coinbase payment) are not liquidation actions
-            if (protocolId == PROTOCOL_INTERNAL) continue;
-
-            bytes memory data = actions[i].data;
-
-            address actionDebt;
-            address actionCollateral;
-            uint256 actionAmount;
-            bool actionReceiveAToken;
-            address actionATokenAddress;
-
-            if (protocolId == PROTOCOL_AAVE_V3) {
-                AaveV3Action memory a = abi.decode(data, (AaveV3Action));
-                if (a.actionType != 4) revert UnsupportedActionType(a.actionType);
-                if (a.collateralAsset == address(0)) revert InvalidCollateralAsset();
-                actionDebt = a.debtAsset;
-                actionCollateral = a.collateralAsset;
-                actionAmount = a.debtToCover;
-                actionReceiveAToken = a.receiveAToken;
-                actionATokenAddress = a.aTokenAddress;
-            } else if (protocolId == PROTOCOL_AAVE_V2) {
-                AaveV2Liquidation memory a = abi.decode(data, (AaveV2Liquidation));
-                if (a.receiveAToken) revert ReceiveATokenV2Unsupported();
-                if (a.collateralAsset == address(0)) revert InvalidCollateralAsset();
-                actionDebt = a.debtAsset;
-                actionCollateral = a.collateralAsset;
-                actionAmount = a.debtToCover;
-            } else if (protocolId == PROTOCOL_MORPHO_BLUE) {
-                MorphoLiquidation memory a = abi.decode(data, (MorphoLiquidation));
-                if (a.marketParams.loanToken == address(0)) revert MorphoInvalidMarketParams();
-                if (a.marketParams.collateralToken == address(0)) revert MorphoInvalidMarketParams();
-                // Only seized-assets mode is supported. Share mode and mixed mode are rejected.
-                if (a.seizedAssets == 0) revert MorphoShareModeUnsupported();
-                if (a.repaidShares != 0) revert MorphoMixedModeUnsupported();
-                if (a.maxRepayAssets == 0) revert InvalidPlan();
-                actionDebt = a.marketParams.loanToken;
-                actionCollateral = a.marketParams.collateralToken;
-                actionAmount = a.seizedAssets;
-            } else {
-                revert InvalidProtocolId(protocolId);
-            }
-
-            if (actionAmount == 0) revert ZeroActionAmount();
-            if (actionDebt != loanToken) revert DebtAssetMismatch(loanToken, actionDebt);
-
-            if (actionCollateral != address(0)) {
-                if (collateralAsset == address(0)) {
-                    collateralAsset = actionCollateral;
-                } else {
-                    if (actionCollateral != collateralAsset) {
-                        revert CollateralAssetMismatch(collateralAsset, actionCollateral);
-                    }
-                }
-            }
-
-            // receiveAToken consistency check (Aave V3 only — V2 receiveAToken=true is blocked above)
-            if (protocolId == PROTOCOL_AAVE_V3) {
-                if (!receiveATokenSet) {
-                    receiveAToken = actionReceiveAToken;
-                    receiveATokenSet = true;
-                    if (receiveAToken) {
-                        if (actionATokenAddress == address(0)) revert ATokenAddressRequired();
-                        aTokenAddr = actionATokenAddress;
-                    }
-                } else {
-                    if (actionReceiveAToken != receiveAToken) revert MixedReceiveAToken();
-                    if (receiveAToken && actionATokenAddress != aTokenAddr) {
-                        revert CollateralAssetMismatch(aTokenAddr, actionATokenAddress);
-                    }
-                }
-            }
-
-            liquidationCount++;
-        }
-
-        if (liquidationCount == 0) revert NoLiquidationAction();
-
-        // Set trackingToken: aToken when receiveAToken=true, underlying otherwise
-        trackingToken = (receiveAToken && aTokenAddr != address(0)) ? aTokenAddr : collateralAsset;
-    }
+    // _validateActions moved to SwapValidationLib.validateActions (external,
+    // DELEGATECALL) to keep this contract under the EIP-170 runtime-size limit.
+    // Pure plan-shape validation, no storage — identical logic, identical error
+    // selectors. Callers use SwapValidationLib.validateActions(actions, loanToken).
 
     /// @dev Per-leg fail-fast validation. Called once per leg from execute()
     /// BEFORE the flashloan is requested, so malformed plans never burn a
@@ -703,7 +638,14 @@ contract LiquidationExecutor is
     }
 
     // ─── Core Execute ────────────────────────────────────────────────
-    function execute(bytes calldata planData) external onlyOperator whenNotPaused nonReentrant {
+    /// @notice Execute a liquidation plan. **The coinbase bid rides in
+    /// `msg.value`**, denominated in BASIS POINTS (wei == bps, so 9_850 wei
+    /// means 98.50% of realized profit to `block.coinbase`); the wei itself is
+    /// dust that is spent into the bribe, it is a parameter and not the
+    /// payment. Keeping the bid out of the ABI-encoded plan means one
+    /// pre-built blob — same bytes, same plan hash — can be re-bid by patching
+    /// only the 32-byte value field, with no re-encoding.
+    function execute(bytes calldata planData) external payable onlyOperator whenNotPaused nonReentrant {
         Plan memory plan = abi.decode(planData, (Plan));
 
         // Deadline check is hoisted into `_validateLeg` (after the NO_SWAP
@@ -717,6 +659,19 @@ contract LiquidationExecutor is
         if (plan.actions.length == 0) revert NoActions();
         if (plan.actions.length > MAX_ACTIONS) revert TooManyActions(plan.actions.length);
 
+        // Coinbase bid (wei == bps). Both gates fire BEFORE the flashloan is
+        // taken — the old action-time check only rejected a non-WETH profit
+        // token after the swap had already run.
+        uint256 bidBps = msg.value;
+        if (bidBps > 10_000) revert InvalidCoinbaseBps();
+        if (bidBps > 0 && plan.swapPlan.profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
+        // Written UNCONDITIONALLY, zero included: transient storage lives for
+        // the whole TRANSACTION, so a second `execute` in the same tx would
+        // otherwise inherit this call's bid.
+        assembly ("memory-safe") {
+            tstore(BID_BPS_TSLOT, bidBps)
+        }
+
         // Final-leg repayToken MUST equal outer loanToken. For hasSplit, leg1
         // IS the repay leg (collateral → loanToken), matching the single-leg
         // derivation since hasLeg2 is forbidden in split mode (see block below).
@@ -729,7 +684,8 @@ contract LiquidationExecutor is
         }
 
         // Validate all actions use same debt/collateral assets
-        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
+        (address collateralAsset, address trackingToken) =
+            SwapValidationLib.validateActions(plan.actions, plan.loanToken);
 
         // Collateral linkage: leg1.srcToken must be either the underlying
         // collateral (standard path, contract unwraps aToken after
@@ -771,6 +727,12 @@ contract LiquidationExecutor is
             if (nOps == 0) revert EmptyOps();
             if (nOps > MAX_OPS) revert TooManyOps();
             for (uint256 i = 0; i < nOps; ++i) {
+                // WETH-unwrap ops carry no external `target` — they only invoke
+                // `IWETH(weth).withdraw` on the contract-pinned `weth` inside the
+                // lib (which enforces `srcToken == weth` and the exact-flag
+                // shape), so there is nothing to allowlist. Exempt them from the
+                // target gate; every other op's target must be allowlisted.
+                if (plan.swapPlan.ops[i].flags & GenericSequenceLib.FLAG_WETH_UNWRAP != 0) continue;
                 // Every op target must be allowlisted. This is the authoritative
                 // target gate — GenericSequenceLib runs the ops via DELEGATECALL
                 // and cannot re-read `allowedTargets`, so it trusts this check.
@@ -1027,7 +989,8 @@ contract LiquidationExecutor is
         if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
         // Derive collateralAsset and trackingToken for delta check and swap plan
-        (address collateralAsset, address trackingToken) = _validateActions(plan.actions, plan.loanToken);
+        (address collateralAsset, address trackingToken) =
+            SwapValidationLib.validateActions(plan.actions, plan.loanToken);
 
         // Verify aToken address against canonical source when receiveAToken=true
         if (trackingToken != address(0) && trackingToken != collateralAsset) {
@@ -1049,11 +1012,10 @@ contract LiquidationExecutor is
             collateralAssetBefore = IERC20(collateralAsset).balanceOf(address(this));
         }
 
-        // Execute protocol actions (liquidations), skip INTERNAL
+        // Execute protocol actions (liquidations). Every action is a protocol
+        // action now — the coinbase bid is no longer an action at all.
         for (uint256 i = 0; i < plan.actions.length; ++i) {
-            if (plan.actions[i].protocolId != PROTOCOL_INTERNAL) {
-                _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
-            }
+            _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
         }
 
         // Post-action: verify liquidation produced collateral AND
@@ -1106,19 +1068,23 @@ contract LiquidationExecutor is
         _executeSwapPlan(plan.swapPlan, flashRepayAmount, flashFee, collateralAsset, collateralDelta, plan.loanToken);
 
         // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
-        // BEFORE flash repay. This is the authoritative base that ACTION_PAY_COINBASE
-        // basis-points arithmetic multiplies against.
+        // BEFORE flash repay. This is the authoritative base the `msg.value`
+        // basis-points bid multiplies against.
         realizedProfit = CoinbasePaymentLib.computeRealizedProfit(
             plan.loanToken, plan.swapPlan.profitToken, profitBefore, plan.loanAmount, flashRepayAmount
         );
 
-        // Execute internal actions (coinbase bps payments) now that realized profit
-        // is known. Per-action bps is validated and multiplied against realizedProfit.
-        for (uint256 i = 0; i < plan.actions.length; ++i) {
-            if (plan.actions[i].protocolId == PROTOCOL_INTERNAL) {
-                totalCoinbasePayment += _executeInternalAction(
-                    plan.actions[i].data, plan.swapPlan.profitToken, realizedProfit
-                );
+        // Coinbase bribe — bid read back from transient storage (`execute`
+        // captured `msg.value`). Bounds and the WETH-profit precondition were
+        // already enforced there, pre-flashloan.
+        uint256 bidBps;
+        assembly ("memory-safe") {
+            bidBps := tload(BID_BPS_TSLOT)
+        }
+        if (bidBps > 0 && realizedProfit > 0) {
+            totalCoinbasePayment = realizedProfit * bidBps / 10_000;
+            if (totalCoinbasePayment > 0) {
+                CoinbasePaymentLib.payCoinbase(totalCoinbasePayment, weth);
             }
         }
     }
@@ -1179,7 +1145,7 @@ contract LiquidationExecutor is
             // pre-flashloan validation; the heavy op loop + per-srcToken
             // containment run in GenericSequenceLib via DELEGATECALL (to keep
             // this contract under the EIP-170 size limit).
-            GenericSequenceLib.run(plan.ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta);
+            GenericSequenceLib.run(plan.ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta, weth);
             return;
         }
 
@@ -1550,6 +1516,7 @@ contract LiquidationExecutor is
         address pm = leg.v4PoolManager;
         _activeV4PoolManager = pm;
         _activeV4TokenIn = tokenIn;
+        _v4Armed = true;
         // tokenIn is NOT included in the unlock payload — the callback
         // reads it from storage so the PM cannot substitute it.
         // Single-hop vs multihop is dispatched by v4SwapData length:
@@ -1567,6 +1534,7 @@ contract LiquidationExecutor is
         // V4Hop[]. Main never has to crack the inner shape.
         IPoolManager(pm).unlock(abi.encode(leg.v4SwapData, amountSpec));
         _activeV4PoolManager = address(0);
+        _v4Armed = false;
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
@@ -1600,7 +1568,7 @@ contract LiquidationExecutor is
     ///   exact-input single-hop ERC20→ERC20 swap inside the flashloan pipeline.
     /// @dev Three layers of protection against stray or adversarial calls:
     ///   1. `ExecutionPhase.FlashLoanActive` — only valid inside execute()
-    ///   2. `_activeV4PoolManager != 0`     — only while `_executeUniV4Leg` is mid-unlock
+    ///   2. `_v4Armed`                       — only while `_executeUniV4Leg` is mid-unlock
     ///   3. `msg.sender == _activeV4PoolManager` — only the pinned PoolManager
     /// BalanceDelta invariant: tokenInDelta < 0 (we owe) AND tokenOutDelta > 0
     /// (we receive). Any other shape — including zero-output swaps, partial
@@ -1611,14 +1579,18 @@ contract LiquidationExecutor is
         if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
         // tokenIn is read from storage (pinned by _executeUniV4Leg) rather
         // than from `data` — PM controls the data, not storage, so
-        // substitution is impossible by construction. Clearing on entry
-        // doubles as the re-entry guard: a nested unlockCallback from
-        // inside swap() finds tokenIn == 0 and the combined check below
-        // fails closed. The msg.sender check covers the not-in-flow case
-        // (_activeV4PoolManager == 0 → msg.sender != 0 = always true).
+        // substitution is impossible by construction. The re-entry guard
+        // is `_v4Armed` (NOT tokenIn != 0 — that collided with native-ETH
+        // legs, where tokenIn == address(0) by design): claiming it
+        // (clearing to false) on entry means a nested unlockCallback from
+        // inside swap() finds `_v4Armed == false` and the combined check
+        // below fails closed, regardless of what tokenIn is. The
+        // msg.sender check covers the not-in-flow case (_activeV4PoolManager
+        // == 0 → msg.sender != 0 = always true).
         address tokenIn = _activeV4TokenIn;
-        if (tokenIn == address(0) || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
-        _activeV4TokenIn = address(0); // CLAIM
+        if (!_v4Armed || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
+        _v4Armed = false; // CLAIM — nested unlockCallback finds false and fails closed
+        _activeV4TokenIn = address(0); // CLAIM (hygiene only now — see above)
 
         // Uniform unlock-data shape for single-hop AND multihop:
         //   abi.encode(bytes inner, int256 amountSpec)
@@ -1772,41 +1744,6 @@ contract LiquidationExecutor is
     }
 
     // ─── Internal: Execute Internal Action ──────────────────────────
-    /// @dev Centralized dispatch for PROTOCOL_INTERNAL actions. Only
-    /// ACTION_PAY_COINBASE is defined.
-    ///
-    /// ACTION_PAY_COINBASE amount is interpreted as basis points (0..10000)
-    /// over realized on-chain profit, not as an absolute payment amount.
-    /// The operator specifies a percentage; the contract sizes the actual
-    /// bid from the on-chain-computed `realizedProfit` snapshot taken
-    /// between swap completion and any coinbase payment.
-    ///
-    /// No-ops (returns 0, no transfer) when `realizedProfit == 0` or
-    /// `coinbaseBps == 0` — consistent behaviour in both degenerate cases.
-    function _executeInternalAction(bytes memory actionData, address profitToken, uint256 realizedProfit)
-        internal
-        returns (uint256 coinbasePaid)
-    {
-        uint8 actionType = abi.decode(actionData, (uint8));
-
-        if (actionType == ACTION_PAY_COINBASE) {
-            // Coinbase payment is ETH-denominated — only valid when profit is in WETH
-            if (profitToken != weth) revert CoinbasePaymentRequiresWethProfit();
-
-            (, uint256 coinbaseBps) = abi.decode(actionData, (uint8, uint256));
-            if (coinbaseBps > 10_000) revert InvalidCoinbaseBps();
-
-            if (realizedProfit == 0 || coinbaseBps == 0) return 0;
-
-            coinbasePaid = realizedProfit * coinbaseBps / 10_000;
-            if (coinbasePaid > 0) {
-                CoinbasePaymentLib.payCoinbase(coinbasePaid, weth);
-            }
-        } else {
-            revert InvalidAction(actionType);
-        }
-    }
-
     // V10+ refactor: `_payCoinbase` moved to
     // `CoinbasePaymentLib.payCoinbase(amount, weth)`. The library
     // takes `weth` as a parameter (libs cannot read another contract's

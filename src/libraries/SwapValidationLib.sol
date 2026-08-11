@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {SwapMode, SwapLeg} from "../types/SwapTypes.sol";
+import {SwapMode, SwapLeg, Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../types/SwapTypes.sol";
 
 /// @title SwapValidationLib
 /// @notice Per-mode pre-flashloan validation of `SwapLeg`. Single
@@ -34,6 +34,123 @@ library SwapValidationLib {
     error InvalidV2Path();
     error InvalidV3Fee(uint24 fee);
     error InvalidSwapMode();
+
+    // ─── validateActions errors (selectors match LiquidationExecutor) ────
+    error UnsupportedActionType(uint8 actionType);
+    error InvalidCollateralAsset();
+    error ReceiveATokenV2Unsupported();
+    error MorphoInvalidMarketParams();
+    error MorphoShareModeUnsupported();
+    error MorphoMixedModeUnsupported();
+    error InvalidProtocolId(uint8 id);
+    error ZeroActionAmount();
+    error DebtAssetMismatch(address expected, address actual);
+    error CollateralAssetMismatch(address expected, address actual);
+    error ATokenAddressRequired();
+    error MixedReceiveAToken();
+    error NoLiquidationAction();
+
+    // ─── Protocol ids (must match LiquidationExecutor) ───────────────────
+    uint8 internal constant PROTOCOL_AAVE_V3 = 1;
+    uint8 internal constant PROTOCOL_MORPHO_BLUE = 2;
+    uint8 internal constant PROTOCOL_AAVE_V2 = 3;
+
+    /// @notice Pure plan-shape validation, moved out of LiquidationExecutor to
+    /// keep the executor under the EIP-170 runtime-size limit. Called via
+    /// DELEGATECALL, so error selectors surface exactly as the caller's own.
+    /// Validates every action's protocol/shape, that all liquidations target
+    /// the same `loanToken` debt and a single collateral asset, and the
+    /// receiveAToken consistency; returns (collateralAsset, trackingToken).
+    function validateActions(Action[] memory actions, address loanToken)
+        external
+        pure
+        returns (address collateralAsset, address trackingToken)
+    {
+        uint256 liquidationCount;
+        bool receiveATokenSet;
+        bool receiveAToken;
+        address aTokenAddr;
+
+        for (uint256 i = 0; i < actions.length; ++i) {
+            uint8 protocolId = actions[i].protocolId;
+
+            bytes memory data = actions[i].data;
+
+            address actionDebt;
+            address actionCollateral;
+            uint256 actionAmount;
+            bool actionReceiveAToken;
+            address actionATokenAddress;
+
+            if (protocolId == PROTOCOL_AAVE_V3) {
+                AaveV3Action memory a = abi.decode(data, (AaveV3Action));
+                if (a.actionType != 4) revert UnsupportedActionType(a.actionType);
+                if (a.collateralAsset == address(0)) revert InvalidCollateralAsset();
+                actionDebt = a.debtAsset;
+                actionCollateral = a.collateralAsset;
+                actionAmount = a.debtToCover;
+                actionReceiveAToken = a.receiveAToken;
+                actionATokenAddress = a.aTokenAddress;
+            } else if (protocolId == PROTOCOL_AAVE_V2) {
+                AaveV2Liquidation memory a = abi.decode(data, (AaveV2Liquidation));
+                if (a.receiveAToken) revert ReceiveATokenV2Unsupported();
+                if (a.collateralAsset == address(0)) revert InvalidCollateralAsset();
+                actionDebt = a.debtAsset;
+                actionCollateral = a.collateralAsset;
+                actionAmount = a.debtToCover;
+            } else if (protocolId == PROTOCOL_MORPHO_BLUE) {
+                MorphoLiquidation memory a = abi.decode(data, (MorphoLiquidation));
+                if (a.marketParams.loanToken == address(0)) revert MorphoInvalidMarketParams();
+                if (a.marketParams.collateralToken == address(0)) revert MorphoInvalidMarketParams();
+                // Only seized-assets mode is supported. Share mode and mixed mode are rejected.
+                if (a.seizedAssets == 0) revert MorphoShareModeUnsupported();
+                if (a.repaidShares != 0) revert MorphoMixedModeUnsupported();
+                if (a.maxRepayAssets == 0) revert InvalidPlan();
+                actionDebt = a.marketParams.loanToken;
+                actionCollateral = a.marketParams.collateralToken;
+                actionAmount = a.seizedAssets;
+            } else {
+                revert InvalidProtocolId(protocolId);
+            }
+
+            if (actionAmount == 0) revert ZeroActionAmount();
+            if (actionDebt != loanToken) revert DebtAssetMismatch(loanToken, actionDebt);
+
+            if (actionCollateral != address(0)) {
+                if (collateralAsset == address(0)) {
+                    collateralAsset = actionCollateral;
+                } else {
+                    if (actionCollateral != collateralAsset) {
+                        revert CollateralAssetMismatch(collateralAsset, actionCollateral);
+                    }
+                }
+            }
+
+            // receiveAToken consistency check (Aave V3 only — V2 receiveAToken=true is blocked above)
+            if (protocolId == PROTOCOL_AAVE_V3) {
+                if (!receiveATokenSet) {
+                    receiveAToken = actionReceiveAToken;
+                    receiveATokenSet = true;
+                    if (receiveAToken) {
+                        if (actionATokenAddress == address(0)) revert ATokenAddressRequired();
+                        aTokenAddr = actionATokenAddress;
+                    }
+                } else {
+                    if (actionReceiveAToken != receiveAToken) revert MixedReceiveAToken();
+                    if (receiveAToken && actionATokenAddress != aTokenAddr) {
+                        revert CollateralAssetMismatch(aTokenAddr, actionATokenAddress);
+                    }
+                }
+            }
+
+            liquidationCount++;
+        }
+
+        if (liquidationCount == 0) revert NoLiquidationAction();
+
+        // Set trackingToken: aToken when receiveAToken=true, underlying otherwise
+        trackingToken = (receiveAToken && aTokenAddr != address(0)) ? aTokenAddr : collateralAsset;
+    }
 
     /// @dev Pre-flashloan validation for every SwapMode except V4.
     ///

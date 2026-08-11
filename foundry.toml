@@ -7,7 +7,13 @@ libs = ["lib"]
 # state-override runtime bytecode.
 ast = true
 solc_version = "0.8.24"
-evm_version = "shanghai"
+# cancun: required for EIP-1153 transient storage (TSTORE/TLOAD), which carries
+# the per-tx coinbase bid from `execute()` into the flash callback frame (where
+# `msg.value` is 0). Transient storage is deliberate — a REGULAR storage slot
+# would shift the V4 arming fields that GenericSequenceLib raw-`sstore`s at
+# pinned slot numbers, and would need explicit clearing to avoid a stale bid
+# leaking into a later tx. Mainnet has been on cancun since Dencun (2024-03).
+evm_version = "cancun"
 optimizer = true
 # optimizer_runs = 1 biases toward smaller runtime code (fewer inlined copies
 # of internal functions). Callers pay slightly more gas per call but the
@@ -18,6 +24,11 @@ via_ir = true
 # deployed contract comfortably under the EIP-170 24,576-byte limit.
 bytecode_hash = "none"
 cbor_metadata = false
+# Emit storageLayout in build artifacts so `forge inspect <Contract>
+# storageLayout` works — the authoritative offline check that V4 arming
+# fields (GenericSequenceLib's hardcoded V4_PM_SLOT/V4_TOKENIN_SLOT) land at
+# the right slots in both LiquidationExecutor and ArbExecutor.
+extra_output = ["storageLayout"]
 
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",

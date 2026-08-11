@@ -288,9 +288,16 @@ library UniswapLib {
         uint256 owedIn = uint256(int256(-tokenInDelta));
         uint256 gainedOut = uint256(int256(tokenOutDelta));
 
-        pm.sync(tokenIn);
-        IERC20(tokenIn).safeTransfer(address(pm), owedIn);
-        pm.settle();
+        if (tokenIn == address(0)) {
+            // Native-ETH input: PoolManager credits the settlement via
+            // msg.value on `settle`, not via sync+ERC20 transfer. No
+            // `sync`/`approve`/`safeTransfer` — those are ERC20-only.
+            pm.settle{value: owedIn}();
+        } else {
+            pm.sync(tokenIn);
+            IERC20(tokenIn).safeTransfer(address(pm), owedIn);
+            pm.settle();
+        }
         pm.take(tokenOut, address(this), gainedOut);
     }
 
@@ -343,8 +350,12 @@ library UniswapLib {
         (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address h) =
             abi.decode(data, (address, address, uint24, int24, address));
         if (
-            tokenIn == address(0) || tokenOut == address(0) || tokenIn != srcToken || tokenOut != repayToken
-                || tokenIn == tokenOut || fee == 0 || tickSpacing <= 0 || fee & 0x800000 != 0
+            // Native-ETH tokenIn is allowed (settled via `settle{value}`,
+            // see `runV4UnlockSwap`); native-ETH tokenOut stays out of
+            // scope (no unwrap-on-receive path exists yet) and is still
+            // rejected here.
+            tokenOut == address(0) || tokenIn != srcToken || tokenOut != repayToken || tokenIn == tokenOut || fee == 0
+                || tickSpacing <= 0 || fee & 0x800000 != 0
         ) revert InvalidPlan();
         return h;
     }

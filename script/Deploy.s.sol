@@ -85,7 +85,7 @@ contract Deploy is Script {
         // intended before trusting the deployment.
         LiquidationExecutor ex = LiquidationExecutor(payable(liqExecutor));
         require(ex.owner() == OWNER, "readback: owner");
-        require(ex.operator() == OPERATOR, "readback: operator");
+        require(ex.operators(OPERATOR), "readback: operator");
         require(ex.weth() == WETH, "readback: weth");
         require(ex.aavePool() == AAVE_V3_POOL, "readback: aavePool");
         require(ex.morphoBlue() == MORPHO_BLUE, "readback: morphoBlue");
