@@ -159,7 +159,8 @@ contract ExecutorForkV4Test is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(0),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -178,7 +179,8 @@ contract ExecutorForkV4Test is Test {
             v4PoolManager: V4_POOL_MANAGER,
             v4SwapData: v4Data,
             repayToken: WETH,
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,

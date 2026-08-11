@@ -92,6 +92,22 @@ struct SwapLeg {
     // For leg2 always:            == outer plan.loanToken.
     address repayToken;
     uint256 minAmountOut;
+    /// @dev Word index (after the 4-byte selector) at which Bebop allows the
+    /// taker amount to be rewritten, taken verbatim from the quote's
+    /// `partialFillOffset`. Zero means the maker offered no partial fill and
+    /// the order must be taken whole.
+    ///
+    /// A signed RFQ order is written for an exact amount. A liquidation's
+    /// realised collateral is only known on-chain and moves with the block, so
+    /// an order quoted a few blocks earlier is routinely for the wrong size —
+    /// and the settlement rejects it outright rather than filling less. That
+    /// cost a live liquidation on 2026-08-10: the order had 60 of its 76
+    /// seconds left and still reverted with BebopSwapFailed.
+    ///
+    /// Verified against mainnet: writing 1e18 at this word on a 2e18 quote
+    /// transferred exactly 1 WETH for 1889.58 USDC, against 2 WETH for
+    /// 3779.15 USDC unpatched — same price, half the size.
+    uint256 bebopPartialFillOffset;
 }
 
 /// @dev One generic DEX call in a GENERIC_SEQUENCE (direct-call routing).

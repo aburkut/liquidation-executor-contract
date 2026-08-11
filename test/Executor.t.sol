@@ -533,7 +533,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(0),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -561,7 +562,8 @@ contract ExecutorTest is Test {
             // `amountIn × SWAP_RATE / 1e18`; use `1` as a trivial
             // non-zero floor — fixture-level invariant, not a
             // production-grade slippage cap.
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
@@ -600,7 +602,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: repayTkn,
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
@@ -640,7 +643,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: minOut
+            minAmountOut: minOut,
+            bebopPartialFillOffset: 0
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
@@ -678,7 +682,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: minOut
+            minAmountOut: minOut,
+            bebopPartialFillOffset: 0
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
@@ -719,7 +724,8 @@ contract ExecutorTest is Test {
             v4PoolManager: poolManager,
             v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook),
             repayToken: dstToken,
-            minAmountOut: minOut
+            minAmountOut: minOut,
+            bebopPartialFillOffset: 0
         });
         return LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
@@ -776,7 +782,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -801,7 +808,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: repayTkn,
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -827,7 +835,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: minOut
+            minAmountOut: minOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -853,7 +862,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: minOut
+            minAmountOut: minOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -881,7 +891,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: amountOut
+            minAmountOut: amountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -914,7 +925,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: amountOut
+            minAmountOut: amountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -943,7 +955,8 @@ contract ExecutorTest is Test {
             v4PoolManager: poolManager,
             v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook),
             repayToken: dstToken,
-            minAmountOut: minOut
+            minAmountOut: minOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -992,7 +1005,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: path,
             repayToken: dstToken,
-            minAmountOut: minAmountOut
+            minAmountOut: minAmountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -1019,7 +1033,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: pathReversed,
             repayToken: dstToken,
-            minAmountOut: amountOut
+            minAmountOut: amountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -1057,7 +1072,8 @@ contract ExecutorTest is Test {
             v4PoolManager: poolManager,
             v4SwapData: abi.encode(hops),
             repayToken: dstToken,
-            minAmountOut: minAmountOut
+            minAmountOut: minAmountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -1085,7 +1101,8 @@ contract ExecutorTest is Test {
             v4PoolManager: poolManager,
             v4SwapData: abi.encode(srcToken, dstToken, fee, tickSpacing, hook),
             repayToken: dstToken,
-            minAmountOut: amountOut
+            minAmountOut: amountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -1731,7 +1748,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -1832,7 +1850,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2624,7 +2643,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2683,7 +2703,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2729,7 +2750,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2779,7 +2801,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2824,7 +2847,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2867,7 +2891,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2910,7 +2935,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -2954,7 +2980,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3005,7 +3032,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3051,7 +3079,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3094,7 +3123,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3137,7 +3167,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3177,7 +3208,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3226,7 +3258,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3265,7 +3298,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3308,7 +3342,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3365,7 +3400,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3465,7 +3501,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3556,7 +3593,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3641,7 +3679,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3743,7 +3782,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -3838,7 +3878,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -4140,7 +4181,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -4655,7 +4697,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -4774,7 +4817,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5487,7 +5531,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5708,7 +5753,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5748,7 +5794,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5792,7 +5839,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5841,7 +5889,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5880,7 +5929,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5935,7 +5985,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -5978,7 +6029,8 @@ contract ExecutorTest is Test {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -6361,7 +6413,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(loanToken),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
@@ -6408,7 +6461,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(loanToken),
-            minAmountOut: 1100e18 // exact amountOut
+            minAmountOut: 1100e18, // exact amountOut
+            bebopPartialFillOffset: 0
         });
         LiquidationExecutor.SwapPlan memory swapPlan = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
@@ -7835,7 +7889,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(loanToken),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildTwoLegPlan(leg1, leg2, address(loanToken), 0);
@@ -8209,7 +8264,8 @@ contract ExecutorTest is Test {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(mockWeth),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildMixedSplitPlan(repayLeg, profitLeg, address(mockWeth), 0);
@@ -8462,7 +8518,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: token,
-                minAmountOut: 0
+                minAmountOut: 0,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -8619,7 +8676,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -8700,7 +8758,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -8771,7 +8830,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(loanToken),
-            minAmountOut: 0
+            minAmountOut: 0,
+            bebopPartialFillOffset: 0
         });
         // leg2 amountIn=0 — contract fills it at runtime from balance.
         SwapLeg memory profitLeg = _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
@@ -8828,7 +8888,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(loanToken),
-            minAmountOut: 0
+            minAmountOut: 0,
+            bebopPartialFillOffset: 0
         });
         SwapLeg memory profitLeg = _buildUniV3Leg(address(collateralToken), address(mockWeth), 0, 3000, 1, false);
 
@@ -8878,7 +8939,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(loanToken),
-            minAmountOut: 0
+            minAmountOut: 0,
+            bebopPartialFillOffset: 0
         });
         SwapLeg memory profitLeg = _buildUniV3Leg(address(loanToken), address(mockWeth), 0, 3000, 1, false);
 
@@ -8935,7 +8997,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(loanToken),
-            minAmountOut: 0
+            minAmountOut: 0,
+            bebopPartialFillOffset: 0
         });
         // leg2 must satisfy: leg1.repayToken == leg2.srcToken (loanToken
         // → loanToken won't pass _validateLeg's src!=repay; we need
@@ -8997,7 +9060,8 @@ contract ExecutorNoSwapTest is ExecutorTest {
                 v4PoolManager: address(0),
                 v4SwapData: "",
                 repayToken: address(loanToken),
-                minAmountOut: 1
+                minAmountOut: 1,
+                bebopPartialFillOffset: 0
             }),
             hasLeg2: false,
             leg2: _zeroLeg(),
@@ -9229,7 +9293,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: minAmountOut
+            minAmountOut: minAmountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -9257,7 +9322,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: dstToken,
-            minAmountOut: minAmountOut
+            minAmountOut: minAmountOut,
+            bebopPartialFillOffset: 0
         });
     }
 
@@ -9452,7 +9518,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(profitToken),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
         // leg2 profitToken → loanToken via Curve V1
         SwapLeg memory leg2 = _curveV1Leg(
@@ -9569,7 +9636,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(profitToken),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
         SwapLeg memory leg2 = _balancerV2Leg(
             SwapMode.BAL_V2,
@@ -10117,7 +10185,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(profitToken),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
         SwapLeg memory leg2 = _curveV1Leg(
             SwapMode.CURVE_V1_BUY, // BUY variant — not allowed as leg2
@@ -10164,7 +10233,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(profitToken),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
         SwapLeg memory leg2 = _balancerV2Leg(
             SwapMode.BAL_V2_BUY,
@@ -10737,7 +10807,8 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             v4PoolManager: address(0),
             v4SwapData: "",
             repayToken: address(mockWeth),
-            minAmountOut: 1
+            minAmountOut: 1,
+            bebopPartialFillOffset: 0
         });
         LiquidationExecutor.SwapPlan memory sp = LiquidationExecutor.SwapPlan({
             hasGenericSequence: false,
