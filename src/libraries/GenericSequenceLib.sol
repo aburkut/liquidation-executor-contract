@@ -367,10 +367,19 @@ library GenericSequenceLib {
                 // check below still pins the swap output to the executor, and
                 // the per-srcToken containment cap bounds what the op spends.
                 if (op.callData.length != V4_SWAP_DATA_LENGTH) revert InvalidPlan();
-                // FULL_BALANCE / PREV_RETURN would make `amount` an INPUT
-                // amount, but a V4 op's `amount` is the exact-OUT spec —
-                // reject the combination instead of mis-signing the swap.
-                if (op.flags & (FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN) != 0) revert InvalidPlan();
+                // FULL_BALANCE / PREV_RETURN make `amount` an INPUT amount.
+                // That contradicts an exact-OUT V4 op, whose `amount` is the
+                // output spec — reject there instead of mis-signing the swap.
+                //
+                // Under FLAG_V4_EXACT_IN, though, `amount` IS the input sold
+                // (`amountSpec = -int256(amount)` below), so the combination is
+                // exactly right. Forbidding it outright barred V4 from every
+                // step but the first, since each later leg must spend the
+                // previous leg's output — which is what PREV_RETURN means.
+                if (op.flags & FLAG_V4_EXACT_IN == 0 && op.flags & (FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN) != 0)
+                {
+                    revert InvalidPlan();
+                }
                 // Positive int256 discriminates exact-out in the callback;
                 // bound the cast so the sign can never flip (mirrors
                 // `_executeUniV4Leg`).
