@@ -85,13 +85,32 @@ library UniswapLib {
     /// `swapExactTokensForTokens`) and UNI_V2_BUY (BUY via
     /// `swapTokensForExactTokens`). Multihop is supported "for free"
     /// because the V2 router accepts any `path.length >= 2`.
+
+    /// @dev Clear a router allowance only when the swap could have left one.
+    ///
+    /// `approvalResetAfterSwap` is a tested invariant, so the allowance must
+    /// read zero when a leg returns. An EXACT-IN swap already satisfies it
+    /// without a write: the router pulls exactly `amountIn`, which takes the
+    /// allowance to zero on its own. Writing zero over zero is a second SSTORE
+    /// bought for nothing.
+    ///
+    /// An exact-OUT swap is different — it consumes only what the output
+    /// needed and leaves the remainder standing, so that one still has to be
+    /// cleared explicitly.
+    function _clearIfResidual(address token, address spender) private {
+        if (IERC20(token).allowance(address(this), spender) != 0) {
+            IERC20(token).forceApprove(spender, 0);
+        }
+    }
+
     function executeUniV2Leg(SwapLeg memory leg, uint256 amountIn, address router) external {
         if (amountIn == 0) revert ZeroSwapInput();
 
-        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
-        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
-
+        // One read, used for both the sufficiency check and the before-image:
+        // they were two calls returning the same number.
         uint256 srcBefore = IERC20(leg.srcToken).balanceOf(address(this));
+        if (srcBefore < amountIn) revert InsufficientSrcBalance(amountIn, srcBefore);
+
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
         IERC20(leg.srcToken).forceApprove(router, amountIn);
@@ -110,8 +129,6 @@ library UniswapLib {
                 .swapExactTokensForTokens(amountIn, leg.minAmountOut, leg.v2Path, address(this), leg.deadline);
             actualIn = amountIn;
         }
-        IERC20(leg.srcToken).forceApprove(router, 0);
-
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
@@ -207,8 +224,6 @@ library UniswapLib {
             }
             actualIn = amountIn;
         }
-        IERC20(leg.srcToken).forceApprove(router, 0);
-
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
