@@ -189,18 +189,21 @@ contract ArbExecutorSecurityTest is Test {
     /// a plan can fully honour repay and still burn standing loanToken-
     /// denominated profit past what THIS tx is allowed to move.
     function test_arb_loanTokenOverspend_reverts() public {
+        // A standing balance >= loanAmount now runs the cycle off the
+        // INVENTORY (no flash), so the whole 3000 is what an op may try to
+        // route out; the cap still bounds the net spend to loanAmount.
         uint256 donation = 3_000e18;
         tokenA.mint(address(exec), donation);
 
         Op[] memory ops = new Op[](2);
-        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT + donation, 0);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), donation, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 1_000e18, 0);
 
         bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
 
-        // spent = snapshot(4000) - final(1100) = 2900; allowed = loanAmount = 1000.
+        // spent = snapshot(3000) - final(1100) = 1900; allowed = loanAmount = 1000.
         vm.prank(operatorAddr);
-        vm.expectRevert(abi.encodeWithSelector(GenericSequenceLib.CollateralOverspent.selector, 2_900e18, LOAN_AMOUNT));
+        vm.expectRevert(abi.encodeWithSelector(GenericSequenceLib.CollateralOverspent.selector, 1_900e18, LOAN_AMOUNT));
         exec.execute(plan);
     }
 

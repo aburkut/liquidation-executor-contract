@@ -753,7 +753,10 @@ contract ArbExecutorForkTest is Test {
     function test_fork_v4_nativeIn_via_router_parity() public forkOnly {
         uint256 loanAmount = 1e18; // 1 WETH
         uint256 unwrapAmount = 0.05e18; // small, realistic native-in leg
-        uint256 buffer = 1e18; // dwarfs loanAmount + unwrapAmount
+        // Below loanAmount on purpose: a standing balance >= loanAmount would
+        // run the sequence off the inventory (no flash) and refuse it for
+        // shrinking the balance — this is a one-way parity probe, not a cycle.
+        uint256 buffer = 0.5e18; // covers unwrapAmount with room
 
         uint256 snap = vm.snapshotState();
 

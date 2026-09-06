@@ -48,6 +48,30 @@ contract MockWETH is MockERC20 {
 ///   * Profit floor + withdraw + admin surface.
 ///   * End-to-end op-sequence execution through the real flash callback
 ///     (`test_execute_opSequence_arb_profits_and_repays`).
+/// A flash provider that hands the principal over and then relays the
+/// callback through a SECOND address, so the executor sees the right phase
+/// and plan hash but the wrong `msg.sender`.
+contract HostileMorpho {
+    CallbackRelay public relay = new CallbackRelay();
+
+    function flashLoan(address token, uint256 assets, bytes calldata data) external {
+        IERC20(token).transfer(msg.sender, assets);
+        relay.forward(msg.sender, assets, data);
+    }
+}
+
+contract CallbackRelay {
+    function forward(address exec, uint256 assets, bytes calldata data) external {
+        (bool ok, bytes memory ret) =
+            exec.call(abi.encodeWithSignature("onMorphoFlashLoan(uint256,bytes)", assets, data));
+        if (!ok) {
+            assembly {
+                revert(add(ret, 0x20), mload(ret))
+            }
+        }
+    }
+}
+
 contract ArbExecutorTest is Test {
     ArbExecutor public exec;
 
@@ -689,32 +713,123 @@ contract ArbExecutorTest is Test {
         exec.onMorphoFlashLoan(LOAN_AMOUNT, hex"");
     }
 
+    /// The phase and plan hash live in TRANSIENT storage now, so they cannot
+    /// be planted with `vm.store`; the "inside the phase, wrong caller" case
+    /// is driven for real: a hostile flash provider that relays the callback
+    /// through another address while `execute` is in flight. Only the caller
+    /// check may reject it — the phase is active and the hash matches.
     function test_revert_morphoCallbackWrongCaller_evenInsidePhase() public {
-        // Plant `_executionPhase = FlashLoanActive` and `_activePlanHash`
-        // matching `data` — only the caller check should reject.
+        HostileMorpho hostile = new HostileMorpho();
+        address[] memory allowed = new address[](0);
+        vm.prank(ownerAddr);
+        ArbExecutor exec2 = new ArbExecutor(
+            ownerAddr,
+            operatorAddr,
+            address(weth),
+            address(balancerFlash),
+            address(hostile),
+            address(augustus),
+            address(uniV2),
+            address(uniV3),
+            allowed
+        );
+        tokenA.mint(address(hostile), LOAN_AMOUNT);
+
         Op[] memory ops = new Op[](2);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
         bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
-        bytes32 planHash = keccak256(plan);
 
-        // Storage slots (forge inspect ArbExecutor storageLayout, post V4
-        // storage-alignment — see task-3-report.md):
-        //   morphoBlue              slot 2
-        //   allowedFlashProviders   slot 3 (mapping)
-        //   allowedTargets          slot 4 (mapping)
-        //   allowedV4Hooks          slot 5 (mapping)
-        //   operators               slot 6 (mapping)
-        //   _activePlanHash         slot 7
-        //   __reservedSlot0..2      slots 8-10 (V4 alignment padding)
-        //   _activeV4PoolManager    slot 11 offset 0  (packs with _executionPhase)
-        //   _executionPhase         slot 11 offset 20 (uint8 enum)
-        vm.store(address(exec), bytes32(uint256(7)), planHash);
-        vm.store(address(exec), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive @ offset 20
-
-        vm.prank(attacker);
+        vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.InvalidCallbackCaller.selector);
+        exec2.execute(plan);
+    }
+
+    /// Outside `execute` the transient phase reads unset, whoever calls.
+    function test_revert_morphoCallbackOutsideExecute() public {
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(address(morpho));
+        vm.expectRevert(ArbExecutor.InvalidExecutionPhase.selector);
         exec.onMorphoFlashLoan(LOAN_AMOUNT, plan);
+    }
+
+    // ─── Inventory path (no flash when the principal is already held) ───
+
+    /// Holding the principal, the cycle runs off the balance: the flash
+    /// provider is never called and the profit is the plain balance delta.
+    function test_inventory_skips_flash_and_keeps_profit() public {
+        tokenA.mint(address(exec), LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 0);
+        uint256 morphoBefore = tokenA.balanceOf(address(morpho));
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+
+        assertEq(tokenA.balanceOf(address(exec)), LOAN_AMOUNT + 210e18, "inventory plus profit");
+        assertEq(tokenA.balanceOf(address(morpho)), morphoBefore, "flash provider untouched");
+    }
+
+    /// Short of the principal by one wei, the flash path is taken as before.
+    function test_inventory_short_falls_back_to_flash() public {
+        tokenA.mint(address(exec), LOAN_AMOUNT - 1);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 1);
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+
+        assertEq(tokenA.balanceOf(address(exec)), LOAN_AMOUNT - 1 + 210e18, "profit on top of the inventory");
+    }
+
+    /// A losing cycle on the inventory path reverts: the balance may not
+    /// shrink, exactly as an unrepayable flash would revert.
+    function test_inventory_losing_cycle_reverts() public {
+        MockUniV2Router losing = new MockUniV2Router(0.9e18);
+        tokenA.mint(address(losing), 10 * LOAN_AMOUNT);
+        tokenB.mint(address(losing), 10 * LOAN_AMOUNT);
+        vm.prank(ownerAddr);
+        exec.setAllowedTarget(address(losing), true);
+        tokenA.mint(address(exec), LOAN_AMOUNT);
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[0].target = address(losing);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        ops[1].target = address(losing);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(ArbExecutor.InsufficientRepayBalance.selector, LOAN_AMOUNT, 810e18));
+        exec.execute(plan);
+    }
+
+    /// The coinbase bid is paid on the inventory path too (WETH principal).
+    function test_inventory_pays_coinbase_bid() public {
+        weth.mint(address(exec), LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(weth), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(weth), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0);
+
+        address coinbaseAddr = address(0xC01BA5E);
+        vm.coinbase(coinbaseAddr);
+        uint256 cbBefore = coinbaseAddr.balance;
+        vm.prank(operatorAddr);
+        exec.execute{value: 5_000}(plan); // 50% of the realized 210 WETH
+        assertEq(coinbaseAddr.balance - cbBefore, 105e18, "half the profit to the coinbase");
+        // The 5_000 wei bid rides in as msg.value and ends up wrapped alongside the profit.
+        assertEq(weth.balanceOf(address(exec)), LOAN_AMOUNT + 105e18 + 5_000, "the other half kept");
     }
 
     function test_revert_balancerCallbackFromNonBalancer() public {
@@ -791,40 +906,15 @@ contract ArbExecutorTest is Test {
     /// moved these fields from 10/11 to 11/12. The offline
     /// `forge inspect ArbExecutor storageLayout` remains the authority on the
     /// exact field names; this is the guard that fails in CI when they drift.
-    function test_v4SlotConstantsMatchLayout() public {
-        uint256 V4_PM_SLOT = 11;
-        uint256 V4_TOKENIN_SLOT = 12;
-
-        // Padding slots between `_activePlanHash` and the V4 fields must be
-        // untouched dead space — if a real field ever lands there, the V4
-        // fields have shifted and the lib would corrupt live state.
-        assertEq(vm.load(address(exec), bytes32(uint256(8))), bytes32(0), "slot 8 must be reserved padding");
-        assertEq(vm.load(address(exec), bytes32(uint256(9))), bytes32(0), "slot 9 must be reserved padding");
-        assertEq(vm.load(address(exec), bytes32(uint256(10))), bytes32(0), "slot 10 must be reserved padding");
-
-        // Snapshot every live field reachable through a public getter.
-        address ownerBefore = exec.owner();
-        address morphoBefore = exec.morphoBlue();
-        bool pausedBefore = exec.paused();
-        bool operatorBefore = exec.operators(operatorAddr);
-        bool targetBefore = exec.allowedTargets(address(uniV2));
-        address balProviderBefore = exec.allowedFlashProviders(exec.FLASH_PROVIDER_BALANCER());
-
-        // Poke the slots the lib arms. If either collided with a live field,
-        // one of the assertions below flips.
-        vm.store(address(exec), bytes32(V4_PM_SLOT), bytes32(type(uint256).max));
-        vm.store(address(exec), bytes32(V4_TOKENIN_SLOT), bytes32(type(uint256).max));
-
-        assertEq(exec.owner(), ownerBefore, "owner must not live at slot 11/12");
-        assertEq(exec.morphoBlue(), morphoBefore, "morphoBlue must not live at slot 11/12");
-        assertEq(exec.paused(), pausedBefore, "paused must not live at slot 11/12");
-        assertEq(exec.operators(operatorAddr), operatorBefore, "operators must not live at slot 11/12");
-        assertEq(exec.allowedTargets(address(uniV2)), targetBefore, "allowedTargets must not live at slot 11/12");
-        assertEq(
-            exec.allowedFlashProviders(exec.FLASH_PROVIDER_BALANCER()),
-            balProviderBefore,
-            "allowedFlashProviders must not live at slot 11/12"
-        );
+    /// The V4 arming words are TRANSIENT on the arb path: after a transaction
+    /// nothing is left in persistent storage at the slot numbers the lib
+    /// uses, so a stray PoolManager callback in a later transaction finds the
+    /// executor disarmed. (The end-to-end V4 arming is covered by the
+    /// ArbGenericSequence V4 tests, which drive a real unlock through
+    /// `execute`.)
+    function test_v4ArmingLeavesNoPersistentState() public {
+        assertEq(vm.load(address(exec), bytes32(uint256(11))), bytes32(0), "slot 11 untouched");
+        assertEq(vm.load(address(exec), bytes32(uint256(12))), bytes32(0), "slot 12 untouched");
     }
 
     function test_v4UnlockSelectorPin() public pure {

@@ -143,6 +143,14 @@ library GenericSequenceLib {
     /// it is what moved them from 10/11 to 11/12. Adding ANY storage field
     /// to either executor shifts them again — `test_v4SlotConstantsMatchLayout`
     /// is the guard that catches it.
+    ///
+    /// The ARB path (`runArb*`, `transientArming == true`) arms the SAME two
+    /// slot numbers in TRANSIENT storage (EIP-1153) instead — a separate
+    /// address space, read back by `ArbExecutor.unlockCallback` with `tload`.
+    /// Persistent arming cost about 20k gas per V4 leg (an SSTORE from zero
+    /// plus its clear, net of refund) for state that never outlives the
+    /// transaction; transient costs 100 a write. `LiquidationExecutor` keeps
+    /// the persistent slots (its `unlockCallback` reads its own fields).
     uint256 private constant V4_PM_SLOT = 11;
     uint256 private constant V4_TOKENIN_SLOT = 12;
     uint256 private constant V4_ARMED_BIT = 1 << 160;
@@ -204,7 +212,7 @@ library GenericSequenceLib {
         uint256 collateralDelta,
         address weth
     ) external {
-        _executeOps(ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta, weth, RepayGate.Delta);
+        _executeOps(ops, loanToken, flashRepayAmount, collateralAsset, collateralDelta, weth, RepayGate.Delta, false);
     }
 
     /// @notice Execute a flat `Op[]` sequence for ARBITRAGE: the flash
@@ -221,7 +229,17 @@ library GenericSequenceLib {
     function runArb(Op[] memory ops, address loanToken, uint256 flashRepayAmount, uint256 loanAmount, address weth)
         external
     {
-        _executeOps(ops, loanToken, flashRepayAmount, loanToken, loanAmount, weth, RepayGate.Absolute);
+        _executeOps(ops, loanToken, flashRepayAmount, loanToken, loanAmount, weth, RepayGate.Absolute, true);
+    }
+
+    /// @notice `runArb` for a principal the executor already HOLDS: no flash
+    /// was taken, so there is no absolute repayment to gate on. The cap is
+    /// the same (`loanAmount` of `loanToken` may be spent, every other token
+    /// nothing); the "must not shrink" rule is the DELTA gate with a zero
+    /// repayment, and the caller enforces the balance floor on top. MUST be
+    /// invoked via DELEGATECALL.
+    function runArbFromInventory(Op[] memory ops, address loanToken, uint256 loanAmount, address weth) external {
+        _executeOps(ops, loanToken, 0, loanToken, loanAmount, weth, RepayGate.Delta, true);
     }
 
     /// @notice Execute a flat `Op[]` sequence with per-srcToken containment.
@@ -235,7 +253,8 @@ library GenericSequenceLib {
         address capToken,
         uint256 capAmount,
         address weth,
-        RepayGate repayGate
+        RepayGate repayGate,
+        bool transientArming
     ) internal {
         uint256 n = ops.length;
         if (n == 0) revert EmptyOps();
@@ -395,10 +414,18 @@ library GenericSequenceLib {
                 uint256 armedBit = V4_ARMED_BIT;
                 address pm = op.target;
                 address tokenIn = op.srcToken;
-                assembly {
-                    let cur := sload(pmSlot)
-                    sstore(pmSlot, or(and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)), pm))
-                    sstore(tokenInSlot, or(tokenIn, armedBit))
+                if (transientArming) {
+                    // Arb path: same word shapes, transient address space.
+                    assembly {
+                        tstore(pmSlot, pm)
+                        tstore(tokenInSlot, or(tokenIn, armedBit))
+                    }
+                } else {
+                    assembly {
+                        let cur := sload(pmSlot)
+                        sstore(pmSlot, or(and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)), pm))
+                        sstore(tokenInSlot, or(tokenIn, armedBit))
+                    }
                 }
 
                 // Positive amountSpec = exact-out (buy `amount`); negative =
@@ -422,10 +449,17 @@ library GenericSequenceLib {
                 // itself, but clear both defensively (an unlock that never
                 // reached our callback must not leave the executor armed
                 // for a later stray callback).
-                assembly {
-                    let cur := sload(pmSlot)
-                    sstore(pmSlot, and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)))
-                    sstore(tokenInSlot, 0)
+                if (transientArming) {
+                    assembly {
+                        tstore(pmSlot, 0)
+                        tstore(tokenInSlot, 0)
+                    }
+                } else {
+                    assembly {
+                        let cur := sload(pmSlot)
+                        sstore(pmSlot, and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)))
+                        sstore(tokenInSlot, 0)
+                    }
                 }
 
                 if (!okV4) {
