@@ -34,5 +34,8 @@ jobs:
       - name: Run Forge build
         run: forge build --sizes
 
+      - name: Check executor sizes against the EIP-170 threshold
+        run: script/check_sizes.sh 24200
+
       - name: Run Forge tests
         run: forge test -vvv
