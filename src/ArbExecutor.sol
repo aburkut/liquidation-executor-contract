@@ -369,7 +369,7 @@ contract ArbExecutor is
             // most its own `amount`, see DirectSwapLib), so they are not
             // allowlisted — exactly the exposure of an allowlisted router
             // routing into an arbitrary pool.
-            if (plan.ops[i].flags & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V2_DIRECT) != 0) {
+            if (plan.ops[i].flags & GenericSequenceLib.FLAG_DIRECT_ANY != 0) {
                 continue;
             }
             if (!allowedTargets[plan.ops[i].target]) revert TargetNotAllowed();
@@ -389,7 +389,11 @@ contract ArbExecutor is
         // risk documented on the loanToken cap in `GenericSequenceLib`
         // (up to `loanAmount` per tx through an adversarial pool). The owner
         // sizes the inventory with that in mind; `withdraw` drains it.
-        if (IERC20(plan.loanToken).balanceOf(address(this)) >= plan.loanAmount) {
+        // SELF-FUNDED path: a sequence whose first op is a FLASH swap gets its
+        // principal from that pool (paid back at the end of the sequence out
+        // of the cycle's proceeds), so neither a loan nor inventory is needed.
+        bool selfFunded = plan.ops[0].flags & (GenericSequenceLib.FLAG_V3_FLASH | GenericSequenceLib.FLAG_V2_FLASH) != 0;
+        if (selfFunded || IERC20(plan.loanToken).balanceOf(address(this)) >= plan.loanAmount) {
             _setPhase(true);
             _runArbPipeline(plan, 0, address(this), keccak256(planData));
             _setPhase(false);
@@ -554,16 +558,50 @@ contract ArbExecutor is
         return "";
     }
 
-    // ─── Direct V3 pool swaps: the pool pulls its input through here ───
-    /// @dev Called by a V3-style pool mid-`swap` for a `FLAG_V3_DIRECT` op.
-    /// Pays only the pool the sequence is armed for, once, never more than
-    /// the op's amount (DirectSwapLib). Pancake V3 pools use the second name.
-    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
-        DirectSwapLib.payV3Callback(amount0Delta, amount1Delta);
+    // ─── Direct / flash pool swaps: the pool pulls its input through here ───
+    /// @dev Called by a V3-style pool mid-`swap`. Empty data = a
+    /// `FLAG_V3_DIRECT` op: pay now, only the armed pool, never more than the
+    /// op's amount. Non-empty data = a `FLAG_V3_FLASH` op: the data is the
+    /// rest of the sequence (verified by hash), which runs HERE, and the pool
+    /// is paid last out of what it produced (DirectSwapLib). Pancake V3
+    /// pools use the second name.
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _v3Callback(amount0Delta, amount1Delta, data);
     }
 
-    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
-        DirectSwapLib.payV3Callback(amount0Delta, amount1Delta);
+    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _v3Callback(amount0Delta, amount1Delta, data);
+    }
+
+    function _v3Callback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) private {
+        if (data.length == 0) {
+            DirectSwapLib.payV3Callback(amount0Delta, amount1Delta);
+            return;
+        }
+        (address tokenIn, uint256 maxOwed) = DirectSwapLib.beginContinuation(data);
+        address pool = msg.sender;
+        GenericSequenceLib.continueOps(data, DirectSwapLib.receivedV3(amount0Delta, amount1Delta));
+        DirectSwapLib.settleV3(pool, amount0Delta, amount1Delta, tokenIn, maxOwed);
+    }
+
+    /// @dev Called by a V2-style pair mid-`swap` for a `FLAG_V2_FLASH` op
+    /// (pairs only call back when the swap carries data). Same continuation
+    /// as V3; the pair is then sent exactly the op's input and applies its
+    /// own K check. Pancake V2 pairs use the second name.
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _v2Callback(sender, amount0, amount1, data);
+    }
+
+    function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _v2Callback(sender, amount0, amount1, data);
+    }
+
+    function _v2Callback(address sender, uint256 amount0, uint256 amount1, bytes calldata data) private {
+        if (sender != address(this)) revert InvalidCallbackCaller();
+        (address tokenIn, uint256 owed) = DirectSwapLib.beginContinuation(data);
+        address pair = msg.sender;
+        GenericSequenceLib.continueOps(data, amount0 > 0 ? amount0 : amount1);
+        DirectSwapLib.settleV2(pair, tokenIn, owed);
     }
 
     // ─── Pipeline (inside flash) ─────────────────────────────────────
@@ -582,8 +620,10 @@ contract ArbExecutor is
         // is simply the balance delta.
         bool inventory = vault == address(this);
 
-        // Verify the flash actually arrived (or the inventory covers it).
-        if (IERC20(loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
+        // Verify the flash actually arrived. On the inventory path `execute`
+        // already saw the balance cover it — or the first op is a flash swap
+        // that supplies its own principal — so the check is the loan path's.
+        if (!inventory && IERC20(loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
         // Snapshot loanToken BEFORE the sequence runs. For arb the flash
         // principal has already arrived (checked above), so this baseline

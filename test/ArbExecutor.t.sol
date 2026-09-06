@@ -18,7 +18,7 @@ import {MockBalancerVault} from "./mocks/MockBalancerVault.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockParaswapAugustus} from "./mocks/MockParaswapAugustus.sol";
 import {MockRouter} from "./support/Mocks.sol";
-import {MockUniV3Pool, MockUniV2Pair} from "./mocks/MockDirectPools.sol";
+import {MockUniV3Pool, MockUniV2Pair, TamperingV3Pool} from "./mocks/MockDirectPools.sol";
 import {DirectSwapLib} from "../src/libraries/DirectSwapLib.sol";
 
 contract MockWETH is MockERC20 {
@@ -906,6 +906,122 @@ contract ArbExecutorTest is Test {
         vm.prank(operatorAddr);
         vm.expectRevert(GenericSequenceLib.InvalidPlan.selector);
         exec.execute(plan);
+    }
+
+    // ─── Flash swaps: the pool funds the cycle, paid last from the proceeds ───
+
+    function _flashV3Op(address pool, address src, address dst, bool zeroForOne, uint256 amountIn, uint32 extra)
+        internal
+        pure
+        returns (Op memory op)
+    {
+        op = _directV3Op(pool, src, dst, zeroForOne, amountIn, extra);
+        op.flags = GenericSequenceLib.FLAG_V3_FLASH | extra;
+    }
+
+    /// No inventory, no loan: the first pool pays B out first, the second op
+    /// turns B back into A inside the first pool's callback, and the first
+    /// pool is paid its A last. The flash provider is never called.
+    function test_flashV3_selfFunded_cycle_no_loan_no_inventory() public {
+        // Two pools: a real V3 pool holds a reentrancy lock for the whole
+        // swap, so the continuation can never trade on the pool it is
+        // inside of (the mock has no lock, but its balance check would then
+        // measure across the nested swap).
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool2), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        assertEq(tokenA.balanceOf(address(exec)), 0, "starts with nothing");
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 0);
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertEq(tokenA.balanceOf(address(exec)), 210e18, "profit kept, principal came from the pool");
+    }
+
+    /// A flash swap whose continuation holds another flash swap: the inner
+    /// pool is paid inside the outer callback, the outer pool last.
+    function test_flashV3_nested_flash_in_continuation() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _flashV3Op(
+            address(pool2), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertEq(tokenA.balanceOf(address(exec)), 210e18, "profit kept");
+    }
+
+    /// V2 flash swap: the pair pays ~1970 B first, the continuation sells B
+    /// for A on the second pair, the first pair is sent its 1000 A last and
+    /// runs its own K check.
+    function test_flashV2_selfFunded_cycle() public {
+        MockUniV2Pair cheapB = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        tokenA.mint(address(cheapB), 100 * LOAN_AMOUNT);
+        tokenB.mint(address(cheapB), 200 * LOAN_AMOUNT);
+        cheapB.sync();
+        MockUniV2Pair cheapA = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        tokenA.mint(address(cheapA), 200 * LOAN_AMOUNT);
+        tokenB.mint(address(cheapA), 100 * LOAN_AMOUNT);
+        cheapA.sync();
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV2Op(address(cheapB), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[0].flags = GenericSequenceLib.FLAG_V2_FLASH;
+        ops[1] = _directV2Op(
+            address(cheapA), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 0);
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertGt(tokenA.balanceOf(address(exec)), 2_500e18, "profit kept, principal came from the pair");
+    }
+
+    /// A pool that hands back a tampered continuation cannot make the
+    /// executor run anything but the plan: the hash check refuses it.
+    function test_flashV3_tampered_continuation_reverts() public {
+        TamperingV3Pool bad = new TamperingV3Pool(address(tokenA), address(tokenB));
+        tokenB.mint(address(bad), 10 * LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(bad), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(_v3Pool()), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(DirectSwapLib.DirectSwapContinuationMismatch.selector);
+        exec.execute(plan);
+    }
+
+    /// A losing flash cycle reverts at the pool's own settlement: the
+    /// continuation produced less A than the pool is owed.
+    function test_flashV3_losing_cycle_reverts() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool losing = new MockUniV3Pool(address(tokenA), address(tokenB), 0.8e18);
+        tokenA.mint(address(losing), 10 * LOAN_AMOUNT);
+        tokenB.mint(address(losing), 10 * LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(losing), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        exec.execute(plan);
+        assertEq(tokenA.balanceOf(address(exec)), 0, "nothing lost");
     }
 
     // ─── Inventory path (no flash when the principal is already held) ───

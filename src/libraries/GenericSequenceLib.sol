@@ -138,8 +138,17 @@ library GenericSequenceLib {
     /// The executor sends `amount` to the pair and asks for what the reserve
     /// formula yields. Not allowlisted either.
     uint32 internal constant FLAG_V2_DIRECT = 1 << 7;
+    /// FLASH variants of the two direct swaps: the pool pays its output first,
+    /// the REST of the sequence runs inside the pool's callback, and the
+    /// pool's input is paid at the end out of the cycle's proceeds — the
+    /// competitor's funding model: no flash loan, no standing inventory. Same
+    /// `target`/`callData` shape as the DIRECT flags. `ArbExecutor` treats a
+    /// sequence whose FIRST op is a flash swap as self-funded (no loan at all).
+    uint32 internal constant FLAG_V3_FLASH = 1 << 8;
+    uint32 internal constant FLAG_V2_FLASH = 1 << 9;
+    uint32 internal constant FLAG_DIRECT_ANY = FLAG_V3_DIRECT | FLAG_V2_DIRECT | FLAG_V3_FLASH | FLAG_V2_FLASH;
     uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK
-        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN | FLAG_V3_DIRECT | FLAG_V2_DIRECT;
+        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN | FLAG_DIRECT_ANY;
     uint16 internal constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     /// @dev `LiquidationExecutor` storage slots for the V4 unlock arming
@@ -305,9 +314,38 @@ library GenericSequenceLib {
             }
         }
 
-        uint256 prevReturn = 0;
+        _runOps(ops, 0, 0, capToken, capAmount, weth);
 
-        for (uint256 i = 0; i < n; ++i) {
+        _finishOps(loanToken, loanBefore, flashRepayAmount, repayGate, capToken, capAmount, snapTok, snapBal, nSnap);
+    }
+
+    /// @notice Continue a sequence from inside a FLASH-swap callback: the
+    /// remaining ops packed by `_runOps`, chained off `received` (what the
+    /// pool paid out first). Delegatecalled by the executor's callback, which
+    /// has already verified the bytes against the armed hash
+    /// (`DirectSwapLib.beginContinuation`). The end-of-sequence gates run in
+    /// the frame that started the flash swap, after `swap` returns.
+    function continueOps(bytes calldata cont, uint256 received) external {
+        (Op[] memory rest, address capToken, uint256 capAmount, address weth,,) =
+            abi.decode(cont, (Op[], address, uint256, address, address, uint256));
+        uint256 last = _runOps(rest, 0, received, capToken, capAmount, weth);
+        DirectSwapLib.setLastReturn(last);
+    }
+
+    /// @dev The op loop proper, from `start`, chaining off `prevReturn`.
+    /// Returns the last op's output. A FLASH op runs every op after it inside
+    /// the pool's callback (see `continueOps`) and returns what that
+    /// continuation produced.
+    function _runOps(
+        Op[] memory ops,
+        uint256 start,
+        uint256 prevReturn,
+        address capToken,
+        uint256 capAmount,
+        address weth
+    ) private returns (uint256) {
+        uint256 n = ops.length;
+        for (uint256 i = start; i < n; ++i) {
             Op memory op = ops[i];
             // The raw `op.value` struct field stays hard-0 for EVERY op,
             // including `FLAG_NATIVE_IN` ones — that flag forwards value via
@@ -350,12 +388,14 @@ library GenericSequenceLib {
             // Direct pool swaps: an ERC20 input, no calldata patching (the
             // amount goes to the pool as a typed argument), none of the flags
             // that reinterpret `amount` or the op shape, and not both at once.
-            if (op.flags & (FLAG_V3_DIRECT | FLAG_V2_DIRECT) != 0) {
+            if (op.flags & FLAG_DIRECT_ANY != 0) {
                 if (op.srcToken == address(0)) revert InvalidPlan();
                 if (op.flags & (FLAG_V4_UNLOCK | FLAG_NATIVE_IN | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN) != 0) {
                     revert InvalidPlan();
                 }
-                if (op.flags & FLAG_V3_DIRECT != 0 && op.flags & FLAG_V2_DIRECT != 0) revert InvalidPlan();
+                // Exactly one of the four direct/flash bits.
+                uint32 direct = op.flags & FLAG_DIRECT_ANY;
+                if (direct & (direct - 1) != 0) revert InvalidPlan();
                 if (op.fromAmountPos != 0 || op.returnAmountPos != 0) revert InvalidPlan();
             }
 
@@ -396,6 +436,29 @@ library GenericSequenceLib {
                 amount = bal < capAmount ? bal : capAmount;
             } else if (op.flags & FLAG_USE_PREV_RETURN != 0) {
                 amount = prevReturn;
+            }
+
+            if (op.flags & (FLAG_V3_FLASH | FLAG_V2_FLASH) != 0) {
+                // ── Flash swap: the pool pays out first and asks for its input
+                // through the executor's callback; the REST of the sequence
+                // runs inside that callback and the input is paid at its end,
+                // out of the cycle's own proceeds. Nothing is borrowed, nothing
+                // is held. The remaining ops travel in the swap's `data`, are
+                // verified by hash on the way back and run through
+                // `continueOps`; this frame then returns what they produced.
+                // Their per-op checks run in the callback; the repay gate and
+                // the containment cap run once, after `swap` returns.
+                Op[] memory rest = new Op[](n - i - 1);
+                for (uint256 k = i + 1; k < n; ++k) {
+                    rest[k - i - 1] = ops[k];
+                }
+                bytes memory cont = abi.encode(rest, capToken, capAmount, weth, op.srcToken, amount);
+                if (op.flags & FLAG_V3_FLASH != 0) {
+                    DirectSwapLib.flashV3(op.target, amount, op.callData, cont);
+                } else {
+                    DirectSwapLib.flashV2(op.target, amount, op.callData, cont);
+                }
+                return DirectSwapLib.takeLastReturn();
             }
 
             uint256 outBefore = _balOf(op.outToken);
@@ -572,7 +635,23 @@ library GenericSequenceLib {
             if (outDelta == 0) revert OpOutputNotReceived(i);
             prevReturn = outDelta;
         }
+        return prevReturn;
+    }
 
+    /// @dev End-of-sequence gates: the repay gate and the per-srcToken
+    /// containment cap, against the snapshots `_executeOps` took before the
+    /// first op.
+    function _finishOps(
+        address loanToken,
+        uint256 loanBefore,
+        uint256 flashRepayAmount,
+        RepayGate repayGate,
+        address capToken,
+        uint256 capAmount,
+        address[] memory snapTok,
+        uint256[] memory snapBal,
+        uint256 nSnap
+    ) private view {
         // Repay leg gate (mirrors the split/mixed-split repay assertion).
         uint256 loanAfter = IERC20(loanToken).balanceOf(address(this));
         if (repayGate == RepayGate.Delta) {

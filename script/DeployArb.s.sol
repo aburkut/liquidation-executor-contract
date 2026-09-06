@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {ArbExecutor} from "../src/ArbExecutor.sol";
+import {ArbExecutorSeeded} from "../src/deploy/SeededExecutors.sol";
 
 /// @title ArbExecutor deploy
 /// @notice Deploys `ArbExecutor` fully configured. Nothing needs to be called
@@ -62,6 +63,30 @@ contract DeployArb is Script {
     /// so the bot encodes it exactly like Uniswap V3.
     address constant PANCAKE_V3_SWAP_ROUTER = 0x1b81D678ffb9C0263b24A97847620C99d213eB14;
 
+    // ─── Everything the owner added to the LIVE executor after its deploy ───
+    // Read back from the contract's own events (AllowedTargetUpdated,
+    // V4HookAllowedUpdated, OperatorUpdated on 0xfC127EB8…, blocks
+    // 25734276..25919383 via scripts/executor_config_events.py in the bot
+    // repo) on 2026-09-06, so a redeploy needs NO admin call afterwards.
+    /// V2 fork routers (bot: dex/uniswap_v2_quoter/forks.rs).
+    address constant SUSHI_V2_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+    address constant PANCAKE_V2_ROUTER = 0xEfF92A263d31888d860bD50809A8D171709b7b1c;
+    address constant SHIBASWAP_ROUTER = 0x03f7724180AA6b939894B5Ca4314783B0b36b329;
+    /// 1inch Limit Order Protocol v4 (fillOrderArgs).
+    address constant ONEINCH_LOP = 0x111111125421cA6dc452d289314280a0f8842A65;
+    /// Hashflow router (bot: execution/hashflow.rs).
+    address constant HASHFLOW_ROUTER = 0x55084eE0fEf03f14a305cd24286359A35D735151;
+    /// Ekubo router (bot: dex/ekubo/encoder.rs).
+    address constant EKUBO_ROUTER = 0xd26f20001a72a18C002b00e6710000d68700ce00;
+    /// Swaap router (memory: project_swaap_book_measured).
+    address constant SWAAP_ROUTER = 0xd315a9C38eC871068FEC378E4Ce78AF528C76293;
+    /// V4 hooks the bot is allowed to swap through (bot: dex/uniswap_v4_quoter/hook_fee.rs).
+    address constant LAUNCH_HOOK = 0xAFeD2c6e0d906520ca17143a8918Ce6d54b128Cc;
+    address constant LBP_MIGRATION_HOOK = 0xd53006d1e3110fD319a79AEEc4c527a0d265E080;
+    /// The two extra operator keys (independent nonce streams).
+    address constant OPERATOR_2 = 0x25f4c6C1e5Cc564071A1DC1768a1f1ff0BA9d5a1;
+    address constant OPERATOR_3 = 0xf4Bb8842dd662c8edDed051e66376937E308B905;
+
     /// Fluid pools read from `DexReservesResolver.getAllPoolAddresses()` at
     /// block 25_718_394. Asserted below so a changed set is loud.
     uint256 constant FLUID_POOL_COUNT = 48;
@@ -120,7 +145,14 @@ contract DeployArb is Script {
         // Non-Fluid targets. Balancer Vault, Paraswap, the V2 router and the
         // V3 router are seeded by the constructor itself, so they are absent
         // here and asserted below all the same.
-        address[] memory extra = new address[](7);
+        address[] memory extra = new address[](14);
+        extra[7] = SUSHI_V2_ROUTER;
+        extra[8] = PANCAKE_V2_ROUTER;
+        extra[9] = SHIBASWAP_ROUTER;
+        extra[10] = ONEINCH_LOP;
+        extra[11] = HASHFLOW_ROUTER;
+        extra[12] = EKUBO_ROUTER;
+        extra[13] = SWAAP_ROUTER;
         extra[0] = WETH; // FLAG_NATIVE_IN closes a native cycle via WETH9.deposit
         extra[1] = UNI_V4_POOL_MANAGER;
         extra[2] = V4_UNIVERSAL_ROUTER;
@@ -142,8 +174,24 @@ contract DeployArb is Script {
         // PRIVATE_KEY and falls back to Foundry's default sender, so the
         // documented invocation simulated fine and then refused to broadcast.
         vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
-        ArbExecutor exec = new ArbExecutor(
-            OWNER, OPERATOR, WETH, BALANCER_VAULT, MORPHO_BLUE, PARASWAP_AUGUSTUS, UNI_V2_ROUTER, UNI_V3_ROUTER, allowed
+        address[] memory operators = new address[](2);
+        operators[0] = OPERATOR_2;
+        operators[1] = OPERATOR_3;
+        address[] memory hooks = new address[](2);
+        hooks[0] = LAUNCH_HOOK;
+        hooks[1] = LBP_MIGRATION_HOOK;
+        ArbExecutor exec = new ArbExecutorSeeded(
+            OWNER,
+            OPERATOR,
+            WETH,
+            BALANCER_VAULT,
+            MORPHO_BLUE,
+            PARASWAP_AUGUSTUS,
+            UNI_V2_ROUTER,
+            UNI_V3_ROUTER,
+            allowed,
+            operators,
+            hooks
         );
         vm.stopBroadcast();
 
@@ -159,6 +207,8 @@ contract DeployArb is Script {
         require(exec.allowedTargets(UNI_V2_ROUTER), "readback: v2 router");
         require(exec.allowedTargets(UNI_V3_ROUTER), "readback: v3 router");
         require(exec.operators(OPERATOR), "readback: operator armed");
+        require(exec.operators(OPERATOR_2) && exec.operators(OPERATOR_3), "readback: extra operators armed");
+        require(exec.allowedV4Hooks(LAUNCH_HOOK) && exec.allowedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks");
         require(exec.owner() == OWNER, "readback: owner");
 
         console2.log("ArbExecutor:", address(exec));

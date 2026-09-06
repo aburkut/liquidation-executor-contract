@@ -715,6 +715,13 @@ contract LiquidationExecutor is
                 // shape), so there is nothing to allowlist. Exempt them from the
                 // target gate; every other op's target must be allowlisted.
                 if (plan.swapPlan.ops[i].flags & GenericSequenceLib.FLAG_WETH_UNWRAP != 0) continue;
+                // FLASH swaps run the rest of the sequence inside a pool
+                // callback; this executor only implements the immediate-pay
+                // callbacks (size budget), so a flash op cannot run here.
+                if (
+                    plan.swapPlan.ops[i].flags & (GenericSequenceLib.FLAG_V3_FLASH | GenericSequenceLib.FLAG_V2_FLASH)
+                        != 0
+                ) revert InvalidPlan();
                 // Direct pool swaps name the pool itself: permissionless and
                 // bounded by construction (DirectSwapLib), not allowlisted.
                 if (

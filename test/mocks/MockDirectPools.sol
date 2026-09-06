@@ -7,6 +7,40 @@ interface IV3SwapCallback {
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external;
 }
 
+interface IV2Callee {
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external;
+}
+
+/// @dev A V3 "pool" that tampers with the flash-swap continuation it hands
+/// back: one byte flipped. The executor must refuse to run it.
+contract TamperingV3Pool {
+    address public token0;
+    address public token1;
+
+    constructor(address _token0, address _token1) {
+        token0 = _token0;
+        token1 = _token1;
+    }
+
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata data)
+        external
+        returns (int256, int256)
+    {
+        uint256 amountIn = uint256(amountSpecified);
+        (address tokenIn, address tokenOut) = zeroForOne ? (token0, token1) : (token1, token0);
+        IERC20(tokenOut).transfer(recipient, amountIn);
+        bytes memory forged = data;
+        forged[forged.length - 1] ^= 0x01;
+        if (zeroForOne) {
+            IV3SwapCallback(msg.sender).uniswapV3SwapCallback(int256(amountIn), -int256(amountIn), forged);
+        } else {
+            IV3SwapCallback(msg.sender).uniswapV3SwapCallback(-int256(amountIn), int256(amountIn), forged);
+        }
+        tokenIn;
+        return (0, 0);
+    }
+}
+
 /// @dev V3-style pool mock: pays `amountIn * rate / 1e18` of the other token
 /// and asks the caller for the input through the canonical callback. Token
 /// order (token0 < token1) is whatever the constructor says, as on-chain.
@@ -92,10 +126,13 @@ contract MockUniV2Pair {
         return (reserve0, reserve1, 0);
     }
 
-    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata) external {
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external {
         require(amount0Out > 0 || amount1Out > 0, "mock: no output");
         if (amount0Out > 0) IERC20(token0).transfer(to, amount0Out);
         if (amount1Out > 0) IERC20(token1).transfer(to, amount1Out);
+        // As on-chain: a swap carrying data is a flash swap — call back before
+        // the K check, the callee pays inside the callback.
+        if (data.length > 0) IV2Callee(to).uniswapV2Call(msg.sender, amount0Out, amount1Out, data);
         uint256 balance0 = IERC20(token0).balanceOf(address(this));
         uint256 balance1 = IERC20(token1).balanceOf(address(this));
         uint256 amount0In = balance0 > reserve0 - amount0Out ? balance0 - (reserve0 - amount0Out) : 0;
