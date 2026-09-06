@@ -24,6 +24,13 @@ jobs:
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pinned to the build the local gate runs (`forge --version`).
+          # Unpinned, the action installs the latest nightly, whose
+          # formatter drifted on 2026-09-06 and failed `forge fmt --check`
+          # on code that was byte-identical to a green main. A formatter
+          # is part of the toolchain; CI and the local gate must share it.
+          version: nightly-5e88010a83d1b87b8f4d13058e42a2949d3e9dc0
 
       - name: Show Forge version
         run: forge --version
