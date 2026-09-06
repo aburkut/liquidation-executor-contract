@@ -127,18 +127,7 @@ library BalancerV2Lib {
     error ZeroSwapOutput();
     error InvalidPlan();
 
-    // ─── Event ───────────────────────────────────────────────────────
-    /// @dev Mirror of LiquidationExecutor's `BalancerV2SwapExecuted` so
-    /// the emit fires from the executor's address with the canonical
-    /// topic hash. `poolId` is indexed for filtering by venue.
-    event BalancerV2SwapExecuted(
-        bytes32 indexed poolId,
-        address indexed srcToken,
-        address indexed dstToken,
-        uint256 amountIn,
-        uint256 amountOut,
-        uint8 kind
-    );
+    // Per-leg swap event dropped 2026-09-06 (unread off-chain; 1.5-2.5k gas).
 
     /// @dev Single entrypoint for BAL_V2 (SELL) and BAL_V2_BUY. The
     /// caller's `mode` field selects SwapKind.
@@ -188,8 +177,6 @@ library BalancerV2Lib {
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit BalancerV2SwapExecuted(poolId, leg.srcToken, leg.repayToken, amountIn, received, uint8(kind));
     }
 
     // ─── Multihop entrypoint ─────────────────────────────────────────
@@ -271,6 +258,5 @@ library BalancerV2Lib {
         // poolId slot in the event = poolId of the FIRST hop (the entry
         // pool). Full hop sequence lives in the call's `swaps` array
         // (off-chain consumers parse the calldata).
-        emit BalancerV2SwapExecuted(swaps[0].poolId, leg.srcToken, leg.repayToken, consumed, received, uint8(kind));
     }
 }

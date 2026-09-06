@@ -1024,6 +1024,98 @@ contract ArbExecutorTest is Test {
         assertEq(tokenA.balanceOf(address(exec)), 0, "nothing lost");
     }
 
+    // ─── Packed plans: the same plan in ~100 bytes per op ───
+
+    function _pack(uint8 provider, address loanToken, uint256 loanAmount, uint256 minProfit, Op[] memory ops)
+        internal
+        pure
+        returns (bytes memory b)
+    {
+        b = abi.encodePacked(
+            uint8(1), provider, loanToken, uint128(loanAmount), uint128(minProfit), uint128(0), uint8(ops.length)
+        );
+        for (uint256 i = 0; i < ops.length; ++i) {
+            Op memory op = ops[i];
+            b = abi.encodePacked(
+                b,
+                op.target,
+                uint16(op.flags),
+                uint128(op.amountIn),
+                uint16(op.fromAmountPos),
+                uint16(op.returnAmountPos),
+                op.srcToken,
+                op.outToken
+            );
+            if (op.flags & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V3_FLASH) != 0) {
+                (bool z, uint160 lim) = abi.decode(op.callData, (bool, uint160));
+                b = abi.encodePacked(b, uint8(z ? 1 : 0), lim);
+            } else if (op.flags & (GenericSequenceLib.FLAG_V2_DIRECT | GenericSequenceLib.FLAG_V2_FLASH) != 0) {
+                (bool z, uint16 fee) = abi.decode(op.callData, (bool, uint16));
+                b = abi.encodePacked(b, uint8(z ? 1 : 0), fee);
+            } else {
+                b = abi.encodePacked(b, uint16(op.callData.length), op.callData);
+            }
+        }
+    }
+
+    /// The packed form of the self-funded flash cycle executes identically to
+    /// its ABI form and is an order of magnitude smaller on the wire.
+    function test_executePacked_matches_execute_and_is_small() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool2), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory abiPlan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+        bytes memory packed = _pack(3, address(tokenA), LOAN_AMOUNT, 100e18, ops);
+        assertLt(packed.length, 300, "packed plan must be small");
+        assertGt(abiPlan.length, 1_000, "ABI plan is the big one");
+
+        vm.prank(operatorAddr);
+        exec.executePacked(packed);
+        assertEq(tokenA.balanceOf(address(exec)), 210e18, "same profit as execute");
+    }
+
+    /// A router op (raw calldata) survives the packed round trip too.
+    function test_executePacked_router_op_round_trip() public {
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory packed = _pack(3, address(tokenA), LOAN_AMOUNT, 100e18, ops);
+
+        uint256 before = tokenA.balanceOf(address(exec));
+        vm.prank(operatorAddr);
+        exec.executePacked(packed);
+        assertEq(tokenA.balanceOf(address(exec)) - before, 210e18, "profit retained");
+    }
+
+    function test_executePacked_rejects_malformed() public {
+        Op[] memory ops = new Op[](1);
+        ops[0] = _directV3Op(address(_v3Pool()), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        bytes memory packed = _pack(3, address(tokenA), LOAN_AMOUNT, 0, ops);
+
+        bytes memory wrongVersion = packed;
+        wrongVersion[0] = 0x02;
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.PackedPlanMalformed.selector);
+        exec.executePacked(wrongVersion);
+
+        bytes memory trailing = abi.encodePacked(packed, uint8(0));
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.PackedPlanMalformed.selector);
+        exec.executePacked(trailing);
+
+        bytes memory truncated = new bytes(packed.length - 1);
+        for (uint256 i = 0; i < truncated.length; ++i) {
+            truncated[i] = packed[i];
+        }
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.PackedPlanMalformed.selector);
+        exec.executePacked(truncated);
+    }
+
     // ─── Inventory path (no flash when the principal is already held) ───
 
     /// Holding the principal, the cycle runs off the balance: the flash

@@ -81,15 +81,19 @@ library DirectSwapLib {
     /// callback. `data` = `abi.encode(bool zeroForOne, uint160 sqrtPriceLimitX96)`;
     /// a zero limit means "no limit". Output lands on `address(this)`; the
     /// caller checks the delta.
-    function swapV3(address pool, address tokenIn, uint256 amount, bytes memory data) internal {
+    function swapV3(address pool, address tokenIn, uint256 amount, bytes memory data)
+        internal
+        returns (uint256 received)
+    {
         (bool zeroForOne, uint160 limit) = _v3Params(amount, data);
         assembly ("memory-safe") {
             tstore(POOL_TSLOT, pool)
             tstore(TOKENIN_TSLOT, tokenIn)
             tstore(MAX_TSLOT, amount)
         }
-        IUniV3PoolMinimal(pool).swap(address(this), zeroForOne, int256(amount), limit, "");
+        (int256 d0, int256 d1) = IUniV3PoolMinimal(pool).swap(address(this), zeroForOne, int256(amount), limit, "");
         _disarm();
+        received = receivedV3(d0, d1);
     }
 
     /// @notice Body of an IMMEDIATE `uniswapV3SwapCallback` (empty data): pay
@@ -118,8 +122,9 @@ library DirectSwapLib {
     /// numerator is the surviving share of the input out of 1000 — the same
     /// `fee_numerator` the bot's V2 fork table quotes with (997 Uniswap /
     /// Sushi, 998 Pancake V2), so quote and execution agree to the wei.
-    function swapV2(address pair, address tokenIn, uint256 amount, bytes memory data) internal {
-        (bool zeroForOne, uint256 out) = _v2Out(pair, amount, data);
+    function swapV2(address pair, address tokenIn, uint256 amount, bytes memory data) internal returns (uint256 out) {
+        bool zeroForOne;
+        (zeroForOne, out) = _v2Out(pair, amount, data);
         IERC20(tokenIn).safeTransfer(pair, amount);
         if (zeroForOne) {
             IUniV2PairMinimal(pair).swap(0, out, address(this), "");

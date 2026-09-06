@@ -55,11 +55,7 @@ library SwapLegExecutorLib {
     error BebopPartialFillOffsetOutOfRange();
     error TargetNotAllowed();
 
-    // ─── Events (match LiquidationExecutor signatures; emitted under DELEGATECALL) ──
-    event ParaswapSwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
-    event BebopSwapExecuted(
-        address indexed target, address indexed srcToken, uint256 amountIn, uint256 repayDelta, uint256 profitDelta
-    );
+    // Per-leg swap events dropped 2026-09-06 (unread off-chain; 1.5-2.5k gas each).
 
     // ─── Paraswap single leg ─────────────────────────────────────────
     /// @dev Orchestrates decode → approve → call → reset → delta check.
@@ -110,8 +106,6 @@ library SwapLegExecutorLib {
         // intended `leg.minAmountOut` as a hard floor. Now both bind.
         if (amountOut < minAmountOut) revert InsufficientRepayOutput(amountOut, minAmountOut);
         if (amountOut < leg.minAmountOut) revert InsufficientRepayOutput(amountOut, leg.minAmountOut);
-
-        emit ParaswapSwapExecuted(srcToken, dstToken, actualIn, amountOut);
     }
 
     // ─── Bebop multi leg ─────────────────────────────────────────────
@@ -158,8 +152,6 @@ library SwapLegExecutorLib {
         uint256 repayAfter = IERC20(leg.repayToken).balanceOf(address(this));
         uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
         if (repayDelta < leg.minAmountOut) revert InsufficientRepayOutput(repayDelta, leg.minAmountOut);
-
-        emit BebopSwapExecuted(target, leg.srcToken, fill, repayDelta, 0);
     }
 
     /// @dev Overwrite the taker amount inside a signed Bebop order.

@@ -36,8 +36,8 @@ library CoinbasePaymentLib {
     error CoinbaseExceedsProfit(uint256 coinbase, uint256 profit);
     error InsufficientProfit(uint256 realized, uint256 min);
 
-    // ─── Event (mirror LiquidationExecutor signature) ───────────────
-    event CoinbasePaid(address indexed coinbase, uint256 amount);
+    // CoinbasePaid event dropped 2026-09-06: unread off-chain (the bribe is
+    // measured from the coinbase transfer itself), ~1.5k gas per execution.
 
     /// @dev Gas limit on coinbase ETH transfers. Small bound keeps a
     /// malicious block.coinbase from grinding gas in the callback. ETH
@@ -69,8 +69,6 @@ library CoinbasePaymentLib {
 
         (bool success,) = block.coinbase.call{value: amount, gas: COINBASE_CALL_GAS}("");
         if (!success) revert CoinbasePaymentFailed();
-
-        emit CoinbasePaid(block.coinbase, amount);
     }
 
     /// @dev Realized on-chain profit net of the flashloan obligation,

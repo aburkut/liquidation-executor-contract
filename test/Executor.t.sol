@@ -2487,8 +2487,6 @@ contract ExecutorTest is Test {
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
         vm.prank(operatorAddr);
-        vm.expectEmit(true, true, false, true);
-        emit LiquidationExecutor.FlashExecuted(2, address(loanToken), LOAN_AMOUNT);
         executor.execute(plan);
     }
 
@@ -2607,8 +2605,6 @@ contract ExecutorTest is Test {
             swapPlan
         );
         vm.prank(operatorAddr);
-        vm.expectEmit(true, true, true, true);
-        emit LiquidationExecutor.LiquidationExecuted(3, address(collateralToken), address(loanToken), 500e18);
         executor.execute(plan);
     }
 
@@ -4330,10 +4326,10 @@ contract ExecutorTest is Test {
         uint256 bps = 100;
         uint256 expected = WETH_REALIZED_PROFIT * bps / 10_000;
 
+        uint256 cbBefore = coinbase.balance;
         vm.prank(operatorAddr);
-        vm.expectEmit(true, false, false, true);
-        emit LiquidationExecutor.CoinbasePaid(coinbase, expected);
         executor.execute{value: bps}(_buildWethPlan(2, _wethLiqAction(400e18), 0));
+        assertEq(coinbase.balance - cbBefore, expected, "coinbase paid (event dropped, balance is the proof)");
     }
 
     function test_coinbasePayment_balancerProvider() public {
@@ -9396,10 +9392,6 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             _defaultLiqAction(500e18),
             _curveV1SinglePlan(SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
         );
-        vm.expectEmit(true, true, true, false);
-        emit LiquidationExecutor.CurveV1SwapExecuted(
-            address(curveV1Mock), address(collateralToken), address(loanToken), 0, 0
-        );
         vm.prank(operatorAddr);
         executor.execute(plan);
     }
@@ -9561,10 +9553,6 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             FLASH_FEE,
             _defaultLiqAction(500e18),
             _balancerV2SinglePlan(SwapMode.BAL_V2, DEFAULT_SWAP_AMOUNT, 1)
-        );
-        vm.expectEmit(true, true, true, false);
-        emit LiquidationExecutor.BalancerV2SwapExecuted(
-            bytes32(uint256(0xdeadbeef)), address(collateralToken), address(loanToken), 0, 0, 0
         );
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -10675,8 +10663,6 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             minProfitAmount: 0
         });
         bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
-        vm.expectEmit(true, true, true, false);
-        emit LiquidationExecutor.BalancerV2SwapExecuted(poolId, address(collateralToken), address(loanToken), 0, 0, 0);
         vm.prank(operatorAddr);
         executor.execute(plan);
     }

@@ -229,9 +229,11 @@ contract LiquidationExecutor is
 
     // ─── State ───────────────────────────────────────────────────────
     address public immutable weth;
-    address public aavePool;
-    address public morphoBlue;
-    address public paraswapAugustusV6;
+    /// @dev Constructor-pinned (no setters): immutables read for free where a
+    /// storage slot cost 2.1k cold on every liquidation / repayment / swap.
+    address public immutable aavePool;
+    address public immutable morphoBlue;
+    address public immutable paraswapAugustusV6;
     address public aaveV2LendingPool;
     /// @dev Immutable — canonical Uniswap V2 Router02 (mainnet
     /// 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D). Auto-whitelisted in
@@ -288,51 +290,15 @@ contract LiquidationExecutor is
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
     // V10+: FlashProviderUpdated dropped — both flash providers
     // (Balancer Vault, Morpho Blue) are now constructor-pinned.
-    event FlashExecuted(uint8 indexed providerId, address indexed loanToken, uint256 loanAmount);
     event RepayExecuted(
         uint8 indexed protocolId, bytes32 indexed positionKeyHash, address indexed asset, uint256 amount
     );
-    event LiquidationExecuted(
-        uint8 indexed protocolId, address indexed collateralAsset, address indexed debtAsset, uint256 debtToCover
-    );
-    event CoinbasePaid(address indexed coinbase, uint256 amount);
     event Rescue(address indexed token, address indexed to, uint256 amount);
-
-    // Swap events
-    event ParaswapSwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
-    event BebopSwapExecuted(
-        address indexed target, address indexed srcToken, uint256 amountIn, uint256 repayDelta, uint256 profitDelta
-    );
-    event UniV2SwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
-    event UniV3SwapExecuted(
-        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
-    );
-    event UniV4SwapExecuted(
-        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
-    );
-    /// @dev Emitted by `CurveV1Lib.executeLeg` under DELEGATECALL.
-    /// `pool` is the StableSwap V1 pool address (or its lending wrapper);
-    /// declared here so the contract's external ABI surfaces the event.
-    event CurveV1SwapExecuted(
-        address indexed pool, address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut
-    );
-    /// @dev Emitted by `BalancerV2Lib.executeLeg` under DELEGATECALL.
-    /// `kind` is the SwapKind enum (0=GIVEN_IN/SELL, 1=GIVEN_OUT/BUY).
-    event BalancerV2SwapExecuted(
-        bytes32 indexed poolId,
-        address indexed srcToken,
-        address indexed dstToken,
-        uint256 amountIn,
-        uint256 amountOut,
-        uint8 kind
-    );
-    event TwoLegSwapExecuted(
-        address indexed intermediateToken,
-        uint256 leg1AmountIn,
-        uint256 intermediateDelta,
-        uint256 leg2AmountIn,
-        uint256 finalRepayDelta
-    );
+    // FlashExecuted, LiquidationExecuted, CoinbasePaid and the per-leg swap
+    // events were dropped 2026-09-06: nothing off-chain read them (the bot
+    // decodes only ArbExecutor.ArbExecuted; Aave's own LiquidationCall and the
+    // pools' events carry the same facts), and together they cost 6-10k gas
+    // per liquidation plus bytecode in a size-constrained contract.
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
     /// @dev V10 audit fix: emitted by `setAllowedTarget` and by the
     /// provider-rotation revocation paths (`setFlashProvider`,
@@ -885,7 +851,6 @@ contract LiquidationExecutor is
 
         _setPlanHash(bytes32(0));
         _setPhase(false);
-        emit FlashExecuted(plan.flashProviderId, plan.loanToken, plan.loanAmount);
     }
 
     // ─── Transient execution state ───────────────────────────────────
@@ -1387,9 +1352,7 @@ contract LiquidationExecutor is
         uint256 repayDelta = finalRepayAfter > finalRepayBefore ? finalRepayAfter - finalRepayBefore : 0;
         if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
 
-        if (plan.hasLeg2) {
-            emit TwoLegSwapExecuted(plan.leg2.srcToken, leg1AmountIn, trackedLeftover, trackedLeftover, repayDelta);
-        }
+        if (plan.hasLeg2) {}
     }
 
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
@@ -1602,7 +1565,6 @@ contract LiquidationExecutor is
         // leg.v4SwapData and the call trace; off-chain consumers
         // recover it from there. Not emitting it here saves a
         // single-hop abi.decode in main (EIP-170 budget).
-        emit UniV4SwapExecuted(tokenIn, tokenOut, 0, consumed, received);
     }
 
     /// @inheritdoc IUnlockCallback
@@ -1706,8 +1668,6 @@ contract LiquidationExecutor is
             .liquidationCall(
                 action.collateralAsset, action.debtAsset, action.user, action.debtToCover, action.receiveAToken
             );
-
-        emit LiquidationExecuted(PROTOCOL_AAVE_V3, action.collateralAsset, action.debtAsset, action.debtToCover);
     }
 
     function _executeAaveV2Liquidation(bytes memory actionData) internal {
@@ -1720,8 +1680,6 @@ contract LiquidationExecutor is
         AllowanceLib.ensure(liq.debtAsset, pool, liq.debtToCover);
         IAaveV2LendingPool(pool)
             .liquidationCall(liq.collateralAsset, liq.debtAsset, liq.user, liq.debtToCover, liq.receiveAToken);
-
-        emit LiquidationExecuted(PROTOCOL_AAVE_V2, liq.collateralAsset, liq.debtAsset, liq.debtToCover);
     }
 
     function _executeMorphoLiquidation(bytes memory actionData) internal {
@@ -1748,10 +1706,6 @@ contract LiquidationExecutor is
 
         // Verify Morpho didn't pull more than the operator authorized
         if (assetsRepaid > liq.maxRepayAssets) revert InsufficientRepayBalance(assetsRepaid, liq.maxRepayAssets);
-
-        emit LiquidationExecuted(
-            PROTOCOL_MORPHO_BLUE, liq.marketParams.collateralToken, liq.marketParams.loanToken, assetsRepaid
-        );
     }
 
     /// @dev Verifies operator-supplied aTokenAddress matches the canonical aToken from the Aave pool.

@@ -72,12 +72,7 @@ library CurveV1Lib {
     error ZeroSwapOutput();
     error InvalidPlan();
 
-    // ─── Event ───────────────────────────────────────────────────────
-    /// @dev Mirror of LiquidationExecutor's `CurveV1SwapExecuted` so the
-    /// emit fires from the executor's address with the canonical topic.
-    event CurveV1SwapExecuted(
-        address indexed pool, address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut
-    );
+    // Per-leg swap event dropped 2026-09-06 (unread off-chain; 1.5-2.5k gas).
 
     // ─── External entrypoint ─────────────────────────────────────────
     /// @dev Single entrypoint for both CURVE_V1 (SELL) and CURVE_V1_BUY.
@@ -122,8 +117,6 @@ library CurveV1Lib {
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit CurveV1SwapExecuted(pool, leg.srcToken, leg.repayToken, amountIn, received);
     }
 
     // ─── Multihop entrypoint ─────────────────────────────────────────
@@ -197,6 +190,5 @@ library CurveV1Lib {
 
         // Pool slot in the event = the router address. The path itself
         // tells off-chain consumers which actual pools were touched.
-        emit CurveV1SwapExecuted(router, leg.srcToken, leg.repayToken, amountIn, received);
     }
 }

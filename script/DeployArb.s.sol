@@ -29,8 +29,9 @@ import {ArbExecutorSeeded} from "../src/deploy/SeededExecutors.sol";
 /// derivable rather than unknowable, and leaving a venue we already quote
 /// unroutable is a worse default than looking it up.
 ///
-/// Usage:
-///   PRIVATE_KEY=<owner> forge script script/DeployArb.s.sol:DeployArb \
+/// Usage (the `arb` profile compiles for runtime gas, not size — ArbExecutor
+/// has 12 KB of EIP-170 headroom; see foundry.toml):
+///   FOUNDRY_PROFILE=arb PRIVATE_KEY=<owner> forge script script/DeployArb.s.sol:DeployArb \
 ///     --rpc-url $ETHEREUM_RPC_URL --broadcast --legacy
 contract DeployArb is Script {
     // ─── Ownership / operation ──────────────────────────────────────

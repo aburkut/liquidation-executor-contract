@@ -461,7 +461,15 @@ library GenericSequenceLib {
                 return DirectSwapLib.takeLastReturn();
             }
 
-            uint256 outBefore = _balOf(op.outToken);
+            // A DIRECT pool swap reports its own output exactly — the V3 pool
+            // returns its deltas, the V2 output is the reserve formula the
+            // pair itself enforces — so the two balanceOf reads around the op
+            // (≈2-4k) are skipped for those. A pool that lied would only make
+            // the NEXT op overspend a balance it does not have and revert; the
+            // containment cap still measures real balances at the end.
+            bool directOut = op.flags & (FLAG_V3_DIRECT | FLAG_V2_DIRECT) != 0;
+            uint256 outBefore = directOut ? 0 : _balOf(op.outToken);
+            uint256 reported;
 
             if (op.flags & FLAG_V4_UNLOCK != 0) {
                 // ── V4 single-hop exact-out via PoolManager unlock ──
@@ -555,11 +563,11 @@ library GenericSequenceLib {
                 // ── Direct V3-style pool swap: no router, no allowance. The
                 // pool pulls `amount` (at most) through the executor's swap
                 // callback; the output-delta check below pins the result.
-                DirectSwapLib.swapV3(op.target, op.srcToken, amount, op.callData);
+                reported = DirectSwapLib.swapV3(op.target, op.srcToken, amount, op.callData);
             } else if (op.flags & FLAG_V2_DIRECT != 0) {
                 // ── Direct V2-style pair swap: send `amount`, take what the
                 // reserve formula yields; the output-delta check below pins it.
-                DirectSwapLib.swapV2(op.target, op.srcToken, amount, op.callData);
+                reported = DirectSwapLib.swapV2(op.target, op.srcToken, amount, op.callData);
             } else if (op.flags & FLAG_NATIVE_IN != 0) {
                 // ── Native-ETH input to a plain payable DEX call ──
                 // srcToken==address(0) and flag-exclusivity are already
@@ -630,6 +638,11 @@ library GenericSequenceLib {
             // this contract. An op whose raw calldata routed output elsewhere
             // produces a zero delta and is rejected. Saturating delta matches
             // the codebase idiom (clean revert instead of a Panic underflow).
+            if (directOut) {
+                if (reported == 0) revert OpOutputNotReceived(i);
+                prevReturn = reported;
+                continue;
+            }
             uint256 outBal = _balOf(op.outToken);
             uint256 outDelta = outBal > outBefore ? outBal - outBefore : 0;
             if (outDelta == 0) revert OpOutputNotReceived(i);

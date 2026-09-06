@@ -114,8 +114,6 @@ contract ArbExecutor is
     event AllowedTargetUpdated(address indexed target, bool allowed);
     // V10+: FlashProviderUpdated dropped — both providers constructor-pinned.
     event Withdraw(address indexed token, address indexed to, uint256 amount);
-    // Mirrors CoinbasePaymentLib.CoinbasePaid for tests that pin the topic.
-    event CoinbasePaid(address indexed coinbase, uint256 amount);
     event V4HookAllowedUpdated(address indexed hook, bool allowed);
     event OperatorUpdated(address indexed operator, bool allowed);
 
@@ -162,7 +160,13 @@ contract ArbExecutor is
     // GenericSequenceLib's pinned V4_PM_SLOT/V4_TOKENIN_SLOT constants (the
     // lib sstores into them via DELEGATECALL). test_v4SlotConstantsMatchLayout
     // is the authority — if it fails, adjust the field order/padding below.
-    address public morphoBlue;
+    /// @dev The two flash providers are constructor-pinned and read on the
+    /// hot path (provider dispatch, callback caller checks): immutables cost
+    /// nothing to read where a storage slot costs 2.1k cold. The
+    /// `allowedFlashProviders` mapping stays for the ABI (getter, deploy
+    /// read-backs) and is written once, in the constructor.
+    address public immutable morphoBlue;
+    address public immutable balancerVault;
     mapping(uint8 => address) public allowedFlashProviders;
     /// @dev Generic allowlist for Bebop settlement / future protocol
     /// targets that need owner-curated trust. Uni V2/V3 routers are
@@ -219,6 +223,7 @@ contract ArbExecutor is
         uniV2Router = uniV2Router_;
         uniV3Router = uniV3Router_;
         morphoBlue = morpho_;
+        balancerVault = balancerVault_;
 
         allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
         allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho_;
@@ -333,8 +338,78 @@ contract ArbExecutor is
     /// the flash-callback frame, where `msg.value` is 0 (the callback is a
     /// fresh call from the flash provider, not from the operator).
     function execute(bytes calldata planData) external payable onlyOperator whenNotPaused nonReentrant {
-        ArbTypes.ArbPlan memory plan = abi.decode(planData, (ArbTypes.ArbPlan));
+        _execute(abi.decode(planData, (ArbTypes.ArbPlan)), planData);
+    }
 
+    /// @notice `execute` for a PACKED plan. ABI encoding of an `ArbPlan`
+    /// costs 2.2-2.6 KB of calldata for a two- or three-op cycle (a 32-byte
+    /// word per field, offsets, padding — half of it zero bytes), i.e.
+    /// 37-39k of intrinsic gas against the competitor's 24-32k. The packed
+    /// form below is ~100 bytes per op. It is decoded once into the same
+    /// `ArbPlan` and takes the same path as `execute`; the plan hash the
+    /// callbacks gate on and the event carries is over the ABI re-encoding,
+    /// so it is the same hash `execute` would have used for this plan.
+    ///
+    /// Layout (big-endian, no padding):
+    ///   u8 version (1) | u8 flashProviderId | address loanToken |
+    ///   u128 loanAmount | u128 minProfitAmount | u128 maxFlashFee | u8 nOps
+    ///   then per op:
+    ///   address target | u16 flags | u128 amountIn | u16 fromAmountPos |
+    ///   u16 returnAmountPos | address srcToken | address outToken |
+    ///   callData: V3 direct/flash → u8 zeroForOne, u160 sqrtPriceLimitX96;
+    ///             V2 direct/flash → u8 zeroForOne, u16 feeNumerator;
+    ///             otherwise       → u16 len, len bytes.
+    function executePacked(bytes calldata packed) external payable onlyOperator whenNotPaused nonReentrant {
+        ArbTypes.ArbPlan memory plan = _decodePacked(packed);
+        _execute(plan, abi.encode(plan));
+    }
+
+    uint8 private constant PACKED_VERSION = 1;
+
+    error PackedPlanMalformed();
+
+    function _decodePacked(bytes calldata p) private pure returns (ArbTypes.ArbPlan memory plan) {
+        if (p.length < 71 || uint8(p[0]) != PACKED_VERSION) revert PackedPlanMalformed();
+        plan.flashProviderId = uint8(p[1]);
+        plan.loanToken = address(bytes20(p[2:22]));
+        plan.loanAmount = uint128(bytes16(p[22:38]));
+        plan.minProfitAmount = uint128(bytes16(p[38:54]));
+        plan.maxFlashFee = uint128(bytes16(p[54:70]));
+        uint256 n = uint8(p[70]);
+        plan.ops = new Op[](n);
+        uint256 o = 71;
+        for (uint256 i = 0; i < n; ++i) {
+            if (p.length < o + 82) revert PackedPlanMalformed();
+            Op memory op = plan.ops[i];
+            op.target = address(bytes20(p[o:o + 20]));
+            op.flags = uint16(bytes2(p[o + 20:o + 22]));
+            op.amountIn = uint128(bytes16(p[o + 22:o + 38]));
+            op.fromAmountPos = uint16(bytes2(p[o + 38:o + 40]));
+            op.returnAmountPos = uint16(bytes2(p[o + 40:o + 42]));
+            op.srcToken = address(bytes20(p[o + 42:o + 62]));
+            op.outToken = address(bytes20(p[o + 62:o + 82]));
+            o += 82;
+            if (op.flags & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V3_FLASH) != 0) {
+                if (p.length < o + 21) revert PackedPlanMalformed();
+                op.callData = abi.encode(uint8(p[o]) != 0, uint160(bytes20(p[o + 1:o + 21])));
+                o += 21;
+            } else if (op.flags & (GenericSequenceLib.FLAG_V2_DIRECT | GenericSequenceLib.FLAG_V2_FLASH) != 0) {
+                if (p.length < o + 3) revert PackedPlanMalformed();
+                op.callData = abi.encode(uint8(p[o]) != 0, uint16(bytes2(p[o + 1:o + 3])));
+                o += 3;
+            } else {
+                if (p.length < o + 2) revert PackedPlanMalformed();
+                uint256 len = uint16(bytes2(p[o:o + 2]));
+                o += 2;
+                if (p.length < o + len) revert PackedPlanMalformed();
+                op.callData = p[o:o + len];
+                o += len;
+            }
+        }
+        if (o != p.length) revert PackedPlanMalformed();
+    }
+
+    function _execute(ArbTypes.ArbPlan memory plan, bytes memory planData) private {
         // Plan invariants — fail fast pre-flashloan.
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
@@ -400,7 +475,9 @@ contract ArbExecutor is
             return;
         }
 
-        address provider = allowedFlashProviders[plan.flashProviderId];
+        address provider = plan.flashProviderId == FLASH_PROVIDER_MORPHO
+            ? morphoBlue
+            : (plan.flashProviderId == FLASH_PROVIDER_BALANCER ? balancerVault : address(0));
         if (provider == address(0)) revert InvalidFlashProvider(plan.flashProviderId);
 
         // Pin plan hash for the callback gate. The phase + hash pair
@@ -464,7 +541,7 @@ contract ArbExecutor is
         if (!_phaseActive()) revert InvalidExecutionPhase();
         bytes32 planHash = _planHash();
         if (planHash == bytes32(0)) revert NoActivePlan();
-        if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) revert InvalidCallbackCaller();
+        if (msg.sender != balancerVault) revert InvalidCallbackCaller();
         if (keccak256(userData) != planHash) revert InvalidPlan();
         // V10 audit fix: clear plan hash to block callback re-entry
         // within the same flash. The triple-gate (phase + hash + caller)
@@ -492,7 +569,7 @@ contract ArbExecutor is
         if (!_phaseActive()) revert InvalidExecutionPhase();
         bytes32 planHash = _planHash();
         if (planHash == bytes32(0)) revert NoActivePlan();
-        if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_MORPHO]) revert InvalidCallbackCaller();
+        if (msg.sender != morphoBlue) revert InvalidCallbackCaller();
         if (keccak256(data) != planHash) revert InvalidPlan();
         // V10 audit fix: clear plan hash to block callback re-entry.
         // Mirror of `receiveFlashLoan`.

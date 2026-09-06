@@ -69,14 +69,10 @@ library UniswapLib {
     error InvalidPlan();
     error V4UnexpectedDelta();
 
-    // ─── Events (match LiquidationExecutor signatures; emitted under DELEGATECALL) ──
-    event UniV2SwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
-    event UniV3SwapExecuted(
-        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
-    );
-    event UniV4SwapExecuted(
-        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
-    );
+    // Per-leg swap events were dropped 2026-09-06: nothing off-chain read
+    // them (the bot decodes only ArbExecuted; every analysis works from the
+    // pools' own events and Transfer logs), and each cost 1.5-2.5k gas plus
+    // bytecode in a size-constrained executor.
 
     // =================================================================
     //                          UNISWAP V2
@@ -117,8 +113,6 @@ library UniswapLib {
         }
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit UniV2SwapExecuted(leg.srcToken, leg.repayToken, actualIn, received);
     }
 
     // =================================================================
@@ -212,8 +206,6 @@ library UniswapLib {
         }
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, leg.v3Fee, actualIn, received);
     }
 
     /// @dev Read first and last 20 bytes of a V3 path-bytes blob as
