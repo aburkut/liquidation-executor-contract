@@ -7,8 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  FOUNDRY_PROFILE: ci
+# No FOUNDRY_PROFILE override: foundry.toml has no `ci` profile. Newer forge
+# builds silently fell back to `default` when it was set; the pinned build
+# refuses to run ("selected profile `ci` does not exist").
 
 jobs:
   check:
