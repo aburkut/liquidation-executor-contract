@@ -18,6 +18,8 @@ import {MockBalancerVault} from "./mocks/MockBalancerVault.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockParaswapAugustus} from "./mocks/MockParaswapAugustus.sol";
 import {MockRouter} from "./support/Mocks.sol";
+import {MockUniV3Pool, MockUniV2Pair} from "./mocks/MockDirectPools.sol";
+import {DirectSwapLib} from "../src/libraries/DirectSwapLib.sol";
 
 contract MockWETH is MockERC20 {
     constructor() MockERC20("Wrapped Ether", "WETH", 18) {}
@@ -755,6 +757,155 @@ contract ArbExecutorTest is Test {
         vm.prank(address(morpho));
         vm.expectRevert(ArbExecutor.InvalidExecutionPhase.selector);
         exec.onMorphoFlashLoan(LOAN_AMOUNT, plan);
+    }
+
+    // ─── Direct pool swaps (no router, no allowance, pool not allowlisted) ───
+
+    function _directV3Op(address pool, address src, address dst, bool zeroForOne, uint256 amountIn, uint32 extra)
+        internal
+        pure
+        returns (Op memory op)
+    {
+        op.target = pool;
+        op.srcToken = src;
+        op.outToken = dst;
+        op.amountIn = amountIn;
+        op.flags = GenericSequenceLib.FLAG_V3_DIRECT | extra;
+        op.callData = abi.encode(zeroForOne, uint160(0));
+    }
+
+    function _directV2Op(address pair, address src, address dst, bool zeroForOne, uint256 amountIn, uint32 extra)
+        internal
+        pure
+        returns (Op memory op)
+    {
+        op.target = pair;
+        op.srcToken = src;
+        op.outToken = dst;
+        op.amountIn = amountIn;
+        op.flags = GenericSequenceLib.FLAG_V2_DIRECT | extra;
+        op.callData = abi.encode(zeroForOne, uint16(997));
+    }
+
+    function _v3Pool() internal returns (MockUniV3Pool pool) {
+        pool = new MockUniV3Pool(address(tokenA), address(tokenB), SWAP_RATE);
+        tokenA.mint(address(pool), 10 * LOAN_AMOUNT);
+        tokenB.mint(address(pool), 10 * LOAN_AMOUNT);
+    }
+
+    /// A→B→A through one V3 pool at 1.1× per hop: the pool is never
+    /// allowlisted, no router is involved and no allowance is ever granted.
+    function test_directV3_cycle_lands_without_router_or_allowlist() public {
+        MockUniV3Pool pool = _v3Pool();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        assertFalse(exec.allowedTargets(address(pool)), "pool must not need allowlisting");
+        uint256 before = tokenA.balanceOf(address(exec));
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertEq(tokenA.balanceOf(address(exec)) - before, 210e18, "profit retained");
+        assertEq(tokenA.allowance(address(exec), address(pool)), 0, "no allowance granted");
+        assertEq(tokenB.allowance(address(exec), address(pool)), 0, "no allowance granted");
+    }
+
+    /// The callback pays at most the op's amount: a pool asking for one bip
+    /// more is refused.
+    function test_directV3_overpull_reverts() public {
+        MockUniV3Pool pool = _v3Pool();
+        pool.setOverpullBps(1);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                DirectSwapLib.DirectSwapCallbackOverpull.selector, LOAN_AMOUNT + LOAN_AMOUNT / 10_000, LOAN_AMOUNT
+            )
+        );
+        exec.execute(plan);
+    }
+
+    /// One payment per arming: a pool calling back twice finds the arming
+    /// claimed on the second call.
+    function test_directV3_double_callback_reverts() public {
+        MockUniV3Pool pool = _v3Pool();
+        pool.setDoubleCallback(true);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(DirectSwapLib.DirectSwapCallbackUnarmed.selector);
+        exec.execute(plan);
+    }
+
+    /// Outside a direct swap the callback is unarmed, whoever calls it.
+    function test_directV3_stray_callback_reverts() public {
+        MockUniV3Pool pool = _v3Pool();
+        tokenA.mint(address(exec), LOAN_AMOUNT);
+        vm.expectRevert(DirectSwapLib.DirectSwapCallbackUnarmed.selector);
+        pool.strayCallback(address(exec), int256(1e18), -int256(1e18));
+        assertEq(tokenA.balanceOf(address(exec)), LOAN_AMOUNT, "nothing paid out");
+    }
+
+    /// A→B on a pair priced 2 B/A, B→A on a pair priced 2 A/B: the executor
+    /// computes both outputs from the reserves with the 997/1000 fee and the
+    /// pairs' own K checks accept them.
+    function test_directV2_cycle_lands_with_reserve_formula() public {
+        MockUniV2Pair cheapB = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        tokenA.mint(address(cheapB), 100 * LOAN_AMOUNT);
+        tokenB.mint(address(cheapB), 200 * LOAN_AMOUNT);
+        cheapB.sync();
+        MockUniV2Pair cheapA = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        tokenA.mint(address(cheapA), 200 * LOAN_AMOUNT);
+        tokenB.mint(address(cheapA), 100 * LOAN_AMOUNT);
+        cheapA.sync();
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV2Op(address(cheapB), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV2Op(
+            address(cheapA), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        uint256 before = tokenA.balanceOf(address(exec));
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        // 1000 A → ~1970 B → ~3800 A: well over the 100 A floor.
+        assertGt(tokenA.balanceOf(address(exec)) - before, 2_500e18, "profit retained");
+        assertEq(tokenA.allowance(address(exec), address(cheapB)), 0, "no allowance granted");
+    }
+
+    /// A direct op may not carry calldata patch positions or the flags that
+    /// reinterpret its amount.
+    function test_directV3_rejects_patch_positions_and_v4_flags() public {
+        MockUniV3Pool pool = _v3Pool();
+        Op[] memory ops = new Op[](1);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenA), true, LOAN_AMOUNT, 0);
+        ops[0].fromAmountPos = 4;
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(GenericSequenceLib.InvalidPlan.selector);
+        exec.execute(plan);
+
+        ops[0].fromAmountPos = 0;
+        ops[0].flags |= GenericSequenceLib.FLAG_V4_UNLOCK;
+        plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(GenericSequenceLib.InvalidPlan.selector);
+        exec.execute(plan);
     }
 
     // ─── Inventory path (no flash when the principal is already held) ───

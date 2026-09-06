@@ -11,6 +11,7 @@ import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.s
 import {IMorphoBlue, IMorphoFlashLoanCallback} from "./interfaces/IMorphoBlue.sol";
 import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
 import {AllowanceLib} from "./libraries/AllowanceLib.sol";
+import {DirectSwapLib} from "./libraries/DirectSwapLib.sol";
 import {UniswapLib} from "./libraries/UniswapLib.sol";
 import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
@@ -363,6 +364,14 @@ contract ArbExecutor is
         // instead of relying on it as the sole backstop.
         for (uint256 i = 0; i < plan.ops.length; ++i) {
             if (plan.ops[i].flags == GenericSequenceLib.FLAG_WETH_UNWRAP) continue;
+            // Direct pool swaps name the pool itself as the target: pools are
+            // permissionless and bounded by construction (the op spends at
+            // most its own `amount`, see DirectSwapLib), so they are not
+            // allowlisted — exactly the exposure of an allowlisted router
+            // routing into an arbitrary pool.
+            if (plan.ops[i].flags & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V2_DIRECT) != 0) {
+                continue;
+            }
             if (!allowedTargets[plan.ops[i].target]) revert TargetNotAllowed();
         }
 
@@ -543,6 +552,18 @@ contract ArbExecutor is
             UniswapLib.runV4UnlockMultihop(IPoolManager(msg.sender), tokenIn, data);
         }
         return "";
+    }
+
+    // ─── Direct V3 pool swaps: the pool pulls its input through here ───
+    /// @dev Called by a V3-style pool mid-`swap` for a `FLAG_V3_DIRECT` op.
+    /// Pays only the pool the sequence is armed for, once, never more than
+    /// the op's amount (DirectSwapLib). Pancake V3 pools use the second name.
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        DirectSwapLib.payV3Callback(amount0Delta, amount1Delta);
+    }
+
+    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        DirectSwapLib.payV3Callback(amount0Delta, amount1Delta);
     }
 
     // ─── Pipeline (inside flash) ─────────────────────────────────────

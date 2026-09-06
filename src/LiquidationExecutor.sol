@@ -15,6 +15,7 @@ import {IUniV2Router} from "./interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "./interfaces/IUniV3SwapRouter.sol";
 import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
 import {AllowanceLib} from "./libraries/AllowanceLib.sol";
+import {DirectSwapLib} from "./libraries/DirectSwapLib.sol";
 import {ParaswapDecoderLib} from "./libraries/ParaswapDecoderLib.sol";
 import {SwapLegExecutorLib} from "./libraries/SwapLegExecutorLib.sol";
 import {UniswapLib} from "./libraries/UniswapLib.sol";
@@ -714,6 +715,12 @@ contract LiquidationExecutor is
                 // shape), so there is nothing to allowlist. Exempt them from the
                 // target gate; every other op's target must be allowlisted.
                 if (plan.swapPlan.ops[i].flags & GenericSequenceLib.FLAG_WETH_UNWRAP != 0) continue;
+                // Direct pool swaps name the pool itself: permissionless and
+                // bounded by construction (DirectSwapLib), not allowlisted.
+                if (
+                    plan.swapPlan.ops[i].flags & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V2_DIRECT)
+                        != 0
+                ) continue;
                 // Every op target must be allowlisted. This is the authoritative
                 // target gate — GenericSequenceLib runs the ops via DELEGATECALL
                 // and cannot re-read `allowedTargets`, so it trusts this check.
@@ -908,6 +915,18 @@ contract LiquidationExecutor is
             tstore(V4_PM_TSLOT, pm)
             tstore(V4_TOKENIN_TSLOT, word)
         }
+    }
+
+    // ─── Direct V3 pool swaps: the pool pulls its input through here ───
+    /// @dev Called by a V3-style pool mid-`swap` for a `FLAG_V3_DIRECT` op.
+    /// Pays only the pool the sequence is armed for, once, never more than
+    /// the op's amount (DirectSwapLib). Pancake V3 pools use the second name.
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        DirectSwapLib.payV3Callback(amount0Delta, amount1Delta);
+    }
+
+    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        DirectSwapLib.payV3Callback(amount0Delta, amount1Delta);
     }
 
     // ─── Balancer Flashloan Callback ─────────────────────────────────

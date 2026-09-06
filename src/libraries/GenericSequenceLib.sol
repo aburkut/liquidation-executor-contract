@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {AllowanceLib} from "./AllowanceLib.sol";
+import {DirectSwapLib} from "./DirectSwapLib.sol";
 import {Op} from "../types/SwapTypes.sol";
 
 /// @dev Subset of WETH9 used by the `FLAG_WETH_UNWRAP` op — the same one-method
@@ -123,8 +124,22 @@ library GenericSequenceLib {
     /// for input sizing — `amount` is resolved from it above the branch,
     /// same as any other op.
     uint32 internal constant FLAG_NATIVE_IN = 1 << 5;
+    /// Exact-input swap straight against a V3-style pool (Uniswap V3, Sushi
+    /// V3, Pancake V3): `target` is the POOL, `callData` =
+    /// `abi.encode(bool zeroForOne, uint160 sqrtPriceLimitX96)` (0 = no
+    /// limit). No router, no allowance — the pool pulls its input through
+    /// the executor's `uniswapV3SwapCallback`, which pays only the armed pool
+    /// and never more than `amount` (see `DirectSwapLib`). The pool is NOT
+    /// allowlisted; `execute` exempts these ops from the target walk.
+    uint32 internal constant FLAG_V3_DIRECT = 1 << 6;
+    /// Exact-input swap straight against a V2-style pair: `target` is the
+    /// PAIR, `callData` = `abi.encode(bool zeroForOne, uint16 feeNumerator)`
+    /// (surviving input share out of 1000: 997 Uniswap/Sushi, 998 Pancake).
+    /// The executor sends `amount` to the pair and asks for what the reserve
+    /// formula yields. Not allowlisted either.
+    uint32 internal constant FLAG_V2_DIRECT = 1 << 7;
     uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK
-        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN;
+        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN | FLAG_V3_DIRECT | FLAG_V2_DIRECT;
     uint16 internal constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     /// @dev `LiquidationExecutor` storage slots for the V4 unlock arming
@@ -332,6 +347,17 @@ library GenericSequenceLib {
                     revert InvalidPlan();
                 }
             }
+            // Direct pool swaps: an ERC20 input, no calldata patching (the
+            // amount goes to the pool as a typed argument), none of the flags
+            // that reinterpret `amount` or the op shape, and not both at once.
+            if (op.flags & (FLAG_V3_DIRECT | FLAG_V2_DIRECT) != 0) {
+                if (op.srcToken == address(0)) revert InvalidPlan();
+                if (op.flags & (FLAG_V4_UNLOCK | FLAG_NATIVE_IN | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN) != 0) {
+                    revert InvalidPlan();
+                }
+                if (op.flags & FLAG_V3_DIRECT != 0 && op.flags & FLAG_V2_DIRECT != 0) revert InvalidPlan();
+                if (op.fromAmountPos != 0 || op.returnAmountPos != 0) revert InvalidPlan();
+            }
 
             if (op.flags & FLAG_WETH_UNWRAP != 0) {
                 // ── WETH → native-ETH unwrap ──
@@ -462,6 +488,15 @@ library GenericSequenceLib {
                     uint256 v4Consumed = v4InBefore > v4InAfter ? v4InBefore - v4InAfter : 0;
                     if (v4Consumed > amount) revert V4InputOverspent(v4Consumed, amount);
                 }
+            } else if (op.flags & FLAG_V3_DIRECT != 0) {
+                // ── Direct V3-style pool swap: no router, no allowance. The
+                // pool pulls `amount` (at most) through the executor's swap
+                // callback; the output-delta check below pins the result.
+                DirectSwapLib.swapV3(op.target, op.srcToken, amount, op.callData);
+            } else if (op.flags & FLAG_V2_DIRECT != 0) {
+                // ── Direct V2-style pair swap: send `amount`, take what the
+                // reserve formula yields; the output-delta check below pins it.
+                DirectSwapLib.swapV2(op.target, op.srcToken, amount, op.callData);
             } else if (op.flags & FLAG_NATIVE_IN != 0) {
                 // ── Native-ETH input to a plain payable DEX call ──
                 // srcToken==address(0) and flag-exclusivity are already
