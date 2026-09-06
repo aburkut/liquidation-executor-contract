@@ -1091,6 +1091,44 @@ contract ArbExecutorTest is Test {
         assertEq(tokenA.balanceOf(address(exec)) - before, 210e18, "profit retained");
     }
 
+    /// Cross-repo reference vector: fixed addresses and amounts, so the
+    /// bot's Rust packer can assert the same bytes without running Solidity.
+    /// Two ops — a V3 flash and a V2 direct — cover both packed callData
+    /// shapes and the header. The expected bytes are the decoder's contract.
+    function test_packedVector_fixed() public pure {
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(
+            0x1111111111111111111111111111111111111111,
+            0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa,
+            0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB,
+            true,
+            1_000e18,
+            0
+        );
+        ops[0].callData = abi.encode(true, uint160(4_295_128_740));
+        ops[1] = _directV2Op(
+            0x2222222222222222222222222222222222222222,
+            0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB,
+            0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa,
+            false,
+            0,
+            GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        ops[1].callData = abi.encode(false, uint16(998));
+        bytes memory packed = _pack(3, 0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa, 1_000e18, 100e18, ops);
+        assertEq(packed.length, 71 + 82 + 21 + 82 + 3, "layout: header + op + V3 params + op + V2 params");
+        // Generated with `cast abi-encode --packed`, field by field:
+        //   header  x(uint8,uint8,address,uint128,uint128,uint128,uint8)
+        //   op      x(address,uint16,uint128,uint16,uint16,address,address, ...params)
+        assertEq(
+            packed,
+            hex"0103aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000000000003635c9adc5dea0000000000000000000056bc75e2d631000000000000000000000000000000000000002"
+            hex"11111111111111111111111111111111111111110100000000000000003635c9adc5dea0000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0100000000000000000000000000000001000276a4"
+            hex"222222222222222222222222222222222222222200820000000000000000000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0003e6",
+            "packed vector"
+        );
+    }
+
     function test_executePacked_rejects_malformed() public {
         Op[] memory ops = new Op[](1);
         ops[0] = _directV3Op(address(_v3Pool()), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
