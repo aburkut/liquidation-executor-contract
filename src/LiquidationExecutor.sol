@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -14,6 +14,7 @@ import {IMorphoBlue, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/
 import {IUniV2Router} from "./interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "./interfaces/IUniV3SwapRouter.sol";
 import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
+import {AllowanceLib} from "./libraries/AllowanceLib.sol";
 import {ParaswapDecoderLib} from "./libraries/ParaswapDecoderLib.sol";
 import {SwapLegExecutorLib} from "./libraries/SwapLegExecutorLib.sol";
 import {UniswapLib} from "./libraries/UniswapLib.sol";
@@ -36,7 +37,7 @@ import {SwapMode, SwapLeg, Op, Action, AaveV3Action, AaveV2Liquidation, MorphoLi
 contract LiquidationExecutor is
     Ownable2Step,
     Pausable,
-    ReentrancyGuard,
+    ReentrancyGuardTransient,
     IFlashLoanRecipient,
     IMorphoFlashLoanCallback,
     IUnlockCallback
@@ -193,6 +194,22 @@ contract LiquidationExecutor is
     /// Transient and persistent storage are SEPARATE address spaces — slot 0
     /// here does not alias `_owner`. Mirrors `ArbExecutor`.
     uint256 private constant BID_BPS_TSLOT = 0;
+    /// @dev TRANSIENT slots for the per-transaction execution state the
+    /// callbacks gate on: the hash of the plan being executed, whether an
+    /// `execute` is in flight, and the V4 arming words (the PoolManager
+    /// mid-unlock; the input token in the low 160 bits with the armed bit at
+    /// 160). These were persistent fields written at entry and cleared at
+    /// exit — two SSTOREs from zero and their clears per liquidation (~30k
+    /// net of refunds) plus ~20k per V4 leg — for state that never outlives
+    /// the transaction. Transient costs 100 a write, self-clears, and keeps
+    /// the same guard semantics inside the transaction. Slot numbers 11/12
+    /// are shared with `GenericSequenceLib`, which arms them for its V4 ops.
+    /// Mirrors `ArbExecutor`.
+    uint256 private constant PLAN_HASH_TSLOT = 1;
+    uint256 private constant PHASE_TSLOT = 2;
+    uint256 private constant V4_PM_TSLOT = 11;
+    uint256 private constant V4_TOKENIN_TSLOT = 12;
+    uint256 private constant V4_ARMED_BIT = 1 << 160;
 
     // V10+ refactor: COINBASE_CALL_GAS moved to CoinbasePaymentLib
     // (constant lives next to the only function that reads it).
@@ -257,50 +274,14 @@ contract LiquidationExecutor is
     // not steal. Pool sanity (`!= 0`, `code.length > 0`) is enforced in
     // those libraries; the bot is the trusted source of pool addresses.
 
-    bytes32 private _activePlanHash;
-
-    /// @dev PoolManager address currently mid-unlock. Set by `_executeUniV4Leg`
-    /// before `unlock()` and cleared on return. `unlockCallback` refuses any
-    /// caller that is not this address, so stray `unlockCallback` invocations
-    /// from an allow-listed PoolManager acting outside our pipeline revert.
-    address private _activeV4PoolManager;
-
-    /// @dev Execution phase guard — prevents unexpected callbacks. Slot
-    /// layout note: kept directly after `_activeV4PoolManager` so both
-    /// pack into the same storage slot (test_morphoCallbackRejectsCaller
-    /// relies on this layout via vm.store at slot 11).
-    enum ExecutionPhase {
-        Idle,
-        FlashLoanActive
-    }
-    ExecutionPhase private _executionPhase;
-
-    /// @dev tokenIn pinned for the active V4 unlock. Set by
-    /// `_executeUniV4Leg` BEFORE `unlock()`, CLEARED to address(0) by
-    /// `unlockCallback` on entry (hygiene — no stale address left in
-    /// storage — but no longer the re-entry sentinel itself; see
-    /// `_v4Armed`). Reading tokenIn from storage (rather than decoding
-    /// from `data`) closes the substitution drain — `pm` cannot
-    /// influence storage, only the callback payload. Declared AFTER
-    /// `_executionPhase` so the legacy slot 11 packing (read by
-    /// storage-poking tests) stays untouched.
-    address private _activeV4TokenIn;
-
-    /// @dev Dedicated re-entry/arming sentinel for the V4 unlock-callback
-    /// flow, decoupled from `_activeV4TokenIn`. Before this flag, the
-    /// sentinel WAS `_activeV4TokenIn != 0`, which collided with a
-    /// native-ETH leg (tokenIn == address(0)) — an armed native swap was
-    /// indistinguishable from "not armed". Set `true` by `_executeUniV4Leg`
-    /// immediately before `unlock()`, CLAIMed (set back to `false`) by
-    /// `unlockCallback` on entry — the clear-on-entry semantics double as
-    /// the re-entry guard: a nested `unlockCallback` (e.g. from a
-    /// malicious hook calling `pm.unlock()` mid-swap) sees `_v4Armed ==
-    /// false` and the entry guard rejects it, regardless of what tokenIn
-    /// happens to be. Declared directly after `_activeV4TokenIn` so both
-    /// pack into the same slot (slot 11) — the existing slot 10/11
-    /// storage-poking tests are unaffected since neither touches byte
-    /// offset 20 of slot 11.
-    bool private _v4Armed;
+    // No per-transaction execution state lives in persistent storage any
+    // more — plan hash, phase and the V4 arming words (PoolManager mid-unlock,
+    // pinned tokenIn, armed bit) are transient; see the *_TSLOT constants.
+    // The V4 words keep their guard semantics: `unlockCallback` refuses any
+    // caller that is not the armed PoolManager, reads tokenIn from the word
+    // (the PM controls the payload, not our transient storage, so
+    // substitution is impossible), and CLAIMs the armed bit on entry so a
+    // nested unlockCallback from a hostile hook fails closed.
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
@@ -872,8 +853,8 @@ contract LiquidationExecutor is
         address provider = allowedFlashProviders[plan.flashProviderId];
         if (provider == address(0)) revert FlashProviderNotAllowed();
 
-        _activePlanHash = keccak256(planData);
-        _executionPhase = ExecutionPhase.FlashLoanActive;
+        _setPlanHash(keccak256(planData));
+        _setPhase(true);
 
         if (plan.flashProviderId == FLASH_PROVIDER_BALANCER) {
             IERC20[] memory tokens = new IERC20[](1);
@@ -888,9 +869,45 @@ contract LiquidationExecutor is
             revert FlashProviderNotAllowed();
         }
 
-        _activePlanHash = bytes32(0);
-        _executionPhase = ExecutionPhase.Idle;
+        _setPlanHash(bytes32(0));
+        _setPhase(false);
         emit FlashExecuted(plan.flashProviderId, plan.loanToken, plan.loanAmount);
+    }
+
+    // ─── Transient execution state ───────────────────────────────────
+    function _planHash() private view returns (bytes32 h) {
+        assembly ("memory-safe") {
+            h := tload(PLAN_HASH_TSLOT)
+        }
+    }
+
+    function _setPlanHash(bytes32 h) private {
+        assembly ("memory-safe") {
+            tstore(PLAN_HASH_TSLOT, h)
+        }
+    }
+
+    function _phaseActive() private view returns (bool active) {
+        assembly ("memory-safe") {
+            active := tload(PHASE_TSLOT)
+        }
+    }
+
+    function _setPhase(bool active) private {
+        assembly ("memory-safe") {
+            tstore(PHASE_TSLOT, active)
+        }
+    }
+
+    /// @dev Arm (or, with zeros, disarm) the transient V4 words the callback
+    /// gates on: PM word 11, tokenIn | armed-bit word 12. Arming with a
+    /// non-zero PM sets the bit; disarming clears both words.
+    function _armV4(address pm, address tokenIn) private {
+        uint256 word = pm == address(0) ? 0 : (uint256(uint160(tokenIn)) | V4_ARMED_BIT);
+        assembly ("memory-safe") {
+            tstore(V4_PM_TSLOT, pm)
+            tstore(V4_TOKENIN_TSLOT, word)
+        }
     }
 
     // ─── Balancer Flashloan Callback ─────────────────────────────────
@@ -900,20 +917,19 @@ contract LiquidationExecutor is
         uint256[] memory feeAmounts,
         bytes memory userData
     ) external override {
-        if (_executionPhase != ExecutionPhase.FlashLoanActive) {
-            revert InvalidExecutionPhase();
-        }
-        if (_activePlanHash == bytes32(0)) revert NoActivePlan();
+        if (!_phaseActive()) revert InvalidExecutionPhase();
+        bytes32 planHash = _planHash();
+        if (planHash == bytes32(0)) revert NoActivePlan();
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) {
             revert InvalidCallbackCaller();
         }
-        if (keccak256(userData) != _activePlanHash) revert InvalidPlan();
+        if (keccak256(userData) != planHash) revert InvalidPlan();
         // V10 audit fix: clear plan hash immediately so a hostile or
         // buggy flash provider re-invoking the callback in the same flash
         // (with the same userData) fails the hash gate on the second
         // entry. V4 `unlockCallback` does not consult `_activePlanHash`
         // so this clear does not break the V4 leg dispatch path.
-        _activePlanHash = bytes32(0);
+        _setPlanHash(bytes32(0));
         if (tokens.length != 1) revert BalancerSingleTokenOnly();
 
         Plan memory plan = abi.decode(userData, (Plan));
@@ -944,13 +960,14 @@ contract LiquidationExecutor is
     /// must approve `amount` to msg.sender (the Morpho contract). Reverts on insufficient
     /// repayment balance or any caller other than the registered Morpho flash provider.
     function onMorphoFlashLoan(uint256 amount, bytes calldata data) external override {
-        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
-        if (_activePlanHash == bytes32(0)) revert NoActivePlan();
+        if (!_phaseActive()) revert InvalidExecutionPhase();
+        bytes32 planHash = _planHash();
+        if (planHash == bytes32(0)) revert NoActivePlan();
         if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_MORPHO]) revert InvalidCallbackCaller();
-        if (keccak256(data) != _activePlanHash) revert InvalidPlan();
+        if (keccak256(data) != planHash) revert InvalidPlan();
         // V10 audit fix: clear plan hash to block callback re-entry
         // within the same flash. Mirror of `receiveFlashLoan`.
-        _activePlanHash = bytes32(0);
+        _setPlanHash(bytes32(0));
 
         Plan memory plan = abi.decode(data, (Plan));
 
@@ -1112,7 +1129,9 @@ contract LiquidationExecutor is
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
 
         if (vault == address(0)) {
-            IERC20(asset).forceApprove(msg.sender, repayAmount);
+            // Morpho pulls the repayment after the callback; the provider is
+            // constructor-pinned, so the allowance stands (AllowanceLib).
+            AllowanceLib.ensure(asset, msg.sender, repayAmount);
         } else {
             IERC20(asset).safeTransfer(vault, repayAmount);
         }
@@ -1514,11 +1533,9 @@ contract LiquidationExecutor is
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
 
         address pm = leg.v4PoolManager;
-        _activeV4PoolManager = pm;
-        _activeV4TokenIn = tokenIn;
-        _v4Armed = true;
+        _armV4(pm, tokenIn);
         // tokenIn is NOT included in the unlock payload — the callback
-        // reads it from storage so the PM cannot substitute it.
+        // reads it from the transient word so the PM cannot substitute it.
         // Single-hop vs multihop is dispatched by v4SwapData length:
         //   == V4_SWAP_DATA_LENGTH (160) → single-hop 5-tuple,
         //                                  passed verbatim to callback
@@ -1533,8 +1550,7 @@ contract LiquidationExecutor is
         // the 160 inner bytes as a 5-tuple; multihop re-decodes them as
         // V4Hop[]. Main never has to crack the inner shape.
         IPoolManager(pm).unlock(abi.encode(leg.v4SwapData, amountSpec));
-        _activeV4PoolManager = address(0);
-        _v4Armed = false;
+        _armV4(address(0), address(0));
 
         uint256 received = IERC20(tokenOut).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
@@ -1576,7 +1592,7 @@ contract LiquidationExecutor is
     /// (multi-hop, native ETH, exact-output, hook-specific deltas) requires
     /// new tests and security review.
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
-        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
+        if (!_phaseActive()) revert InvalidExecutionPhase();
         // tokenIn is read from storage (pinned by _executeUniV4Leg) rather
         // than from `data` — PM controls the data, not storage, so
         // substitution is impossible by construction. The re-entry guard
@@ -1587,10 +1603,18 @@ contract LiquidationExecutor is
         // below fails closed, regardless of what tokenIn is. The
         // msg.sender check covers the not-in-flow case (_activeV4PoolManager
         // == 0 → msg.sender != 0 = always true).
-        address tokenIn = _activeV4TokenIn;
-        if (!_v4Armed || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
-        _v4Armed = false; // CLAIM — nested unlockCallback finds false and fails closed
-        _activeV4TokenIn = address(0); // CLAIM (hygiene only now — see above)
+        address tokenIn;
+        bool armed;
+        address pm;
+        assembly ("memory-safe") {
+            let w := tload(V4_TOKENIN_TSLOT)
+            tokenIn := and(w, 0xffffffffffffffffffffffffffffffffffffffff)
+            armed := gt(and(w, V4_ARMED_BIT), 0)
+            pm := tload(V4_PM_TSLOT)
+            // CLAIM — a nested unlockCallback finds the word cleared and fails closed.
+            tstore(V4_TOKENIN_TSLOT, 0)
+        }
+        if (!armed || msg.sender != pm) revert InvalidCallbackCaller();
 
         // Uniform unlock-data shape for single-hop AND multihop:
         //   abi.encode(bytes inner, int256 amountSpec)
@@ -1648,12 +1672,14 @@ contract LiquidationExecutor is
         if (action.user == address(0)) revert ZeroAddress();
         if (action.debtToCover == 0) revert InvalidPlan();
 
-        IERC20(action.debtAsset).forceApprove(pool, action.debtToCover);
+        // The pool is constructor-pinned and allowlisted: standing allowance
+        // (AllowanceLib) instead of an approve from zero plus a reset per
+        // liquidation (~24k gas).
+        AllowanceLib.ensure(action.debtAsset, pool, action.debtToCover);
         IAaveV3Pool(pool)
             .liquidationCall(
                 action.collateralAsset, action.debtAsset, action.user, action.debtToCover, action.receiveAToken
             );
-        IERC20(action.debtAsset).forceApprove(pool, 0);
 
         emit LiquidationExecuted(PROTOCOL_AAVE_V3, action.collateralAsset, action.debtAsset, action.debtToCover);
     }
@@ -1665,10 +1691,9 @@ contract LiquidationExecutor is
         if (pool == address(0)) revert ZeroAddress();
         if (!allowedTargets[pool]) revert TargetNotAllowed();
 
-        IERC20(liq.debtAsset).forceApprove(pool, liq.debtToCover);
+        AllowanceLib.ensure(liq.debtAsset, pool, liq.debtToCover);
         IAaveV2LendingPool(pool)
             .liquidationCall(liq.collateralAsset, liq.debtAsset, liq.user, liq.debtToCover, liq.receiveAToken);
-        IERC20(liq.debtAsset).forceApprove(pool, 0);
 
         emit LiquidationExecuted(PROTOCOL_AAVE_V2, liq.collateralAsset, liq.debtAsset, liq.debtToCover);
     }
@@ -1689,10 +1714,11 @@ contract LiquidationExecutor is
         // Approve maxRepayAssets — loan-token denominated bound (NOT collateral-side seizedAssets).
         // seizedAssets is collateral units; assetsRepaid (what Morpho actually pulls) is loan-token units.
         // These are different dimensions — approval must match the repay side.
-        IERC20(liq.marketParams.loanToken).forceApprove(morpho, liq.maxRepayAssets);
+        // Standing allowance to the pinned Morpho (AllowanceLib); the
+        // `assetsRepaid <= maxRepayAssets` check below still bounds the pull.
+        AllowanceLib.ensure(liq.marketParams.loanToken, morpho, liq.maxRepayAssets);
         (, uint256 assetsRepaid) =
             IMorphoBlue(morpho).liquidate(liq.marketParams, liq.borrower, liq.seizedAssets, liq.repaidShares, "");
-        IERC20(liq.marketParams.loanToken).forceApprove(morpho, 0);
 
         // Verify Morpho didn't pull more than the operator authorized
         if (assetsRepaid > liq.maxRepayAssets) revert InsufficientRepayBalance(assetsRepaid, liq.maxRepayAssets);

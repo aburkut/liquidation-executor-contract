@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {ExecutorTest} from "./Executor.t.sol";
 import {Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../src/types/SwapTypes.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
+import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
 import {Op} from "../src/types/SwapTypes.sol";
 import {MockGenericDex} from "./ExecutorGenericSequence.t.sol";
 
@@ -34,11 +35,12 @@ contract ExecutorNativeV4Test is ExecutorTest {
     /// native-ETH leg: PM pinned, phase active, tokenIn left at its zero
     /// default (native), armed bit set iff `setArmedBit`.
     function _armNativeCallback(bool setArmedBit) internal {
-        bytes32 slot10 = bytes32(uint256(uint160(address(uniV4Mock)))) | bytes32(PHASE_FLASHLOAN_ACTIVE << 160);
-        vm.store(address(executor), bytes32(V4_PM_PHASE_SLOT), slot10);
-
-        bytes32 slot11 = setArmedBit ? bytes32(uint256(1) << 160) : bytes32(0);
-        vm.store(address(executor), bytes32(V4_TOKENIN_ARMED_SLOT), slot11);
+        // The arming words and the phase are TRANSIENT now; the harness
+        // primes them for this test transaction (tokenIn stays zero: native).
+        LiquidationExecutorHarness(payable(address(executor))).tArmV4(address(uniV4Mock), address(0), setArmedBit, true);
+        V4_PM_PHASE_SLOT;
+        V4_TOKENIN_ARMED_SLOT;
+        PHASE_FLASHLOAN_ACTIVE;
     }
 
     /// Minimal well-formed single-hop unlock payload: (inner, amountSpec)

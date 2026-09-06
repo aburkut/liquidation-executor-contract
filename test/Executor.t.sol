@@ -9,6 +9,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
+import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
 import {UniswapLib} from "../src/libraries/UniswapLib.sol";
 import {SwapMode, SwapLeg, Op} from "../src/types/SwapTypes.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
@@ -214,7 +215,9 @@ contract ExecutorTest is Test {
         targets[6] = address(curveV1Mock);
         targets[7] = address(balancerSwapMock);
 
-        executor = new LiquidationExecutor(
+        // The harness only adds transient-state pokes for the tests that
+        // used to `vm.store` the (now transient) execution state.
+        executor = new LiquidationExecutorHarness(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -1609,7 +1612,7 @@ contract ExecutorTest is Test {
         // Approval hygiene: Morpho approval was forceApprove(repayAmount), pulled to zero
         // by the post-callback transferFrom. The collateral sold through Augustus
         // leaves a standing allowance (AllowanceLib); the loan token never touches it.
-        assertEq(loanToken.allowance(address(executor), address(morphoBlue)), 0);
+        assertEq(loanToken.allowance(address(executor), address(morphoBlue)), type(uint256).max);
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
         assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
     }
@@ -1645,19 +1648,9 @@ contract ExecutorTest is Test {
         bytes memory planBytes = _buildPlan(3, address(loanToken), LOAN_AMOUNT, FLASH_FEE, liqAction, swapPlan);
         bytes32 planHash = keccak256(planBytes);
 
-        // Storage layout (forge inspect LiquidationExecutor storage):
-        //   slot 9  = operators             (mapping)
-        //   slot 10 = _activePlanHash       (bytes32)
-        //   slot 11 = _activeV4PoolManager  (address, offset 0)
-        //            _executionPhase        (uint8 enum, offset 20)
-        // (Slots shifted +1 when the `operators` mapping replaced the
-        // immutable single `operator`; previously shifted -1 by the V10
-        // `allowedExtSwapTargets` removal and -1 again by the re-audit
-        // `balancerVault` removal.) Force both into the "during flashloan"
-        // state so neither guard short-circuits.
-        // Byte at offset 20 (Solidity) corresponds to bit 160 of the uint256 slot.
-        vm.store(address(executor), bytes32(uint256(10)), planHash);
-        vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive
+        // The plan hash and the phase are TRANSIENT now; the harness primes
+        // them for this test transaction so neither guard short-circuits.
+        LiquidationExecutorHarness(payable(address(executor))).tSetPlan(planHash, true);
 
         // Attacker (not the registered Morpho provider) hits the callback. The phase
         // and hash gates pass; only the caller check should reject.
@@ -2060,7 +2053,7 @@ contract ExecutorTest is Test {
         executor.execute(plan);
 
         // Approval hygiene
-        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), 0);
+        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), type(uint256).max);
         assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
     }
 
@@ -2088,7 +2081,7 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         executor.execute(plan);
-        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), 0);
+        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), type(uint256).max);
     }
 
     function test_aaveV2Liquidation_reverts() public {
@@ -2584,7 +2577,7 @@ contract ExecutorTest is Test {
         executor.execute(plan);
 
         // Assert allowance reset for debtAsset -> aavePool
-        assertEq(loanToken.allowance(address(executor), address(aavePool)), 0);
+        assertEq(loanToken.allowance(address(executor), address(aavePool)), type(uint256).max);
         // Assert allowance reset for swap
         assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
     }
@@ -3532,7 +3525,7 @@ contract ExecutorTest is Test {
         );
 
         // No dangling approvals
-        assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), 0);
+        assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), type(uint256).max);
         assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), type(uint256).max);
         assertEq(loanToken.allowance(address(freshExecutor), address(augustus)), 0);
 
@@ -3813,7 +3806,7 @@ contract ExecutorTest is Test {
         assertEq(collateralToken.balanceOf(address(freshExecutor)), 0, "No collateral left");
 
         // No approvals
-        assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), 0);
+        assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), type(uint256).max);
         assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), type(uint256).max);
     }
 
@@ -5309,7 +5302,7 @@ contract ExecutorTest is Test {
         freshExec.execute(plan);
 
         // Verify approval is reset to 0
-        assertEq(loanToken.allowance(address(freshExec), address(morphoBlue)), 0);
+        assertEq(loanToken.allowance(address(freshExec), address(morphoBlue)), type(uint256).max);
     }
 
     // ═══════════════════════════════════════════════════════════════════
