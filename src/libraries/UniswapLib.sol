@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {AllowanceLib} from "./AllowanceLib.sol";
 
 import {IUniV2Router} from "../interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "../interfaces/IUniV3SwapRouter.sol";
@@ -86,23 +87,6 @@ library UniswapLib {
     /// `swapTokensForExactTokens`). Multihop is supported "for free"
     /// because the V2 router accepts any `path.length >= 2`.
 
-    /// @dev Clear a router allowance only when the swap could have left one.
-    ///
-    /// `approvalResetAfterSwap` is a tested invariant, so the allowance must
-    /// read zero when a leg returns. An EXACT-IN swap already satisfies it
-    /// without a write: the router pulls exactly `amountIn`, which takes the
-    /// allowance to zero on its own. Writing zero over zero is a second SSTORE
-    /// bought for nothing.
-    ///
-    /// An exact-OUT swap is different — it consumes only what the output
-    /// needed and leaves the remainder standing, so that one still has to be
-    /// cleared explicitly.
-    function _clearIfResidual(address token, address spender) private {
-        if (IERC20(token).allowance(address(this), spender) != 0) {
-            IERC20(token).forceApprove(spender, 0);
-        }
-    }
-
     function executeUniV2Leg(SwapLeg memory leg, uint256 amountIn, address router) external {
         if (amountIn == 0) revert ZeroSwapInput();
 
@@ -113,7 +97,9 @@ library UniswapLib {
 
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
+        // The router is immutable on the executor: a standing allowance, not
+        // a fresh SSTORE from zero on every leg (AllowanceLib).
+        AllowanceLib.ensure(leg.srcToken, router, amountIn);
 
         uint256 actualIn;
         if (leg.mode == SwapMode.UNI_V2_BUY) {
@@ -160,7 +146,7 @@ library UniswapLib {
 
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
+        AllowanceLib.ensure(leg.srcToken, router, amountIn);
 
         bool isMultihop = leg.v4SwapData.length > 0;
         if (isMultihop) {

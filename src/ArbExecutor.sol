@@ -10,6 +10,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IMorphoBlue, IMorphoFlashLoanCallback} from "./interfaces/IMorphoBlue.sol";
 import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
+import {AllowanceLib} from "./libraries/AllowanceLib.sol";
 import {UniswapLib} from "./libraries/UniswapLib.sol";
 import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
@@ -556,7 +557,10 @@ contract ArbExecutor is
         if (balance < flashRepay) revert InsufficientRepayBalance(flashRepay, balance);
 
         if (vault == address(0)) {
-            IERC20(loanToken).forceApprove(msg.sender, flashRepay);
+            // Morpho pulls the repayment from us after the callback returns;
+            // the provider is constructor-pinned, so the allowance stands
+            // (AllowanceLib) instead of being re-written from zero per cycle.
+            AllowanceLib.ensure(loanToken, msg.sender, flashRepay);
         } else {
             IERC20(loanToken).safeTransfer(vault, flashRepay);
         }

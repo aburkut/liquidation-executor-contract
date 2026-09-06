@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+import {AllowanceLib} from "./AllowanceLib.sol";
 import {SwapLeg} from "../types/SwapTypes.sol";
 
 /// @title CurveV1Lib
@@ -179,14 +180,16 @@ library CurveV1Lib {
 
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
+        // The router is an owner-allowlisted target (RouterNG), so it gets a
+        // standing allowance; the single-pool path above keeps the exact
+        // approve/reset because its pool address is operator-supplied.
+        AllowanceLib.ensure(leg.srcToken, router, amountIn);
 
         // Router exchange selector: keccak256("exchange(address[11],uint256[5][5],uint256,uint256,address[5],address)")[0:4]
         // = 0xc872a3c5. Hand-encoded so we don't pay for a sol! interface.
         bytes memory callData =
             abi.encodeWithSelector(0xc872a3c5, path, swapParams, amountIn, leg.minAmountOut, pools, address(this));
         (bool ok,) = router.call(callData);
-        IERC20(leg.srcToken).forceApprove(router, 0);
         if (!ok) revert CurveSwapFailed();
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;

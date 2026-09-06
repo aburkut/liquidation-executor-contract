@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+import {AllowanceLib} from "./AllowanceLib.sol";
 import {ParaswapDecoderLib} from "./ParaswapDecoderLib.sol";
 import {SwapLeg} from "../types/SwapTypes.sol";
 
@@ -76,9 +77,9 @@ library SwapLegExecutorLib {
         if (srcBefore < declaredIn) revert InsufficientSrcBalance(declaredIn, srcBefore);
         uint256 dstBefore = IERC20(dstToken).balanceOf(address(this));
 
-        IERC20(srcToken).forceApprove(augustus, declaredIn);
+        // Augustus is constructor-pinned: standing allowance (AllowanceLib).
+        AllowanceLib.ensure(srcToken, augustus, declaredIn);
         (bool ok,) = augustus.call(leg.paraswapCalldata);
-        IERC20(srcToken).forceApprove(augustus, 0);
         if (!ok) revert ParaswapSwapFailed();
 
         uint256 actualIn;
@@ -147,9 +148,10 @@ library SwapLegExecutorLib {
             _writeBebopFill(leg.bebopCalldata, leg.bebopPartialFillOffset, fill);
         }
 
-        IERC20(leg.srcToken).forceApprove(target, fill);
+        // `target` passed the caller's allowlist check above: standing
+        // allowance (AllowanceLib).
+        AllowanceLib.ensure(leg.srcToken, target, fill);
         (bool ok,) = target.call(leg.bebopCalldata);
-        IERC20(leg.srcToken).forceApprove(target, 0);
 
         if (!ok) revert BebopSwapFailed();
 

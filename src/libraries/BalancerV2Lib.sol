@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+import {AllowanceLib} from "./AllowanceLib.sol";
 import {SwapMode, SwapLeg} from "../types/SwapTypes.sol";
 
 /// @dev Subset of Balancer V2 Vault — single-swap entrypoint only.
@@ -101,7 +102,7 @@ interface IBalancerV2Vault {
 ///     is the trusted source of the Vault address. The single canonical
 ///     Balancer V2 Vault `0xBA12222222228d8Ba445958a75a0704d566BF2C8`
 ///     is the only one a real plan should ever reference.
-///   * `forceApprove(vault, amountIn) → swap → forceApprove(vault, 0)`.
+///   * standing allowance to the constructor-pinned vault (AllowanceLib).
 ///   * Output delta floor: `received >= leg.minAmountOut`.
 ///
 /// STRUCT DISCIPLINE: `SwapLeg` imported from `../types/SwapTypes.sol`
@@ -160,7 +161,7 @@ library BalancerV2Lib {
         if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        IERC20(leg.srcToken).forceApprove(vault, amountIn);
+        AllowanceLib.ensure(leg.srcToken, vault, amountIn);
 
         bool isBuy = leg.mode == SwapMode.BAL_V2_BUY;
         IBalancerV2Vault.SwapKind kind =
@@ -184,7 +185,6 @@ library BalancerV2Lib {
         });
 
         IBalancerV2Vault(vault).swap(single, funds, swapLimit, leg.deadline);
-        IERC20(leg.srcToken).forceApprove(vault, 0);
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
@@ -243,7 +243,7 @@ library BalancerV2Lib {
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
         uint256 inBefore = IERC20(leg.srcToken).balanceOf(address(this));
 
-        IERC20(leg.srcToken).forceApprove(vault, amountIn);
+        AllowanceLib.ensure(leg.srcToken, vault, amountIn);
 
         bool isBuy = leg.mode == SwapMode.BAL_V2_MH_BUY;
         IBalancerV2Vault.SwapKind kind =
@@ -257,7 +257,6 @@ library BalancerV2Lib {
         });
 
         IBalancerV2Vault(vault).batchSwap(kind, swaps, assets, funds, limits, leg.deadline);
-        IERC20(leg.srcToken).forceApprove(vault, 0);
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);

@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {AllowanceLib} from "./AllowanceLib.sol";
 import {Op} from "../types/SwapTypes.sol";
 
 /// @dev Subset of WETH9 used by the `FLAG_WETH_UNWRAP` op — the same one-method
@@ -480,7 +481,8 @@ library GenericSequenceLib {
             } else {
                 // Direct call into an allowlisted router/aggregator whose calldata
                 // was built offchain. Patch runtime values into the pre-built
-                // calldata (bounds-checked), approve exact input, call, then reset.
+                // calldata (bounds-checked), make sure the allowlisted target may
+                // pull the input (a STANDING allowance, see AllowanceLib), call.
                 // srcToken is provably nonzero here (native srcToken == 0x0 is
                 // only admitted with FLAG_V4_UNLOCK or FLAG_NATIVE_IN, both of
                 // which take their own branch above), so the forceApprove
@@ -496,7 +498,7 @@ library GenericSequenceLib {
                     _patchWord(data, op.returnAmountPos, prevReturn);
                 }
                 if (amount != 0) {
-                    IERC20(op.srcToken).forceApprove(op.target, amount);
+                    AllowanceLib.ensure(op.srcToken, op.target, amount);
                 }
 
                 (bool ok, bytes memory ret) = op.target.call(data); // op.value == 0 (checked above)
@@ -508,8 +510,6 @@ library GenericSequenceLib {
                     }
                     revert OpCallFailed(i);
                 }
-
-                IERC20(op.srcToken).forceApprove(op.target, 0);
             }
 
             // Output MUST accrue to the executor — pins the swap recipient to

@@ -1558,8 +1558,10 @@ contract ExecutorTest is Test {
         uint256 loanAfter = loanToken.balanceOf(address(executor));
         assertGe(loanAfter - loanBefore, MIN_PROFIT);
 
-        // Balancer doesn't use approval (safeTransfer), but check Augustus approval reset
+        // Balancer doesn't use approval (safeTransfer); the loan token never touches Augustus
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+        // The collateral leg sold through Augustus leaves a standing allowance (AllowanceLib)
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
         assertEq(collateralToken.allowance(address(executor), address(aavePool)), 0);
     }
 
@@ -1571,6 +1573,7 @@ contract ExecutorTest is Test {
         executor.execute(plan);
 
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
         assertEq(loanToken.allowance(address(executor), address(balancerVault)), 0);
         assertEq(collateralToken.allowance(address(executor), address(aavePool)), 0);
         assertEq(collateralToken.allowance(address(executor), address(balancerVault)), 0);
@@ -1604,9 +1607,11 @@ contract ExecutorTest is Test {
         assertGe(loanAfter - loanBefore, MIN_PROFIT);
 
         // Approval hygiene: Morpho approval was forceApprove(repayAmount), pulled to zero
-        // by the post-callback transferFrom. Augustus approval reset by the swap path.
+        // by the post-callback transferFrom. The collateral sold through Augustus
+        // leaves a standing allowance (AllowanceLib); the loan token never touches it.
         assertEq(loanToken.allowance(address(executor), address(morphoBlue)), 0);
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
     }
 
     /// Direct call to onMorphoFlashLoan from outside an active flashloan must revert.
@@ -1812,7 +1817,7 @@ contract ExecutorTest is Test {
         assertGe(loanAfter - loanBefore, MIN_PROFIT);
 
         // Approval hygiene
-        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
     }
 
     function test_paraswapSingle_revertsOnSwapFailure() public {
@@ -2056,7 +2061,7 @@ contract ExecutorTest is Test {
 
         // Approval hygiene
         assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), 0);
-        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
     }
 
     function test_aaveV2Liquidation_approvalReset() public {
@@ -2581,7 +2586,7 @@ contract ExecutorTest is Test {
         // Assert allowance reset for debtAsset -> aavePool
         assertEq(loanToken.allowance(address(executor), address(aavePool)), 0);
         // Assert allowance reset for swap
-        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -3528,7 +3533,7 @@ contract ExecutorTest is Test {
 
         // No dangling approvals
         assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), 0);
-        assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), type(uint256).max);
         assertEq(loanToken.allowance(address(freshExecutor), address(augustus)), 0);
 
         // Verify profit math
@@ -3809,7 +3814,7 @@ contract ExecutorTest is Test {
 
         // No approvals
         assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), 0);
-        assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), type(uint256).max);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -7201,7 +7206,7 @@ contract ExecutorTest is Test {
         assertTrue(executor.allowedTargets(address(uniV3Mock)), "V3 router must be whitelisted");
     }
 
-    function test_UniV2_approvalResetAfterSwap() public {
+    function test_UniV2_standingAllowanceAfterSwap() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 1, 0);
         bytes memory plan =
@@ -7212,12 +7217,12 @@ contract ExecutorTest is Test {
 
         assertEq(
             collateralToken.allowance(address(executor), address(uniV2Mock)),
-            0,
-            "V2 router allowance must be zero after swap"
+            type(uint256).max,
+            "V2 router keeps a standing allowance after the swap (AllowanceLib)"
         );
     }
 
-    function test_UniV3_approvalResetAfterSwap() public {
+    function test_UniV3_standingAllowanceAfterSwap() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV3SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 3000, 1, 0);
         bytes memory plan =
@@ -7228,8 +7233,8 @@ contract ExecutorTest is Test {
 
         assertEq(
             collateralToken.allowance(address(executor), address(uniV3Mock)),
-            0,
-            "V3 router allowance must be zero after swap"
+            type(uint256).max,
+            "V3 router keeps a standing allowance after the swap (AllowanceLib)"
         );
     }
 
