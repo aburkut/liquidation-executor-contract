@@ -302,7 +302,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         assertEq(curveRouter.lastFinalToken(), address(loanToken), "dst mismatch");
         assertEq(curveRouter.lastHopCount(), 1, "hop count != 1");
         // The allowlisted router keeps a standing allowance (AllowanceLib).
-        assertEq(IERC20(address(collateralToken)).allowance(address(executor), address(curveRouter)), type(uint256).max);
+        assertEq(IERC20(address(collateralToken)).allowance(address(executor), address(curveRouter)), 0);
     }
 
     function test_CurveMH_sell_3hop_success() public {
@@ -605,7 +605,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         );
         vm.prank(operatorAddr);
         executor.execute(plan);
-        assertEq(IERC20(address(collateralToken)).allowance(address(executor), address(curveRouter)), type(uint256).max);
+        assertEq(IERC20(address(collateralToken)).allowance(address(executor), address(curveRouter)), 0);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -653,10 +653,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         assertEq(balancerBatchVault.lastStepCount(), 2, "step count != 2");
         assertEq(balancerBatchVault.lastSrcAsset(), address(collateralToken));
         assertEq(balancerBatchVault.lastDstAsset(), address(loanToken));
-        assertEq(
-            IERC20(address(collateralToken)).allowance(address(executor), address(balancerBatchVault)),
-            type(uint256).max
-        );
+        assertEq(IERC20(address(collateralToken)).allowance(address(executor), address(balancerBatchVault)), 0);
     }
 
     function test_BalMH_sell_3hop_success() public {

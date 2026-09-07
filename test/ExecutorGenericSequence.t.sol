@@ -164,7 +164,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         executor.execute(plan);
         assertGe(loanToken.balanceOf(address(executor)), before, "profit retained after flash repay");
         // The allowlisted DEX keeps a standing allowance (AllowanceLib).
-        assertEq(collateralToken.allowance(address(executor), address(dex)), type(uint256).max, "standing allowance");
+        assertEq(collateralToken.allowance(address(executor), address(dex)), 0, "no allowance survives the op");
     }
 
     function test_GenericSequence_UnderRepay_Reverts() public {
@@ -206,7 +206,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
 
         vm.prank(operatorAddr);
         executor.execute(plan);
-        assertEq(interToken.allowance(address(executor), address(dex)), type(uint256).max, "inter standing allowance");
+        assertEq(interToken.allowance(address(executor), address(dex)), 0, "no allowance survives the intermediate op");
     }
 
     // ── containment (audit fix): compromised operator cannot drain ──

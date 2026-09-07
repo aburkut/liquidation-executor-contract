@@ -173,9 +173,13 @@ library CurveV1Lib {
 
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        // The router is an owner-allowlisted target (RouterNG), so it gets a
-        // standing allowance; the single-pool path above keeps the exact
-        // approve/reset because its pool address is operator-supplied.
+        // This comment used to claim "the router is an owner-allowlisted target
+        // (RouterNG), so it gets a standing allowance". No allowlist is
+        // consulted anywhere on this path — `router` IS `leg.bebopTarget`,
+        // straight out of the operator's plan, checked only for `!= 0` and
+        // `code.length > 0`. AUDITED 2026-09-08: the standing grant made every
+        // such leg hand a permanent unlimited spender to an address a hot key
+        // picked. Bounded and cleared, exactly like the single-pool path.
         AllowanceLib.ensure(leg.srcToken, router, amountIn);
 
         // Router exchange selector: keccak256("exchange(address[11],uint256[5][5],uint256,uint256,address[5],address)")[0:4]
@@ -184,6 +188,8 @@ library CurveV1Lib {
             abi.encodeWithSelector(0xc872a3c5, path, swapParams, amountIn, leg.minAmountOut, pools, address(this));
         (bool ok,) = router.call(callData);
         if (!ok) revert CurveSwapFailed();
+
+        AllowanceLib.clear(leg.srcToken, router);
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);

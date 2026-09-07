@@ -93,8 +93,9 @@ library UniswapLib {
 
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        // The router is immutable on the executor: a standing allowance, not
-        // a fresh SSTORE from zero on every leg (AllowanceLib).
+        // Bounded by this leg's `amountIn`, which is also the router's
+        // `amountInMaximum` on the BUY side, so the approval and the cap are
+        // the same number by construction (AllowanceLib).
         AllowanceLib.ensure(leg.srcToken, router, amountIn);
 
         uint256 actualIn;

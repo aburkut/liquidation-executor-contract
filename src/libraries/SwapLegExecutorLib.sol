@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {AllowanceLib} from "./AllowanceLib.sol";
 import {ParaswapDecoderLib} from "./ParaswapDecoderLib.sol";
@@ -53,6 +54,8 @@ library SwapLegExecutorLib {
     /// @dev The quote's `partialFillOffset` does not address a whole word
     /// inside its own calldata. Fail closed rather than write out of bounds.
     error BebopPartialFillOffsetOutOfRange();
+    /// @dev The settlement pulled more `srcToken` than the leg declared.
+    error BebopInputOverspent(uint256 consumed, uint256 declared);
     error TargetNotAllowed();
 
     // Per-leg swap events dropped 2026-09-06 (unread off-chain; 1.5-2.5k gas each).
@@ -73,7 +76,8 @@ library SwapLegExecutorLib {
         if (srcBefore < declaredIn) revert InsufficientSrcBalance(declaredIn, srcBefore);
         uint256 dstBefore = IERC20(dstToken).balanceOf(address(this));
 
-        // Augustus is constructor-pinned: standing allowance (AllowanceLib).
+        // Bounded by the amount this leg declared (AllowanceLib): Augustus
+        // is constructor-pinned, but the calldata that drives it is not.
         AllowanceLib.ensure(srcToken, augustus, declaredIn);
         (bool ok,) = augustus.call(leg.paraswapCalldata);
         if (!ok) revert ParaswapSwapFailed();
@@ -142,16 +146,36 @@ library SwapLegExecutorLib {
             _writeBebopFill(leg.bebopCalldata, leg.bebopPartialFillOffset, fill);
         }
 
-        // `target` passed the caller's allowlist check above: standing
-        // allowance (AllowanceLib).
+        // `target` passed the caller's allowlist check above, and that is NOT
+        // enough on its own: `bebopCalldata` is opaque and operator-built, so
+        // an allowlisted multicall router will pull whatever the calldata says.
+        // AUDITED 2026-09-08 — with a standing unlimited allowance the leg's
+        // `fill`, `amountIn` and `collateralDelta` caps all bounded a declared
+        // number while the actual pull was unbounded. The approval is the only
+        // place that can bind the two together, so it is exactly `fill`.
         AllowanceLib.ensure(leg.srcToken, target, fill);
         (bool ok,) = target.call(leg.bebopCalldata);
 
         if (!ok) revert BebopSwapFailed();
 
+        AllowanceLib.clear(leg.srcToken, target);
+
+        // And measure it, rather than trusting the approval alone.
+        uint256 consumed = srcBal - IERC20(leg.srcToken).balanceOf(address(this));
+        if (consumed > fill) revert BebopInputOverspent(consumed, fill);
+
         uint256 repayAfter = IERC20(leg.repayToken).balanceOf(address(this));
         uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
-        if (repayDelta < leg.minAmountOut) revert InsufficientRepayOutput(repayDelta, leg.minAmountOut);
+
+        // The floor must scale with the fill or the partial-fill feature
+        // reverts in precisely the case it exists for: `minAmountOut` is
+        // written for the FULL `leg.amountIn`, and a block that seized less
+        // collateral fills pro-rata. Rounding up keeps the floor honest.
+        uint256 floor_ = leg.minAmountOut;
+        if (fill < leg.amountIn && leg.amountIn != 0) {
+            floor_ = Math.mulDiv(leg.minAmountOut, fill, leg.amountIn, Math.Rounding.Ceil);
+        }
+        if (repayDelta < floor_) revert InsufficientRepayOutput(repayDelta, floor_);
     }
 
     /// @dev Overwrite the taker amount inside a signed Bebop order.

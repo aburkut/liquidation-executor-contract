@@ -249,6 +249,15 @@ contract ExecutorNativeV4Test is ExecutorTest {
     /// FULL_BALANCE/PREV_RETURN inject an INPUT amount; an unwrap op's
     /// `amountIn` is an explicit WETH amount, not derived from either — the
     /// combination must be rejected rather than silently mis-sized.
+    /// A combined-flag op is rejected by the EXECUTOR, not by a library.
+    ///
+    /// AUDITED 2026-09-08: this expected `InvalidPlan`, the backstop inside
+    /// `GenericSequenceLib._runOps`, because the executor's own pre-flight walk
+    /// skipped any op with the unwrap BIT set and never looked at its target.
+    /// The walk now tests for flags EXACTLY equal to `FLAG_WETH_UNWRAP`, the
+    /// way `ArbExecutor` always has, so a combined-flag op reaches the target
+    /// allowlist and is refused there first. Same rejection, one gate earlier,
+    /// and the executor is authoritative again.
     function test_unwrapOp_FullBalanceCombo_Reverts() public {
         _unwrapSetUp();
 
@@ -257,7 +266,7 @@ contract ExecutorNativeV4Test is ExecutorTest {
         bytes memory plan = _wethCollateralPlan(_oneOp(op), 1 ether);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.execute(plan);
     }
 

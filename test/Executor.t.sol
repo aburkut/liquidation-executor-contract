@@ -1564,7 +1564,7 @@ contract ExecutorTest is Test {
         // Balancer doesn't use approval (safeTransfer); the loan token never touches Augustus
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
         // The collateral leg sold through Augustus leaves a standing allowance (AllowanceLib)
-        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
         assertEq(collateralToken.allowance(address(executor), address(aavePool)), 0);
     }
 
@@ -1576,7 +1576,7 @@ contract ExecutorTest is Test {
         executor.execute(plan);
 
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
-        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
         assertEq(loanToken.allowance(address(executor), address(balancerVault)), 0);
         assertEq(collateralToken.allowance(address(executor), address(aavePool)), 0);
         assertEq(collateralToken.allowance(address(executor), address(balancerVault)), 0);
@@ -1612,9 +1612,9 @@ contract ExecutorTest is Test {
         // Approval hygiene: Morpho approval was forceApprove(repayAmount), pulled to zero
         // by the post-callback transferFrom. The collateral sold through Augustus
         // leaves a standing allowance (AllowanceLib); the loan token never touches it.
-        assertEq(loanToken.allowance(address(executor), address(morphoBlue)), type(uint256).max);
+        assertEq(loanToken.allowance(address(executor), address(morphoBlue)), 0);
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
-        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
     }
 
     /// Direct call to onMorphoFlashLoan from outside an active flashloan must revert.
@@ -1810,7 +1810,7 @@ contract ExecutorTest is Test {
         assertGe(loanAfter - loanBefore, MIN_PROFIT);
 
         // Approval hygiene
-        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
     }
 
     function test_paraswapSingle_revertsOnSwapFailure() public {
@@ -1937,6 +1937,78 @@ contract ExecutorTest is Test {
         assertEq(profitAfter - profitBefore, profitOutput);
     }
 
+    /// A leg must not be able to reach a balance it did not seize.
+    ///
+    /// AUDITED 2026-09-08. `bebopCalldata` is opaque and operator-built, so the
+    /// allowlist on `bebopTarget` bounds the CALLEE and nothing else; what the
+    /// callee pulls is decided inside those bytes. While the approval was an
+    /// unlimited standing one, a settlement asking for the executor's entire
+    /// `srcToken` balance — profit sitting there awaiting `withdraw`, not this
+    /// transaction's collateral — was granted it, and every downstream gate
+    /// still passed because the leg produced its `minAmountOut`.
+    ///
+    /// Now the approval is exactly the leg's `fill`, and a post-call
+    /// measurement backs it up. Either guard is enough to refuse the plan; the
+    /// property under test is that the standing balance is still there.
+    function test_bebopMulti_cannotPullStandingBalance() public {
+        uint256 debtToCover = 400e18;
+        uint256 collateralIn = COLLATERAL_REWARD;
+
+        // Profit from earlier runs, waiting for the owner to withdraw it.
+        uint256 standing = 5_000e18;
+        collateralToken.mint(address(executor), standing);
+        uint256 before = collateralToken.balanceOf(address(executor));
+
+        // The settlement asks for the collateral AND the standing balance,
+        // and honestly returns enough to satisfy every output check.
+        bebop.configure(address(collateralToken), collateralIn + standing, address(loanToken), 1100e18, address(0), 0);
+        bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildBebopMultiSwapPlan(
+            address(collateralToken), collateralIn, address(bebop), bebopCd, address(loanToken), address(loanToken), 0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+
+        assertEq(
+            collateralToken.balanceOf(address(executor)), before, "a leg must not reach a balance it did not seize"
+        );
+    }
+
+    /// The owner can take an allowance back.
+    ///
+    /// AUDITED 2026-09-08: `setAllowedTarget(t, false)`, `setOperator(op,
+    /// false)` and `pause()` are the documented kill-switches for a leaked hot
+    /// key, and none of them could touch an allowance — `withdraw` and the
+    /// `rescue*` family only move tokens the contract still holds. So a
+    /// spender's power over FUTURE balances outlived every revocation the
+    /// owner had.
+    function test_revokeAllowance_takesBackASpendersPower() public {
+        vm.prank(address(executor));
+        collateralToken.approve(address(augustus), type(uint256).max);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
+
+        vm.prank(owner);
+        executor.revokeAllowance(address(collateralToken), address(augustus));
+
+        assertEq(
+            collateralToken.allowance(address(executor), address(augustus)),
+            0,
+            "the owner must be able to disarm a spender"
+        );
+    }
+
+    /// And only the owner can. An operator key is hot by design.
+    function test_revokeAllowance_isOwnerOnly() public {
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.revokeAllowance(address(collateralToken), address(augustus));
+    }
+
     function test_bebopMulti_revertsOnUntrustedTarget() public {
         address untrustedTarget = address(0xBAD);
 
@@ -2053,8 +2125,8 @@ contract ExecutorTest is Test {
         executor.execute(plan);
 
         // Approval hygiene
-        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), type(uint256).max);
-        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
+        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
     }
 
     function test_aaveV2Liquidation_approvalReset() public {
@@ -2081,7 +2153,7 @@ contract ExecutorTest is Test {
 
         vm.prank(operatorAddr);
         executor.execute(plan);
-        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), type(uint256).max);
+        assertEq(loanToken.allowance(address(executor), address(aaveV2Pool)), 0);
     }
 
     function test_aaveV2Liquidation_reverts() public {
@@ -2575,9 +2647,9 @@ contract ExecutorTest is Test {
         executor.execute(plan);
 
         // Assert allowance reset for debtAsset -> aavePool
-        assertEq(loanToken.allowance(address(executor), address(aavePool)), type(uint256).max);
+        assertEq(loanToken.allowance(address(executor), address(aavePool)), 0);
         // Assert allowance reset for swap
-        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -3521,8 +3593,8 @@ contract ExecutorTest is Test {
         );
 
         // No dangling approvals
-        assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), type(uint256).max);
-        assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), type(uint256).max);
+        assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), 0);
+        assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), 0);
         assertEq(loanToken.allowance(address(freshExecutor), address(augustus)), 0);
 
         // Verify profit math
@@ -3802,8 +3874,8 @@ contract ExecutorTest is Test {
         assertEq(collateralToken.balanceOf(address(freshExecutor)), 0, "No collateral left");
 
         // No approvals
-        assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), type(uint256).max);
-        assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), type(uint256).max);
+        assertEq(loanToken.allowance(address(freshExecutor), address(aavePool)), 0);
+        assertEq(collateralToken.allowance(address(freshExecutor), address(augustus)), 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -5298,7 +5370,7 @@ contract ExecutorTest is Test {
         freshExec.execute(plan);
 
         // Verify approval is reset to 0
-        assertEq(loanToken.allowance(address(freshExec), address(morphoBlue)), type(uint256).max);
+        assertEq(loanToken.allowance(address(freshExec), address(morphoBlue)), 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -7195,7 +7267,14 @@ contract ExecutorTest is Test {
         assertTrue(executor.allowedTargets(address(uniV3Mock)), "V3 router must be whitelisted");
     }
 
-    function test_UniV2_standingAllowanceAfterSwap() public {
+    /// The V2 router must NOT keep an allowance once its leg is done.
+    ///
+    /// AUDITED 2026-09-08: this test used to assert the opposite — that the
+    /// router kept `type(uint256).max` standing. A standing allowance is a
+    /// spender with power over every future balance, which no owner call
+    /// could take back, and it is what let an operator-named target be
+    /// turned into a permanent drain.
+    function test_UniV2_noAllowanceSurvivesTheSwap() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 1, 0);
         bytes memory plan =
@@ -7206,12 +7285,13 @@ contract ExecutorTest is Test {
 
         assertEq(
             collateralToken.allowance(address(executor), address(uniV2Mock)),
-            type(uint256).max,
-            "V2 router keeps a standing allowance after the swap (AllowanceLib)"
+            0,
+            "the V2 router must keep no allowance once its leg is done"
         );
     }
 
-    function test_UniV3_standingAllowanceAfterSwap() public {
+    /// Same invariant on the V3 router. See the V2 case above.
+    function test_UniV3_noAllowanceSurvivesTheSwap() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV3SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 3000, 1, 0);
         bytes memory plan =
@@ -7222,8 +7302,8 @@ contract ExecutorTest is Test {
 
         assertEq(
             collateralToken.allowance(address(executor), address(uniV3Mock)),
-            type(uint256).max,
-            "V3 router keeps a standing allowance after the swap (AllowanceLib)"
+            0,
+            "the V3 router must keep no allowance once its leg is done"
         );
     }
 

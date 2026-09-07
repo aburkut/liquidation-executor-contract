@@ -268,6 +268,19 @@ contract ArbExecutor is
         emit AllowedTargetUpdated(target, allowed);
     }
 
+    /// @notice Take back a spender's allowance on `token`.
+    ///
+    /// AUDITED 2026-09-08: `setAllowedTarget(t, false)`, `setOperator(op,
+    /// false)` and `pause()` are the documented kill-switches for a leaked hot
+    /// key, and none of them can touch an ERC20 allowance — `withdraw` and the
+    /// `rescue*` family only move tokens this contract still holds. So a
+    /// spender's power over future balances outlived every revocation the
+    /// owner had. This is the missing half.
+    function revokeAllowance(address token, address spender) external onlyOwner {
+        if (token == address(0) || spender == address(0)) revert ZeroAddress();
+        IERC20(token).forceApprove(spender, 0);
+    }
+
     /// @notice Add or remove an operator EOA authorised to call `execute`.
     /// @dev Deliberately NOT self-service: only the owner may rotate keys.
     /// Revoking is immediate, which is the kill-switch for a leaked hot key

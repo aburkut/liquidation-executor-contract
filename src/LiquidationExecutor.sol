@@ -507,6 +507,19 @@ contract LiquidationExecutor is
         emit AllowedTargetUpdated(target, allowed);
     }
 
+    /// @notice Take back a spender's allowance on `token`.
+    ///
+    /// AUDITED 2026-09-08: `setAllowedTarget(t, false)`, `setOperator(op,
+    /// false)` and `pause()` are the documented kill-switches for a leaked hot
+    /// key, and none of them can touch an ERC20 allowance — `withdraw` and the
+    /// `rescue*` family only move tokens this contract still holds. So a
+    /// spender's power over future balances outlived every revocation the
+    /// owner had. This is the missing half.
+    function revokeAllowance(address token, address spender) external onlyOwner {
+        if (token == address(0) || spender == address(0)) revert ZeroAddress();
+        IERC20(token).forceApprove(spender, 0);
+    }
+
     /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.
     /// @dev Hooks execute arbitrary logic during `beforeSwap`/`afterSwap` on the
     /// PoolManager; any non-zero hook that is NOT in this whitelist causes the
@@ -680,7 +693,14 @@ contract LiquidationExecutor is
                 // lib (which enforces `srcToken == weth` and the exact-flag
                 // shape), so there is nothing to allowlist. Exempt them from the
                 // target gate; every other op's target must be allowlisted.
-                if (plan.swapPlan.ops[i].flags & GenericSequenceLib.FLAG_WETH_UNWRAP != 0) continue;
+                // EXACT equality, not bit presence. A combined-flag op
+                // (FLAG_WETH_UNWRAP | FLAG_V4_UNLOCK, or | FLAG_V3_FLASH)
+                // DOES carry an external target, so bit-presence skipped
+                // this contract's own allowlist gate — and, sitting above
+                // the flash rejection below, the flash gate too. Only a
+                // library backstop stood behind them. `ArbExecutor` has
+                // always used equality here; the two now agree.
+                if (plan.swapPlan.ops[i].flags == GenericSequenceLib.FLAG_WETH_UNWRAP) continue;
                 // FLASH swaps run the rest of the sequence inside a pool
                 // callback; this executor only implements the immediate-pay
                 // callbacks (size budget), so a flash op cannot run here.
@@ -1660,9 +1680,8 @@ contract LiquidationExecutor is
         if (action.user == address(0)) revert ZeroAddress();
         if (action.debtToCover == 0) revert InvalidPlan();
 
-        // The pool is constructor-pinned and allowlisted: standing allowance
-        // (AllowanceLib) instead of an approve from zero plus a reset per
-        // liquidation (~24k gas).
+        // The pool is constructor-pinned and allowlisted; the allowance is
+        // bounded by exactly the debt this call repays (AllowanceLib).
         AllowanceLib.ensure(action.debtAsset, pool, action.debtToCover);
         IAaveV3Pool(pool)
             .liquidationCall(

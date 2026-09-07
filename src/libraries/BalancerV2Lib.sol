@@ -102,7 +102,8 @@ interface IBalancerV2Vault {
 ///     is the trusted source of the Vault address. The single canonical
 ///     Balancer V2 Vault `0xBA12222222228d8Ba445958a75a0704d566BF2C8`
 ///     is the only one a real plan should ever reference.
-///   * standing allowance to the constructor-pinned vault (AllowanceLib).
+///   * allowance bounded by the leg's `amountIn` and cleared after the call
+///     — the vault address comes from the plan, not the constructor.
 ///   * Output delta floor: `received >= leg.minAmountOut`.
 ///
 /// STRUCT DISCIPLINE: `SwapLeg` imported from `../types/SwapTypes.sol`
@@ -149,7 +150,13 @@ library BalancerV2Lib {
         uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
         if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
+        uint256 inBefore = srcBal;
 
+        // `vault` is `leg.bebopTarget`: OPERATOR-supplied, checked only for
+        // code, never against `allowedTargets`. So the allowance is bounded by
+        // this leg's `amountIn` and taken back after the call — a standing one
+        // here is a permanent unlimited spender chosen by a hot key
+        // (AUDITED 2026-09-08).
         AllowanceLib.ensure(leg.srcToken, vault, amountIn);
 
         bool isBuy = leg.mode == SwapMode.BAL_V2_BUY;
@@ -175,8 +182,20 @@ library BalancerV2Lib {
 
         IBalancerV2Vault(vault).swap(single, funds, swapLimit, leg.deadline);
 
+        // Take back anything the vault did not pull: an operator-supplied
+        // spender must not keep a live allowance past its own leg.
+        AllowanceLib.clear(leg.srcToken, vault);
+
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
+
+        // Input cap, which the batchSwap sibling below has always had and this
+        // one did not: `received >= minAmountOut` says the leg produced
+        // enough, never that it consumed only what it declared. A vault that
+        // returns the floor while pulling the whole standing balance passes
+        // every other check in this function.
+        uint256 consumed = inBefore - IERC20(leg.srcToken).balanceOf(address(this));
+        if (consumed > amountIn) revert InsufficientSrcBalance(consumed, amountIn);
     }
 
     // ─── Multihop entrypoint ─────────────────────────────────────────
@@ -230,6 +249,7 @@ library BalancerV2Lib {
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
         uint256 inBefore = IERC20(leg.srcToken).balanceOf(address(this));
 
+        // OPERATOR-supplied spender: bounded by this leg and cleared after it.
         AllowanceLib.ensure(leg.srcToken, vault, amountIn);
 
         bool isBuy = leg.mode == SwapMode.BAL_V2_MH_BUY;
@@ -244,6 +264,9 @@ library BalancerV2Lib {
         });
 
         IBalancerV2Vault(vault).batchSwap(kind, swaps, assets, funds, limits, leg.deadline);
+
+        // Same reason as the single-swap path: `vault` came from the plan.
+        AllowanceLib.clear(leg.srcToken, vault);
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);

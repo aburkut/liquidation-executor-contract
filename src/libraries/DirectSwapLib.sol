@@ -90,6 +90,15 @@ library DirectSwapLib {
             tstore(POOL_TSLOT, pool)
             tstore(TOKENIN_TSLOT, tokenIn)
             tstore(MAX_TSLOT, amount)
+            // Zero the continuation hash, mirroring what `_armContinuation`
+            // does to TOKENIN/MAX in the other direction. AUDITED 2026-09-08:
+            // arming an IMMEDIATE swap inside a live FLASH continuation left
+            // the outer hash standing, so the operator-named (never
+            // allowlisted) pool armed here could answer with those bytes,
+            // satisfy `beginContinuation`, and re-run the remaining ops —
+            // paying out under a token and ceiling it was never armed for.
+            // Only one of the two shapes may ever be claimable at a time.
+            tstore(CONT_HASH_TSLOT, 0)
         }
         (int256 d0, int256 d1) = IUniV3PoolMinimal(pool).swap(address(this), zeroForOne, int256(amount), limit, "");
         _disarm();
@@ -171,6 +180,9 @@ library DirectSwapLib {
             expected := tload(CONT_HASH_TSLOT)
             phase := tload(PHASE_TSLOT)
             tstore(POOL_TSLOT, 0)
+            // Claim the hash too, not only the pool word: a claimed
+            // continuation must not be presentable a second time.
+            tstore(CONT_HASH_TSLOT, 0)
         }
         if (!phase || pool == address(0) || msg.sender != pool) revert DirectSwapCallbackUnarmed();
         if (keccak256(cont) != expected) revert DirectSwapContinuationMismatch();
