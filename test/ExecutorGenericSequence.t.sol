@@ -25,6 +25,24 @@ contract MockGenericDex {
     }
 }
 
+/// @dev A DEX that spends only HALF of what it was approved.
+///
+/// The plain `MockGenericDex` above pulls exactly the patched `amountIn`, so it
+/// consumes its whole allowance and leaves nothing behind — which is why the
+/// existing allowance assertions passed even while `_runOps` granted an
+/// approval and never took it back. Under-spending is the shape that actually
+/// exercises the take-back, and it is the NORMAL shape in production: every
+/// exact-output route and every `amountInMaximum` fills for less than it asked
+/// for.
+contract MockUnderspendingDex {
+    function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 rate) external {
+        uint256 spend = amountIn / 2;
+        IMiniERC20(tokenIn).transferFrom(msg.sender, address(this), spend);
+        uint256 out = (amountIn * rate) / 1e18;
+        IMiniERC20(tokenOut).transfer(msg.sender, out);
+    }
+}
+
 /// @dev A native-IN payable router: takes `msg.value` ETH, mints `amountOut`
 /// of `outToken` back to the caller. Same test double as
 /// `ArbGenericSequence.t.sol`'s `MockPayableRouter` — proves a `FLAG_NATIVE_IN`
@@ -165,6 +183,39 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         assertGe(loanToken.balanceOf(address(executor)), before, "profit retained after flash repay");
         // The allowlisted DEX keeps a standing allowance (AllowanceLib).
         assertEq(collateralToken.allowance(address(executor), address(dex)), 0, "no allowance survives the op");
+    }
+
+    /// No allowance may outlive the op that granted it.
+    ///
+    /// AUDITED 2026-09-08 (second pass). Bounding the grant to `amount` was
+    /// only half the fix: a target that spends LESS than it was approved
+    /// leaves the remainder standing, and a standing allowance to an
+    /// allowlisted target is exactly what lets a LATER plan move a token that
+    /// plan never declares — which `_finishOps` does not bucket and therefore
+    /// does not cap. Under-spending is the normal case, not an edge one.
+    ///
+    /// This op carries `FLAG_FULL_BALANCE`, so its approval is sized from the
+    /// BALANCE and its `amountIn` field is zero. The first version of the
+    /// take-back was gated on `op.amountIn != 0` and skipped precisely this
+    /// shape.
+    function test_GenericSequence_NoAllowanceSurvivesAnUnderspendingOp() public {
+        MockUnderspendingDex halfDex = new MockUnderspendingDex();
+        loanToken.mint(address(halfDex), 1_000_000e18);
+        vm.prank(owner);
+        executor.setAllowedTarget(address(halfDex), true);
+
+        Op memory op = _swapOp(address(collateralToken), address(loanToken), 2.2e18, FLAG_FULL_BALANCE);
+        op.target = address(halfDex);
+        bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(
+            collateralToken.allowance(address(executor), address(halfDex)),
+            0,
+            "the unspent half of the approval must not outlive the op"
+        );
     }
 
     function test_GenericSequence_UnderRepay_Reverts() public {

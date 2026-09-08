@@ -112,6 +112,14 @@ library UniswapLib {
                 .swapExactTokensForTokens(amountIn, leg.minAmountOut, leg.v2Path, address(this), leg.deadline);
             actualIn = amountIn;
         }
+        // A BUY approves `amountInMaximum` and fills for less, so the
+        // remainder would stand to the router for good. // AUDITED 2026-09-08 (second pass): bounding the grant is only half
+        // the fix. A call that consumes less than it was approved leaves the
+        // remainder standing, and a standing allowance to an allowlisted
+        // target is what lets a LATER plan move a token it never declares —
+        // which `_finishOps` does not bucket and therefore does not cap.
+        AllowanceLib.clear(leg.srcToken, router);
+        if (actualIn > amountIn) revert InsufficientSrcBalance(actualIn, amountIn);
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
     }
@@ -205,6 +213,10 @@ library UniswapLib {
             }
             actualIn = amountIn;
         }
+        // Same as the V2 leg: a BUY approves `amountInMaximum` and fills for
+        // less, and the remainder would otherwise stand to the router.
+        AllowanceLib.clear(leg.srcToken, router);
+        if (actualIn > amountIn) revert InsufficientSrcBalance(actualIn, amountIn);
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
     }

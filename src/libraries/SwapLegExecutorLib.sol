@@ -78,9 +78,22 @@ library SwapLegExecutorLib {
 
         // Bounded by the amount this leg declared (AllowanceLib): Augustus
         // is constructor-pinned, but the calldata that drives it is not.
+        // The approval is sized from the CALLDATA while the ceiling below is
+        // enforced against the struct field, so tie them together first: an
+        // approval larger than the plan declared is an approval the plan's own
+        // caps never bounded.
+        if (declaredIn > leg.amountIn) revert ParaswapAmountInMismatch(leg.amountIn, declaredIn);
         AllowanceLib.ensure(srcToken, augustus, declaredIn);
         (bool ok,) = augustus.call(leg.paraswapCalldata);
         if (!ok) revert ParaswapSwapFailed();
+
+        // Every exact-out route consumes less than it declared, so a residual
+        // is the EXPECTED outcome here, not an edge case. // AUDITED 2026-09-08 (second pass): bounding the grant is only half
+        // the fix. A call that consumes less than it was approved leaves the
+        // remainder standing, and a standing allowance to an allowlisted
+        // target is what lets a LATER plan move a token it never declares —
+        // which `_finishOps` does not bucket and therefore does not cap.
+        AllowanceLib.clear(srcToken, augustus);
 
         uint256 actualIn;
         {

@@ -708,6 +708,31 @@ contract LiquidationExecutor is
                     plan.swapPlan.ops[i].flags & (GenericSequenceLib.FLAG_V3_FLASH | GenericSequenceLib.FLAG_V2_FLASH)
                         != 0
                 ) revert InvalidPlan();
+                // Being allowlisted is not enough for a target that can move
+                // value WITHOUT an allowance, or mint balance the containment
+                // cap then reads as income. AUDITED 2026-09-08: the
+                // constructor seeds the lending pools and the vault into
+                // `allowedTargets` because the liquidation and flash paths
+                // re-read that mapping as their own kill-switch — which also
+                // handed a generic op their whole function surface, with
+                // operator-authored calldata. Two shapes escape the cap
+                // outright: `borrow(asset, Y, 2, 0, this)` RAISES the balance
+                // the cap measures, so the borrowed principal routes out and
+                // the cap sees nothing; and `withdraw(asset, max, attacker)`
+                // burns the executor's own aTokens with no allowance and no
+                // `srcToken`, so the token is never bucketed at all.
+                // `ArbExecutor` refuses to seed Morpho for this reason and
+                // says so; this is the same refusal, kept narrow so the
+                // liquidation paths still work.
+                //
+                // ABOVE the direct-pool exemption below, not after it: a
+                // direct-pool op names its pool freely, and the check has to
+                // see every op.
+                if (
+                    plan.swapPlan.ops[i].target == aavePool || plan.swapPlan.ops[i].target == morphoBlue
+                        || plan.swapPlan.ops[i].target == aaveV2LendingPool
+                        || plan.swapPlan.ops[i].target == allowedFlashProviders[FLASH_PROVIDER_BALANCER]
+                ) revert TargetNotAllowed();
                 // Direct pool swaps name the pool itself: permissionless and
                 // bounded by construction (DirectSwapLib), not allowlisted.
                 if (
@@ -1378,12 +1403,15 @@ contract LiquidationExecutor is
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
         SwapMode m = leg.mode;
         if (m == SwapMode.PARASWAP_SINGLE) {
+            if (!allowedTargets[paraswapAugustusV6]) revert TargetNotAllowed();
             SwapLegExecutorLib.executeParaswapLeg(leg, paraswapAugustusV6);
         } else if (m == SwapMode.BEBOP_MULTI) {
             SwapLegExecutorLib.executeBebopLeg(leg, outBefore, allowedTargets[leg.bebopTarget]);
         } else if (m == SwapMode.UNI_V2 || m == SwapMode.UNI_V2_BUY) {
+            if (!allowedTargets[uniV2Router]) revert TargetNotAllowed();
             UniswapLib.executeUniV2Leg(leg, amountIn, uniV2Router);
         } else if (m == SwapMode.UNI_V3 || m == SwapMode.UNI_V3_BUY) {
+            if (!allowedTargets[uniV3Router]) revert TargetNotAllowed();
             UniswapLib.executeUniV3Leg(leg, amountIn, uniV3Router);
         } else if (m == SwapMode.UNI_V4 || m == SwapMode.UNI_V4_BUY) {
             // _executeUniV4Leg reads `leg.mode` to flip the V4
@@ -1687,6 +1715,10 @@ contract LiquidationExecutor is
             .liquidationCall(
                 action.collateralAsset, action.debtAsset, action.user, action.debtToCover, action.receiveAToken
             );
+        // Aave pulls min(debtToCover, closeFactor * debt), so a deliberately
+        // padded cover amount leaves the difference standing to a target the
+        // constructor also seeds into `allowedTargets`.
+        AllowanceLib.clear(action.debtAsset, pool);
     }
 
     function _executeAaveV2Liquidation(bytes memory actionData) internal {
@@ -1699,6 +1731,7 @@ contract LiquidationExecutor is
         AllowanceLib.ensure(liq.debtAsset, pool, liq.debtToCover);
         IAaveV2LendingPool(pool)
             .liquidationCall(liq.collateralAsset, liq.debtAsset, liq.user, liq.debtToCover, liq.receiveAToken);
+        AllowanceLib.clear(liq.debtAsset, pool);
     }
 
     function _executeMorphoLiquidation(bytes memory actionData) internal {
@@ -1722,6 +1755,9 @@ contract LiquidationExecutor is
         AllowanceLib.ensure(liq.marketParams.loanToken, morpho, liq.maxRepayAssets);
         (, uint256 assetsRepaid) =
             IMorphoBlue(morpho).liquidate(liq.marketParams, liq.borrower, liq.seizedAssets, liq.repaidShares, "");
+        // `assetsRepaid < maxRepayAssets` is explicitly tolerated below, so a
+        // residual is the normal outcome here.
+        AllowanceLib.clear(liq.marketParams.loanToken, morpho);
 
         // Verify Morpho didn't pull more than the operator authorized
         if (assetsRepaid > liq.maxRepayAssets) revert InsufficientRepayBalance(assetsRepaid, liq.maxRepayAssets);

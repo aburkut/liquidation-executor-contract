@@ -604,7 +604,7 @@ library GenericSequenceLib {
                 // Direct call into an allowlisted router/aggregator whose calldata
                 // was built offchain. Patch runtime values into the pre-built
                 // calldata (bounds-checked), make sure the allowlisted target may
-                // pull the input (a STANDING allowance, see AllowanceLib), call.
+                // pull the input (bounded, and taken back after — AllowanceLib).
                 // srcToken is provably nonzero here (native srcToken == 0x0 is
                 // only admitted with FLAG_V4_UNLOCK or FLAG_NATIVE_IN, both of
                 // which take their own branch above), so the forceApprove
@@ -631,6 +631,27 @@ library GenericSequenceLib {
                         }
                     }
                     revert OpCallFailed(i);
+                }
+                if (amount != 0) {
+                    // Take the remainder back, under EXACTLY the condition
+                    // that granted it — `amount`, not `op.amountIn`.
+                    //
+                    // AUDITED 2026-09-08 (second pass): bounding the approval
+                    // was not enough on its own. `amount` may exceed what the
+                    // call spends (it is an operator literal, or a whole
+                    // balance under FLAG_USE_FULL_BALANCE, or an exact-output
+                    // route's `amountInMaximum`), and anything left standing
+                    // is spendable by a LATER plan against a token that plan
+                    // never declares — which `_finishOps` does not bucket and
+                    // therefore does not cap.
+                    //
+                    // The first version of this guard read `op.amountIn != 0
+                    // || FLAG_USE_PREV_RETURN`, which is NOT the same set: a
+                    // FLAG_USE_FULL_BALANCE op carries `amountIn == 0` and
+                    // still gets an approval sized from the balance, so it
+                    // skipped the take-back entirely. Mirroring the `ensure`
+                    // condition is the only form that cannot drift.
+                    AllowanceLib.clear(op.srcToken, op.target);
                 }
             }
 
