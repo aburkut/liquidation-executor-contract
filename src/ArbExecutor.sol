@@ -737,7 +737,7 @@ contract ArbExecutor is
         // Realized profit (loanToken-denominated, net of flash repay). On the
         // inventory path nothing was borrowed, so principal and repay are
         // both zero and the profit is the plain balance delta.
-        uint256 realizedProfit = CoinbasePaymentLib.computeRealizedProfit(
+        (uint256 realizedProfit, bool shortfall) = CoinbasePaymentLib.computeRealizedProfit(
             loanToken, loanToken, profitBefore, inventory ? 0 : plan.loanAmount, flashRepay
         );
         // The inventory must not shrink: the flash path has the repayment
@@ -777,7 +777,7 @@ contract ArbExecutor is
             IERC20(loanToken).safeTransfer(vault, flashRepay);
         }
 
-        CoinbasePaymentLib.checkProfit(realizedProfit, coinbasePaid, plan.minProfitAmount);
+        CoinbasePaymentLib.checkProfitStrict(realizedProfit, coinbasePaid, plan.minProfitAmount, shortfall);
 
         emit ArbExecuted(planHash, loanToken, realizedProfit, coinbasePaid);
     }

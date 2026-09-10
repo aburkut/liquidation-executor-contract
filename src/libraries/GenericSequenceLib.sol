@@ -12,6 +12,7 @@ import {Op} from "../types/SwapTypes.sol";
 /// the executor's WETH and forwards native ETH to its `receive()`.
 interface IWETH {
     function withdraw(uint256 amount) external;
+    function deposit() external payable;
 }
 
 /// @title GenericSequenceLib
@@ -144,11 +145,30 @@ library GenericSequenceLib {
     /// competitor's funding model: no flash loan, no standing inventory. Same
     /// `target`/`callData` shape as the DIRECT flags. `ArbExecutor` treats a
     /// sequence whose FIRST op is a flash swap as self-funded (no loan at all).
+    /// Native-ETH → WETH wrap. The mirror of [`FLAG_WETH_UNWRAP`], and it
+    /// exists for the same reason: to close a native cycle WITHOUT WETH being
+    /// an allowlisted call target.
+    ///
+    /// AUDIT, closed here: `WETH9.deposit()` used to be reached as an ordinary
+    /// `FLAG_NATIVE_IN` op, which required `allowedTargets[weth] = true` — and
+    /// an allowlisted token target is an open call surface. An op naming
+    /// `srcToken = address(0)` and carrying `WETH.transfer(attacker, …)` passed
+    /// the target walk and was never capped, because the containment snapshot
+    /// is built from the ops' own `srcToken` fields and never contained WETH.
+    /// The inventory path arriving with this branch is what gave that a
+    /// standing balance to take. With this flag the deposit is a pinned
+    /// interface call and WETH leaves the allowlist entirely.
+    ///
+    /// Same shape as the unwrap: exactly this bit, or this bit with
+    /// `FLAG_USE_PREV_RETURN` to wrap what the previous op returned.
+    /// `srcToken` MUST be `address(0)` (the input is native ETH) and
+    /// `outToken` MUST be `weth`.
+    uint32 internal constant FLAG_WETH_WRAP = 1 << 10;
     uint32 internal constant FLAG_V3_FLASH = 1 << 8;
     uint32 internal constant FLAG_V2_FLASH = 1 << 9;
     uint32 internal constant FLAG_DIRECT_ANY = FLAG_V3_DIRECT | FLAG_V2_DIRECT | FLAG_V3_FLASH | FLAG_V2_FLASH;
     uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK
-        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN | FLAG_DIRECT_ANY;
+        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN | FLAG_DIRECT_ANY | FLAG_WETH_WRAP;
     uint16 internal constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     /// @dev `LiquidationExecutor` storage slots for the V4 unlock arming
@@ -397,6 +417,29 @@ library GenericSequenceLib {
                 uint32 direct = op.flags & FLAG_DIRECT_ANY;
                 if (direct & (direct - 1) != 0) revert InvalidPlan();
                 if (op.fromAmountPos != 0 || op.returnAmountPos != 0) revert InvalidPlan();
+            }
+
+            if (op.flags & FLAG_WETH_WRAP != 0) {
+                // ── native ETH → WETH wrap ──
+                // The exact mirror of the unwrap below, and pinned just as
+                // hard: the only address this can call is the executor's own
+                // `weth`, and the only thing it can do there is `deposit`.
+                // `amount` is either the literal or the previous op's return,
+                // which is how a pool that paid raw ETH is wrapped without the
+                // plan naming any target at all.
+                if (op.flags & ~(FLAG_WETH_WRAP | FLAG_USE_PREV_RETURN) != 0) revert InvalidPlan();
+                if (op.srcToken != address(0)) revert InvalidPlan();
+                if (op.outToken != weth) revert InvalidPlan();
+                uint256 wrapAmount = op.flags & FLAG_USE_PREV_RETURN != 0 ? prevReturn : op.amountIn;
+                if (wrapAmount == 0) revert InvalidPlan();
+                // Bounded by what the executor actually holds: a plan cannot
+                // name more native ETH than the cycle produced.
+                if (wrapAmount > address(this).balance) revert InvalidPlan();
+
+                uint256 wethBefore = IERC20(weth).balanceOf(address(this));
+                IWETH(weth).deposit{value: wrapAmount}();
+                prevReturn = IERC20(weth).balanceOf(address(this)) - wethBefore;
+                continue;
             }
 
             if (op.flags & FLAG_WETH_UNWRAP != 0) {

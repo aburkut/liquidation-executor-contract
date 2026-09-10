@@ -976,7 +976,8 @@ contract LiquidationExecutor is
         if (feeAmounts[0] > plan.maxFlashFee) revert FlashFeeExceeded(feeAmounts[0], plan.maxFlashFee);
 
         uint256 flashRepayAmount = amounts[0] + feeAmounts[0];
-        (uint256 realizedProfit, uint256 totalCoinbasePayment) = _runFlashloanPipeline(plan, flashRepayAmount);
+        (uint256 realizedProfit, uint256 totalCoinbasePayment, bool shortfall) =
+            _runFlashloanPipeline(plan, flashRepayAmount);
 
         // Balancer expects funds returned by end of callback via transfer (vault=msg.sender).
         _finalizeFlashloan(
@@ -985,7 +986,8 @@ contract LiquidationExecutor is
             msg.sender,
             realizedProfit,
             totalCoinbasePayment,
-            plan.swapPlan.minProfitAmount
+            plan.swapPlan.minProfitAmount,
+            shortfall
         );
     }
 
@@ -1014,7 +1016,8 @@ contract LiquidationExecutor is
 
         // Morpho fee = 0, so flash repay equals principal
         uint256 flashRepayAmount = amount;
-        (uint256 realizedProfit, uint256 totalCoinbasePayment) = _runFlashloanPipeline(plan, flashRepayAmount);
+        (uint256 realizedProfit, uint256 totalCoinbasePayment, bool shortfall) =
+            _runFlashloanPipeline(plan, flashRepayAmount);
 
         // Morpho also pulls via safeTransferFrom after callback returns (vault=0).
         _finalizeFlashloan(
@@ -1023,7 +1026,8 @@ contract LiquidationExecutor is
             address(0),
             realizedProfit,
             totalCoinbasePayment,
-            plan.swapPlan.minProfitAmount
+            plan.swapPlan.minProfitAmount,
+            shortfall
         );
     }
 
@@ -1036,7 +1040,7 @@ contract LiquidationExecutor is
     /// finalize call (`_finalizeFlashloan` for repayment).
     function _runFlashloanPipeline(Plan memory plan, uint256 flashRepayAmount)
         internal
-        returns (uint256 realizedProfit, uint256 totalCoinbasePayment)
+        returns (uint256 realizedProfit, uint256 totalCoinbasePayment, bool shortfall)
     {
         // Pre-execution: verify flash loan funds received
         if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
@@ -1123,7 +1127,7 @@ contract LiquidationExecutor is
         // Compute realized on-chain profit AFTER swap, BEFORE coinbase payments,
         // BEFORE flash repay. This is the authoritative base the `msg.value`
         // basis-points bid multiplies against.
-        realizedProfit = CoinbasePaymentLib.computeRealizedProfit(
+        (realizedProfit, shortfall) = CoinbasePaymentLib.computeRealizedProfit(
             plan.loanToken, plan.swapPlan.profitToken, profitBefore, plan.loanAmount, flashRepayAmount
         );
 
@@ -1159,7 +1163,11 @@ contract LiquidationExecutor is
         address vault,
         uint256 realizedProfit,
         uint256 totalCoinbasePayment,
-        uint256 minProfitAmount
+        uint256 minProfitAmount,
+        // True when the cycle holds LESS than it began with. Carried rather
+        // than re-derived: the saturation in `computeRealizedProfit` has
+        // already turned the amount into a zero by the time it arrives here.
+        bool shortfall
     ) internal {
         uint256 balance = IERC20(asset).balanceOf(address(this));
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
@@ -1172,7 +1180,7 @@ contract LiquidationExecutor is
             IERC20(asset).safeTransfer(vault, repayAmount);
         }
 
-        CoinbasePaymentLib.checkProfit(realizedProfit, totalCoinbasePayment, minProfitAmount);
+        CoinbasePaymentLib.checkProfitStrict(realizedProfit, totalCoinbasePayment, minProfitAmount, shortfall);
     }
 
     // V10+ refactor: `_checkProfit` moved to
