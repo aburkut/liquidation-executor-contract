@@ -481,11 +481,16 @@ contract ArbExecutor is
             // `op.flags & ~(FLAG_WETH_WRAP | FLAG_USE_PREV_RETURN) != 0` ->
             // InvalidPlan). A combined-flag op carrying a real target stays
             // gated.
-            if (
-                plan.ops[i].flags == GenericSequenceLib.FLAG_WETH_WRAP
-                    || plan.ops[i].flags
-                        == (GenericSequenceLib.FLAG_WETH_WRAP | GenericSequenceLib.FLAG_USE_PREV_RETURN)
-            ) continue;
+            // Masked equality, not two comparisons: `flags & ~PREV == WRAP`
+            // accepts exactly the two shapes the library accepts and still
+            // rejects WRAP|V4_UNLOCK (mask leaves the unlock bit, so the
+            // compare fails) and a bare PREV (leaves 0). Written this way for
+            // the EIP-170 budget — the pair of equality checks cost 86 bytes
+            // and pushed LiquidationExecutor past the project's own headroom
+            // guard at 24200.
+            if (plan.ops[i].flags & ~GenericSequenceLib.FLAG_USE_PREV_RETURN == GenericSequenceLib.FLAG_WETH_WRAP) {
+                continue;
+            }
             // Direct pool swaps name the pool itself as the target: pools are
             // permissionless and bounded by construction (the op spends at
             // most its own `amount`, see DirectSwapLib), so they are not
