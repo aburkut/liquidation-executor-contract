@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {AllowanceLib} from "./AllowanceLib.sol";
 
 import {IUniV2Router} from "../interfaces/IUniV2Router.sol";
 import {IUniV3SwapRouter} from "../interfaces/IUniV3SwapRouter.sol";
@@ -38,7 +39,7 @@ import {SwapMode, SwapLeg} from "../types/SwapTypes.sol";
 /// `LiquidationExecutor.unlockCallback`. The caller MUST:
 ///   (a) verify the PoolManager identity (msg.sender == pinned PM),
 ///   (b) clear the `_activeV4TokenIn` storage pin BEFORE invocation,
-///   (c) re-check every hook in the path against `allowedV4Hooks`.
+///   (c) re-check every hook in the path against `blockedV4Hooks`.
 /// The library has no view of those slots; passing wrong tokenIn or
 /// an un-allowlisted hook would silently route to a different pool.
 library UniswapLib {
@@ -68,14 +69,10 @@ library UniswapLib {
     error InvalidPlan();
     error V4UnexpectedDelta();
 
-    // ─── Events (match LiquidationExecutor signatures; emitted under DELEGATECALL) ──
-    event UniV2SwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
-    event UniV3SwapExecuted(
-        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
-    );
-    event UniV4SwapExecuted(
-        address indexed srcToken, address indexed dstToken, uint24 fee, uint256 amountIn, uint256 amountOut
-    );
+    // Per-leg swap events were dropped 2026-09-06: nothing off-chain read
+    // them (the bot decodes only ArbExecuted; every analysis works from the
+    // pools' own events and Transfer logs), and each cost 1.5-2.5k gas plus
+    // bytecode in a size-constrained executor.
 
     // =================================================================
     //                          UNISWAP V2
@@ -85,16 +82,21 @@ library UniswapLib {
     /// `swapExactTokensForTokens`) and UNI_V2_BUY (BUY via
     /// `swapTokensForExactTokens`). Multihop is supported "for free"
     /// because the V2 router accepts any `path.length >= 2`.
+
     function executeUniV2Leg(SwapLeg memory leg, uint256 amountIn, address router) external {
         if (amountIn == 0) revert ZeroSwapInput();
 
-        uint256 srcBal = IERC20(leg.srcToken).balanceOf(address(this));
-        if (srcBal < amountIn) revert InsufficientSrcBalance(amountIn, srcBal);
-
+        // One read, used for both the sufficiency check and the before-image:
+        // they were two calls returning the same number.
         uint256 srcBefore = IERC20(leg.srcToken).balanceOf(address(this));
+        if (srcBefore < amountIn) revert InsufficientSrcBalance(amountIn, srcBefore);
+
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
+        // Bounded by this leg's `amountIn`, which is also the router's
+        // `amountInMaximum` on the BUY side, so the approval and the cap are
+        // the same number by construction (AllowanceLib).
+        AllowanceLib.ensure(leg.srcToken, router, amountIn);
 
         uint256 actualIn;
         if (leg.mode == SwapMode.UNI_V2_BUY) {
@@ -110,12 +112,16 @@ library UniswapLib {
                 .swapExactTokensForTokens(amountIn, leg.minAmountOut, leg.v2Path, address(this), leg.deadline);
             actualIn = amountIn;
         }
-        IERC20(leg.srcToken).forceApprove(router, 0);
-
+        // A BUY approves `amountInMaximum` and fills for less, so the
+        // remainder would stand to the router for good. // AUDITED 2026-09-08 (second pass): bounding the grant is only half
+        // the fix. A call that consumes less than it was approved leaves the
+        // remainder standing, and a standing allowance to an allowlisted
+        // target is what lets a LATER plan move a token it never declares —
+        // which `_finishOps` does not bucket and therefore does not cap.
+        AllowanceLib.clear(leg.srcToken, router);
+        if (actualIn > amountIn) revert InsufficientSrcBalance(actualIn, amountIn);
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit UniV2SwapExecuted(leg.srcToken, leg.repayToken, actualIn, received);
     }
 
     // =================================================================
@@ -143,7 +149,7 @@ library UniswapLib {
 
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
+        AllowanceLib.ensure(leg.srcToken, router, amountIn);
 
         bool isMultihop = leg.v4SwapData.length > 0;
         if (isMultihop) {
@@ -207,12 +213,12 @@ library UniswapLib {
             }
             actualIn = amountIn;
         }
-        IERC20(leg.srcToken).forceApprove(router, 0);
-
+        // Same as the V2 leg: a BUY approves `amountInMaximum` and fills for
+        // less, and the remainder would otherwise stand to the router.
+        AllowanceLib.clear(leg.srcToken, router);
+        if (actualIn > amountIn) revert InsufficientSrcBalance(actualIn, amountIn);
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit UniV3SwapExecuted(leg.srcToken, leg.repayToken, leg.v3Fee, actualIn, received);
     }
 
     /// @dev Read first and last 20 bytes of a V3 path-bytes blob as
@@ -248,7 +254,7 @@ library UniswapLib {
 
     /// @dev Single-hop V4 swap inside `unlockCallback`. Caller has
     /// already validated PM identity, cleared the tokenIn pin, and
-    /// re-checked the hook against allowedV4Hooks. BalanceDelta
+    /// re-checked the hook against blockedV4Hooks. BalanceDelta
     /// invariant `tokenInDelta < 0 && tokenOutDelta > 0` holds for
     /// both SELL and BUY (sign of `amountSpec` only flips the pool's
     /// quote semantics, not the delta direction).
@@ -337,7 +343,7 @@ library UniswapLib {
     /// `v4SwapData` and asserts: non-native tokens, tokenIn==srcToken,
     /// tokenOut==repayToken, distinct tokens, fee != 0, tickSpacing > 0,
     /// dynamic-fee bit clear. Returns the hook address for the caller's
-    /// `allowedV4Hooks` re-check (lib has no view of that storage).
+    /// `blockedV4Hooks` re-check (lib has no view of that storage).
     /// Hosted in lib to keep the byte-heavy decode + check chain off
     /// the main contract's EIP-170 budget. Reverts use `InvalidPlan` /
     /// `V4UnexpectedDelta` (lib namespace) — granular V4 errors removed
@@ -411,7 +417,7 @@ library UniswapLib {
     ///
     /// Caller (`unlockCallback`) MUST:
     ///   (a) clear `_activeV4TokenIn` BEFORE invoking this function;
-    ///   (b) re-check EVERY hop's `hook` against `allowedV4Hooks`
+    ///   (b) re-check EVERY hop's `hook` against `blockedV4Hooks`
     ///       AFTER decoding the payload (the lib does not have view
     ///       of the allowlist).
     ///

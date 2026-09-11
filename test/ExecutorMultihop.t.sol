@@ -294,11 +294,6 @@ contract ExecutorMultihopTest is ExecutorTest {
             _defaultLiqAction(500e18),
             _curveMHSinglePlan(SwapMode.CURVE_V1_MH, path, DEFAULT_SWAP_AMOUNT, 1)
         );
-        vm.expectEmit(true, true, true, false);
-        emit LiquidationExecutor.CurveV1SwapExecuted(
-            address(curveRouter), address(collateralToken), address(loanToken), 0, 0
-        );
-
         vm.prank(operatorAddr);
         executor.execute(plan);
 
@@ -306,7 +301,7 @@ contract ExecutorMultihopTest is ExecutorTest {
         assertEq(curveRouter.lastFirstToken(), address(collateralToken), "src mismatch");
         assertEq(curveRouter.lastFinalToken(), address(loanToken), "dst mismatch");
         assertEq(curveRouter.lastHopCount(), 1, "hop count != 1");
-        // Approval must be cleared post-call.
+        // The allowlisted router keeps a standing allowance (AllowanceLib).
         assertEq(IERC20(address(collateralToken)).allowance(address(executor), address(curveRouter)), 0);
     }
 
@@ -650,11 +645,6 @@ contract ExecutorMultihopTest is ExecutorTest {
             minProfitAmount: 0
         });
         bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
-
-        vm.expectEmit(true, true, true, false);
-        emit LiquidationExecutor.BalancerV2SwapExecuted(
-            swaps[0].poolId, address(collateralToken), address(loanToken), 0, 0, 0
-        );
 
         vm.prank(operatorAddr);
         executor.execute(plan);

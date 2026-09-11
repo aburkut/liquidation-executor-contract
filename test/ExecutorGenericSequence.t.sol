@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {ExecutorTest} from "./Executor.t.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
+import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
 import {Op} from "../src/types/SwapTypes.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockV4PoolManager} from "./mocks/MockV4PoolManager.sol";
@@ -19,6 +20,24 @@ interface IMiniERC20 {
 contract MockGenericDex {
     function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 rate) external {
         IMiniERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        uint256 out = (amountIn * rate) / 1e18;
+        IMiniERC20(tokenOut).transfer(msg.sender, out);
+    }
+}
+
+/// @dev A DEX that spends only HALF of what it was approved.
+///
+/// The plain `MockGenericDex` above pulls exactly the patched `amountIn`, so it
+/// consumes its whole allowance and leaves nothing behind — which is why the
+/// existing allowance assertions passed even while `_runOps` granted an
+/// approval and never took it back. Under-spending is the shape that actually
+/// exercises the take-back, and it is the NORMAL shape in production: every
+/// exact-output route and every `amountInMaximum` fills for less than it asked
+/// for.
+contract MockUnderspendingDex {
+    function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 rate) external {
+        uint256 spend = amountIn / 2;
+        IMiniERC20(tokenIn).transferFrom(msg.sender, address(this), spend);
         uint256 out = (amountIn * rate) / 1e18;
         IMiniERC20(tokenOut).transfer(msg.sender, out);
     }
@@ -162,8 +181,41 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         vm.prank(operatorAddr);
         executor.execute(plan);
         assertGe(loanToken.balanceOf(address(executor)), before, "profit retained after flash repay");
-        // Approval fully reset (no lingering allowance to the DEX).
-        assertEq(collateralToken.allowance(address(executor), address(dex)), 0, "approval reset");
+        // The allowlisted DEX keeps a standing allowance (AllowanceLib).
+        assertEq(collateralToken.allowance(address(executor), address(dex)), 0, "no allowance survives the op");
+    }
+
+    /// No allowance may outlive the op that granted it.
+    ///
+    /// AUDITED 2026-09-08 (second pass). Bounding the grant to `amount` was
+    /// only half the fix: a target that spends LESS than it was approved
+    /// leaves the remainder standing, and a standing allowance to an
+    /// allowlisted target is exactly what lets a LATER plan move a token that
+    /// plan never declares — which `_finishOps` does not bucket and therefore
+    /// does not cap. Under-spending is the normal case, not an edge one.
+    ///
+    /// This op carries `FLAG_FULL_BALANCE`, so its approval is sized from the
+    /// BALANCE and its `amountIn` field is zero. The first version of the
+    /// take-back was gated on `op.amountIn != 0` and skipped precisely this
+    /// shape.
+    function test_GenericSequence_NoAllowanceSurvivesAnUnderspendingOp() public {
+        MockUnderspendingDex halfDex = new MockUnderspendingDex();
+        loanToken.mint(address(halfDex), 1_000_000e18);
+        vm.prank(owner);
+        executor.setAllowedTarget(address(halfDex), true);
+
+        Op memory op = _swapOp(address(collateralToken), address(loanToken), 2.2e18, FLAG_FULL_BALANCE);
+        op.target = address(halfDex);
+        bytes memory plan = _genericPlan(_oneOp(op), address(loanToken), 0);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(
+            collateralToken.allowance(address(executor), address(halfDex)),
+            0,
+            "the unspent half of the approval must not outlive the op"
+        );
     }
 
     function test_GenericSequence_UnderRepay_Reverts() public {
@@ -205,7 +257,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
 
         vm.prank(operatorAddr);
         executor.execute(plan);
-        assertEq(interToken.allowance(address(executor), address(dex)), 0, "inter approval reset");
+        assertEq(interToken.allowance(address(executor), address(dex)), 0, "no allowance survives the intermediate op");
     }
 
     // ── containment (audit fix): compromised operator cannot drain ──
@@ -315,10 +367,14 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         uint256 PHASE_FLASHLOAN_ACTIVE = 1;
 
         // ── Probe 1: direct field round-trip via unlockCallback ──
-        bytes32 pmSlotWord = bytes32(uint256(uint160(address(uniV4Mock)))) | bytes32(PHASE_FLASHLOAN_ACTIVE << 160);
-        vm.store(address(executor), bytes32(V4_PM_SLOT), pmSlotWord);
-        bytes32 tokenInSlotWord = bytes32(uint256(uint160(address(loanToken)))) | bytes32(V4_ARMED_BIT);
-        vm.store(address(executor), bytes32(V4_TOKENIN_SLOT), tokenInSlotWord);
+        // The arming words are TRANSIENT now (same slot numbers, other
+        // address space): the harness primes them for this test transaction.
+        LiquidationExecutorHarness h = LiquidationExecutorHarness(payable(address(executor)));
+        h.tArmV4(address(uniV4Mock), address(loanToken), true, true);
+        V4_PM_SLOT;
+        V4_TOKENIN_SLOT;
+        V4_ARMED_BIT;
+        PHASE_FLASHLOAN_ACTIVE;
 
         uint256 execLoanBefore = loanToken.balanceOf(address(executor));
         uint256 execCollBefore = collateralToken.balanceOf(address(executor));
@@ -340,25 +396,15 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
 
         // CLAIM proof: unlockCallback clears tokenIn + armed bit at the exact
         // same slot it read them from.
-        assertEq(
-            vm.load(address(executor), bytes32(V4_TOKENIN_SLOT)),
-            bytes32(0),
-            "V4 tokenIn slot must be fully cleared post-callback"
-        );
-        // unlockCallback does not touch the PM half of that slot — only the
-        // outer `_executeUniV4Leg` disarms it — so the phase byte we poked
-        // must still read back untouched at the same byte offset.
-        assertEq(
-            vm.load(address(executor), bytes32(V4_PM_SLOT)) & bytes32(~uint256(type(uint160).max)),
-            bytes32(PHASE_FLASHLOAN_ACTIVE << 160),
-            "phase byte at the V4 PM slot offset 20 must be untouched"
-        );
+        assertEq(h.tV4TokenIn(), bytes32(0), "V4 tokenIn word must be fully cleared post-callback");
+        // unlockCallback does not touch the PM word — only the outer
+        // `_executeUniV4Leg` disarms it.
+        assertEq(h.tV4Pm(), bytes32(uint256(uint160(address(uniV4Mock)))), "PM word must be untouched by the callback");
 
         // ── Probe 2: the real GenericSequenceLib arming path, end to end ──
-        // Reset to Idle/disarmed (probe 1 raw-poked phase=FlashLoanActive;
-        // `execute()` expects to start from Idle).
-        vm.store(address(executor), bytes32(V4_PM_SLOT), bytes32(0));
-        vm.store(address(executor), bytes32(V4_TOKENIN_SLOT), bytes32(0));
+        // Reset to Idle/disarmed (probe 1 primed phase=active; `execute()`
+        // expects to start from Idle).
+        h.tArmV4(address(0), address(0), false, false);
 
         uint256 repay = LOAN_AMOUNT + FLASH_FEE;
         Op memory op = _v4Op(address(collateralToken), address(loanToken), repay);
@@ -370,9 +416,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         // V4_TOKENIN_SLOT / V4_ARMED_BIT constants ever address anything
         // other than these same fields.
 
-        assertEq(
-            vm.load(address(executor), bytes32(V4_TOKENIN_SLOT)), bytes32(0), "post-execute tokenIn slot must be clear"
-        );
+        assertEq(h.tV4TokenIn(), bytes32(0), "post-execute tokenIn word must be clear");
     }
 
     /// Happy path: single V4 exact-out op repays the flash loan; leftover
@@ -382,7 +426,6 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     /// storage slots — wrong slot constants revert InvalidCallbackCaller.
     function test_GenericSequence_V4UnlockOp_ExactOut_HappyPath() public {
         uint256 repay = LOAN_AMOUNT + FLASH_FEE; // 1001e18 exact-out
-        bytes32 pmSlotBefore = vm.load(address(executor), bytes32(uint256(11)));
 
         Op memory op = _v4Op(address(collateralToken), address(loanToken), repay);
         bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 1e18);
@@ -390,12 +433,12 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         vm.prank(operatorAddr);
         executor.execute(plan);
 
-        // Disarm proof: the PM slot (address bytes 0..19, packed with
-        // _executionPhase at byte 20) is bit-identical to pre-execute — the
-        // arm preserved the phase byte and the disarm cleared the PM. The
-        // tokenIn slot is zero (CLAIMed by the callback, re-cleared by the lib).
-        assertEq(vm.load(address(executor), bytes32(uint256(11))), pmSlotBefore, "PM slot must round-trip (PM + phase)");
-        assertEq(vm.load(address(executor), bytes32(uint256(12))), bytes32(0), "tokenIn slot must be cleared");
+        // Disarm proof: both transient arming words are clear after the
+        // execute (PM cleared by the lib's disarm, tokenIn CLAIMed by the
+        // callback and re-cleared by the lib).
+        LiquidationExecutorHarness h = LiquidationExecutorHarness(payable(address(executor)));
+        assertEq(h.tV4Pm(), bytes32(0), "PM word must be cleared");
+        assertEq(h.tV4TokenIn(), bytes32(0), "tokenIn word must be cleared");
     }
 
     /// Multihop v4SwapData (> 160 bytes) is forbidden on the op path — its
@@ -473,12 +516,14 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         executor.execute(plan);
     }
 
-    /// The callback-time hook allowlist re-check stays authoritative on the
+    /// The callback-time hook blocklist re-check stays authoritative on the
     /// op path (single-hop shape guarantees the branch that performs it).
-    function test_GenericSequence_V4UnlockOp_DisallowedHook_Reverts() public {
+    function test_GenericSequence_V4UnlockOp_BlockedHook_Reverts() public {
         Op memory op = _v4Op(address(collateralToken), address(loanToken), LOAN_AMOUNT + FLASH_FEE);
         op.callData = abi.encode(address(collateralToken), address(loanToken), uint24(500), int24(10), address(0xBEEF));
         bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
+        vm.prank(owner);
+        executor.setV4HookBlocked(address(0xBEEF), true);
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidV4CallbackHook.selector);
         executor.execute(plan);

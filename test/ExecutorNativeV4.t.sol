@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {ExecutorTest} from "./Executor.t.sol";
 import {Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../src/types/SwapTypes.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
+import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
 import {Op} from "../src/types/SwapTypes.sol";
 import {MockGenericDex} from "./ExecutorGenericSequence.t.sol";
 
@@ -34,11 +35,12 @@ contract ExecutorNativeV4Test is ExecutorTest {
     /// native-ETH leg: PM pinned, phase active, tokenIn left at its zero
     /// default (native), armed bit set iff `setArmedBit`.
     function _armNativeCallback(bool setArmedBit) internal {
-        bytes32 slot10 = bytes32(uint256(uint160(address(uniV4Mock)))) | bytes32(PHASE_FLASHLOAN_ACTIVE << 160);
-        vm.store(address(executor), bytes32(V4_PM_PHASE_SLOT), slot10);
-
-        bytes32 slot11 = setArmedBit ? bytes32(uint256(1) << 160) : bytes32(0);
-        vm.store(address(executor), bytes32(V4_TOKENIN_ARMED_SLOT), slot11);
+        // The arming words and the phase are TRANSIENT now; the harness
+        // primes them for this test transaction (tokenIn stays zero: native).
+        LiquidationExecutorHarness(payable(address(executor))).tArmV4(address(uniV4Mock), address(0), setArmedBit, true);
+        V4_PM_PHASE_SLOT;
+        V4_TOKENIN_ARMED_SLOT;
+        PHASE_FLASHLOAN_ACTIVE;
     }
 
     /// Minimal well-formed single-hop unlock payload: (inner, amountSpec)
@@ -247,6 +249,15 @@ contract ExecutorNativeV4Test is ExecutorTest {
     /// FULL_BALANCE/PREV_RETURN inject an INPUT amount; an unwrap op's
     /// `amountIn` is an explicit WETH amount, not derived from either — the
     /// combination must be rejected rather than silently mis-sized.
+    /// A combined-flag op is rejected by the EXECUTOR, not by a library.
+    ///
+    /// AUDITED 2026-09-08: this expected `InvalidPlan`, the backstop inside
+    /// `GenericSequenceLib._runOps`, because the executor's own pre-flight walk
+    /// skipped any op with the unwrap BIT set and never looked at its target.
+    /// The walk now tests for flags EXACTLY equal to `FLAG_WETH_UNWRAP`, the
+    /// way `ArbExecutor` always has, so a combined-flag op reaches the target
+    /// allowlist and is refused there first. Same rejection, one gate earlier,
+    /// and the executor is authoritative again.
     function test_unwrapOp_FullBalanceCombo_Reverts() public {
         _unwrapSetUp();
 
@@ -255,7 +266,7 @@ contract ExecutorNativeV4Test is ExecutorTest {
         bytes memory plan = _wethCollateralPlan(_oneOp(op), 1 ether);
 
         vm.prank(operatorAddr);
-        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
         executor.execute(plan);
     }
 

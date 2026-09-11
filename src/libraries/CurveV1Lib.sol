@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+import {AllowanceLib} from "./AllowanceLib.sol";
 import {SwapLeg} from "../types/SwapTypes.sol";
 
 /// @title CurveV1Lib
@@ -71,12 +72,7 @@ library CurveV1Lib {
     error ZeroSwapOutput();
     error InvalidPlan();
 
-    // ─── Event ───────────────────────────────────────────────────────
-    /// @dev Mirror of LiquidationExecutor's `CurveV1SwapExecuted` so the
-    /// emit fires from the executor's address with the canonical topic.
-    event CurveV1SwapExecuted(
-        address indexed pool, address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut
-    );
+    // Per-leg swap event dropped 2026-09-06 (unread off-chain; 1.5-2.5k gas).
 
     // ─── External entrypoint ─────────────────────────────────────────
     /// @dev Single entrypoint for both CURVE_V1 (SELL) and CURVE_V1_BUY.
@@ -121,8 +117,6 @@ library CurveV1Lib {
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
-
-        emit CurveV1SwapExecuted(pool, leg.srcToken, leg.repayToken, amountIn, received);
     }
 
     // ─── Multihop entrypoint ─────────────────────────────────────────
@@ -179,21 +173,28 @@ library CurveV1Lib {
 
         uint256 outBefore = IERC20(leg.repayToken).balanceOf(address(this));
 
-        IERC20(leg.srcToken).forceApprove(router, amountIn);
+        // This comment used to claim "the router is an owner-allowlisted target
+        // (RouterNG), so it gets a standing allowance". No allowlist is
+        // consulted anywhere on this path — `router` IS `leg.bebopTarget`,
+        // straight out of the operator's plan, checked only for `!= 0` and
+        // `code.length > 0`. AUDITED 2026-09-08: the standing grant made every
+        // such leg hand a permanent unlimited spender to an address a hot key
+        // picked. Bounded and cleared, exactly like the single-pool path.
+        AllowanceLib.ensure(leg.srcToken, router, amountIn);
 
         // Router exchange selector: keccak256("exchange(address[11],uint256[5][5],uint256,uint256,address[5],address)")[0:4]
         // = 0xc872a3c5. Hand-encoded so we don't pay for a sol! interface.
         bytes memory callData =
             abi.encodeWithSelector(0xc872a3c5, path, swapParams, amountIn, leg.minAmountOut, pools, address(this));
         (bool ok,) = router.call(callData);
-        IERC20(leg.srcToken).forceApprove(router, 0);
         if (!ok) revert CurveSwapFailed();
+
+        AllowanceLib.clear(leg.srcToken, router);
 
         uint256 received = IERC20(leg.repayToken).balanceOf(address(this)) - outBefore;
         if (received < leg.minAmountOut) revert InsufficientRepayOutput(received, leg.minAmountOut);
 
         // Pool slot in the event = the router address. The path itself
         // tells off-chain consumers which actual pools were touched.
-        emit CurveV1SwapExecuted(router, leg.srcToken, leg.repayToken, amountIn, received);
     }
 }

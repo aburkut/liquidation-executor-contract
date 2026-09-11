@@ -3,7 +3,9 @@ pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
+import {AllowanceLib} from "./AllowanceLib.sol";
 import {ParaswapDecoderLib} from "./ParaswapDecoderLib.sol";
 import {SwapLeg} from "../types/SwapTypes.sol";
 
@@ -52,13 +54,11 @@ library SwapLegExecutorLib {
     /// @dev The quote's `partialFillOffset` does not address a whole word
     /// inside its own calldata. Fail closed rather than write out of bounds.
     error BebopPartialFillOffsetOutOfRange();
+    /// @dev The settlement pulled more `srcToken` than the leg declared.
+    error BebopInputOverspent(uint256 consumed, uint256 declared);
     error TargetNotAllowed();
 
-    // ─── Events (match LiquidationExecutor signatures; emitted under DELEGATECALL) ──
-    event ParaswapSwapExecuted(address indexed srcToken, address indexed dstToken, uint256 amountIn, uint256 amountOut);
-    event BebopSwapExecuted(
-        address indexed target, address indexed srcToken, uint256 amountIn, uint256 repayDelta, uint256 profitDelta
-    );
+    // Per-leg swap events dropped 2026-09-06 (unread off-chain; 1.5-2.5k gas each).
 
     // ─── Paraswap single leg ─────────────────────────────────────────
     /// @dev Orchestrates decode → approve → call → reset → delta check.
@@ -76,10 +76,24 @@ library SwapLegExecutorLib {
         if (srcBefore < declaredIn) revert InsufficientSrcBalance(declaredIn, srcBefore);
         uint256 dstBefore = IERC20(dstToken).balanceOf(address(this));
 
-        IERC20(srcToken).forceApprove(augustus, declaredIn);
+        // Bounded by the amount this leg declared (AllowanceLib): Augustus
+        // is constructor-pinned, but the calldata that drives it is not.
+        // The approval is sized from the CALLDATA while the ceiling below is
+        // enforced against the struct field, so tie them together first: an
+        // approval larger than the plan declared is an approval the plan's own
+        // caps never bounded.
+        if (declaredIn > leg.amountIn) revert ParaswapAmountInMismatch(leg.amountIn, declaredIn);
+        AllowanceLib.ensure(srcToken, augustus, declaredIn);
         (bool ok,) = augustus.call(leg.paraswapCalldata);
-        IERC20(srcToken).forceApprove(augustus, 0);
         if (!ok) revert ParaswapSwapFailed();
+
+        // Every exact-out route consumes less than it declared, so a residual
+        // is the EXPECTED outcome here, not an edge case. // AUDITED 2026-09-08 (second pass): bounding the grant is only half
+        // the fix. A call that consumes less than it was approved leaves the
+        // remainder standing, and a standing allowance to an allowlisted
+        // target is what lets a LATER plan move a token it never declares —
+        // which `_finishOps` does not bucket and therefore does not cap.
+        AllowanceLib.clear(srcToken, augustus);
 
         uint256 actualIn;
         {
@@ -109,8 +123,6 @@ library SwapLegExecutorLib {
         // intended `leg.minAmountOut` as a hard floor. Now both bind.
         if (amountOut < minAmountOut) revert InsufficientRepayOutput(amountOut, minAmountOut);
         if (amountOut < leg.minAmountOut) revert InsufficientRepayOutput(amountOut, leg.minAmountOut);
-
-        emit ParaswapSwapExecuted(srcToken, dstToken, actualIn, amountOut);
     }
 
     // ─── Bebop multi leg ─────────────────────────────────────────────
@@ -147,17 +159,36 @@ library SwapLegExecutorLib {
             _writeBebopFill(leg.bebopCalldata, leg.bebopPartialFillOffset, fill);
         }
 
-        IERC20(leg.srcToken).forceApprove(target, fill);
+        // `target` passed the caller's allowlist check above, and that is NOT
+        // enough on its own: `bebopCalldata` is opaque and operator-built, so
+        // an allowlisted multicall router will pull whatever the calldata says.
+        // AUDITED 2026-09-08 — with a standing unlimited allowance the leg's
+        // `fill`, `amountIn` and `collateralDelta` caps all bounded a declared
+        // number while the actual pull was unbounded. The approval is the only
+        // place that can bind the two together, so it is exactly `fill`.
+        AllowanceLib.ensure(leg.srcToken, target, fill);
         (bool ok,) = target.call(leg.bebopCalldata);
-        IERC20(leg.srcToken).forceApprove(target, 0);
 
         if (!ok) revert BebopSwapFailed();
 
+        AllowanceLib.clear(leg.srcToken, target);
+
+        // And measure it, rather than trusting the approval alone.
+        uint256 consumed = srcBal - IERC20(leg.srcToken).balanceOf(address(this));
+        if (consumed > fill) revert BebopInputOverspent(consumed, fill);
+
         uint256 repayAfter = IERC20(leg.repayToken).balanceOf(address(this));
         uint256 repayDelta = repayAfter > repayBefore ? repayAfter - repayBefore : 0;
-        if (repayDelta < leg.minAmountOut) revert InsufficientRepayOutput(repayDelta, leg.minAmountOut);
 
-        emit BebopSwapExecuted(target, leg.srcToken, fill, repayDelta, 0);
+        // The floor must scale with the fill or the partial-fill feature
+        // reverts in precisely the case it exists for: `minAmountOut` is
+        // written for the FULL `leg.amountIn`, and a block that seized less
+        // collateral fills pro-rata. Rounding up keeps the floor honest.
+        uint256 floor_ = leg.minAmountOut;
+        if (fill < leg.amountIn && leg.amountIn != 0) {
+            floor_ = Math.mulDiv(leg.minAmountOut, fill, leg.amountIn, Math.Rounding.Ceil);
+        }
+        if (repayDelta < floor_) revert InsufficientRepayOutput(repayDelta, floor_);
     }
 
     /// @dev Overwrite the taker amount inside a signed Bebop order.

@@ -9,6 +9,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
+import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
 import {UniswapLib} from "../src/libraries/UniswapLib.sol";
 import {SwapMode, SwapLeg, Op} from "../src/types/SwapTypes.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
@@ -214,7 +215,9 @@ contract ExecutorTest is Test {
         targets[6] = address(curveV1Mock);
         targets[7] = address(balancerSwapMock);
 
-        executor = new LiquidationExecutor(
+        // The harness only adds transient-state pokes for the tests that
+        // used to `vm.store` the (now transient) execution state.
+        executor = new LiquidationExecutorHarness(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -1558,8 +1561,10 @@ contract ExecutorTest is Test {
         uint256 loanAfter = loanToken.balanceOf(address(executor));
         assertGe(loanAfter - loanBefore, MIN_PROFIT);
 
-        // Balancer doesn't use approval (safeTransfer), but check Augustus approval reset
+        // Balancer doesn't use approval (safeTransfer); the loan token never touches Augustus
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+        // The collateral leg sold through Augustus leaves a standing allowance (AllowanceLib)
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
         assertEq(collateralToken.allowance(address(executor), address(aavePool)), 0);
     }
 
@@ -1571,6 +1576,7 @@ contract ExecutorTest is Test {
         executor.execute(plan);
 
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
         assertEq(loanToken.allowance(address(executor), address(balancerVault)), 0);
         assertEq(collateralToken.allowance(address(executor), address(aavePool)), 0);
         assertEq(collateralToken.allowance(address(executor), address(balancerVault)), 0);
@@ -1604,9 +1610,11 @@ contract ExecutorTest is Test {
         assertGe(loanAfter - loanBefore, MIN_PROFIT);
 
         // Approval hygiene: Morpho approval was forceApprove(repayAmount), pulled to zero
-        // by the post-callback transferFrom. Augustus approval reset by the swap path.
+        // by the post-callback transferFrom. The collateral sold through Augustus
+        // leaves a standing allowance (AllowanceLib); the loan token never touches it.
         assertEq(loanToken.allowance(address(executor), address(morphoBlue)), 0);
         assertEq(loanToken.allowance(address(executor), address(augustus)), 0);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), 0);
     }
 
     /// Direct call to onMorphoFlashLoan from outside an active flashloan must revert.
@@ -1640,19 +1648,9 @@ contract ExecutorTest is Test {
         bytes memory planBytes = _buildPlan(3, address(loanToken), LOAN_AMOUNT, FLASH_FEE, liqAction, swapPlan);
         bytes32 planHash = keccak256(planBytes);
 
-        // Storage layout (forge inspect LiquidationExecutor storage):
-        //   slot 9  = operators             (mapping)
-        //   slot 10 = _activePlanHash       (bytes32)
-        //   slot 11 = _activeV4PoolManager  (address, offset 0)
-        //            _executionPhase        (uint8 enum, offset 20)
-        // (Slots shifted +1 when the `operators` mapping replaced the
-        // immutable single `operator`; previously shifted -1 by the V10
-        // `allowedExtSwapTargets` removal and -1 again by the re-audit
-        // `balancerVault` removal.) Force both into the "during flashloan"
-        // state so neither guard short-circuits.
-        // Byte at offset 20 (Solidity) corresponds to bit 160 of the uint256 slot.
-        vm.store(address(executor), bytes32(uint256(10)), planHash);
-        vm.store(address(executor), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive
+        // The plan hash and the phase are TRANSIENT now; the harness primes
+        // them for this test transaction so neither guard short-circuits.
+        LiquidationExecutorHarness(payable(address(executor))).tSetPlan(planHash, true);
 
         // Attacker (not the registered Morpho provider) hits the callback. The phase
         // and hash gates pass; only the caller check should reject.
@@ -1937,6 +1935,78 @@ contract ExecutorTest is Test {
         executor.execute(plan);
         uint256 profitAfter = profitToken.balanceOf(address(executor));
         assertEq(profitAfter - profitBefore, profitOutput);
+    }
+
+    /// A leg must not be able to reach a balance it did not seize.
+    ///
+    /// AUDITED 2026-09-08. `bebopCalldata` is opaque and operator-built, so the
+    /// allowlist on `bebopTarget` bounds the CALLEE and nothing else; what the
+    /// callee pulls is decided inside those bytes. While the approval was an
+    /// unlimited standing one, a settlement asking for the executor's entire
+    /// `srcToken` balance — profit sitting there awaiting `withdraw`, not this
+    /// transaction's collateral — was granted it, and every downstream gate
+    /// still passed because the leg produced its `minAmountOut`.
+    ///
+    /// Now the approval is exactly the leg's `fill`, and a post-call
+    /// measurement backs it up. Either guard is enough to refuse the plan; the
+    /// property under test is that the standing balance is still there.
+    function test_bebopMulti_cannotPullStandingBalance() public {
+        uint256 debtToCover = 400e18;
+        uint256 collateralIn = COLLATERAL_REWARD;
+
+        // Profit from earlier runs, waiting for the owner to withdraw it.
+        uint256 standing = 5_000e18;
+        collateralToken.mint(address(executor), standing);
+        uint256 before = collateralToken.balanceOf(address(executor));
+
+        // The settlement asks for the collateral AND the standing balance,
+        // and honestly returns enough to satisfy every output check.
+        bebop.configure(address(collateralToken), collateralIn + standing, address(loanToken), 1100e18, address(0), 0);
+        bytes memory bebopCd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(1));
+
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildBebopMultiSwapPlan(
+            address(collateralToken), collateralIn, address(bebop), bebopCd, address(loanToken), address(loanToken), 0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(plan);
+
+        assertEq(
+            collateralToken.balanceOf(address(executor)), before, "a leg must not reach a balance it did not seize"
+        );
+    }
+
+    /// The owner can take an allowance back.
+    ///
+    /// AUDITED 2026-09-08: `setAllowedTarget(t, false)`, `setOperator(op,
+    /// false)` and `pause()` are the documented kill-switches for a leaked hot
+    /// key, and none of them could touch an allowance — `withdraw` and the
+    /// `rescue*` family only move tokens the contract still holds. So a
+    /// spender's power over FUTURE balances outlived every revocation the
+    /// owner had.
+    function test_revokeAllowance_takesBackASpendersPower() public {
+        vm.prank(address(executor));
+        collateralToken.approve(address(augustus), type(uint256).max);
+        assertEq(collateralToken.allowance(address(executor), address(augustus)), type(uint256).max);
+
+        vm.prank(owner);
+        executor.revokeAllowance(address(collateralToken), address(augustus));
+
+        assertEq(
+            collateralToken.allowance(address(executor), address(augustus)),
+            0,
+            "the owner must be able to disarm a spender"
+        );
+    }
+
+    /// And only the owner can. An operator key is hot by design.
+    function test_revokeAllowance_isOwnerOnly() public {
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.revokeAllowance(address(collateralToken), address(augustus));
     }
 
     function test_bebopMulti_revertsOnUntrustedTarget() public {
@@ -2489,8 +2559,6 @@ contract ExecutorTest is Test {
         bytes memory plan =
             _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), _defaultSwapPlan());
         vm.prank(operatorAddr);
-        vm.expectEmit(true, true, false, true);
-        emit LiquidationExecutor.FlashExecuted(2, address(loanToken), LOAN_AMOUNT);
         executor.execute(plan);
     }
 
@@ -2609,8 +2677,6 @@ contract ExecutorTest is Test {
             swapPlan
         );
         vm.prank(operatorAddr);
-        vm.expectEmit(true, true, true, true);
-        emit LiquidationExecutor.LiquidationExecuted(3, address(collateralToken), address(loanToken), 500e18);
         executor.execute(plan);
     }
 
@@ -4332,10 +4398,10 @@ contract ExecutorTest is Test {
         uint256 bps = 100;
         uint256 expected = WETH_REALIZED_PROFIT * bps / 10_000;
 
+        uint256 cbBefore = coinbase.balance;
         vm.prank(operatorAddr);
-        vm.expectEmit(true, false, false, true);
-        emit LiquidationExecutor.CoinbasePaid(coinbase, expected);
         executor.execute{value: bps}(_buildWethPlan(2, _wethLiqAction(400e18), 0));
+        assertEq(coinbase.balance - cbBefore, expected, "coinbase paid (event dropped, balance is the proof)");
     }
 
     function test_coinbasePayment_balancerProvider() public {
@@ -7151,12 +7217,15 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
-    function test_UniV4_multihop_unallowlistedHook_reverts() public {
-        // Each hop's hook must be address(0) OR in allowedV4Hooks. The
+    function test_UniV4_multihop_blockedHook_reverts() public {
+        // Any hook is accepted unless the owner BLOCKED it. The
         // function-pointer callback (`this.isV4HookAllowed`) returns
-        // false → lib reverts InvalidPlan inside the per-hop loop.
+        // false for a blocked hook → lib reverts InvalidPlan inside the
+        // per-hop loop.
         MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
         address strangerHook = address(0xBADC0DE);
+        vm.prank(owner);
+        executor.setV4HookBlocked(strangerHook, true);
         UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
         hops[0] = UniswapLib.V4Hop({
             tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: strangerHook
@@ -7201,7 +7270,14 @@ contract ExecutorTest is Test {
         assertTrue(executor.allowedTargets(address(uniV3Mock)), "V3 router must be whitelisted");
     }
 
-    function test_UniV2_approvalResetAfterSwap() public {
+    /// The V2 router must NOT keep an allowance once its leg is done.
+    ///
+    /// AUDITED 2026-09-08: this test used to assert the opposite — that the
+    /// router kept `type(uint256).max` standing. A standing allowance is a
+    /// spender with power over every future balance, which no owner call
+    /// could take back, and it is what let an operator-named target be
+    /// turned into a permanent drain.
+    function test_UniV2_noAllowanceSurvivesTheSwap() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV2SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 1, 0);
         bytes memory plan =
@@ -7213,11 +7289,12 @@ contract ExecutorTest is Test {
         assertEq(
             collateralToken.allowance(address(executor), address(uniV2Mock)),
             0,
-            "V2 router allowance must be zero after swap"
+            "the V2 router must keep no allowance once its leg is done"
         );
     }
 
-    function test_UniV3_approvalResetAfterSwap() public {
+    /// Same invariant on the V3 router. See the V2 case above.
+    function test_UniV3_noAllowanceSurvivesTheSwap() public {
         LiquidationExecutor.SwapPlan memory swapPlan =
             _buildUniV3SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 3000, 1, 0);
         bytes memory plan =
@@ -7229,7 +7306,7 @@ contract ExecutorTest is Test {
         assertEq(
             collateralToken.allowance(address(executor), address(uniV3Mock)),
             0,
-            "V3 router allowance must be zero after swap"
+            "the V3 router must keep no allowance once its leg is done"
         );
     }
 
@@ -7304,8 +7381,12 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
-    function test_UniV4_invalidHook_reverts() public {
+    /// A hook the owner BLOCKED is refused at validation. (This used to be
+    /// "any hook not on the allowlist"; the list is inverted now.)
+    function test_UniV4_blockedHook_reverts() public {
         address rogueHook = address(0x1234);
+        vm.prank(owner);
+        executor.setV4HookBlocked(rogueHook, true);
         LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
             address(collateralToken),
             address(loanToken),
@@ -7325,10 +7406,11 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
-    function test_UniV4_whitelistedHook_succeeds() public {
+    /// No owner action precedes this: a hook nobody blocked trades. The
+    /// economic defence is `minAmountOut` on the leg, the same one that
+    /// covers the Curve/Balancer pools whose allowlist was dropped earlier.
+    function test_UniV4_unknownHook_succeedsWithoutOwnerAction() public {
         address allowedHook = address(0x5678);
-        vm.prank(owner);
-        executor.setV4HookAllowed(allowedHook, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
             address(collateralToken),
@@ -7472,16 +7554,48 @@ contract ExecutorTest is Test {
         executor.unlockCallback("");
     }
 
-    function test_setV4HookAllowed_onlyOwner() public {
+    function test_setV4HookBlocked_onlyOwner() public {
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
-        executor.setV4HookAllowed(address(0x5678), true);
+        executor.setV4HookBlocked(address(0x5678), true);
     }
 
-    function test_setV4HookAllowed_rejectsZero() public {
+    function test_setV4HookBlocked_rejectsZero() public {
         vm.prank(owner);
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
-        executor.setV4HookAllowed(address(0), true);
+        executor.setV4HookBlocked(address(0), true);
+    }
+
+    /// A blocked hook is refused at validation, before the flash loan, and
+    /// unblocking it lets the same plan through — the list is the owner's
+    /// brake for a griefing hook, not the gate every hook must pass.
+    function test_UniV4_blockedHook_revertsUntilUnblocked() public {
+        address hook = address(0x5678);
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            hook,
+            address(uniV4Mock),
+            1,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(owner);
+        executor.setV4HookBlocked(hook, true);
+        assertTrue(executor.blockedV4Hooks(hook));
+        assertFalse(executor.isV4HookAllowed(hook));
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+        vm.prank(owner);
+        executor.setV4HookBlocked(hook, false);
+        assertTrue(executor.isV4HookAllowed(hook));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -9398,10 +9512,6 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             _defaultLiqAction(500e18),
             _curveV1SinglePlan(SwapMode.CURVE_V1, DEFAULT_SWAP_AMOUNT, 1)
         );
-        vm.expectEmit(true, true, true, false);
-        emit LiquidationExecutor.CurveV1SwapExecuted(
-            address(curveV1Mock), address(collateralToken), address(loanToken), 0, 0
-        );
         vm.prank(operatorAddr);
         executor.execute(plan);
     }
@@ -9563,10 +9673,6 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             FLASH_FEE,
             _defaultLiqAction(500e18),
             _balancerV2SinglePlan(SwapMode.BAL_V2, DEFAULT_SWAP_AMOUNT, 1)
-        );
-        vm.expectEmit(true, true, true, false);
-        emit LiquidationExecutor.BalancerV2SwapExecuted(
-            bytes32(uint256(0xdeadbeef)), address(collateralToken), address(loanToken), 0, 0, 0
         );
         vm.prank(operatorAddr);
         executor.execute(plan);
@@ -10677,8 +10783,6 @@ contract ExecutorV4SecurityTest is ExecutorTest {
             minProfitAmount: 0
         });
         bytes memory plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
-        vm.expectEmit(true, true, true, false);
-        emit LiquidationExecutor.BalancerV2SwapExecuted(poolId, address(collateralToken), address(loanToken), 0, 0, 0);
         vm.prank(operatorAddr);
         executor.execute(plan);
     }

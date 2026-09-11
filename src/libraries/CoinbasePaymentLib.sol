@@ -35,9 +35,12 @@ library CoinbasePaymentLib {
     error CoinbasePaymentFailed();
     error CoinbaseExceedsProfit(uint256 coinbase, uint256 profit);
     error InsufficientProfit(uint256 realized, uint256 min);
+    /// The cycle holds less than it began with. Distinct from
+    /// `InsufficientProfit`, which is about a floor: this one is about a loss.
+    error CycleEndedBelowItsStart();
 
-    // ─── Event (mirror LiquidationExecutor signature) ───────────────
-    event CoinbasePaid(address indexed coinbase, uint256 amount);
+    // CoinbasePaid event dropped 2026-09-06: unread off-chain (the bribe is
+    // measured from the coinbase transfer itself), ~1.5k gas per execution.
 
     /// @dev Gas limit on coinbase ETH transfers. Small bound keeps a
     /// malicious block.coinbase from grinding gas in the callback. ETH
@@ -69,8 +72,6 @@ library CoinbasePaymentLib {
 
         (bool success,) = block.coinbase.call{value: amount, gas: COINBASE_CALL_GAS}("");
         if (!success) revert CoinbasePaymentFailed();
-
-        emit CoinbasePaid(block.coinbase, amount);
     }
 
     /// @dev Realized on-chain profit net of the flashloan obligation,
@@ -86,21 +87,31 @@ library CoinbasePaymentLib {
     ///     includes principal)
     ///   * Realized profit once repay settles:
     ///       `(profitNow - repayAmount) - (profitBefore - principalAmount)`
-    /// Saturating subtraction — underflow means the swap under-delivered.
+    /// Saturating subtraction — underflow means the swap under-delivered,
+    /// and the second return value says so.
+    ///
+    /// AUDIT LEAD, closed here: the saturation alone reads a LOSS as zero
+    /// profit, so with `minProfitAmount == 0` a cycle that ended below where
+    /// it started passed `checkProfit` and settled out of standing inventory.
+    /// The inventory path arriving with this branch is exactly what makes that
+    /// reachable: before it, a cycle had nothing of its own to lose.
+    ///
+    /// So the shortfall is reported rather than rounded away, and
+    /// [`checkProfit`] refuses it whatever the floor says.
     function computeRealizedProfit(
         address asset,
         address profitTkn,
         uint256 profitBefore,
         uint256 principalAmount,
         uint256 repayAmount
-    ) external view returns (uint256) {
+    ) external view returns (uint256 profit, bool shortfall) {
         uint256 profitNow = IERC20(profitTkn).balanceOf(address(this));
         if (profitTkn == asset) {
             uint256 lhs = profitNow + principalAmount;
             uint256 rhs = profitBefore + repayAmount;
-            return lhs > rhs ? lhs - rhs : 0;
+            return lhs > rhs ? (lhs - rhs, false) : (0, lhs < rhs);
         }
-        return profitNow > profitBefore ? profitNow - profitBefore : 0;
+        return profitNow > profitBefore ? (profitNow - profitBefore, false) : (0, profitNow < profitBefore);
     }
 
     /// @dev `realizedProfit` already accounts for the flashloan
@@ -109,7 +120,25 @@ library CoinbasePaymentLib {
     /// defensive against multiple coinbase actions whose bps sum
     /// exceeds 100% (each per-action bps is ≤ 10000, but nothing
     /// blocks operators from stacking them).
+    /// A cycle that ended BELOW where it started is refused whatever the floor
+    /// says: `minProfitAmount == 0` means "any profit will do", never "a loss
+    /// will do". See [`computeRealizedProfit`] for how the shortfall survives
+    /// the saturation that used to hide it.
+    function checkProfitStrict(
+        uint256 realizedProfit,
+        uint256 totalCoinbasePayment,
+        uint256 minProfitAmount,
+        bool shortfall
+    ) external pure {
+        if (shortfall) revert CycleEndedBelowItsStart();
+        _checkProfit(realizedProfit, totalCoinbasePayment, minProfitAmount);
+    }
+
     function checkProfit(uint256 realizedProfit, uint256 totalCoinbasePayment, uint256 minProfitAmount) external pure {
+        _checkProfit(realizedProfit, totalCoinbasePayment, minProfitAmount);
+    }
+
+    function _checkProfit(uint256 realizedProfit, uint256 totalCoinbasePayment, uint256 minProfitAmount) private pure {
         if (totalCoinbasePayment > realizedProfit) {
             revert CoinbaseExceedsProfit(totalCoinbasePayment, realizedProfit);
         }

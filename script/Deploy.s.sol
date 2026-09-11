@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
+import {LiquidationExecutorSeeded} from "../src/deploy/SeededExecutors.sol";
 
 /// @title V10 Deploy
 /// @notice Deploys `LiquidationExecutor` V10 against canonical mainnet
@@ -44,13 +45,33 @@ contract Deploy is Script {
     /// allowedTargets is required for ALL ops).
     address constant CURVE_ROUTER_NG = 0x16C6521Dff6baB339122a0FE25a9116693265353;
 
+    // ─── Everything the owner added to the LIVE liquidator after deploy ───
+    // Read from the contract's own events on 0x7800c252… (blocks
+    // 25730434..25919383 via scripts/executor_config_events.py in the bot
+    // repo, 2026-09-06), so a redeploy through the seeded constructor needs
+    // NO Safe transaction afterwards. The live liquidator NEVER had its Aave
+    // V2 lending pool set (no ConfigUpdated("aaveV2Pool") event), so it stays
+    // unset here too — pass AAVE_V2_POOL to `aaveV2LendingPool_` below only if
+    // V2 liquidations are actually wanted.
+    address constant SUSHI_V2_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+    address constant PANCAKE_V2_ROUTER = 0xEfF92A263d31888d860bD50809A8D171709b7b1c;
+    address constant SHIBASWAP_ROUTER = 0x03f7724180AA6b939894B5Ca4314783B0b36b329;
+    address constant ONEINCH_LOP = 0x111111125421cA6dc452d289314280a0f8842A65;
+    address constant HASHFLOW_ROUTER = 0x55084eE0fEf03f14a305cd24286359A35D735151;
+    address constant EKUBO_ROUTER = 0xd26f20001a72a18C002b00e6710000d68700ce00;
+    address constant SWAAP_ROUTER = 0xd315a9C38eC871068FEC378E4Ce78AF528C76293;
+    address constant LAUNCH_HOOK = 0xAFeD2c6e0d906520ca17143a8918Ce6d54b128Cc;
+    address constant LBP_MIGRATION_HOOK = 0xd53006d1e3110fD319a79AEEc4c527a0d265E080;
+    address constant OPERATOR_2 = 0x25f4c6C1e5Cc564071A1DC1768a1f1ff0BA9d5a1;
+    address constant OPERATOR_3 = 0xf4Bb8842dd662c8edDed051e66376937E308B905;
+
     function run() external returns (address liqExecutor) {
         // V10+ liquidation allowlist seed: Bebop settlement + Aave V2
         // lending pool + Uni V4 PoolManager + the GENERIC_SEQUENCE
         // direct-call routers (V3 SwapRouter01, V2 Router02, Curve
         // RouterNG, Balancer Vault) the knapsack split generator emits
         // ops against. Morpho is constructor-pinned (not in `allowed[]`).
-        address[] memory liqAllowed = new address[](7);
+        address[] memory liqAllowed = new address[](14);
         liqAllowed[0] = BEBOP_SETTLEMENT;
         liqAllowed[1] = AAVE_V2_POOL;
         liqAllowed[2] = UNI_V4_POOL_MANAGER;
@@ -58,11 +79,27 @@ contract Deploy is Script {
         liqAllowed[4] = UNI_V2_ROUTER;
         liqAllowed[5] = CURVE_ROUTER_NG;
         liqAllowed[6] = BALANCER_VAULT;
+        // Added on the live contract after deploy (see above).
+        liqAllowed[7] = SUSHI_V2_ROUTER;
+        liqAllowed[8] = PANCAKE_V2_ROUTER;
+        liqAllowed[9] = SHIBASWAP_ROUTER;
+        liqAllowed[10] = ONEINCH_LOP;
+        liqAllowed[11] = HASHFLOW_ROUTER;
+        liqAllowed[12] = EKUBO_ROUTER;
+        liqAllowed[13] = SWAAP_ROUTER;
+
+        address[] memory operators = new address[](2);
+        operators[0] = OPERATOR_2;
+        operators[1] = OPERATOR_3;
+        // V4 hooks are accepted by default now (blocklist, not allowlist);
+        // nothing to seed. The two hooks that used to be allowed here are
+        // kept as constants only for the read-back below.
+        address[] memory hooks = new address[](0);
 
         vm.startBroadcast();
 
         liqExecutor = address(
-            new LiquidationExecutor(
+            new LiquidationExecutorSeeded(
                 OWNER,
                 OPERATOR,
                 WETH,
@@ -72,7 +109,12 @@ contract Deploy is Script {
                 PARASWAP_AUGUSTUS,
                 UNI_V2_ROUTER,
                 UNI_V3_ROUTER,
-                liqAllowed
+                liqAllowed,
+                operators,
+                hooks,
+                // The live liquidator never set its Aave V2 lending pool
+                // (no event); leave it unset. Pass AAVE_V2_POOL to enable V2.
+                address(0)
             )
         );
 
@@ -99,6 +141,16 @@ contract Deploy is Script {
         require(ex.allowedTargets(UNI_V2_ROUTER), "readback: v2router allowed");
         require(ex.allowedTargets(CURVE_ROUTER_NG), "readback: curve routerNG allowed");
         require(ex.allowedTargets(BALANCER_VAULT), "readback: bal vault allowed");
+        // Seeded post-deploy state (what the live contract accumulated).
+        require(ex.allowedTargets(ONEINCH_LOP), "readback: 1inch LOP allowed");
+        require(ex.allowedTargets(HASHFLOW_ROUTER), "readback: hashflow allowed");
+        require(ex.allowedTargets(EKUBO_ROUTER), "readback: ekubo allowed");
+        require(ex.allowedTargets(SWAAP_ROUTER), "readback: swaap allowed");
+        require(ex.allowedTargets(SUSHI_V2_ROUTER), "readback: sushi v2 allowed");
+        require(ex.allowedTargets(PANCAKE_V2_ROUTER), "readback: pancake v2 allowed");
+        require(ex.allowedTargets(SHIBASWAP_ROUTER), "readback: shibaswap allowed");
+        require(ex.operators(OPERATOR_2) && ex.operators(OPERATOR_3), "readback: extra operators");
+        require(!ex.blockedV4Hooks(LAUNCH_HOOK) && !ex.blockedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks open");
 
         console2.log("LiquidationExecutor V10:", liqExecutor);
     }

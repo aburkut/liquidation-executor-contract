@@ -3,13 +3,15 @@ pragma solidity ^0.8.24;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
 import {IMorphoBlue, IMorphoFlashLoanCallback} from "./interfaces/IMorphoBlue.sol";
 import {IPoolManager, IUnlockCallback} from "./interfaces/IPoolManager.sol";
+import {AllowanceLib} from "./libraries/AllowanceLib.sol";
+import {DirectSwapLib} from "./libraries/DirectSwapLib.sol";
 import {UniswapLib} from "./libraries/UniswapLib.sol";
 import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
@@ -73,7 +75,7 @@ library ArbTypes {
 contract ArbExecutor is
     Ownable2Step,
     Pausable,
-    ReentrancyGuard,
+    ReentrancyGuardTransient,
     IFlashLoanRecipient,
     IMorphoFlashLoanCallback,
     IUnlockCallback
@@ -112,9 +114,7 @@ contract ArbExecutor is
     event AllowedTargetUpdated(address indexed target, bool allowed);
     // V10+: FlashProviderUpdated dropped — both providers constructor-pinned.
     event Withdraw(address indexed token, address indexed to, uint256 amount);
-    // Mirrors CoinbasePaymentLib.CoinbasePaid for tests that pin the topic.
-    event CoinbasePaid(address indexed coinbase, uint256 amount);
-    event V4HookAllowedUpdated(address indexed hook, bool allowed);
+    event V4HookBlockedUpdated(address indexed hook, bool blocked);
     event OperatorUpdated(address indexed operator, bool allowed);
 
     // ─── Constants ───────────────────────────────────────────────────
@@ -130,6 +130,24 @@ contract ArbExecutor is
     /// and persistent storage have SEPARATE address spaces — slot 0 here does
     /// not alias `_owner`.
     uint256 private constant BID_BPS_TSLOT = 0;
+    /// @dev TRANSIENT slots for the per-transaction execution state the
+    /// callbacks gate on: the hash of the plan being executed and whether an
+    /// `execute` is in flight. These used to be persistent storage
+    /// (`_activePlanHash`, `_executionPhase`), written at entry and cleared
+    /// at exit: two SSTOREs from zero and two clears per transaction, about
+    /// 30k gas net of refunds, for state that by construction never outlives
+    /// the transaction. Transient storage costs 100 gas a write, self-clears,
+    /// and keeps the same guard semantics inside the transaction — a callback
+    /// that arrives outside `execute` still finds the phase unset.
+    uint256 private constant PLAN_HASH_TSLOT = 1;
+    uint256 private constant PHASE_TSLOT = 2;
+    /// @dev TRANSIENT slots `GenericSequenceLib.runArb*` arms for a V4 leg
+    /// (same numbers as its persistent `V4_PM_SLOT`/`V4_TOKENIN_SLOT`, other
+    /// address space): word 11 = the PoolManager mid-unlock, word 12 = the
+    /// input token in the low 160 bits with the armed bit at 160.
+    uint256 private constant V4_PM_TSLOT = 11;
+    uint256 private constant V4_TOKENIN_TSLOT = 12;
+    uint256 private constant V4_ARMED_BIT = 1 << 160;
 
     // ─── Immutables (constructor-pinned) ─────────────────────────────
     address public immutable weth;
@@ -142,16 +160,36 @@ contract ArbExecutor is
     // GenericSequenceLib's pinned V4_PM_SLOT/V4_TOKENIN_SLOT constants (the
     // lib sstores into them via DELEGATECALL). test_v4SlotConstantsMatchLayout
     // is the authority — if it fails, adjust the field order/padding below.
-    address public morphoBlue;
+    /// @dev The two flash providers are constructor-pinned and read on the
+    /// hot path (provider dispatch, callback caller checks): immutables cost
+    /// nothing to read where a storage slot costs 2.1k cold. The
+    /// `allowedFlashProviders` mapping stays for the ABI (getter, deploy
+    /// read-backs) and is written once, in the constructor.
+    address public immutable morphoBlue;
+    address public immutable balancerVault;
     mapping(uint8 => address) public allowedFlashProviders;
     /// @dev Generic allowlist for Bebop settlement / future protocol
     /// targets that need owner-curated trust. Uni V2/V3 routers are
     /// constructor-immutable; Curve / Balancer pool addresses are
     /// trusted from the bot (sanity-gated inside their libraries).
     mapping(address => bool) public allowedTargets;
-    /// @dev V4 hook allowlist (parity with LiquidationExecutor). Owner-curated;
-    /// the unlockCallback single-hop branch re-checks `allowedV4Hooks[hook]`.
-    mapping(address => bool) public allowedV4Hooks;
+    /// @dev V4 hook BLOCKlist (parity with LiquidationExecutor). Any hook is
+    /// accepted unless the owner has blocked it; `unlockCallback` re-checks.
+    ///
+    /// This used to be an ALLOWlist, curated one owner transaction per hook.
+    /// It was dropped for the reason the Curve/Balancer target allowlist was
+    /// dropped before it (see LiquidationExecutor's `allowedTargets` notes):
+    /// the bot is the trusted source of pools, and a hostile hook can only
+    /// make the transaction revert, not take standing funds. What bounds it:
+    /// v4-core caps a `beforeSwap` delta at the swap's own amount
+    /// (`HookDeltaExceedsSwapAmount`), `runV4UnlockSwap` reverts on any
+    /// delta with the wrong sign, `owedIn` is read from the delta rather
+    /// than the plan, and `runArb` ends in `checkProfitStrict`, which
+    /// refuses a cycle that ended below where it started whatever the
+    /// plan's floor says (a zero floor included). Same slot as before, so
+    /// the V4 arming fields stay at 11/12. The blocklist remains for a hook
+    /// that reverts on us on purpose (gas griefing), which no floor can see.
+    mapping(address => bool) public blockedV4Hooks;
     /// @dev Operator allowlist. Several operator EOAs may drive ONE executor
     /// so sends spread over independent nonce streams — one stuck tx then
     /// cannot jam the others, and same-nonce bid fan-out does not have to
@@ -160,34 +198,11 @@ contract ArbExecutor is
     /// containment caps, never move standing funds (`withdraw` is onlyOwner).
     mapping(address => bool) public operators;
 
-    bytes32 private _activePlanHash;
-    /// @dev Storage-layout alignment padding (slots 8-10). `ArbExecutor` has
-    /// three fewer pre-V4 storage fields than `LiquidationExecutor`
-    /// (`aavePool`, `paraswapAugustusV6`, `aaveV2LendingPool` are either
-    /// Aave-specific — not applicable to an arb-only executor — or
-    /// constructor-`immutable` here, so they consume no storage slot).
-    /// Without this padding `_activeV4PoolManager`/`_activeV4TokenIn` would
-    /// land at slots 8/9 instead of the 11/12 `GenericSequenceLib` hardcodes
-    /// (`V4_PM_SLOT`/`V4_TOKENIN_SLOT`) and shares with `LiquidationExecutor`
-    /// via the same DELEGATECALL sstore. Reserved, never read/written by
-    /// this contract — `forge inspect ArbExecutor storageLayout` is the
-    /// authority that these three slots land the V4 fields correctly.
-    bytes32 private __reservedSlot0;
-    bytes32 private __reservedSlot1;
-    bytes32 private __reservedSlot2;
-    /// @dev Slot 11 (bytes 0..19) — armed V4 PoolManager. Packs with
-    /// `_executionPhase` (byte 20). Pinned by test_v4SlotConstantsMatchLayout.
-    address private _activeV4PoolManager;
-    enum ExecutionPhase {
-        Idle,
-        FlashLoanActive
-    }
-    ExecutionPhase private _executionPhase;
-    /// @dev Slot 12 (bytes 0..19) — armed V4 input token. Packs with
-    /// `_v4Armed` (byte 20).
-    address private _activeV4TokenIn;
-    /// @dev Slot 12 byte 20 — the re-entry sentinel unlockCallback gates on.
-    bool private _v4Armed;
+    // No per-transaction execution state lives in persistent storage any
+    // more: the plan hash, the phase and the V4 arming words (`V4_PM_TSLOT`,
+    // `V4_TOKENIN_TSLOT`, written by `GenericSequenceLib.runArb*`) are all
+    // transient. The padding that once aligned V4 fields to slots 11/12 is
+    // gone with them — nothing raw-`sstore`s into this contract.
 
     // ─── Constructor ─────────────────────────────────────────────────
     /// @dev Both flash providers (Balancer Vault + Morpho Blue) are
@@ -222,6 +237,7 @@ contract ArbExecutor is
         uniV2Router = uniV2Router_;
         uniV3Router = uniV3Router_;
         morphoBlue = morpho_;
+        balancerVault = balancerVault_;
 
         allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
         allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho_;
@@ -266,6 +282,19 @@ contract ArbExecutor is
         emit AllowedTargetUpdated(target, allowed);
     }
 
+    /// @notice Take back a spender's allowance on `token`.
+    ///
+    /// AUDITED 2026-09-08: `setAllowedTarget(t, false)`, `setOperator(op,
+    /// false)` and `pause()` are the documented kill-switches for a leaked hot
+    /// key, and none of them can touch an ERC20 allowance — `withdraw` and the
+    /// `rescue*` family only move tokens this contract still holds. So a
+    /// spender's power over future balances outlived every revocation the
+    /// owner had. This is the missing half.
+    function revokeAllowance(address token, address spender) external onlyOwner {
+        if (token == address(0) || spender == address(0)) revert ZeroAddress();
+        IERC20(token).forceApprove(spender, 0);
+    }
+
     /// @notice Add or remove an operator EOA authorised to call `execute`.
     /// @dev Deliberately NOT self-service: only the owner may rotate keys.
     /// Revoking is immediate, which is the kill-switch for a leaked hot key
@@ -278,16 +307,15 @@ contract ArbExecutor is
         emit OperatorUpdated(operator_, allowed);
     }
 
-    /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.
-    /// @dev Hooks execute arbitrary logic during `beforeSwap`/`afterSwap` on the
-    /// PoolManager; any non-zero hook that is NOT in this whitelist causes the
-    /// V4 path to revert with `InvalidPlan`. Default is empty — operator
-    /// routes MUST stay on hook-less pools unless the owner explicitly enables
-    /// a hook after review.
-    function setV4HookAllowed(address hook, bool allowed) external onlyOwner {
+    /// @notice Block (or unblock) a Uniswap V4 hook contract inside V4 swaps.
+    /// @dev Every hook is accepted by default — the economic defence is the
+    /// delta-sign check plus the non-zero profit floor, not a list. Blocking
+    /// is for a hook that reverts on us deliberately: a griefing hook costs
+    /// gas per attempt and no floor can detect it before the swap.
+    function setV4HookBlocked(address hook, bool blocked) external onlyOwner {
         if (hook == address(0)) revert ZeroAddress();
-        allowedV4Hooks[hook] = allowed;
-        emit V4HookAllowedUpdated(hook, allowed);
+        blockedV4Hooks[hook] = blocked;
+        emit V4HookBlockedUpdated(hook, blocked);
     }
 
     function pause() external onlyOwner {
@@ -336,8 +364,78 @@ contract ArbExecutor is
     /// the flash-callback frame, where `msg.value` is 0 (the callback is a
     /// fresh call from the flash provider, not from the operator).
     function execute(bytes calldata planData) external payable onlyOperator whenNotPaused nonReentrant {
-        ArbTypes.ArbPlan memory plan = abi.decode(planData, (ArbTypes.ArbPlan));
+        _execute(abi.decode(planData, (ArbTypes.ArbPlan)), planData);
+    }
 
+    /// @notice `execute` for a PACKED plan. ABI encoding of an `ArbPlan`
+    /// costs 2.2-2.6 KB of calldata for a two- or three-op cycle (a 32-byte
+    /// word per field, offsets, padding — half of it zero bytes), i.e.
+    /// 37-39k of intrinsic gas against the competitor's 24-32k. The packed
+    /// form below is ~100 bytes per op. It is decoded once into the same
+    /// `ArbPlan` and takes the same path as `execute`; the plan hash the
+    /// callbacks gate on and the event carries is over the ABI re-encoding,
+    /// so it is the same hash `execute` would have used for this plan.
+    ///
+    /// Layout (big-endian, no padding):
+    ///   u8 version (1) | u8 flashProviderId | address loanToken |
+    ///   u128 loanAmount | u128 minProfitAmount | u128 maxFlashFee | u8 nOps
+    ///   then per op:
+    ///   address target | u16 flags | u128 amountIn | u16 fromAmountPos |
+    ///   u16 returnAmountPos | address srcToken | address outToken |
+    ///   callData: V3 direct/flash → u8 zeroForOne, u160 sqrtPriceLimitX96;
+    ///             V2 direct/flash → u8 zeroForOne, u16 feeNumerator;
+    ///             otherwise       → u16 len, len bytes.
+    function executePacked(bytes calldata packed) external payable onlyOperator whenNotPaused nonReentrant {
+        ArbTypes.ArbPlan memory plan = _decodePacked(packed);
+        _execute(plan, abi.encode(plan));
+    }
+
+    uint8 private constant PACKED_VERSION = 1;
+
+    error PackedPlanMalformed();
+
+    function _decodePacked(bytes calldata p) private pure returns (ArbTypes.ArbPlan memory plan) {
+        if (p.length < 71 || uint8(p[0]) != PACKED_VERSION) revert PackedPlanMalformed();
+        plan.flashProviderId = uint8(p[1]);
+        plan.loanToken = address(bytes20(p[2:22]));
+        plan.loanAmount = uint128(bytes16(p[22:38]));
+        plan.minProfitAmount = uint128(bytes16(p[38:54]));
+        plan.maxFlashFee = uint128(bytes16(p[54:70]));
+        uint256 n = uint8(p[70]);
+        plan.ops = new Op[](n);
+        uint256 o = 71;
+        for (uint256 i = 0; i < n; ++i) {
+            if (p.length < o + 82) revert PackedPlanMalformed();
+            Op memory op = plan.ops[i];
+            op.target = address(bytes20(p[o:o + 20]));
+            op.flags = uint16(bytes2(p[o + 20:o + 22]));
+            op.amountIn = uint128(bytes16(p[o + 22:o + 38]));
+            op.fromAmountPos = uint16(bytes2(p[o + 38:o + 40]));
+            op.returnAmountPos = uint16(bytes2(p[o + 40:o + 42]));
+            op.srcToken = address(bytes20(p[o + 42:o + 62]));
+            op.outToken = address(bytes20(p[o + 62:o + 82]));
+            o += 82;
+            if (op.flags & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V3_FLASH) != 0) {
+                if (p.length < o + 21) revert PackedPlanMalformed();
+                op.callData = abi.encode(uint8(p[o]) != 0, uint160(bytes20(p[o + 1:o + 21])));
+                o += 21;
+            } else if (op.flags & (GenericSequenceLib.FLAG_V2_DIRECT | GenericSequenceLib.FLAG_V2_FLASH) != 0) {
+                if (p.length < o + 3) revert PackedPlanMalformed();
+                op.callData = abi.encode(uint8(p[o]) != 0, uint16(bytes2(p[o + 1:o + 3])));
+                o += 3;
+            } else {
+                if (p.length < o + 2) revert PackedPlanMalformed();
+                uint256 len = uint16(bytes2(p[o:o + 2]));
+                o += 2;
+                if (p.length < o + len) revert PackedPlanMalformed();
+                op.callData = p[o:o + len];
+                o += len;
+            }
+        }
+        if (o != p.length) revert PackedPlanMalformed();
+    }
+
+    function _execute(ArbTypes.ArbPlan memory plan, bytes memory planData) private {
         // Plan invariants — fail fast pre-flashloan.
         if (plan.loanToken == address(0)) revert ZeroAddress();
         if (plan.loanAmount == 0) revert InvalidPlan();
@@ -367,18 +465,53 @@ contract ArbExecutor is
         // instead of relying on it as the sole backstop.
         for (uint256 i = 0; i < plan.ops.length; ++i) {
             if (plan.ops[i].flags == GenericSequenceLib.FLAG_WETH_UNWRAP) continue;
+            // Direct pool swaps name the pool itself as the target: pools are
+            // permissionless and bounded by construction (the op spends at
+            // most its own `amount`, see DirectSwapLib), so they are not
+            // allowlisted — exactly the exposure of an allowlisted router
+            // routing into an arbitrary pool.
+            if (plan.ops[i].flags & GenericSequenceLib.FLAG_DIRECT_ANY != 0) {
+                continue;
+            }
             if (!allowedTargets[plan.ops[i].target]) revert TargetNotAllowed();
         }
 
-        address provider = allowedFlashProviders[plan.flashProviderId];
+        // INVENTORY path: when the contract already holds the principal, the
+        // flash loan is pure overhead — provider call, transfer in, callback,
+        // second decode of the plan, transfer back: about 55k gas on a Morpho
+        // cycle. Run the sequence straight off the standing balance instead.
+        // The containment cap is the same (`loanAmount` of `loanToken` may be
+        // spent, nothing else), and the pipeline requires the balance not to
+        // shrink, so a losing cycle reverts exactly as an unrepayable flash
+        // would. The bot needs no new field: a plan naming a flash provider
+        // simply does not use it when the inventory covers it.
+        //
+        // SECURITY: a standing balance is exposed to the accepted operator-key
+        // risk documented on the loanToken cap in `GenericSequenceLib`
+        // (up to `loanAmount` per tx through an adversarial pool). The owner
+        // sizes the inventory with that in mind; `withdraw` drains it.
+        // SELF-FUNDED path: a sequence whose first op is a FLASH swap gets its
+        // principal from that pool (paid back at the end of the sequence out
+        // of the cycle's proceeds), so neither a loan nor inventory is needed.
+        bool selfFunded = plan.ops[0].flags & (GenericSequenceLib.FLAG_V3_FLASH | GenericSequenceLib.FLAG_V2_FLASH) != 0;
+        if (selfFunded || IERC20(plan.loanToken).balanceOf(address(this)) >= plan.loanAmount) {
+            _setPhase(true);
+            _runArbPipeline(plan, 0, address(this), keccak256(planData));
+            _setPhase(false);
+            return;
+        }
+
+        address provider = plan.flashProviderId == FLASH_PROVIDER_MORPHO
+            ? morphoBlue
+            : (plan.flashProviderId == FLASH_PROVIDER_BALANCER ? balancerVault : address(0));
         if (provider == address(0)) revert InvalidFlashProvider(plan.flashProviderId);
 
         // Pin plan hash for the callback gate. The phase + hash pair
         // is the only thing standing between a hostile caller and the
         // flashloan-borrowed funds; both MUST be set BEFORE the
         // external flash call.
-        _activePlanHash = keccak256(planData);
-        _executionPhase = ExecutionPhase.FlashLoanActive;
+        _setPlanHash(keccak256(planData));
+        _setPhase(true);
 
         if (plan.flashProviderId == FLASH_PROVIDER_MORPHO) {
             IMorphoBlue(provider).flashLoan(plan.loanToken, plan.loanAmount, planData);
@@ -392,8 +525,33 @@ contract ArbExecutor is
             revert InvalidFlashProvider(plan.flashProviderId);
         }
 
-        _activePlanHash = bytes32(0);
-        _executionPhase = ExecutionPhase.Idle;
+        _setPlanHash(bytes32(0));
+        _setPhase(false);
+    }
+
+    // ─── Transient execution state ───────────────────────────────────
+    function _planHash() private view returns (bytes32 h) {
+        assembly ("memory-safe") {
+            h := tload(PLAN_HASH_TSLOT)
+        }
+    }
+
+    function _setPlanHash(bytes32 h) private {
+        assembly ("memory-safe") {
+            tstore(PLAN_HASH_TSLOT, h)
+        }
+    }
+
+    function _phaseActive() private view returns (bool active) {
+        assembly ("memory-safe") {
+            active := tload(PHASE_TSLOT)
+        }
+    }
+
+    function _setPhase(bool active) private {
+        assembly ("memory-safe") {
+            tstore(PHASE_TSLOT, active)
+        }
     }
 
     // ─── Flashloan callbacks ─────────────────────────────────────────
@@ -406,22 +564,17 @@ contract ArbExecutor is
         uint256[] calldata feeAmounts,
         bytes calldata userData
     ) external override {
-        if (_executionPhase != ExecutionPhase.FlashLoanActive) {
-            revert InvalidExecutionPhase();
-        }
-        if (_activePlanHash == bytes32(0)) revert NoActivePlan();
-        if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_BALANCER]) revert InvalidCallbackCaller();
-        if (keccak256(userData) != _activePlanHash) revert InvalidPlan();
-        // Capture BEFORE the clear below — the clear zeroes the slot the
-        // event emission used to read from, which made every ArbExecuted
-        // topic bytes32(0) (Task 8 fix 1).
-        bytes32 planHash = _activePlanHash;
+        if (!_phaseActive()) revert InvalidExecutionPhase();
+        bytes32 planHash = _planHash();
+        if (planHash == bytes32(0)) revert NoActivePlan();
+        if (msg.sender != balancerVault) revert InvalidCallbackCaller();
+        if (keccak256(userData) != planHash) revert InvalidPlan();
         // V10 audit fix: clear plan hash to block callback re-entry
         // within the same flash. The triple-gate (phase + hash + caller)
         // is otherwise stable for the entire flash window — a hostile
         // or buggy flash provider invoking the callback twice would pass
         // all three checks without this clear.
-        _activePlanHash = bytes32(0);
+        _setPlanHash(bytes32(0));
         if (tokens.length != 1) revert BalancerSingleTokenOnly();
 
         ArbTypes.ArbPlan memory plan = abi.decode(userData, (ArbTypes.ArbPlan));
@@ -439,17 +592,14 @@ contract ArbExecutor is
     /// approve `msg.sender` (the Morpho contract) for `amount` rather
     /// than transferring out.
     function onMorphoFlashLoan(uint256 amount, bytes calldata data) external override {
-        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
-        if (_activePlanHash == bytes32(0)) revert NoActivePlan();
-        if (msg.sender != allowedFlashProviders[FLASH_PROVIDER_MORPHO]) revert InvalidCallbackCaller();
-        if (keccak256(data) != _activePlanHash) revert InvalidPlan();
-        // Capture BEFORE the clear below — mirror of `receiveFlashLoan`'s
-        // fix (Task 8 fix 1): reading the slot AFTER the clear always
-        // produced bytes32(0) in the emitted event.
-        bytes32 planHash = _activePlanHash;
+        if (!_phaseActive()) revert InvalidExecutionPhase();
+        bytes32 planHash = _planHash();
+        if (planHash == bytes32(0)) revert NoActivePlan();
+        if (msg.sender != morphoBlue) revert InvalidCallbackCaller();
+        if (keccak256(data) != planHash) revert InvalidPlan();
         // V10 audit fix: clear plan hash to block callback re-entry.
         // Mirror of `receiveFlashLoan`.
-        _activePlanHash = bytes32(0);
+        _setPlanHash(bytes32(0));
 
         ArbTypes.ArbPlan memory plan = abi.decode(data, (ArbTypes.ArbPlan));
         if (amount != plan.loanAmount) revert CallbackAmountMismatch();
@@ -462,28 +612,36 @@ contract ArbExecutor is
     /// @notice PRODUCTION SCOPE — this callback implements exactly ONE shape:
     ///   exact-input single-hop ERC20→ERC20 swap inside the flashloan pipeline.
     /// @dev Three layers of protection against stray or adversarial calls:
-    ///   1. `ExecutionPhase.FlashLoanActive` — only valid inside execute()
-    ///   2. `_v4Armed`                       — only while a V4 leg is mid-unlock
-    ///   3. `msg.sender == _activeV4PoolManager` — only the pinned PoolManager
+    ///   1. the transient phase flag        — only valid inside execute()
+    ///   2. the transient armed bit         — only while a V4 leg is mid-unlock
+    ///   3. `msg.sender` == the transient PoolManager word — only the pinned PoolManager
     /// Verbatim port of `LiquidationExecutor.unlockCallback` (line 1509) —
     /// same guards, same re-entry CLAIM-on-entry discipline, same
     /// single-hop/multihop dispatch on `inner.length`.
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
-        if (_executionPhase != ExecutionPhase.FlashLoanActive) revert InvalidExecutionPhase();
-        // tokenIn is read from storage (pinned by the V4 leg arming path)
-        // rather than from `data` — PM controls the data, not storage, so
-        // substitution is impossible by construction. The re-entry guard
-        // is `_v4Armed` (NOT tokenIn != 0 — that collided with native-ETH
-        // legs, where tokenIn == address(0) by design): claiming it
-        // (clearing to false) on entry means a nested unlockCallback from
-        // inside swap() finds `_v4Armed == false` and the combined check
-        // below fails closed, regardless of what tokenIn is. The
-        // msg.sender check covers the not-in-flow case (_activeV4PoolManager
-        // == 0 → msg.sender != 0 = always true).
-        address tokenIn = _activeV4TokenIn;
-        if (!_v4Armed || msg.sender != _activeV4PoolManager) revert InvalidCallbackCaller();
-        _v4Armed = false; // CLAIM — nested unlockCallback finds false and fails closed
-        _activeV4TokenIn = address(0); // CLAIM (hygiene only now — see above)
+        if (!_phaseActive()) revert InvalidExecutionPhase();
+        // tokenIn is read from the transient arming word (pinned by the V4
+        // leg arming path in `GenericSequenceLib.runArb*`) rather than from
+        // `data` — the PM controls the data, not our transient storage, so
+        // substitution is impossible by construction. The re-entry guard is
+        // the armed bit (NOT tokenIn != 0 — that collided with native-ETH
+        // legs, where tokenIn == address(0) by design): claiming it (clearing
+        // the word) on entry means a nested unlockCallback from inside swap()
+        // finds it unarmed and the combined check below fails closed,
+        // regardless of what tokenIn is. The msg.sender check covers the
+        // not-in-flow case (PM word == 0 → msg.sender != 0 = always true).
+        address tokenIn;
+        bool armed;
+        address pm;
+        assembly ("memory-safe") {
+            let w := tload(V4_TOKENIN_TSLOT)
+            tokenIn := and(w, 0xffffffffffffffffffffffffffffffffffffffff)
+            armed := gt(and(w, V4_ARMED_BIT), 0)
+            pm := tload(V4_PM_TSLOT)
+            // CLAIM — a nested unlockCallback finds the word cleared and fails closed.
+            tstore(V4_TOKENIN_TSLOT, 0)
+        }
+        if (!armed || msg.sender != pm) revert InvalidCallbackCaller();
 
         // Uniform unlock-data shape for single-hop AND multihop:
         //   abi.encode(bytes inner, int256 amountSpec)
@@ -495,7 +653,7 @@ contract ArbExecutor is
         if (inner.length == V4_SWAP_DATA_LENGTH) {
             (, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
                 abi.decode(inner, (address, address, uint24, int24, address));
-            if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
+            if (blockedV4Hooks[hook]) revert InvalidV4CallbackHook();
             UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec);
         } else {
             UniswapLib.runV4UnlockMultihop(IPoolManager(msg.sender), tokenIn, data);
@@ -503,19 +661,72 @@ contract ArbExecutor is
         return "";
     }
 
+    // ─── Direct / flash pool swaps: the pool pulls its input through here ───
+    /// @dev Called by a V3-style pool mid-`swap`. Empty data = a
+    /// `FLAG_V3_DIRECT` op: pay now, only the armed pool, never more than the
+    /// op's amount. Non-empty data = a `FLAG_V3_FLASH` op: the data is the
+    /// rest of the sequence (verified by hash), which runs HERE, and the pool
+    /// is paid last out of what it produced (DirectSwapLib). Pancake V3
+    /// pools use the second name.
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _v3Callback(amount0Delta, amount1Delta, data);
+    }
+
+    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _v3Callback(amount0Delta, amount1Delta, data);
+    }
+
+    function _v3Callback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) private {
+        if (data.length == 0) {
+            DirectSwapLib.payV3Callback(amount0Delta, amount1Delta);
+            return;
+        }
+        (address tokenIn, uint256 maxOwed) = DirectSwapLib.beginContinuation(data);
+        address pool = msg.sender;
+        GenericSequenceLib.continueOps(data, DirectSwapLib.receivedV3(amount0Delta, amount1Delta));
+        DirectSwapLib.settleV3(pool, amount0Delta, amount1Delta, tokenIn, maxOwed);
+    }
+
+    /// @dev Called by a V2-style pair mid-`swap` for a `FLAG_V2_FLASH` op
+    /// (pairs only call back when the swap carries data). Same continuation
+    /// as V3; the pair is then sent exactly the op's input and applies its
+    /// own K check. Pancake V2 pairs use the second name.
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _v2Callback(sender, amount0, amount1, data);
+    }
+
+    function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _v2Callback(sender, amount0, amount1, data);
+    }
+
+    function _v2Callback(address sender, uint256 amount0, uint256 amount1, bytes calldata data) private {
+        if (sender != address(this)) revert InvalidCallbackCaller();
+        (address tokenIn, uint256 owed) = DirectSwapLib.beginContinuation(data);
+        address pair = msg.sender;
+        GenericSequenceLib.continueOps(data, amount0 > 0 ? amount0 : amount1);
+        DirectSwapLib.settleV2(pair, tokenIn, owed);
+    }
+
     // ─── Pipeline (inside flash) ─────────────────────────────────────
     /// @dev `vault == address(0)` ⇒ approve-only (Morpho pulls).
-    /// `vault != 0` ⇒ push transfer to the vault. `planHash` is captured by
-    /// the caller BEFORE it clears `_activePlanHash` (the V10 re-entry
-    /// guard) — reading the storage slot from here would always see the
+    /// `vault != 0` ⇒ push transfer to the vault. `vault == address(this)`
+    /// ⇒ the contract's own inventory, nothing to repay. `planHash` is
+    /// captured by the caller BEFORE it clears the transient plan hash (the
+    /// V10 re-entry guard) — reading the slot from here would always see the
     /// already-cleared bytes32(0) (Task 8 fix 1).
     function _runArbPipeline(ArbTypes.ArbPlan memory plan, uint256 flashRepay, address vault, bytes32 planHash)
         internal
     {
         address loanToken = plan.loanToken;
+        // `vault == address(this)` ⇒ the principal is the contract's own
+        // inventory: nothing was borrowed, nothing is repaid, and the profit
+        // is simply the balance delta.
+        bool inventory = vault == address(this);
 
-        // Verify the flash actually arrived.
-        if (IERC20(loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
+        // Verify the flash actually arrived. On the inventory path `execute`
+        // already saw the balance cover it — or the first op is a flash swap
+        // that supplies its own principal — so the check is the loan path's.
+        if (!inventory && IERC20(loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
 
         // Snapshot loanToken BEFORE the sequence runs. For arb the flash
         // principal has already arrived (checked above), so this baseline
@@ -530,11 +741,24 @@ contract ArbExecutor is
         // Op targets were validated allowlisted in execute(); the op loop +
         // per-srcToken containment (cap = loanToken/loanAmount, absolute
         // repay gate) run in GenericSequenceLib via DELEGATECALL.
-        GenericSequenceLib.runArb(plan.ops, loanToken, flashRepay, plan.loanAmount, weth);
+        if (inventory) {
+            GenericSequenceLib.runArbFromInventory(plan.ops, loanToken, plan.loanAmount, weth);
+        } else {
+            GenericSequenceLib.runArb(plan.ops, loanToken, flashRepay, plan.loanAmount, weth);
+        }
 
-        // Realized profit (loanToken-denominated, net of flash repay).
-        uint256 realizedProfit =
-            CoinbasePaymentLib.computeRealizedProfit(loanToken, loanToken, profitBefore, plan.loanAmount, flashRepay);
+        // Realized profit (loanToken-denominated, net of flash repay). On the
+        // inventory path nothing was borrowed, so principal and repay are
+        // both zero and the profit is the plain balance delta.
+        (uint256 realizedProfit, bool shortfall) = CoinbasePaymentLib.computeRealizedProfit(
+            loanToken, loanToken, profitBefore, inventory ? 0 : plan.loanAmount, flashRepay
+        );
+        // The inventory must not shrink: the flash path has the repayment
+        // gate for this, the inventory path gets the same rule explicitly.
+        if (inventory) {
+            uint256 held = IERC20(loanToken).balanceOf(address(this));
+            if (held < profitBefore) revert InsufficientRepayBalance(profitBefore, held);
+        }
 
         // Coinbase bribe — bid read back from transient storage (`execute`
         // captured `msg.value`; this frame's own `msg.value` is 0, it was
@@ -555,13 +779,18 @@ contract ArbExecutor is
         uint256 balance = IERC20(loanToken).balanceOf(address(this));
         if (balance < flashRepay) revert InsufficientRepayBalance(flashRepay, balance);
 
-        if (vault == address(0)) {
-            IERC20(loanToken).forceApprove(msg.sender, flashRepay);
+        if (inventory) {
+            // Own principal: nothing to repay.
+        } else if (vault == address(0)) {
+            // Morpho pulls the repayment from us after the callback returns;
+            // the provider is constructor-pinned, so the allowance stands
+            // (AllowanceLib) instead of being re-written from zero per cycle.
+            AllowanceLib.ensure(loanToken, msg.sender, flashRepay);
         } else {
             IERC20(loanToken).safeTransfer(vault, flashRepay);
         }
 
-        CoinbasePaymentLib.checkProfit(realizedProfit, coinbasePaid, plan.minProfitAmount);
+        CoinbasePaymentLib.checkProfitStrict(realizedProfit, coinbasePaid, plan.minProfitAmount, shortfall);
 
         emit ArbExecuted(planHash, loanToken, realizedProfit, coinbasePaid);
     }

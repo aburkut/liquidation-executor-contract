@@ -18,6 +18,8 @@ import {MockBalancerVault} from "./mocks/MockBalancerVault.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockParaswapAugustus} from "./mocks/MockParaswapAugustus.sol";
 import {MockRouter} from "./support/Mocks.sol";
+import {MockUniV3Pool, MockUniV2Pair, TamperingV3Pool} from "./mocks/MockDirectPools.sol";
+import {DirectSwapLib} from "../src/libraries/DirectSwapLib.sol";
 
 contract MockWETH is MockERC20 {
     constructor() MockERC20("Wrapped Ether", "WETH", 18) {}
@@ -48,6 +50,30 @@ contract MockWETH is MockERC20 {
 ///   * Profit floor + withdraw + admin surface.
 ///   * End-to-end op-sequence execution through the real flash callback
 ///     (`test_execute_opSequence_arb_profits_and_repays`).
+/// A flash provider that hands the principal over and then relays the
+/// callback through a SECOND address, so the executor sees the right phase
+/// and plan hash but the wrong `msg.sender`.
+contract HostileMorpho {
+    CallbackRelay public relay = new CallbackRelay();
+
+    function flashLoan(address token, uint256 assets, bytes calldata data) external {
+        IERC20(token).transfer(msg.sender, assets);
+        relay.forward(msg.sender, assets, data);
+    }
+}
+
+contract CallbackRelay {
+    function forward(address exec, uint256 assets, bytes calldata data) external {
+        (bool ok, bytes memory ret) =
+            exec.call(abi.encodeWithSignature("onMorphoFlashLoan(uint256,bytes)", assets, data));
+        if (!ok) {
+            assembly {
+                revert(add(ret, 0x20), mload(ret))
+            }
+        }
+    }
+}
+
 contract ArbExecutorTest is Test {
     ArbExecutor public exec;
 
@@ -689,32 +715,518 @@ contract ArbExecutorTest is Test {
         exec.onMorphoFlashLoan(LOAN_AMOUNT, hex"");
     }
 
+    /// The phase and plan hash live in TRANSIENT storage now, so they cannot
+    /// be planted with `vm.store`; the "inside the phase, wrong caller" case
+    /// is driven for real: a hostile flash provider that relays the callback
+    /// through another address while `execute` is in flight. Only the caller
+    /// check may reject it — the phase is active and the hash matches.
     function test_revert_morphoCallbackWrongCaller_evenInsidePhase() public {
-        // Plant `_executionPhase = FlashLoanActive` and `_activePlanHash`
-        // matching `data` — only the caller check should reject.
+        HostileMorpho hostile = new HostileMorpho();
+        address[] memory allowed = new address[](0);
+        vm.prank(ownerAddr);
+        ArbExecutor exec2 = new ArbExecutor(
+            ownerAddr,
+            operatorAddr,
+            address(weth),
+            address(balancerFlash),
+            address(hostile),
+            address(augustus),
+            address(uniV2),
+            address(uniV3),
+            allowed
+        );
+        tokenA.mint(address(hostile), LOAN_AMOUNT);
+
         Op[] memory ops = new Op[](2);
         ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
         ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
         bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
-        bytes32 planHash = keccak256(plan);
 
-        // Storage slots (forge inspect ArbExecutor storageLayout, post V4
-        // storage-alignment — see task-3-report.md):
-        //   morphoBlue              slot 2
-        //   allowedFlashProviders   slot 3 (mapping)
-        //   allowedTargets          slot 4 (mapping)
-        //   allowedV4Hooks          slot 5 (mapping)
-        //   operators               slot 6 (mapping)
-        //   _activePlanHash         slot 7
-        //   __reservedSlot0..2      slots 8-10 (V4 alignment padding)
-        //   _activeV4PoolManager    slot 11 offset 0  (packs with _executionPhase)
-        //   _executionPhase         slot 11 offset 20 (uint8 enum)
-        vm.store(address(exec), bytes32(uint256(7)), planHash);
-        vm.store(address(exec), bytes32(uint256(11)), bytes32(uint256(1) << 160)); // FlashLoanActive @ offset 20
-
-        vm.prank(attacker);
+        vm.prank(operatorAddr);
         vm.expectRevert(ArbExecutor.InvalidCallbackCaller.selector);
+        exec2.execute(plan);
+    }
+
+    /// Outside `execute` the transient phase reads unset, whoever calls.
+    function test_revert_morphoCallbackOutsideExecute() public {
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(address(morpho));
+        vm.expectRevert(ArbExecutor.InvalidExecutionPhase.selector);
         exec.onMorphoFlashLoan(LOAN_AMOUNT, plan);
+    }
+
+    // ─── Direct pool swaps (no router, no allowance, pool not allowlisted) ───
+
+    function _directV3Op(address pool, address src, address dst, bool zeroForOne, uint256 amountIn, uint32 extra)
+        internal
+        pure
+        returns (Op memory op)
+    {
+        op.target = pool;
+        op.srcToken = src;
+        op.outToken = dst;
+        op.amountIn = amountIn;
+        op.flags = GenericSequenceLib.FLAG_V3_DIRECT | extra;
+        op.callData = abi.encode(zeroForOne, uint160(0));
+    }
+
+    function _directV2Op(address pair, address src, address dst, bool zeroForOne, uint256 amountIn, uint32 extra)
+        internal
+        pure
+        returns (Op memory op)
+    {
+        op.target = pair;
+        op.srcToken = src;
+        op.outToken = dst;
+        op.amountIn = amountIn;
+        op.flags = GenericSequenceLib.FLAG_V2_DIRECT | extra;
+        op.callData = abi.encode(zeroForOne, uint16(997));
+    }
+
+    function _v3Pool() internal returns (MockUniV3Pool pool) {
+        pool = new MockUniV3Pool(address(tokenA), address(tokenB), SWAP_RATE);
+        tokenA.mint(address(pool), 10 * LOAN_AMOUNT);
+        tokenB.mint(address(pool), 10 * LOAN_AMOUNT);
+    }
+
+    /// A→B→A through one V3 pool at 1.1× per hop: the pool is never
+    /// allowlisted, no router is involved and no allowance is ever granted.
+    function test_directV3_cycle_lands_without_router_or_allowlist() public {
+        MockUniV3Pool pool = _v3Pool();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        assertFalse(exec.allowedTargets(address(pool)), "pool must not need allowlisting");
+        uint256 before = tokenA.balanceOf(address(exec));
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertEq(tokenA.balanceOf(address(exec)) - before, 210e18, "profit retained");
+        assertEq(tokenA.allowance(address(exec), address(pool)), 0, "no allowance granted");
+        assertEq(tokenB.allowance(address(exec), address(pool)), 0, "no allowance granted");
+    }
+
+    /// The callback pays at most the op's amount: a pool asking for one bip
+    /// more is refused.
+    function test_directV3_overpull_reverts() public {
+        MockUniV3Pool pool = _v3Pool();
+        pool.setOverpullBps(1);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                DirectSwapLib.DirectSwapCallbackOverpull.selector, LOAN_AMOUNT + LOAN_AMOUNT / 10_000, LOAN_AMOUNT
+            )
+        );
+        exec.execute(plan);
+    }
+
+    /// One payment per arming: a pool calling back twice finds the arming
+    /// claimed on the second call.
+    function test_directV3_double_callback_reverts() public {
+        MockUniV3Pool pool = _v3Pool();
+        pool.setDoubleCallback(true);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(DirectSwapLib.DirectSwapCallbackUnarmed.selector);
+        exec.execute(plan);
+    }
+
+    /// Outside a direct swap the callback is unarmed, whoever calls it.
+    function test_directV3_stray_callback_reverts() public {
+        MockUniV3Pool pool = _v3Pool();
+        tokenA.mint(address(exec), LOAN_AMOUNT);
+        vm.expectRevert(DirectSwapLib.DirectSwapCallbackUnarmed.selector);
+        pool.strayCallback(address(exec), int256(1e18), -int256(1e18));
+        assertEq(tokenA.balanceOf(address(exec)), LOAN_AMOUNT, "nothing paid out");
+    }
+
+    /// A→B on a pair priced 2 B/A, B→A on a pair priced 2 A/B: the executor
+    /// computes both outputs from the reserves with the 997/1000 fee and the
+    /// pairs' own K checks accept them.
+    function test_directV2_cycle_lands_with_reserve_formula() public {
+        MockUniV2Pair cheapB = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        tokenA.mint(address(cheapB), 100 * LOAN_AMOUNT);
+        tokenB.mint(address(cheapB), 200 * LOAN_AMOUNT);
+        cheapB.sync();
+        MockUniV2Pair cheapA = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        tokenA.mint(address(cheapA), 200 * LOAN_AMOUNT);
+        tokenB.mint(address(cheapA), 100 * LOAN_AMOUNT);
+        cheapA.sync();
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV2Op(address(cheapB), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV2Op(
+            address(cheapA), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        uint256 before = tokenA.balanceOf(address(exec));
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        // 1000 A → ~1970 B → ~3800 A: well over the 100 A floor.
+        assertGt(tokenA.balanceOf(address(exec)) - before, 2_500e18, "profit retained");
+        assertEq(tokenA.allowance(address(exec), address(cheapB)), 0, "no allowance granted");
+    }
+
+    /// A direct op may not carry calldata patch positions or the flags that
+    /// reinterpret its amount.
+    function test_directV3_rejects_patch_positions_and_v4_flags() public {
+        MockUniV3Pool pool = _v3Pool();
+        Op[] memory ops = new Op[](1);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenA), true, LOAN_AMOUNT, 0);
+        ops[0].fromAmountPos = 4;
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(GenericSequenceLib.InvalidPlan.selector);
+        exec.execute(plan);
+
+        ops[0].fromAmountPos = 0;
+        ops[0].flags |= GenericSequenceLib.FLAG_V4_UNLOCK;
+        plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(GenericSequenceLib.InvalidPlan.selector);
+        exec.execute(plan);
+    }
+
+    // ─── Flash swaps: the pool funds the cycle, paid last from the proceeds ───
+
+    function _flashV3Op(address pool, address src, address dst, bool zeroForOne, uint256 amountIn, uint32 extra)
+        internal
+        pure
+        returns (Op memory op)
+    {
+        op = _directV3Op(pool, src, dst, zeroForOne, amountIn, extra);
+        op.flags = GenericSequenceLib.FLAG_V3_FLASH | extra;
+    }
+
+    /// No inventory, no loan: the first pool pays B out first, the second op
+    /// turns B back into A inside the first pool's callback, and the first
+    /// pool is paid its A last. The flash provider is never called.
+    function test_flashV3_selfFunded_cycle_no_loan_no_inventory() public {
+        // Two pools: a real V3 pool holds a reentrancy lock for the whole
+        // swap, so the continuation can never trade on the pool it is
+        // inside of (the mock has no lock, but its balance check would then
+        // measure across the nested swap).
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool2), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        assertEq(tokenA.balanceOf(address(exec)), 0, "starts with nothing");
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 0);
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertEq(tokenA.balanceOf(address(exec)), 210e18, "profit kept, principal came from the pool");
+    }
+
+    /// A flash swap whose continuation holds another flash swap: the inner
+    /// pool is paid inside the outer callback, the outer pool last.
+    function test_flashV3_nested_flash_in_continuation() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _flashV3Op(
+            address(pool2), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertEq(tokenA.balanceOf(address(exec)), 210e18, "profit kept");
+    }
+
+    /// V2 flash swap: the pair pays ~1970 B first, the continuation sells B
+    /// for A on the second pair, the first pair is sent its 1000 A last and
+    /// runs its own K check.
+    function test_flashV2_selfFunded_cycle() public {
+        MockUniV2Pair cheapB = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        tokenA.mint(address(cheapB), 100 * LOAN_AMOUNT);
+        tokenB.mint(address(cheapB), 200 * LOAN_AMOUNT);
+        cheapB.sync();
+        MockUniV2Pair cheapA = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        tokenA.mint(address(cheapA), 200 * LOAN_AMOUNT);
+        tokenB.mint(address(cheapA), 100 * LOAN_AMOUNT);
+        cheapA.sync();
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV2Op(address(cheapB), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[0].flags = GenericSequenceLib.FLAG_V2_FLASH;
+        ops[1] = _directV2Op(
+            address(cheapA), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 0);
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertGt(tokenA.balanceOf(address(exec)), 2_500e18, "profit kept, principal came from the pair");
+    }
+
+    /// A pool that hands back a tampered continuation cannot make the
+    /// executor run anything but the plan: the hash check refuses it.
+    function test_flashV3_tampered_continuation_reverts() public {
+        TamperingV3Pool bad = new TamperingV3Pool(address(tokenA), address(tokenB));
+        tokenB.mint(address(bad), 10 * LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(bad), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(_v3Pool()), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(DirectSwapLib.DirectSwapContinuationMismatch.selector);
+        exec.execute(plan);
+    }
+
+    /// A losing flash cycle reverts at the pool's own settlement: the
+    /// continuation produced less A than the pool is owed.
+    function test_flashV3_losing_cycle_reverts() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool losing = new MockUniV3Pool(address(tokenA), address(tokenB), 0.8e18);
+        tokenA.mint(address(losing), 10 * LOAN_AMOUNT);
+        tokenB.mint(address(losing), 10 * LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(losing), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        exec.execute(plan);
+        assertEq(tokenA.balanceOf(address(exec)), 0, "nothing lost");
+    }
+
+    // ─── Packed plans: the same plan in ~100 bytes per op ───
+
+    function _pack(uint8 provider, address loanToken, uint256 loanAmount, uint256 minProfit, Op[] memory ops)
+        internal
+        pure
+        returns (bytes memory b)
+    {
+        b = abi.encodePacked(
+            uint8(1), provider, loanToken, uint128(loanAmount), uint128(minProfit), uint128(0), uint8(ops.length)
+        );
+        for (uint256 i = 0; i < ops.length; ++i) {
+            Op memory op = ops[i];
+            b = abi.encodePacked(
+                b,
+                op.target,
+                uint16(op.flags),
+                uint128(op.amountIn),
+                uint16(op.fromAmountPos),
+                uint16(op.returnAmountPos),
+                op.srcToken,
+                op.outToken
+            );
+            if (op.flags & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V3_FLASH) != 0) {
+                (bool z, uint160 lim) = abi.decode(op.callData, (bool, uint160));
+                b = abi.encodePacked(b, uint8(z ? 1 : 0), lim);
+            } else if (op.flags & (GenericSequenceLib.FLAG_V2_DIRECT | GenericSequenceLib.FLAG_V2_FLASH) != 0) {
+                (bool z, uint16 fee) = abi.decode(op.callData, (bool, uint16));
+                b = abi.encodePacked(b, uint8(z ? 1 : 0), fee);
+            } else {
+                b = abi.encodePacked(b, uint16(op.callData.length), op.callData);
+            }
+        }
+    }
+
+    /// The packed form of the self-funded flash cycle executes identically to
+    /// its ABI form and is an order of magnitude smaller on the wire.
+    function test_executePacked_matches_execute_and_is_small() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool2), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory abiPlan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+        bytes memory packed = _pack(3, address(tokenA), LOAN_AMOUNT, 100e18, ops);
+        assertLt(packed.length, 300, "packed plan must be small");
+        assertGt(abiPlan.length, 1_000, "ABI plan is the big one");
+
+        vm.prank(operatorAddr);
+        exec.executePacked(packed);
+        assertEq(tokenA.balanceOf(address(exec)), 210e18, "same profit as execute");
+    }
+
+    /// A router op (raw calldata) survives the packed round trip too.
+    function test_executePacked_router_op_round_trip() public {
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory packed = _pack(3, address(tokenA), LOAN_AMOUNT, 100e18, ops);
+
+        uint256 before = tokenA.balanceOf(address(exec));
+        vm.prank(operatorAddr);
+        exec.executePacked(packed);
+        assertEq(tokenA.balanceOf(address(exec)) - before, 210e18, "profit retained");
+    }
+
+    /// Cross-repo reference vector: fixed addresses and amounts, so the
+    /// bot's Rust packer can assert the same bytes without running Solidity.
+    /// Two ops — a V3 flash and a V2 direct — cover both packed callData
+    /// shapes and the header. The expected bytes are the decoder's contract.
+    function test_packedVector_fixed() public pure {
+        Op[] memory ops = new Op[](2);
+        ops[0] = _flashV3Op(
+            0x1111111111111111111111111111111111111111,
+            0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa,
+            0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB,
+            true,
+            1_000e18,
+            0
+        );
+        ops[0].callData = abi.encode(true, uint160(4_295_128_740));
+        ops[1] = _directV2Op(
+            0x2222222222222222222222222222222222222222,
+            0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB,
+            0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa,
+            false,
+            0,
+            GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        ops[1].callData = abi.encode(false, uint16(998));
+        bytes memory packed = _pack(3, 0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa, 1_000e18, 100e18, ops);
+        assertEq(packed.length, 71 + 82 + 21 + 82 + 3, "layout: header + op + V3 params + op + V2 params");
+        // Generated with `cast abi-encode --packed`, field by field:
+        //   header  x(uint8,uint8,address,uint128,uint128,uint128,uint8)
+        //   op      x(address,uint16,uint128,uint16,uint16,address,address, ...params)
+        assertEq(
+            packed,
+            hex"0103aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000000000003635c9adc5dea0000000000000000000056bc75e2d631000000000000000000000000000000000000002"
+            hex"11111111111111111111111111111111111111110100000000000000003635c9adc5dea0000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0100000000000000000000000000000001000276a4"
+            hex"222222222222222222222222222222222222222200820000000000000000000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0003e6",
+            "packed vector"
+        );
+    }
+
+    function test_executePacked_rejects_malformed() public {
+        Op[] memory ops = new Op[](1);
+        ops[0] = _directV3Op(address(_v3Pool()), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        bytes memory packed = _pack(3, address(tokenA), LOAN_AMOUNT, 0, ops);
+
+        bytes memory wrongVersion = packed;
+        wrongVersion[0] = 0x02;
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.PackedPlanMalformed.selector);
+        exec.executePacked(wrongVersion);
+
+        bytes memory trailing = abi.encodePacked(packed, uint8(0));
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.PackedPlanMalformed.selector);
+        exec.executePacked(trailing);
+
+        bytes memory truncated = new bytes(packed.length - 1);
+        for (uint256 i = 0; i < truncated.length; ++i) {
+            truncated[i] = packed[i];
+        }
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.PackedPlanMalformed.selector);
+        exec.executePacked(truncated);
+    }
+
+    // ─── Inventory path (no flash when the principal is already held) ───
+
+    /// Holding the principal, the cycle runs off the balance: the flash
+    /// provider is never called and the profit is the plain balance delta.
+    function test_inventory_skips_flash_and_keeps_profit() public {
+        tokenA.mint(address(exec), LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 0);
+        uint256 morphoBefore = tokenA.balanceOf(address(morpho));
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+
+        assertEq(tokenA.balanceOf(address(exec)), LOAN_AMOUNT + 210e18, "inventory plus profit");
+        assertEq(tokenA.balanceOf(address(morpho)), morphoBefore, "flash provider untouched");
+    }
+
+    /// Short of the principal by one wei, the flash path is taken as before.
+    function test_inventory_short_falls_back_to_flash() public {
+        tokenA.mint(address(exec), LOAN_AMOUNT - 1);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 1);
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+
+        assertEq(tokenA.balanceOf(address(exec)), LOAN_AMOUNT - 1 + 210e18, "profit on top of the inventory");
+    }
+
+    /// A losing cycle on the inventory path reverts: the balance may not
+    /// shrink, exactly as an unrepayable flash would revert.
+    function test_inventory_losing_cycle_reverts() public {
+        MockUniV2Router losing = new MockUniV2Router(0.9e18);
+        tokenA.mint(address(losing), 10 * LOAN_AMOUNT);
+        tokenB.mint(address(losing), 10 * LOAN_AMOUNT);
+        vm.prank(ownerAddr);
+        exec.setAllowedTarget(address(losing), true);
+        tokenA.mint(address(exec), LOAN_AMOUNT);
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[0].target = address(losing);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        ops[1].target = address(losing);
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(ArbExecutor.InsufficientRepayBalance.selector, LOAN_AMOUNT, 810e18));
+        exec.execute(plan);
+    }
+
+    /// The coinbase bid is paid on the inventory path too (WETH principal).
+    function test_inventory_pays_coinbase_bid() public {
+        weth.mint(address(exec), LOAN_AMOUNT);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _v2Op(address(weth), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(weth), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0);
+
+        address coinbaseAddr = address(0xC01BA5E);
+        vm.coinbase(coinbaseAddr);
+        uint256 cbBefore = coinbaseAddr.balance;
+        vm.prank(operatorAddr);
+        exec.execute{value: 5_000}(plan); // 50% of the realized 210 WETH
+        assertEq(coinbaseAddr.balance - cbBefore, 105e18, "half the profit to the coinbase");
+        // The 5_000 wei bid rides in as msg.value and ends up wrapped alongside the profit.
+        assertEq(weth.balanceOf(address(exec)), LOAN_AMOUNT + 105e18 + 5_000, "the other half kept");
     }
 
     function test_revert_balancerCallbackFromNonBalancer() public {
@@ -791,40 +1303,15 @@ contract ArbExecutorTest is Test {
     /// moved these fields from 10/11 to 11/12. The offline
     /// `forge inspect ArbExecutor storageLayout` remains the authority on the
     /// exact field names; this is the guard that fails in CI when they drift.
-    function test_v4SlotConstantsMatchLayout() public {
-        uint256 V4_PM_SLOT = 11;
-        uint256 V4_TOKENIN_SLOT = 12;
-
-        // Padding slots between `_activePlanHash` and the V4 fields must be
-        // untouched dead space — if a real field ever lands there, the V4
-        // fields have shifted and the lib would corrupt live state.
-        assertEq(vm.load(address(exec), bytes32(uint256(8))), bytes32(0), "slot 8 must be reserved padding");
-        assertEq(vm.load(address(exec), bytes32(uint256(9))), bytes32(0), "slot 9 must be reserved padding");
-        assertEq(vm.load(address(exec), bytes32(uint256(10))), bytes32(0), "slot 10 must be reserved padding");
-
-        // Snapshot every live field reachable through a public getter.
-        address ownerBefore = exec.owner();
-        address morphoBefore = exec.morphoBlue();
-        bool pausedBefore = exec.paused();
-        bool operatorBefore = exec.operators(operatorAddr);
-        bool targetBefore = exec.allowedTargets(address(uniV2));
-        address balProviderBefore = exec.allowedFlashProviders(exec.FLASH_PROVIDER_BALANCER());
-
-        // Poke the slots the lib arms. If either collided with a live field,
-        // one of the assertions below flips.
-        vm.store(address(exec), bytes32(V4_PM_SLOT), bytes32(type(uint256).max));
-        vm.store(address(exec), bytes32(V4_TOKENIN_SLOT), bytes32(type(uint256).max));
-
-        assertEq(exec.owner(), ownerBefore, "owner must not live at slot 11/12");
-        assertEq(exec.morphoBlue(), morphoBefore, "morphoBlue must not live at slot 11/12");
-        assertEq(exec.paused(), pausedBefore, "paused must not live at slot 11/12");
-        assertEq(exec.operators(operatorAddr), operatorBefore, "operators must not live at slot 11/12");
-        assertEq(exec.allowedTargets(address(uniV2)), targetBefore, "allowedTargets must not live at slot 11/12");
-        assertEq(
-            exec.allowedFlashProviders(exec.FLASH_PROVIDER_BALANCER()),
-            balProviderBefore,
-            "allowedFlashProviders must not live at slot 11/12"
-        );
+    /// The V4 arming words are TRANSIENT on the arb path: after a transaction
+    /// nothing is left in persistent storage at the slot numbers the lib
+    /// uses, so a stray PoolManager callback in a later transaction finds the
+    /// executor disarmed. (The end-to-end V4 arming is covered by the
+    /// ArbGenericSequence V4 tests, which drive a real unlock through
+    /// `execute`.)
+    function test_v4ArmingLeavesNoPersistentState() public {
+        assertEq(vm.load(address(exec), bytes32(uint256(11))), bytes32(0), "slot 11 untouched");
+        assertEq(vm.load(address(exec), bytes32(uint256(12))), bytes32(0), "slot 12 untouched");
     }
 
     function test_v4UnlockSelectorPin() public pure {
@@ -839,14 +1326,17 @@ contract ArbExecutorTest is Test {
         exec.unlockCallback(abi.encode(bytes(""), int256(0)));
     }
 
-    function test_setV4HookAllowed_onlyOwner() public {
+    function test_setV4HookBlocked_onlyOwner() public {
         vm.prank(attacker);
         vm.expectRevert(); // Ownable: caller is not the owner
-        exec.setV4HookAllowed(address(0x1234), true);
+        exec.setV4HookBlocked(address(0x1234), true);
         // owner path:
         vm.prank(ownerAddr);
-        exec.setV4HookAllowed(address(0x1234), true);
-        assertTrue(exec.allowedV4Hooks(address(0x1234)));
+        exec.setV4HookBlocked(address(0x1234), true);
+        assertTrue(exec.blockedV4Hooks(address(0x1234)));
+        vm.prank(ownerAddr);
+        exec.setV4HookBlocked(address(0x1234), false);
+        assertFalse(exec.blockedV4Hooks(address(0x1234)));
     }
 
     // ─── Multi-operator (parallel nonce streams) ──────────────────────

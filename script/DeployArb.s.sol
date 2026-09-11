@@ -3,11 +3,12 @@ pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {ArbExecutor} from "../src/ArbExecutor.sol";
+import {ArbExecutorSeeded} from "../src/deploy/SeededExecutors.sol";
 
 /// @title ArbExecutor deploy
 /// @notice Deploys `ArbExecutor` fully configured. Nothing needs to be called
-/// on the contract afterwards — no `setAllowedTarget`, no `setOperator`, no
-/// `setV4HookAllowed`. Every target the bot can emit an `Op` against is seeded
+/// on the contract afterwards — no `setAllowedTarget`, no `setOperator`.
+/// Every target the bot can emit an `Op` against is seeded
 /// in the constructor, and the run asserts each one back before returning, so a
 /// partially-seeded deploy fails here instead of at the first arb.
 ///
@@ -28,8 +29,9 @@ import {ArbExecutor} from "../src/ArbExecutor.sol";
 /// derivable rather than unknowable, and leaving a venue we already quote
 /// unroutable is a worse default than looking it up.
 ///
-/// Usage:
-///   PRIVATE_KEY=<owner> forge script script/DeployArb.s.sol:DeployArb \
+/// Usage (the `arb` profile compiles for runtime gas, not size — ArbExecutor
+/// has 12 KB of EIP-170 headroom; see foundry.toml):
+///   FOUNDRY_PROFILE=arb PRIVATE_KEY=<owner> forge script script/DeployArb.s.sol:DeployArb \
 ///     --rpc-url $ETHEREUM_RPC_URL --broadcast --legacy
 contract DeployArb is Script {
     // ─── Ownership / operation ──────────────────────────────────────
@@ -61,6 +63,31 @@ contract DeployArb is Script {
     /// carries selector 0x414bf389 — the deadline-carrying `exactInputSingle`,
     /// so the bot encodes it exactly like Uniswap V3.
     address constant PANCAKE_V3_SWAP_ROUTER = 0x1b81D678ffb9C0263b24A97847620C99d213eB14;
+
+    // ─── Everything the owner added to the LIVE executor after its deploy ───
+    // Read back from the contract's own events (AllowedTargetUpdated,
+    // V4HookAllowedUpdated, OperatorUpdated on 0xfC127EB8…, blocks
+    // 25734276..25919383 via scripts/executor_config_events.py in the bot
+    // repo) on 2026-09-06, so a redeploy needs NO admin call afterwards.
+    /// V2 fork routers (bot: dex/uniswap_v2_quoter/forks.rs).
+    address constant SUSHI_V2_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+    address constant PANCAKE_V2_ROUTER = 0xEfF92A263d31888d860bD50809A8D171709b7b1c;
+    address constant SHIBASWAP_ROUTER = 0x03f7724180AA6b939894B5Ca4314783B0b36b329;
+    /// 1inch Limit Order Protocol v4 (fillOrderArgs).
+    address constant ONEINCH_LOP = 0x111111125421cA6dc452d289314280a0f8842A65;
+    /// Hashflow router (bot: execution/hashflow.rs).
+    address constant HASHFLOW_ROUTER = 0x55084eE0fEf03f14a305cd24286359A35D735151;
+    /// Ekubo router (bot: dex/ekubo/encoder.rs).
+    address constant EKUBO_ROUTER = 0xd26f20001a72a18C002b00e6710000d68700ce00;
+    /// Swaap router (memory: project_swaap_book_measured).
+    address constant SWAAP_ROUTER = 0xd315a9C38eC871068FEC378E4Ce78AF528C76293;
+    address constant PROPAMM_ROUTER = 0x4DdF368080CD7946db5b459aD591c350158175e1;
+    /// V4 hooks the bot is allowed to swap through (bot: dex/uniswap_v4_quoter/hook_fee.rs).
+    address constant LAUNCH_HOOK = 0xAFeD2c6e0d906520ca17143a8918Ce6d54b128Cc;
+    address constant LBP_MIGRATION_HOOK = 0xd53006d1e3110fD319a79AEEc4c527a0d265E080;
+    /// The two extra operator keys (independent nonce streams).
+    address constant OPERATOR_2 = 0x25f4c6C1e5Cc564071A1DC1768a1f1ff0BA9d5a1;
+    address constant OPERATOR_3 = 0xf4Bb8842dd662c8edDed051e66376937E308B905;
 
     /// Fluid pools read from `DexReservesResolver.getAllPoolAddresses()` at
     /// block 25_718_394. Asserted below so a changed set is loud.
@@ -120,14 +147,35 @@ contract DeployArb is Script {
         // Non-Fluid targets. Balancer Vault, Paraswap, the V2 router and the
         // V3 router are seeded by the constructor itself, so they are absent
         // here and asserted below all the same.
-        address[] memory extra = new address[](7);
-        extra[0] = WETH; // FLAG_NATIVE_IN closes a native cycle via WETH9.deposit
-        extra[1] = UNI_V4_POOL_MANAGER;
-        extra[2] = V4_UNIVERSAL_ROUTER;
-        extra[3] = CURVE_ROUTER_NG;
-        extra[4] = BEBOP_SETTLEMENT;
-        extra[5] = UNI_V3_SWAP_ROUTER_01;
-        extra[6] = PANCAKE_V3_SWAP_ROUTER;
+        address[] memory extra = new address[](14);
+        extra[6] = SUSHI_V2_ROUTER;
+        extra[7] = PANCAKE_V2_ROUTER;
+        extra[8] = SHIBASWAP_ROUTER;
+        extra[9] = ONEINCH_LOP;
+        extra[10] = HASHFLOW_ROUTER;
+        extra[11] = EKUBO_ROUTER;
+        extra[12] = SWAAP_ROUTER;
+        // Titan's PropAMM router: one address reaches all seven proprietary
+        // AMMs, and the owner allowlisted it on the LIVE executors on
+        // 2026-09-10 after three hours of measurement (a pAMM beats our best
+        // V3 pool by a median 5 bps at the same block). A fresh deploy without
+        // it silently undoes that.
+        extra[13] = PROPAMM_ROUTER;
+        // NOT WETH. It sat here so `FLAG_NATIVE_IN` could reach
+        // `WETH9.deposit()` and close a native cycle -- and an allowlisted
+        // TOKEN is an open call surface: an op naming `srcToken = address(0)`
+        // and carrying `WETH.transfer(attacker, ...)` passed the target walk
+        // and was never capped, because the containment snapshot is built from
+        // the ops' own `srcToken` fields and so never contained WETH. The
+        // inventory path in this branch is what would have given that a
+        // standing balance to take. `FLAG_WETH_WRAP` now does the deposit
+        // through a pinned interface, so nothing needs WETH to be a target.
+        extra[0] = UNI_V4_POOL_MANAGER;
+        extra[1] = V4_UNIVERSAL_ROUTER;
+        extra[2] = CURVE_ROUTER_NG;
+        extra[3] = BEBOP_SETTLEMENT;
+        extra[4] = UNI_V3_SWAP_ROUTER_01;
+        extra[5] = PANCAKE_V3_SWAP_ROUTER;
 
         address[] memory allowed = new address[](extra.length + FLUID_POOL_COUNT);
         for (uint256 i = 0; i < extra.length; ++i) {
@@ -142,8 +190,25 @@ contract DeployArb is Script {
         // PRIVATE_KEY and falls back to Foundry's default sender, so the
         // documented invocation simulated fine and then refused to broadcast.
         vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
-        ArbExecutor exec = new ArbExecutor(
-            OWNER, OPERATOR, WETH, BALANCER_VAULT, MORPHO_BLUE, PARASWAP_AUGUSTUS, UNI_V2_ROUTER, UNI_V3_ROUTER, allowed
+        address[] memory operators = new address[](2);
+        operators[0] = OPERATOR_2;
+        operators[1] = OPERATOR_3;
+        // V4 hooks are accepted by default now (blocklist, not allowlist);
+        // nothing to seed. The two hooks that used to be allowed here are
+        // kept as constants only for the read-back below.
+        address[] memory hooks = new address[](0);
+        ArbExecutor exec = new ArbExecutorSeeded(
+            OWNER,
+            OPERATOR,
+            WETH,
+            BALANCER_VAULT,
+            MORPHO_BLUE,
+            PARASWAP_AUGUSTUS,
+            UNI_V2_ROUTER,
+            UNI_V3_ROUTER,
+            allowed,
+            operators,
+            hooks
         );
         vm.stopBroadcast();
 
@@ -154,11 +219,20 @@ contract DeployArb is Script {
         for (uint256 i = 0; i < allowed.length; ++i) {
             require(exec.allowedTargets(allowed[i]), "readback: allowed target");
         }
+        require(exec.allowedTargets(PROPAMM_ROUTER), "readback: propamm router");
+        // The one target that must answer FALSE. An allowlisted token is a
+        // call surface, and `FLAG_WETH_WRAP` removed the only reason WETH was
+        // ever on the list.
+        require(!exec.allowedTargets(WETH), "readback: WETH must NOT be a target");
         require(exec.allowedTargets(BALANCER_VAULT), "readback: balancer vault");
         require(exec.allowedTargets(PARASWAP_AUGUSTUS), "readback: paraswap");
         require(exec.allowedTargets(UNI_V2_ROUTER), "readback: v2 router");
         require(exec.allowedTargets(UNI_V3_ROUTER), "readback: v3 router");
         require(exec.operators(OPERATOR), "readback: operator armed");
+        require(exec.operators(OPERATOR_2) && exec.operators(OPERATOR_3), "readback: extra operators armed");
+        require(
+            !exec.blockedV4Hooks(LAUNCH_HOOK) && !exec.blockedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks open"
+        );
         require(exec.owner() == OWNER, "readback: owner");
 
         console2.log("ArbExecutor:", address(exec));

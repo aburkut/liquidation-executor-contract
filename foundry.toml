@@ -20,6 +20,14 @@ optimizer = true
 # deployed contract stays under EIP-170 (24,576 bytes).
 optimizer_runs = 1
 via_ir = true
+
+# ArbExecutor and its libraries are deployed from this profile
+# (`FOUNDRY_PROFILE=arb forge script script/DeployArb.s.sol`): runtime gas
+# over size. Measured 2026-09-06 on the arb suite: `execute` avg 168,293 →
+# 165,642 (−1.6%), max 326,468 → 321,167. ArbExecutor has 12 KB of EIP-170
+# headroom; LiquidationExecutor does not (620 bytes) and keeps the default.
+[profile.arb]
+optimizer_runs = 1_000_000
 # Strip cbor metadata suffix (~53 bytes) from runtime bytecode — keeps the
 # deployed contract comfortably under the EIP-170 24,576-byte limit.
 bytecode_hash = "none"

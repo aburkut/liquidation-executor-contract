@@ -3,6 +3,8 @@ pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {AllowanceLib} from "./AllowanceLib.sol";
+import {DirectSwapLib} from "./DirectSwapLib.sol";
 import {Op} from "../types/SwapTypes.sol";
 
 /// @dev Subset of WETH9 used by the `FLAG_WETH_UNWRAP` op — the same one-method
@@ -10,6 +12,7 @@ import {Op} from "../types/SwapTypes.sol";
 /// the executor's WETH and forwards native ETH to its `receive()`.
 interface IWETH {
     function withdraw(uint256 amount) external;
+    function deposit() external payable;
 }
 
 /// @title GenericSequenceLib
@@ -122,8 +125,50 @@ library GenericSequenceLib {
     /// for input sizing — `amount` is resolved from it above the branch,
     /// same as any other op.
     uint32 internal constant FLAG_NATIVE_IN = 1 << 5;
+    /// Exact-input swap straight against a V3-style pool (Uniswap V3, Sushi
+    /// V3, Pancake V3): `target` is the POOL, `callData` =
+    /// `abi.encode(bool zeroForOne, uint160 sqrtPriceLimitX96)` (0 = no
+    /// limit). No router, no allowance — the pool pulls its input through
+    /// the executor's `uniswapV3SwapCallback`, which pays only the armed pool
+    /// and never more than `amount` (see `DirectSwapLib`). The pool is NOT
+    /// allowlisted; `execute` exempts these ops from the target walk.
+    uint32 internal constant FLAG_V3_DIRECT = 1 << 6;
+    /// Exact-input swap straight against a V2-style pair: `target` is the
+    /// PAIR, `callData` = `abi.encode(bool zeroForOne, uint16 feeNumerator)`
+    /// (surviving input share out of 1000: 997 Uniswap/Sushi, 998 Pancake).
+    /// The executor sends `amount` to the pair and asks for what the reserve
+    /// formula yields. Not allowlisted either.
+    uint32 internal constant FLAG_V2_DIRECT = 1 << 7;
+    /// FLASH variants of the two direct swaps: the pool pays its output first,
+    /// the REST of the sequence runs inside the pool's callback, and the
+    /// pool's input is paid at the end out of the cycle's proceeds — the
+    /// competitor's funding model: no flash loan, no standing inventory. Same
+    /// `target`/`callData` shape as the DIRECT flags. `ArbExecutor` treats a
+    /// sequence whose FIRST op is a flash swap as self-funded (no loan at all).
+    /// Native-ETH → WETH wrap. The mirror of [`FLAG_WETH_UNWRAP`], and it
+    /// exists for the same reason: to close a native cycle WITHOUT WETH being
+    /// an allowlisted call target.
+    ///
+    /// AUDIT, closed here: `WETH9.deposit()` used to be reached as an ordinary
+    /// `FLAG_NATIVE_IN` op, which required `allowedTargets[weth] = true` — and
+    /// an allowlisted token target is an open call surface. An op naming
+    /// `srcToken = address(0)` and carrying `WETH.transfer(attacker, …)` passed
+    /// the target walk and was never capped, because the containment snapshot
+    /// is built from the ops' own `srcToken` fields and never contained WETH.
+    /// The inventory path arriving with this branch is what gave that a
+    /// standing balance to take. With this flag the deposit is a pinned
+    /// interface call and WETH leaves the allowlist entirely.
+    ///
+    /// Same shape as the unwrap: exactly this bit, or this bit with
+    /// `FLAG_USE_PREV_RETURN` to wrap what the previous op returned.
+    /// `srcToken` MUST be `address(0)` (the input is native ETH) and
+    /// `outToken` MUST be `weth`.
+    uint32 internal constant FLAG_WETH_WRAP = 1 << 10;
+    uint32 internal constant FLAG_V3_FLASH = 1 << 8;
+    uint32 internal constant FLAG_V2_FLASH = 1 << 9;
+    uint32 internal constant FLAG_DIRECT_ANY = FLAG_V3_DIRECT | FLAG_V2_DIRECT | FLAG_V3_FLASH | FLAG_V2_FLASH;
     uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK
-        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN;
+        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN | FLAG_DIRECT_ANY | FLAG_WETH_WRAP;
     uint16 internal constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     /// @dev `LiquidationExecutor` storage slots for the V4 unlock arming
@@ -142,6 +187,14 @@ library GenericSequenceLib {
     /// it is what moved them from 10/11 to 11/12. Adding ANY storage field
     /// to either executor shifts them again — `test_v4SlotConstantsMatchLayout`
     /// is the guard that catches it.
+    ///
+    /// Both slot numbers are now in TRANSIENT storage (EIP-1153) — a separate
+    /// address space, read back by both executors' `unlockCallback` with
+    /// `tload`. Persistent arming cost about 20k gas per V4 leg (an SSTORE
+    /// from zero plus its clear, net of refund) for state that never outlives
+    /// the transaction; transient costs 100 a write and self-clears. The
+    /// numbers stayed 11/12 for continuity with the layout notes above; no
+    /// persistent field lives there any more.
     uint256 private constant V4_PM_SLOT = 11;
     uint256 private constant V4_TOKENIN_SLOT = 12;
     uint256 private constant V4_ARMED_BIT = 1 << 160;
@@ -223,6 +276,16 @@ library GenericSequenceLib {
         _executeOps(ops, loanToken, flashRepayAmount, loanToken, loanAmount, weth, RepayGate.Absolute);
     }
 
+    /// @notice `runArb` for a principal the executor already HOLDS: no flash
+    /// was taken, so there is no absolute repayment to gate on. The cap is
+    /// the same (`loanAmount` of `loanToken` may be spent, every other token
+    /// nothing); the "must not shrink" rule is the DELTA gate with a zero
+    /// repayment, and the caller enforces the balance floor on top. MUST be
+    /// invoked via DELEGATECALL.
+    function runArbFromInventory(Op[] memory ops, address loanToken, uint256 loanAmount, address weth) external {
+        _executeOps(ops, loanToken, 0, loanToken, loanAmount, weth, RepayGate.Delta);
+    }
+
     /// @notice Execute a flat `Op[]` sequence with per-srcToken containment.
     /// @dev MUST be invoked via DELEGATECALL (as `GenericSequenceLib.run(...)`)
     /// so it shares the executor's storage and balances. Targets are assumed
@@ -271,9 +334,38 @@ library GenericSequenceLib {
             }
         }
 
-        uint256 prevReturn = 0;
+        _runOps(ops, 0, 0, capToken, capAmount, weth);
 
-        for (uint256 i = 0; i < n; ++i) {
+        _finishOps(loanToken, loanBefore, flashRepayAmount, repayGate, capToken, capAmount, snapTok, snapBal, nSnap);
+    }
+
+    /// @notice Continue a sequence from inside a FLASH-swap callback: the
+    /// remaining ops packed by `_runOps`, chained off `received` (what the
+    /// pool paid out first). Delegatecalled by the executor's callback, which
+    /// has already verified the bytes against the armed hash
+    /// (`DirectSwapLib.beginContinuation`). The end-of-sequence gates run in
+    /// the frame that started the flash swap, after `swap` returns.
+    function continueOps(bytes calldata cont, uint256 received) external {
+        (Op[] memory rest, address capToken, uint256 capAmount, address weth,,) =
+            abi.decode(cont, (Op[], address, uint256, address, address, uint256));
+        uint256 last = _runOps(rest, 0, received, capToken, capAmount, weth);
+        DirectSwapLib.setLastReturn(last);
+    }
+
+    /// @dev The op loop proper, from `start`, chaining off `prevReturn`.
+    /// Returns the last op's output. A FLASH op runs every op after it inside
+    /// the pool's callback (see `continueOps`) and returns what that
+    /// continuation produced.
+    function _runOps(
+        Op[] memory ops,
+        uint256 start,
+        uint256 prevReturn,
+        address capToken,
+        uint256 capAmount,
+        address weth
+    ) private returns (uint256) {
+        uint256 n = ops.length;
+        for (uint256 i = start; i < n; ++i) {
             Op memory op = ops[i];
             // The raw `op.value` struct field stays hard-0 for EVERY op,
             // including `FLAG_NATIVE_IN` ones — that flag forwards value via
@@ -312,6 +404,42 @@ library GenericSequenceLib {
                 if (op.flags & (FLAG_V4_UNLOCK | FLAG_WETH_UNWRAP | FLAG_USE_FULL_BALANCE | FLAG_V4_EXACT_IN) != 0) {
                     revert InvalidPlan();
                 }
+            }
+            // Direct pool swaps: an ERC20 input, no calldata patching (the
+            // amount goes to the pool as a typed argument), none of the flags
+            // that reinterpret `amount` or the op shape, and not both at once.
+            if (op.flags & FLAG_DIRECT_ANY != 0) {
+                if (op.srcToken == address(0)) revert InvalidPlan();
+                if (op.flags & (FLAG_V4_UNLOCK | FLAG_NATIVE_IN | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN) != 0) {
+                    revert InvalidPlan();
+                }
+                // Exactly one of the four direct/flash bits.
+                uint32 direct = op.flags & FLAG_DIRECT_ANY;
+                if (direct & (direct - 1) != 0) revert InvalidPlan();
+                if (op.fromAmountPos != 0 || op.returnAmountPos != 0) revert InvalidPlan();
+            }
+
+            if (op.flags & FLAG_WETH_WRAP != 0) {
+                // ── native ETH → WETH wrap ──
+                // The exact mirror of the unwrap below, and pinned just as
+                // hard: the only address this can call is the executor's own
+                // `weth`, and the only thing it can do there is `deposit`.
+                // `amount` is either the literal or the previous op's return,
+                // which is how a pool that paid raw ETH is wrapped without the
+                // plan naming any target at all.
+                if (op.flags & ~(FLAG_WETH_WRAP | FLAG_USE_PREV_RETURN) != 0) revert InvalidPlan();
+                if (op.srcToken != address(0)) revert InvalidPlan();
+                if (op.outToken != weth) revert InvalidPlan();
+                uint256 wrapAmount = op.flags & FLAG_USE_PREV_RETURN != 0 ? prevReturn : op.amountIn;
+                if (wrapAmount == 0) revert InvalidPlan();
+                // Bounded by what the executor actually holds: a plan cannot
+                // name more native ETH than the cycle produced.
+                if (wrapAmount > address(this).balance) revert InvalidPlan();
+
+                uint256 wethBefore = IERC20(weth).balanceOf(address(this));
+                IWETH(weth).deposit{value: wrapAmount}();
+                prevReturn = IERC20(weth).balanceOf(address(this)) - wethBefore;
+                continue;
             }
 
             if (op.flags & FLAG_WETH_UNWRAP != 0) {
@@ -353,7 +481,38 @@ library GenericSequenceLib {
                 amount = prevReturn;
             }
 
-            uint256 outBefore = _balOf(op.outToken);
+            if (op.flags & (FLAG_V3_FLASH | FLAG_V2_FLASH) != 0) {
+                // ── Flash swap: the pool pays out first and asks for its input
+                // through the executor's callback; the REST of the sequence
+                // runs inside that callback and the input is paid at its end,
+                // out of the cycle's own proceeds. Nothing is borrowed, nothing
+                // is held. The remaining ops travel in the swap's `data`, are
+                // verified by hash on the way back and run through
+                // `continueOps`; this frame then returns what they produced.
+                // Their per-op checks run in the callback; the repay gate and
+                // the containment cap run once, after `swap` returns.
+                Op[] memory rest = new Op[](n - i - 1);
+                for (uint256 k = i + 1; k < n; ++k) {
+                    rest[k - i - 1] = ops[k];
+                }
+                bytes memory cont = abi.encode(rest, capToken, capAmount, weth, op.srcToken, amount);
+                if (op.flags & FLAG_V3_FLASH != 0) {
+                    DirectSwapLib.flashV3(op.target, amount, op.callData, cont);
+                } else {
+                    DirectSwapLib.flashV2(op.target, amount, op.callData, cont);
+                }
+                return DirectSwapLib.takeLastReturn();
+            }
+
+            // A DIRECT pool swap reports its own output exactly — the V3 pool
+            // returns its deltas, the V2 output is the reserve formula the
+            // pair itself enforces — so the two balanceOf reads around the op
+            // (≈2-4k) are skipped for those. A pool that lied would only make
+            // the NEXT op overspend a balance it does not have and revert; the
+            // containment cap still measures real balances at the end.
+            bool directOut = op.flags & (FLAG_V3_DIRECT | FLAG_V2_DIRECT) != 0;
+            uint256 outBefore = directOut ? 0 : _balOf(op.outToken);
+            uint256 reported;
 
             if (op.flags & FLAG_V4_UNLOCK != 0) {
                 // ── V4 single-hop exact-out via PoolManager unlock ──
@@ -395,9 +554,8 @@ library GenericSequenceLib {
                 address pm = op.target;
                 address tokenIn = op.srcToken;
                 assembly {
-                    let cur := sload(pmSlot)
-                    sstore(pmSlot, or(and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)), pm))
-                    sstore(tokenInSlot, or(tokenIn, armedBit))
+                    tstore(pmSlot, pm)
+                    tstore(tokenInSlot, or(tokenIn, armedBit))
                 }
 
                 // Positive amountSpec = exact-out (buy `amount`); negative =
@@ -422,9 +580,8 @@ library GenericSequenceLib {
                 // reached our callback must not leave the executor armed
                 // for a later stray callback).
                 assembly {
-                    let cur := sload(pmSlot)
-                    sstore(pmSlot, and(cur, not(0xffffffffffffffffffffffffffffffffffffffff)))
-                    sstore(tokenInSlot, 0)
+                    tstore(pmSlot, 0)
+                    tstore(tokenInSlot, 0)
                 }
 
                 if (!okV4) {
@@ -445,6 +602,15 @@ library GenericSequenceLib {
                     uint256 v4Consumed = v4InBefore > v4InAfter ? v4InBefore - v4InAfter : 0;
                     if (v4Consumed > amount) revert V4InputOverspent(v4Consumed, amount);
                 }
+            } else if (op.flags & FLAG_V3_DIRECT != 0) {
+                // ── Direct V3-style pool swap: no router, no allowance. The
+                // pool pulls `amount` (at most) through the executor's swap
+                // callback; the output-delta check below pins the result.
+                reported = DirectSwapLib.swapV3(op.target, op.srcToken, amount, op.callData);
+            } else if (op.flags & FLAG_V2_DIRECT != 0) {
+                // ── Direct V2-style pair swap: send `amount`, take what the
+                // reserve formula yields; the output-delta check below pins it.
+                reported = DirectSwapLib.swapV2(op.target, op.srcToken, amount, op.callData);
             } else if (op.flags & FLAG_NATIVE_IN != 0) {
                 // ── Native-ETH input to a plain payable DEX call ──
                 // srcToken==address(0) and flag-exclusivity are already
@@ -480,7 +646,8 @@ library GenericSequenceLib {
             } else {
                 // Direct call into an allowlisted router/aggregator whose calldata
                 // was built offchain. Patch runtime values into the pre-built
-                // calldata (bounds-checked), approve exact input, call, then reset.
+                // calldata (bounds-checked), make sure the allowlisted target may
+                // pull the input (bounded, and taken back after — AllowanceLib).
                 // srcToken is provably nonzero here (native srcToken == 0x0 is
                 // only admitted with FLAG_V4_UNLOCK or FLAG_NATIVE_IN, both of
                 // which take their own branch above), so the forceApprove
@@ -496,7 +663,7 @@ library GenericSequenceLib {
                     _patchWord(data, op.returnAmountPos, prevReturn);
                 }
                 if (amount != 0) {
-                    IERC20(op.srcToken).forceApprove(op.target, amount);
+                    AllowanceLib.ensure(op.srcToken, op.target, amount);
                 }
 
                 (bool ok, bytes memory ret) = op.target.call(data); // op.value == 0 (checked above)
@@ -508,20 +675,60 @@ library GenericSequenceLib {
                     }
                     revert OpCallFailed(i);
                 }
-
-                IERC20(op.srcToken).forceApprove(op.target, 0);
+                if (amount != 0) {
+                    // Take the remainder back, under EXACTLY the condition
+                    // that granted it — `amount`, not `op.amountIn`.
+                    //
+                    // AUDITED 2026-09-08 (second pass): bounding the approval
+                    // was not enough on its own. `amount` may exceed what the
+                    // call spends (it is an operator literal, or a whole
+                    // balance under FLAG_USE_FULL_BALANCE, or an exact-output
+                    // route's `amountInMaximum`), and anything left standing
+                    // is spendable by a LATER plan against a token that plan
+                    // never declares — which `_finishOps` does not bucket and
+                    // therefore does not cap.
+                    //
+                    // The first version of this guard read `op.amountIn != 0
+                    // || FLAG_USE_PREV_RETURN`, which is NOT the same set: a
+                    // FLAG_USE_FULL_BALANCE op carries `amountIn == 0` and
+                    // still gets an approval sized from the balance, so it
+                    // skipped the take-back entirely. Mirroring the `ensure`
+                    // condition is the only form that cannot drift.
+                    AllowanceLib.clear(op.srcToken, op.target);
+                }
             }
 
             // Output MUST accrue to the executor — pins the swap recipient to
             // this contract. An op whose raw calldata routed output elsewhere
             // produces a zero delta and is rejected. Saturating delta matches
             // the codebase idiom (clean revert instead of a Panic underflow).
+            if (directOut) {
+                if (reported == 0) revert OpOutputNotReceived(i);
+                prevReturn = reported;
+                continue;
+            }
             uint256 outBal = _balOf(op.outToken);
             uint256 outDelta = outBal > outBefore ? outBal - outBefore : 0;
             if (outDelta == 0) revert OpOutputNotReceived(i);
             prevReturn = outDelta;
         }
+        return prevReturn;
+    }
 
+    /// @dev End-of-sequence gates: the repay gate and the per-srcToken
+    /// containment cap, against the snapshots `_executeOps` took before the
+    /// first op.
+    function _finishOps(
+        address loanToken,
+        uint256 loanBefore,
+        uint256 flashRepayAmount,
+        RepayGate repayGate,
+        address capToken,
+        uint256 capAmount,
+        address[] memory snapTok,
+        uint256[] memory snapBal,
+        uint256 nSnap
+    ) private view {
         // Repay leg gate (mirrors the split/mixed-split repay assertion).
         uint256 loanAfter = IERC20(loanToken).balanceOf(address(this));
         if (repayGate == RepayGate.Delta) {
