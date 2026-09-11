@@ -7,8 +7,8 @@ import {ArbExecutorSeeded} from "../src/deploy/SeededExecutors.sol";
 
 /// @title ArbExecutor deploy
 /// @notice Deploys `ArbExecutor` fully configured. Nothing needs to be called
-/// on the contract afterwards — no `setAllowedTarget`, no `setOperator`, no
-/// `setV4HookAllowed`. Every target the bot can emit an `Op` against is seeded
+/// on the contract afterwards — no `setAllowedTarget`, no `setOperator`.
+/// Every target the bot can emit an `Op` against is seeded
 /// in the constructor, and the run asserts each one back before returning, so a
 /// partially-seeded deploy fails here instead of at the first arb.
 ///
@@ -81,6 +81,7 @@ contract DeployArb is Script {
     address constant EKUBO_ROUTER = 0xd26f20001a72a18C002b00e6710000d68700ce00;
     /// Swaap router (memory: project_swaap_book_measured).
     address constant SWAAP_ROUTER = 0xd315a9C38eC871068FEC378E4Ce78AF528C76293;
+    address constant PROPAMM_ROUTER = 0x4DdF368080CD7946db5b459aD591c350158175e1;
     /// V4 hooks the bot is allowed to swap through (bot: dex/uniswap_v4_quoter/hook_fee.rs).
     address constant LAUNCH_HOOK = 0xAFeD2c6e0d906520ca17143a8918Ce6d54b128Cc;
     address constant LBP_MIGRATION_HOOK = 0xd53006d1e3110fD319a79AEEc4c527a0d265E080;
@@ -147,20 +148,34 @@ contract DeployArb is Script {
         // V3 router are seeded by the constructor itself, so they are absent
         // here and asserted below all the same.
         address[] memory extra = new address[](14);
-        extra[7] = SUSHI_V2_ROUTER;
-        extra[8] = PANCAKE_V2_ROUTER;
-        extra[9] = SHIBASWAP_ROUTER;
-        extra[10] = ONEINCH_LOP;
-        extra[11] = HASHFLOW_ROUTER;
-        extra[12] = EKUBO_ROUTER;
-        extra[13] = SWAAP_ROUTER;
-        extra[0] = WETH; // FLAG_NATIVE_IN closes a native cycle via WETH9.deposit
-        extra[1] = UNI_V4_POOL_MANAGER;
-        extra[2] = V4_UNIVERSAL_ROUTER;
-        extra[3] = CURVE_ROUTER_NG;
-        extra[4] = BEBOP_SETTLEMENT;
-        extra[5] = UNI_V3_SWAP_ROUTER_01;
-        extra[6] = PANCAKE_V3_SWAP_ROUTER;
+        extra[6] = SUSHI_V2_ROUTER;
+        extra[7] = PANCAKE_V2_ROUTER;
+        extra[8] = SHIBASWAP_ROUTER;
+        extra[9] = ONEINCH_LOP;
+        extra[10] = HASHFLOW_ROUTER;
+        extra[11] = EKUBO_ROUTER;
+        extra[12] = SWAAP_ROUTER;
+        // Titan's PropAMM router: one address reaches all seven proprietary
+        // AMMs, and the owner allowlisted it on the LIVE executors on
+        // 2026-09-10 after three hours of measurement (a pAMM beats our best
+        // V3 pool by a median 5 bps at the same block). A fresh deploy without
+        // it silently undoes that.
+        extra[13] = PROPAMM_ROUTER;
+        // NOT WETH. It sat here so `FLAG_NATIVE_IN` could reach
+        // `WETH9.deposit()` and close a native cycle -- and an allowlisted
+        // TOKEN is an open call surface: an op naming `srcToken = address(0)`
+        // and carrying `WETH.transfer(attacker, ...)` passed the target walk
+        // and was never capped, because the containment snapshot is built from
+        // the ops' own `srcToken` fields and so never contained WETH. The
+        // inventory path in this branch is what would have given that a
+        // standing balance to take. `FLAG_WETH_WRAP` now does the deposit
+        // through a pinned interface, so nothing needs WETH to be a target.
+        extra[0] = UNI_V4_POOL_MANAGER;
+        extra[1] = V4_UNIVERSAL_ROUTER;
+        extra[2] = CURVE_ROUTER_NG;
+        extra[3] = BEBOP_SETTLEMENT;
+        extra[4] = UNI_V3_SWAP_ROUTER_01;
+        extra[5] = PANCAKE_V3_SWAP_ROUTER;
 
         address[] memory allowed = new address[](extra.length + FLUID_POOL_COUNT);
         for (uint256 i = 0; i < extra.length; ++i) {
@@ -178,9 +193,10 @@ contract DeployArb is Script {
         address[] memory operators = new address[](2);
         operators[0] = OPERATOR_2;
         operators[1] = OPERATOR_3;
-        address[] memory hooks = new address[](2);
-        hooks[0] = LAUNCH_HOOK;
-        hooks[1] = LBP_MIGRATION_HOOK;
+        // V4 hooks are accepted by default now (blocklist, not allowlist);
+        // nothing to seed. The two hooks that used to be allowed here are
+        // kept as constants only for the read-back below.
+        address[] memory hooks = new address[](0);
         ArbExecutor exec = new ArbExecutorSeeded(
             OWNER,
             OPERATOR,
@@ -203,13 +219,20 @@ contract DeployArb is Script {
         for (uint256 i = 0; i < allowed.length; ++i) {
             require(exec.allowedTargets(allowed[i]), "readback: allowed target");
         }
+        require(exec.allowedTargets(PROPAMM_ROUTER), "readback: propamm router");
+        // The one target that must answer FALSE. An allowlisted token is a
+        // call surface, and `FLAG_WETH_WRAP` removed the only reason WETH was
+        // ever on the list.
+        require(!exec.allowedTargets(WETH), "readback: WETH must NOT be a target");
         require(exec.allowedTargets(BALANCER_VAULT), "readback: balancer vault");
         require(exec.allowedTargets(PARASWAP_AUGUSTUS), "readback: paraswap");
         require(exec.allowedTargets(UNI_V2_ROUTER), "readback: v2 router");
         require(exec.allowedTargets(UNI_V3_ROUTER), "readback: v3 router");
         require(exec.operators(OPERATOR), "readback: operator armed");
         require(exec.operators(OPERATOR_2) && exec.operators(OPERATOR_3), "readback: extra operators armed");
-        require(exec.allowedV4Hooks(LAUNCH_HOOK) && exec.allowedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks");
+        require(
+            !exec.blockedV4Hooks(LAUNCH_HOOK) && !exec.blockedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks open"
+        );
         require(exec.owner() == OWNER, "readback: owner");
 
         console2.log("ArbExecutor:", address(exec));

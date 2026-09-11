@@ -39,7 +39,7 @@ import {SwapMode, SwapLeg} from "../types/SwapTypes.sol";
 /// `LiquidationExecutor.unlockCallback`. The caller MUST:
 ///   (a) verify the PoolManager identity (msg.sender == pinned PM),
 ///   (b) clear the `_activeV4TokenIn` storage pin BEFORE invocation,
-///   (c) re-check every hook in the path against `allowedV4Hooks`.
+///   (c) re-check every hook in the path against `blockedV4Hooks`.
 /// The library has no view of those slots; passing wrong tokenIn or
 /// an un-allowlisted hook would silently route to a different pool.
 library UniswapLib {
@@ -254,7 +254,7 @@ library UniswapLib {
 
     /// @dev Single-hop V4 swap inside `unlockCallback`. Caller has
     /// already validated PM identity, cleared the tokenIn pin, and
-    /// re-checked the hook against allowedV4Hooks. BalanceDelta
+    /// re-checked the hook against blockedV4Hooks. BalanceDelta
     /// invariant `tokenInDelta < 0 && tokenOutDelta > 0` holds for
     /// both SELL and BUY (sign of `amountSpec` only flips the pool's
     /// quote semantics, not the delta direction).
@@ -343,7 +343,7 @@ library UniswapLib {
     /// `v4SwapData` and asserts: non-native tokens, tokenIn==srcToken,
     /// tokenOut==repayToken, distinct tokens, fee != 0, tickSpacing > 0,
     /// dynamic-fee bit clear. Returns the hook address for the caller's
-    /// `allowedV4Hooks` re-check (lib has no view of that storage).
+    /// `blockedV4Hooks` re-check (lib has no view of that storage).
     /// Hosted in lib to keep the byte-heavy decode + check chain off
     /// the main contract's EIP-170 budget. Reverts use `InvalidPlan` /
     /// `V4UnexpectedDelta` (lib namespace) — granular V4 errors removed
@@ -417,7 +417,7 @@ library UniswapLib {
     ///
     /// Caller (`unlockCallback`) MUST:
     ///   (a) clear `_activeV4TokenIn` BEFORE invoking this function;
-    ///   (b) re-check EVERY hop's `hook` against `allowedV4Hooks`
+    ///   (b) re-check EVERY hop's `hook` against `blockedV4Hooks`
     ///       AFTER decoding the payload (the lib does not have view
     ///       of the allowlist).
     ///

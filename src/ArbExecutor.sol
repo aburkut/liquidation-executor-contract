@@ -114,7 +114,7 @@ contract ArbExecutor is
     event AllowedTargetUpdated(address indexed target, bool allowed);
     // V10+: FlashProviderUpdated dropped — both providers constructor-pinned.
     event Withdraw(address indexed token, address indexed to, uint256 amount);
-    event V4HookAllowedUpdated(address indexed hook, bool allowed);
+    event V4HookBlockedUpdated(address indexed hook, bool blocked);
     event OperatorUpdated(address indexed operator, bool allowed);
 
     // ─── Constants ───────────────────────────────────────────────────
@@ -173,9 +173,23 @@ contract ArbExecutor is
     /// constructor-immutable; Curve / Balancer pool addresses are
     /// trusted from the bot (sanity-gated inside their libraries).
     mapping(address => bool) public allowedTargets;
-    /// @dev V4 hook allowlist (parity with LiquidationExecutor). Owner-curated;
-    /// the unlockCallback single-hop branch re-checks `allowedV4Hooks[hook]`.
-    mapping(address => bool) public allowedV4Hooks;
+    /// @dev V4 hook BLOCKlist (parity with LiquidationExecutor). Any hook is
+    /// accepted unless the owner has blocked it; `unlockCallback` re-checks.
+    ///
+    /// This used to be an ALLOWlist, curated one owner transaction per hook.
+    /// It was dropped for the reason the Curve/Balancer target allowlist was
+    /// dropped before it (see LiquidationExecutor's `allowedTargets` notes):
+    /// the bot is the trusted source of pools, and a hostile hook can only
+    /// make the transaction revert, not take standing funds. What bounds it:
+    /// v4-core caps a `beforeSwap` delta at the swap's own amount
+    /// (`HookDeltaExceedsSwapAmount`), `runV4UnlockSwap` reverts on any
+    /// delta with the wrong sign, `owedIn` is read from the delta rather
+    /// than the plan, and `runArb` ends in `checkProfitStrict`, which
+    /// refuses a cycle that ended below where it started whatever the
+    /// plan's floor says (a zero floor included). Same slot as before, so
+    /// the V4 arming fields stay at 11/12. The blocklist remains for a hook
+    /// that reverts on us on purpose (gas griefing), which no floor can see.
+    mapping(address => bool) public blockedV4Hooks;
     /// @dev Operator allowlist. Several operator EOAs may drive ONE executor
     /// so sends spread over independent nonce streams — one stuck tx then
     /// cannot jam the others, and same-nonce bid fan-out does not have to
@@ -293,16 +307,15 @@ contract ArbExecutor is
         emit OperatorUpdated(operator_, allowed);
     }
 
-    /// @notice Flag a Uniswap V4 hook contract as allowed inside V4 swaps.
-    /// @dev Hooks execute arbitrary logic during `beforeSwap`/`afterSwap` on the
-    /// PoolManager; any non-zero hook that is NOT in this whitelist causes the
-    /// V4 path to revert with `InvalidPlan`. Default is empty — operator
-    /// routes MUST stay on hook-less pools unless the owner explicitly enables
-    /// a hook after review.
-    function setV4HookAllowed(address hook, bool allowed) external onlyOwner {
+    /// @notice Block (or unblock) a Uniswap V4 hook contract inside V4 swaps.
+    /// @dev Every hook is accepted by default — the economic defence is the
+    /// delta-sign check plus the non-zero profit floor, not a list. Blocking
+    /// is for a hook that reverts on us deliberately: a griefing hook costs
+    /// gas per attempt and no floor can detect it before the swap.
+    function setV4HookBlocked(address hook, bool blocked) external onlyOwner {
         if (hook == address(0)) revert ZeroAddress();
-        allowedV4Hooks[hook] = allowed;
-        emit V4HookAllowedUpdated(hook, allowed);
+        blockedV4Hooks[hook] = blocked;
+        emit V4HookBlockedUpdated(hook, blocked);
     }
 
     function pause() external onlyOwner {
@@ -640,7 +653,7 @@ contract ArbExecutor is
         if (inner.length == V4_SWAP_DATA_LENGTH) {
             (, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
                 abi.decode(inner, (address, address, uint24, int24, address));
-            if (hook != address(0) && !allowedV4Hooks[hook]) revert InvalidV4CallbackHook();
+            if (blockedV4Hooks[hook]) revert InvalidV4CallbackHook();
             UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec);
         } else {
             UniswapLib.runV4UnlockMultihop(IPoolManager(msg.sender), tokenIn, data);
@@ -737,7 +750,7 @@ contract ArbExecutor is
         // Realized profit (loanToken-denominated, net of flash repay). On the
         // inventory path nothing was borrowed, so principal and repay are
         // both zero and the profit is the plain balance delta.
-        uint256 realizedProfit = CoinbasePaymentLib.computeRealizedProfit(
+        (uint256 realizedProfit, bool shortfall) = CoinbasePaymentLib.computeRealizedProfit(
             loanToken, loanToken, profitBefore, inventory ? 0 : plan.loanAmount, flashRepay
         );
         // The inventory must not shrink: the flash path has the repayment
@@ -777,7 +790,7 @@ contract ArbExecutor is
             IERC20(loanToken).safeTransfer(vault, flashRepay);
         }
 
-        CoinbasePaymentLib.checkProfit(realizedProfit, coinbasePaid, plan.minProfitAmount);
+        CoinbasePaymentLib.checkProfitStrict(realizedProfit, coinbasePaid, plan.minProfitAmount, shortfall);
 
         emit ArbExecuted(planHash, loanToken, realizedProfit, coinbasePaid);
     }

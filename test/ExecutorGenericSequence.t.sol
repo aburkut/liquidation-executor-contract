@@ -516,12 +516,14 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         executor.execute(plan);
     }
 
-    /// The callback-time hook allowlist re-check stays authoritative on the
+    /// The callback-time hook blocklist re-check stays authoritative on the
     /// op path (single-hop shape guarantees the branch that performs it).
-    function test_GenericSequence_V4UnlockOp_DisallowedHook_Reverts() public {
+    function test_GenericSequence_V4UnlockOp_BlockedHook_Reverts() public {
         Op memory op = _v4Op(address(collateralToken), address(loanToken), LOAN_AMOUNT + FLASH_FEE);
         op.callData = abi.encode(address(collateralToken), address(loanToken), uint24(500), int24(10), address(0xBEEF));
         bytes memory plan = _genericPlan(_oneOp(op), address(collateralToken), 0);
+        vm.prank(owner);
+        executor.setV4HookBlocked(address(0xBEEF), true);
         vm.prank(operatorAddr);
         vm.expectRevert(LiquidationExecutor.InvalidV4CallbackHook.selector);
         executor.execute(plan);
