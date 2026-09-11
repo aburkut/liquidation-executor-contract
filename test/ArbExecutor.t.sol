@@ -1044,7 +1044,9 @@ contract ArbExecutorTest is Test {
         bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
 
         vm.prank(operatorAddr);
-        vm.expectRevert();
+        // The pair's own K invariant rejects it, not our validation: the
+        // taxed transfer leaves the pair short of what the swap promised.
+        vm.expectRevert("mock: K");
         exec.execute(plan);
     }
 
