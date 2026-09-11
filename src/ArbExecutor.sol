@@ -465,6 +465,27 @@ contract ArbExecutor is
         // instead of relying on it as the sole backstop.
         for (uint256 i = 0; i < plan.ops.length; ++i) {
             if (plan.ops[i].flags == GenericSequenceLib.FLAG_WETH_UNWRAP) continue;
+            // FLAG_WETH_WRAP ops carry no external target either: the library
+            // calls the pinned `weth.deposit{value: ...}` itself and the op's
+            // target is address(0), which is not — and must not be —
+            // allowlisted. #38 taught GenericSequenceLib the new flag and left
+            // this walk behind it, so EVERY native-out cycle reverted
+            // TargetNotAllowed. MEASURED 2026-09-11: that took out the whole
+            // native-ETH Fluid class (13 of Fluid's 49 pools, the WETH-paired
+            // ones a cycle most wants), and no bot-side setting avoided it —
+            // with the flag off the op names WETH, which this deploy removed
+            // from the allowlist on purpose.
+            //
+            // EXACT equality, same discipline as the unwrap above, on the two
+            // shapes the library itself accepts (its guard is
+            // `op.flags & ~(FLAG_WETH_WRAP | FLAG_USE_PREV_RETURN) != 0` ->
+            // InvalidPlan). A combined-flag op carrying a real target stays
+            // gated.
+            if (
+                plan.ops[i].flags == GenericSequenceLib.FLAG_WETH_WRAP
+                    || plan.ops[i].flags
+                        == (GenericSequenceLib.FLAG_WETH_WRAP | GenericSequenceLib.FLAG_USE_PREV_RETURN)
+            ) continue;
             // Direct pool swaps name the pool itself as the target: pools are
             // permissionless and bounded by construction (the op spends at
             // most its own `amount`, see DirectSwapLib), so they are not

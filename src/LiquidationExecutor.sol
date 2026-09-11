@@ -701,6 +701,30 @@ contract LiquidationExecutor is
                 // library backstop stood behind them. `ArbExecutor` has
                 // always used equality here; the two now agree.
                 if (plan.swapPlan.ops[i].flags == GenericSequenceLib.FLAG_WETH_UNWRAP) continue;
+                // The wrap is the unwrap's mirror and needs the same exemption:
+                // the library calls the pinned `weth.deposit{value: ...}` and
+                // the op's target is address(0). #38 added the flag to
+                // GenericSequenceLib without touching either executor's walk;
+                // the arb path hit it in production on 2026-09-11 and this one
+                // is the same gap, latent only because the bot does not emit a
+                // wrap on the liquidation path yet.
+                //
+                // EXACT equality on the two shapes the library accepts, so a
+                // combined-flag op carrying a real target stays gated.
+                //
+                // Placed with the unwrap, ABOVE the dangerous-target check,
+                // and safe for the same reason the unwrap is: the library's
+                // wrap branch NEVER calls `op.target` — it invokes the pinned
+                // `weth.deposit`, so the field is inert. NOT because the
+                // target is address(0): this walk runs BEFORE the library, so
+                // nothing here has yet checked the op's shape, and a plan may
+                // carry `flags == FLAG_WETH_WRAP` with any target it likes.
+                // It simply never gets called.
+                if (
+                    plan.swapPlan.ops[i].flags == GenericSequenceLib.FLAG_WETH_WRAP
+                        || plan.swapPlan.ops[i].flags
+                            == (GenericSequenceLib.FLAG_WETH_WRAP | GenericSequenceLib.FLAG_USE_PREV_RETURN)
+                ) continue;
                 // FLASH swaps run the rest of the sequence inside a pool
                 // callback; this executor only implements the immediate-pay
                 // callbacks (size budget), so a flash op cannot run here.

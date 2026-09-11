@@ -144,6 +144,79 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         executor.execute(plan);
     }
 
+    /// A FLAG_WETH_WRAP op carries no external target — the library calls the
+    /// pinned `weth.deposit` — so the pre-flight walk must exempt it, exactly
+    /// as it exempts the unwrap. #38 taught GenericSequenceLib the flag and
+    /// left BOTH executors' walks behind it; the arb path hit that in
+    /// production on 2026-09-11 (every native-out cycle reverted
+    /// TargetNotAllowed) and this walk carries the identical gap, latent only
+    /// because the bot does not emit a wrap on the liquidation path yet.
+    ///
+    /// Same proof shape as the unlisted-target test above, inverted: the
+    /// target is deliberately NOT allowlisted, and the plan must fail later on
+    /// an unrelated guard rather than on TargetNotAllowed.
+    function test_GenericSequence_PureWrapFlag_StillExempted() public {
+        Op[] memory ops = new Op[](1);
+        ops[0].target = address(0xDEAD); // irrelevant for a wrap op
+        ops[0].srcToken = address(0);
+        ops[0].outToken = address(mockWeth);
+        ops[0].amountIn = 1e18;
+        ops[0].flags = FLAG_WETH_WRAP;
+        bytes memory plan = _genericPlan(ops, address(mockWeth), 0);
+
+        vm.prank(operatorAddr);
+        try executor.execute(plan) {
+            fail("expected a revert downstream, but execute() unexpectedly succeeded");
+        } catch (bytes memory reason) {
+            assertTrue(
+                bytes4(reason) != LiquidationExecutor.TargetNotAllowed.selector,
+                "pure wrap op must be exempt from the pre-flight allowlist walk"
+            );
+        }
+    }
+
+    /// The chainable shape — wrap whatever the previous op returned — is the
+    /// second form GenericSequenceLib accepts (`op.flags & ~(FLAG_WETH_WRAP |
+    /// FLAG_USE_PREV_RETURN) != 0` reverts InvalidPlan), and it is the one the
+    /// bot actually emits. Without this the fix covers only literal amounts.
+    function test_GenericSequence_WrapWithPrevReturn_StillExempted() public {
+        Op[] memory ops = new Op[](1);
+        ops[0].target = address(0xDEAD);
+        ops[0].srcToken = address(0);
+        ops[0].outToken = address(mockWeth);
+        ops[0].amountIn = 1e18;
+        ops[0].flags = FLAG_WETH_WRAP | FLAG_PREV_RETURN;
+        bytes memory plan = _genericPlan(ops, address(mockWeth), 0);
+
+        vm.prank(operatorAddr);
+        try executor.execute(plan) {
+            fail("expected a revert downstream, but execute() unexpectedly succeeded");
+        } catch (bytes memory reason) {
+            assertTrue(
+                bytes4(reason) != LiquidationExecutor.TargetNotAllowed.selector,
+                "wrap|prev-return must be exempt from the pre-flight allowlist walk"
+            );
+        }
+    }
+
+    /// EXACT equality, not bit presence — the same discipline the unwrap's
+    /// guard was rewritten to enforce. A wrap bit set ALONGSIDE a flag that
+    /// carries a real external target (FLAG_V4_UNLOCK, whose PoolManager rides
+    /// in `op.target`) must still be gated, or the fix reopens the hole.
+    function test_GenericSequence_CombinedWrapFlag_NotExempted_Reverts() public {
+        Op[] memory ops = new Op[](1);
+        ops[0].target = address(0xDEAD); // never allowlisted
+        ops[0].srcToken = address(0);
+        ops[0].outToken = address(mockWeth);
+        ops[0].amountIn = 1e18;
+        ops[0].flags = FLAG_WETH_WRAP | FLAG_V4_UNLOCK;
+        bytes memory plan = _genericPlan(ops, address(mockWeth), 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
+        executor.execute(plan);
+    }
+
     function test_GenericSequence_ConflictsWithOtherShape_Reverts() public {
         Op[] memory ops = new Op[](1);
         ops[0].target = address(dex);
@@ -539,6 +612,7 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
     // ═══════════════════════════════════════════════════════════════
 
     uint32 internal constant FLAG_WETH_UNWRAP = 1 << 3;
+    uint32 internal constant FLAG_WETH_WRAP = 1 << 10;
     uint32 internal constant FLAG_NATIVE_IN = 1 << 5;
 
     /// Happy path: collateralAsset == mockWeth (WETH seized as collateral).
