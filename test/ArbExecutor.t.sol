@@ -631,6 +631,85 @@ contract ArbExecutorTest is Test {
         exec.execute(plan);
     }
 
+    /// The wrap's mirror of the unwrap exemption. #38 taught
+    /// GenericSequenceLib `FLAG_WETH_WRAP` and left BOTH executors' pre-flight
+    /// walks behind it, so a wrap op — whose target is address(0), because the
+    /// library calls the pinned `weth.deposit` itself — hit the allowlist gate
+    /// and reverted TargetNotAllowed. MEASURED in production 2026-09-11: it
+    /// took out every native-out cycle, i.e. the whole native-ETH Fluid class.
+    /// Neither bot-side setting avoided it: with the wrap flag off the op names
+    /// WETH instead, and that deploy removed WETH from the allowlist on purpose.
+    ///
+    /// Same proof shape as the unwrap test below: a deliberately
+    /// non-allowlisted target proves the exemption applies, and the plan is
+    /// expected to fail LATER on an unrelated guard, never on TargetNotAllowed.
+    function test_execute_pureWrapFlag_stillExempted_preflight() public {
+        Op[] memory ops = new Op[](1);
+        ops[0].target = address(0xBEEF); // irrelevant for a pure wrap op
+        ops[0].srcToken = address(0); // the library requires the native side
+        ops[0].outToken = address(weth);
+        ops[0].amountIn = 1e18;
+        ops[0].flags = GenericSequenceLib.FLAG_WETH_WRAP;
+
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        try exec.execute(plan) {
+            fail("expected a revert downstream, but execute() unexpectedly succeeded");
+        } catch (bytes memory reason) {
+            bytes4 selector = bytes4(reason);
+            assertTrue(
+                selector != ArbExecutor.TargetNotAllowed.selector,
+                "pure wrap op must be exempt from the pre-flight allowlist walk"
+            );
+        }
+    }
+
+    /// The chainable shape the bot actually emits — `FLAG_WETH_WRAP |
+    /// FLAG_USE_PREV_RETURN`, wrapping whatever the previous op returned — is
+    /// the second form GenericSequenceLib accepts, so the walk must exempt it
+    /// too or the fix only covers the literal-amount case.
+    function test_execute_wrapWithPrevReturn_stillExempted_preflight() public {
+        Op[] memory ops = new Op[](1);
+        ops[0].target = address(0xBEEF);
+        ops[0].srcToken = address(0);
+        ops[0].outToken = address(weth);
+        ops[0].amountIn = 1e18;
+        ops[0].flags = GenericSequenceLib.FLAG_WETH_WRAP | GenericSequenceLib.FLAG_USE_PREV_RETURN;
+
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        try exec.execute(plan) {
+            fail("expected a revert downstream, but execute() unexpectedly succeeded");
+        } catch (bytes memory reason) {
+            assertTrue(
+                bytes4(reason) != ArbExecutor.TargetNotAllowed.selector,
+                "wrap|use-prev-return must be exempt from the pre-flight allowlist walk"
+            );
+        }
+    }
+
+    /// The exemption is EXACT-equality, exactly as the unwrap's is: a wrap bit
+    /// set ALONGSIDE a flag that carries a real external target (here
+    /// FLAG_V4_UNLOCK, whose PoolManager rides in `op.target`) must NOT be
+    /// exempt, or the fix would reopen the hole the unwrap's exact-match guard
+    /// was written to close.
+    function test_execute_combinedFlagWrapTarget_notExempted_reverts() public {
+        Op[] memory ops = new Op[](1);
+        ops[0].target = address(0xBEEF); // never allowlisted
+        ops[0].srcToken = address(0);
+        ops[0].outToken = address(weth);
+        ops[0].amountIn = 1e18;
+        ops[0].flags = GenericSequenceLib.FLAG_WETH_WRAP | GenericSequenceLib.FLAG_V4_UNLOCK;
+        ops[0].callData = abi.encode(address(weth), address(tokenB), uint24(500), int24(10), address(0));
+
+        bytes memory plan = _planMorpho(address(weth), LOAN_AMOUNT, ops, 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.TargetNotAllowed.selector);
+        exec.execute(plan);
+    }
+
     /// Confirms the fix does NOT reject a LEGIT unwrap op: `flags` EXACTLY
     /// equal to `FLAG_WETH_UNWRAP` must still be exempt from the pre-flight
     /// allowlist walk (per the library contract, a real unwrap op carries no
