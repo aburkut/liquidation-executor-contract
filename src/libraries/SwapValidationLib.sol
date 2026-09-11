@@ -10,8 +10,8 @@ import {SwapMode, SwapLeg, Action, AaveV3Action, AaveV2Liquidation, MorphoLiquid
 /// dispatching a leg.
 ///
 /// SCOPE — non-V4 modes only:
-///   * UNI_V4 / UNI_V4_BUY validation consults `allowedV4Hooks` storage
-///     (per-hook allowlist read), which a pure library cannot reach.
+///   * UNI_V4 / UNI_V4_BUY validation consults `blockedV4Hooks` storage
+///     (per-hook blocklist read), which a pure library cannot reach.
 ///     Callers MUST short-circuit V4 to their own `_validateV4Leg`
 ///     BEFORE invoking `validateNonV4Leg`. The lib reverts
 ///     `InvalidSwapMode` if a V4 leg slips through — defense in depth.
