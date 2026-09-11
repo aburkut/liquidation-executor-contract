@@ -8,7 +8,7 @@ import {LiquidationExecutor} from "../LiquidationExecutor.sol";
 /// deploy, set in the constructor.
 ///
 /// The base constructors seed one operator and the target allowlist; extra
-/// operators, the V4 hook allowlist and (for the liquidator) the Aave V2
+/// operators, the V4 hook blocklist and (for the liquidator) the Aave V2
 /// lending pool were always separate owner calls. The liquidator's owner is a
 /// Safe, so every such call is a multisig transaction, and until the last one
 /// lands the contract exists but cannot do what the previous one could.
@@ -31,7 +31,7 @@ contract ArbExecutorSeeded is ArbExecutor {
         address uniV3Router_,
         address[] memory allowedTargets_,
         address[] memory operators_,
-        address[] memory v4Hooks_
+        address[] memory blockedV4Hooks_
     )
         ArbExecutor(
             owner_,
@@ -50,10 +50,10 @@ contract ArbExecutorSeeded is ArbExecutor {
             operators[operators_[i]] = true;
             emit OperatorUpdated(operators_[i], true);
         }
-        for (uint256 i = 0; i < v4Hooks_.length; ++i) {
-            if (v4Hooks_[i] == address(0)) revert ZeroAddress();
-            allowedV4Hooks[v4Hooks_[i]] = true;
-            emit V4HookAllowedUpdated(v4Hooks_[i], true);
+        for (uint256 i = 0; i < blockedV4Hooks_.length; ++i) {
+            if (blockedV4Hooks_[i] == address(0)) revert ZeroAddress();
+            blockedV4Hooks[blockedV4Hooks_[i]] = true;
+            emit V4HookBlockedUpdated(blockedV4Hooks_[i], true);
         }
     }
 }
@@ -71,7 +71,7 @@ contract LiquidationExecutorSeeded is LiquidationExecutor {
         address uniV3Router_,
         address[] memory allowedTargets_,
         address[] memory operators_,
-        address[] memory v4Hooks_,
+        address[] memory blockedV4Hooks_,
         address aaveV2LendingPool_
     )
         LiquidationExecutor(
@@ -92,10 +92,10 @@ contract LiquidationExecutorSeeded is LiquidationExecutor {
             operators[operators_[i]] = true;
             emit OperatorUpdated(operators_[i], true);
         }
-        for (uint256 i = 0; i < v4Hooks_.length; ++i) {
-            if (v4Hooks_[i] == address(0)) revert ZeroAddress();
-            allowedV4Hooks[v4Hooks_[i]] = true;
-            emit V4HookAllowedUpdated(v4Hooks_[i], true);
+        for (uint256 i = 0; i < blockedV4Hooks_.length; ++i) {
+            if (blockedV4Hooks_[i] == address(0)) revert ZeroAddress();
+            blockedV4Hooks[blockedV4Hooks_[i]] = true;
+            emit V4HookBlockedUpdated(blockedV4Hooks_[i], true);
         }
         if (aaveV2LendingPool_ != address(0)) {
             // Same rule as `setAaveV2LendingPool`: the pool must be an

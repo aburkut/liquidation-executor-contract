@@ -91,9 +91,10 @@ contract Deploy is Script {
         address[] memory operators = new address[](2);
         operators[0] = OPERATOR_2;
         operators[1] = OPERATOR_3;
-        address[] memory hooks = new address[](2);
-        hooks[0] = LAUNCH_HOOK;
-        hooks[1] = LBP_MIGRATION_HOOK;
+        // V4 hooks are accepted by default now (blocklist, not allowlist);
+        // nothing to seed. The two hooks that used to be allowed here are
+        // kept as constants only for the read-back below.
+        address[] memory hooks = new address[](0);
 
         vm.startBroadcast();
 
@@ -149,7 +150,7 @@ contract Deploy is Script {
         require(ex.allowedTargets(PANCAKE_V2_ROUTER), "readback: pancake v2 allowed");
         require(ex.allowedTargets(SHIBASWAP_ROUTER), "readback: shibaswap allowed");
         require(ex.operators(OPERATOR_2) && ex.operators(OPERATOR_3), "readback: extra operators");
-        require(ex.allowedV4Hooks(LAUNCH_HOOK) && ex.allowedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks");
+        require(!ex.blockedV4Hooks(LAUNCH_HOOK) && !ex.blockedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks open");
 
         console2.log("LiquidationExecutor V10:", liqExecutor);
     }

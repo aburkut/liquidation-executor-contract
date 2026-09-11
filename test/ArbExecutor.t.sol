@@ -1326,14 +1326,17 @@ contract ArbExecutorTest is Test {
         exec.unlockCallback(abi.encode(bytes(""), int256(0)));
     }
 
-    function test_setV4HookAllowed_onlyOwner() public {
+    function test_setV4HookBlocked_onlyOwner() public {
         vm.prank(attacker);
         vm.expectRevert(); // Ownable: caller is not the owner
-        exec.setV4HookAllowed(address(0x1234), true);
+        exec.setV4HookBlocked(address(0x1234), true);
         // owner path:
         vm.prank(ownerAddr);
-        exec.setV4HookAllowed(address(0x1234), true);
-        assertTrue(exec.allowedV4Hooks(address(0x1234)));
+        exec.setV4HookBlocked(address(0x1234), true);
+        assertTrue(exec.blockedV4Hooks(address(0x1234)));
+        vm.prank(ownerAddr);
+        exec.setV4HookBlocked(address(0x1234), false);
+        assertFalse(exec.blockedV4Hooks(address(0x1234)));
     }
 
     // ─── Multi-operator (parallel nonce streams) ──────────────────────

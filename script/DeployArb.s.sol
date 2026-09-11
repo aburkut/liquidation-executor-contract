@@ -7,8 +7,8 @@ import {ArbExecutorSeeded} from "../src/deploy/SeededExecutors.sol";
 
 /// @title ArbExecutor deploy
 /// @notice Deploys `ArbExecutor` fully configured. Nothing needs to be called
-/// on the contract afterwards — no `setAllowedTarget`, no `setOperator`, no
-/// `setV4HookAllowed`. Every target the bot can emit an `Op` against is seeded
+/// on the contract afterwards — no `setAllowedTarget`, no `setOperator`.
+/// Every target the bot can emit an `Op` against is seeded
 /// in the constructor, and the run asserts each one back before returning, so a
 /// partially-seeded deploy fails here instead of at the first arb.
 ///
@@ -193,9 +193,10 @@ contract DeployArb is Script {
         address[] memory operators = new address[](2);
         operators[0] = OPERATOR_2;
         operators[1] = OPERATOR_3;
-        address[] memory hooks = new address[](2);
-        hooks[0] = LAUNCH_HOOK;
-        hooks[1] = LBP_MIGRATION_HOOK;
+        // V4 hooks are accepted by default now (blocklist, not allowlist);
+        // nothing to seed. The two hooks that used to be allowed here are
+        // kept as constants only for the read-back below.
+        address[] memory hooks = new address[](0);
         ArbExecutor exec = new ArbExecutorSeeded(
             OWNER,
             OPERATOR,
@@ -229,7 +230,9 @@ contract DeployArb is Script {
         require(exec.allowedTargets(UNI_V3_ROUTER), "readback: v3 router");
         require(exec.operators(OPERATOR), "readback: operator armed");
         require(exec.operators(OPERATOR_2) && exec.operators(OPERATOR_3), "readback: extra operators armed");
-        require(exec.allowedV4Hooks(LAUNCH_HOOK) && exec.allowedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks");
+        require(
+            !exec.blockedV4Hooks(LAUNCH_HOOK) && !exec.blockedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks open"
+        );
         require(exec.owner() == OWNER, "readback: owner");
 
         console2.log("ArbExecutor:", address(exec));

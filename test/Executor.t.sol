@@ -7217,12 +7217,15 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
-    function test_UniV4_multihop_unallowlistedHook_reverts() public {
-        // Each hop's hook must be address(0) OR in allowedV4Hooks. The
+    function test_UniV4_multihop_blockedHook_reverts() public {
+        // Any hook is accepted unless the owner BLOCKED it. The
         // function-pointer callback (`this.isV4HookAllowed`) returns
-        // false → lib reverts InvalidPlan inside the per-hop loop.
+        // false for a blocked hook → lib reverts InvalidPlan inside the
+        // per-hop loop.
         MockERC20 intermediateToken = new MockERC20("Intermediate", "INT", 18);
         address strangerHook = address(0xBADC0DE);
+        vm.prank(owner);
+        executor.setV4HookBlocked(strangerHook, true);
         UniswapLib.V4Hop[] memory hops = new UniswapLib.V4Hop[](2);
         hops[0] = UniswapLib.V4Hop({
             tokenOut: address(intermediateToken), fee: 3000, tickSpacing: int24(60), hook: strangerHook
@@ -7378,8 +7381,12 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
-    function test_UniV4_invalidHook_reverts() public {
+    /// A hook the owner BLOCKED is refused at validation. (This used to be
+    /// "any hook not on the allowlist"; the list is inverted now.)
+    function test_UniV4_blockedHook_reverts() public {
         address rogueHook = address(0x1234);
+        vm.prank(owner);
+        executor.setV4HookBlocked(rogueHook, true);
         LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
             address(collateralToken),
             address(loanToken),
@@ -7399,10 +7406,11 @@ contract ExecutorTest is Test {
         executor.execute(plan);
     }
 
-    function test_UniV4_whitelistedHook_succeeds() public {
+    /// No owner action precedes this: a hook nobody blocked trades. The
+    /// economic defence is `minAmountOut` on the leg, the same one that
+    /// covers the Curve/Balancer pools whose allowlist was dropped earlier.
+    function test_UniV4_unknownHook_succeedsWithoutOwnerAction() public {
         address allowedHook = address(0x5678);
-        vm.prank(owner);
-        executor.setV4HookAllowed(allowedHook, true);
 
         LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
             address(collateralToken),
@@ -7546,16 +7554,48 @@ contract ExecutorTest is Test {
         executor.unlockCallback("");
     }
 
-    function test_setV4HookAllowed_onlyOwner() public {
+    function test_setV4HookBlocked_onlyOwner() public {
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
-        executor.setV4HookAllowed(address(0x5678), true);
+        executor.setV4HookBlocked(address(0x5678), true);
     }
 
-    function test_setV4HookAllowed_rejectsZero() public {
+    function test_setV4HookBlocked_rejectsZero() public {
         vm.prank(owner);
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
-        executor.setV4HookAllowed(address(0), true);
+        executor.setV4HookBlocked(address(0), true);
+    }
+
+    /// A blocked hook is refused at validation, before the flash loan, and
+    /// unblocking it lets the same plan through — the list is the owner's
+    /// brake for a griefing hook, not the gate every hook must pass.
+    function test_UniV4_blockedHook_revertsUntilUnblocked() public {
+        address hook = address(0x5678);
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildUniV4SwapPlan(
+            address(collateralToken),
+            address(loanToken),
+            DEFAULT_SWAP_AMOUNT,
+            3000,
+            int24(60),
+            hook,
+            address(uniV4Mock),
+            1,
+            0
+        );
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), swapPlan);
+        vm.prank(owner);
+        executor.setV4HookBlocked(hook, true);
+        assertTrue(executor.blockedV4Hooks(hook));
+        assertFalse(executor.isV4HookAllowed(hook));
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.InvalidPlan.selector);
+        executor.execute(plan);
+        vm.prank(owner);
+        executor.setV4HookBlocked(hook, false);
+        assertTrue(executor.isV4HookAllowed(hook));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
     }
 
     // ═══════════════════════════════════════════════════════════════════
