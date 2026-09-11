@@ -19,6 +19,7 @@ import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockParaswapAugustus} from "./mocks/MockParaswapAugustus.sol";
 import {MockRouter} from "./support/Mocks.sol";
 import {MockUniV3Pool, MockUniV2Pair, TamperingV3Pool} from "./mocks/MockDirectPools.sol";
+import {MockFeeOnTransferERC20} from "./mocks/MockFeeOnTransferERC20.sol";
 import {DirectSwapLib} from "../src/libraries/DirectSwapLib.sol";
 
 contract MockWETH is MockERC20 {
@@ -886,6 +887,86 @@ contract ArbExecutorTest is Test {
         // 1000 A → ~1970 B → ~3800 A: well over the 100 A floor.
         assertGt(tokenA.balanceOf(address(exec)) - before, 2_500e18, "profit retained");
         assertEq(tokenA.allowance(address(exec), address(cheapB)), 0, "no allowance granted");
+    }
+
+    /// A fee-on-transfer token as the INPUT of a direct pair swap.
+    ///
+    /// Production 2026-09-11: 4 of 6 sends died `UniswapV2: K` on a
+    /// `hashflow>v2` FLOKI leg the day direct pool swaps were enabled. The
+    /// pair receives less than it was sent, so an output priced on `amount`
+    /// breaks the pair's own K invariant. That was the earner route — 42 of
+    /// 77 landings — and the router path had already closed this class in
+    /// #555 via `swapExactTokensForTokensSupportingFeeOnTransferTokens`.
+    ///
+    /// Runs on the INVENTORY path deliberately. The taxed token has to be the
+    /// cap token — `runArb*` allows spending `loanAmount` of `loanToken` and
+    /// nothing else, so a taxed token held on the side is refused by the
+    /// containment cap, not by the bug under test. And holding the principal
+    /// means no flash is taken, so the tax never touches a provider transfer
+    /// and the test measures the swap rather than its own funding.
+    ///
+    /// Reverts "mock: K" on `origin/main`; passes once `swapV2` prices from
+    /// `balanceOf(pair, tokenIn) - reserveIn` AFTER the transfer.
+    function test_directV2_feeOnTransferInput_pricesAfterTheTransfer() public {
+        MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", 18, 500); // 5%
+
+        // taxed -> A, cheap in taxed. The INPUT is taxed: the pair receives
+        // 5% less than the op sends, which is exactly the production shape.
+        MockUniV2Pair sell = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        tokenA.mint(address(sell), 400 * LOAN_AMOUNT);
+        taxed.mint(address(sell), 100 * LOAN_AMOUNT);
+        sell.sync();
+
+        // A -> taxed, cheap in A, so the cycle closes above water even after
+        // the 5% on the way in and another 5% on the way back out.
+        MockUniV2Pair buy = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        tokenA.mint(address(buy), 100 * LOAN_AMOUNT);
+        taxed.mint(address(buy), 400 * LOAN_AMOUNT);
+        buy.sync();
+
+        // Principal held, not borrowed: `mint` is exempt from the tax, so the
+        // executor starts with exactly LOAN_AMOUNT and takes the inventory
+        // path (no flashLoan call, DELTA repay gate).
+        taxed.mint(address(exec), LOAN_AMOUNT);
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV2Op(address(sell), address(taxed), address(tokenA), false, LOAN_AMOUNT, 0);
+        ops[1] = _directV2Op(
+            address(buy), address(tokenA), address(taxed), true, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(taxed), LOAN_AMOUNT, ops, 0);
+
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 0);
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+
+        assertGt(taxed.balanceOf(address(exec)), LOAN_AMOUNT, "the cycle closed above water");
+    }
+
+    /// The same token through `flashV2` still cannot work, and that is
+    /// deliberate: the pair pays FIRST, out of pre-transfer reserves, so
+    /// there is no post-transfer measurement point to price from. Pinned so
+    /// nobody fixes flashV2 the same way and ships something the pair cannot
+    /// honour — the bot avoids the combination instead.
+    function test_flashV2_feeOnTransferInput_stillUnserviceable() public {
+        MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", 18, 500);
+
+        MockUniV2Pair pair = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        tokenA.mint(address(pair), 400 * LOAN_AMOUNT);
+        taxed.mint(address(pair), 100 * LOAN_AMOUNT);
+        pair.sync();
+        taxed.mint(address(exec), 10 * LOAN_AMOUNT);
+
+        Op[] memory ops = new Op[](1);
+        ops[0] = _directV2Op(address(pair), address(taxed), address(tokenA), false, LOAN_AMOUNT, 0);
+        // A flash op, not a direct one: the builder's FLAG_V2_DIRECT is
+        // replaced outright rather than or-ed, since the shapes are exclusive.
+        ops[0].flags = GenericSequenceLib.FLAG_V2_FLASH;
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        exec.execute(plan);
     }
 
     /// A direct op may not carry calldata patch positions or the flags that

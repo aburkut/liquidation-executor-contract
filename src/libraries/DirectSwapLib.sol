@@ -131,10 +131,33 @@ library DirectSwapLib {
     /// numerator is the surviving share of the input out of 1000 — the same
     /// `fee_numerator` the bot's V2 fork table quotes with (997 Uniswap /
     /// Sushi, 998 Pancake V2), so quote and execution agree to the wei.
+    /// @dev Prices from what the pair ACTUALLY RECEIVED, not from `amount`.
+    ///
+    /// A fee-on-transfer token delivers less than it is sent, so the reserve
+    /// formula run on `amount` asks the pair for more than the K invariant
+    /// allows and `swap` reverts `UniswapV2: K`. MEASURED in production
+    /// 2026-09-11: 4 of 6 sends died this way on a hashflow>v2 FLOKI leg —
+    /// FLOKI's tax handler trades the same pair inside our transfer, so the
+    /// reserves we priced on are stale by the time we ask.
+    ///
+    /// This is the class #555 closed on the ROUTER path by switching to
+    /// `swapExactTokensForTokensSupportingFeeOnTransferTokens`; enabling
+    /// direct pair swaps reopened it here, because a direct swap computes the
+    /// output itself instead of letting the router measure. Measuring after
+    /// the transfer is exactly what the fee-supporting router does.
+    ///
+    /// `flashV2` cannot take this fix and is deliberately left alone: the pair
+    /// pays FIRST, from pre-transfer reserves, so there is no post-transfer
+    /// measurement point. A fee-on-transfer token simply cannot be flash-swapped.
     function swapV2(address pair, address tokenIn, uint256 amount, bytes memory data) internal returns (uint256 out) {
-        bool zeroForOne;
-        (zeroForOne, out) = _v2Out(pair, amount, data);
+        (bool zeroForOne, uint16 feeNumerator) = _v2Params(amount, data);
+        (uint256 reserveIn, uint256 reserveOut) = _v2Reserves(pair, zeroForOne);
         IERC20(tokenIn).safeTransfer(pair, amount);
+        // What the pair holds beyond its reserve IS the input it will measure
+        // in its own K check. A donation only makes this larger, which is safe:
+        // more input permits more output and K still holds.
+        uint256 received = IERC20(tokenIn).balanceOf(pair) - reserveIn;
+        out = _v2AmountOut(received, feeNumerator, reserveIn, reserveOut);
         if (zeroForOne) {
             IUniV2PairMinimal(pair).swap(0, out, address(this), "");
         } else {
@@ -235,20 +258,39 @@ library DirectSwapLib {
         if (limit == 0) limit = zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1;
     }
 
+    /// @dev Unchanged behaviour, now composed of the three pieces below so
+    /// `swapV2` can run the same maths on a POST-transfer amount. `flashV2`
+    /// still calls this and still prices pre-transfer, which is correct for it.
     function _v2Out(address pair, uint256 amount, bytes memory data)
         private
         view
         returns (bool zeroForOne, uint256 out)
     {
-        if (amount == 0 || data.length != 64) revert DirectSwapInvalid();
         uint16 feeNumerator;
+        (zeroForOne, feeNumerator) = _v2Params(amount, data);
+        (uint256 reserveIn, uint256 reserveOut) = _v2Reserves(pair, zeroForOne);
+        out = _v2AmountOut(amount, feeNumerator, reserveIn, reserveOut);
+    }
+
+    function _v2Params(uint256 amount, bytes memory data) private pure returns (bool zeroForOne, uint16 feeNumerator) {
+        if (amount == 0 || data.length != 64) revert DirectSwapInvalid();
         (zeroForOne, feeNumerator) = abi.decode(data, (bool, uint16));
         if (feeNumerator == 0 || feeNumerator > 1000) revert DirectSwapInvalid();
+    }
 
+    function _v2Reserves(address pair, bool zeroForOne) private view returns (uint256 reserveIn, uint256 reserveOut) {
         (uint112 r0, uint112 r1,) = IUniV2PairMinimal(pair).getReserves();
-        (uint256 reserveIn, uint256 reserveOut) = zeroForOne ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+        (reserveIn, reserveOut) = zeroForOne ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
         if (reserveIn == 0 || reserveOut == 0) revert DirectSwapInvalid();
-        uint256 inWithFee = amount * feeNumerator;
+    }
+
+    function _v2AmountOut(uint256 amountIn, uint16 feeNumerator, uint256 reserveIn, uint256 reserveOut)
+        private
+        pure
+        returns (uint256 out)
+    {
+        if (amountIn == 0) revert DirectSwapInvalid();
+        uint256 inWithFee = amountIn * feeNumerator;
         out = (inWithFee * reserveOut) / (reserveIn * 1000 + inWithFee);
         if (out == 0) revert DirectSwapInvalid();
     }
