@@ -504,15 +504,25 @@ library GenericSequenceLib {
                 return DirectSwapLib.takeLastReturn();
             }
 
-            // A DIRECT pool swap reports its own output exactly — the V3 pool
-            // returns its deltas, the V2 output is the reserve formula the
-            // pair itself enforces — so the two balanceOf reads around the op
-            // (≈2-4k) are skipped for those. A pool that lied would only make
-            // the NEXT op overspend a balance it does not have and revert; the
-            // containment cap still measures real balances at the end.
-            bool directOut = op.flags & (FLAG_V3_DIRECT | FLAG_V2_DIRECT) != 0;
-            uint256 outBefore = directOut ? 0 : _balOf(op.outToken);
-            uint256 reported;
+            // EVERY op's output is the outToken balance delta, direct pool
+            // swaps included. Direct swaps used to skip the two balanceOf
+            // reads (≈2-4k gas) and publish what the POOL reported, on the
+            // reasoning that "a pool that lied would only make the NEXT op
+            // overspend a balance it does not have and revert".
+            //
+            // That is exactly what happened. MEASURED 2026-09-12: nine
+            // `uniswap_v2>hashflow` sims on FLOKI failed
+            // `FLOKI:_transfer:INSUFFICIENT_BALANCE`. The pair was honest —
+            // it sent 25778394255671989 — but FLOKI taxes its own transfer
+            // 0.3%, so the executor held 25701059072904974 while
+            // FLAG_USE_PREV_RETURN handed the pair's figure to the RFQ leg,
+            // which then asked for 77335182767015 it did not have.
+            //
+            // The pool reports what it SENT. Only a balance says what we
+            // RECEIVED, and `Op.outToken` already documents itself as "token
+            // received (its balance delta = this op's output)". This is the
+            // output-side mirror of the input-side fix in #41.
+            uint256 outBefore = _balOf(op.outToken);
 
             if (op.flags & FLAG_V4_UNLOCK != 0) {
                 // ── V4 single-hop exact-out via PoolManager unlock ──
@@ -606,11 +616,11 @@ library GenericSequenceLib {
                 // ── Direct V3-style pool swap: no router, no allowance. The
                 // pool pulls `amount` (at most) through the executor's swap
                 // callback; the output-delta check below pins the result.
-                reported = DirectSwapLib.swapV3(op.target, op.srcToken, amount, op.callData);
+                DirectSwapLib.swapV3(op.target, op.srcToken, amount, op.callData);
             } else if (op.flags & FLAG_V2_DIRECT != 0) {
                 // ── Direct V2-style pair swap: send `amount`, take what the
                 // reserve formula yields; the output-delta check below pins it.
-                reported = DirectSwapLib.swapV2(op.target, op.srcToken, amount, op.callData);
+                DirectSwapLib.swapV2(op.target, op.srcToken, amount, op.callData);
             } else if (op.flags & FLAG_NATIVE_IN != 0) {
                 // ── Native-ETH input to a plain payable DEX call ──
                 // srcToken==address(0) and flag-exclusivity are already
@@ -702,11 +712,6 @@ library GenericSequenceLib {
             // this contract. An op whose raw calldata routed output elsewhere
             // produces a zero delta and is rejected. Saturating delta matches
             // the codebase idiom (clean revert instead of a Panic underflow).
-            if (directOut) {
-                if (reported == 0) revert OpOutputNotReceived(i);
-                prevReturn = reported;
-                continue;
-            }
             uint256 outBal = _balOf(op.outToken);
             uint256 outDelta = outBal > outBefore ? outBal - outBefore : 0;
             if (outDelta == 0) revert OpOutputNotReceived(i);
