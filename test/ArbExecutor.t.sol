@@ -1027,6 +1027,55 @@ contract ArbExecutorTest is Test {
     /// there is no post-transfer measurement point to price from. Pinned so
     /// nobody fixes flashV2 the same way and ships something the pair cannot
     /// honour — the bot avoids the combination instead.
+    /// A direct V2 swap must publish what the executor RECEIVED, not what the
+    /// pair sent. PRODUCTION FAILURE 2026-09-12: nine `uniswap_v2>hashflow`
+    /// sims died `FLOKI:_transfer:INSUFFICIENT_BALANCE`. The pair sent
+    /// 25778394255671989; FLOKI taxed its own transfer 0.3%, so the executor
+    /// held 25701059072904974 — and `FLAG_USE_PREV_RETURN` handed the pair's
+    /// figure to the next leg, which asked for 77335182767015 it never had.
+    ///
+    /// The cycle here is A -> taxed -> A, and the second leg spends the first
+    /// leg's published output. Against the old code the second leg's
+    /// `safeTransfer` moves more taxed than the executor holds and reverts;
+    /// the delta makes the published figure true.
+    function test_directV2_feeOnTransferOutput_publishesWhatWeReceived() public {
+        MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", 18, 500); // 5%
+
+        // A -> taxed, taxed cheap here, so the buy leg gets plenty.
+        MockUniV2Pair buy = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        tokenA.mint(address(buy), 100 * LOAN_AMOUNT);
+        taxed.mint(address(buy), 400 * LOAN_AMOUNT);
+        buy.sync();
+
+        // taxed -> A, taxed expensive here, so the sell leg closes above water
+        // even after 5% on the way out of the first pair and 5% into this one.
+        MockUniV2Pair sell = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        tokenA.mint(address(sell), 400 * LOAN_AMOUNT);
+        taxed.mint(address(sell), 100 * LOAN_AMOUNT);
+        sell.sync();
+
+        // Principal held, not borrowed: the inventory path, DELTA repay gate.
+        tokenA.mint(address(exec), LOAN_AMOUNT);
+
+        Op[] memory ops = new Op[](2);
+        // token0 == tokenA, token1 == taxed, so A-in is zeroForOne.
+        ops[0] = _directV2Op(address(buy), address(tokenA), address(taxed), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV2Op(
+            address(sell), address(taxed), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 0);
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+
+        // The published figure was exactly the balance, so the second leg spent
+        // all of it. A figure taken from the pair would have been larger than
+        // the balance and the transfer would have reverted before reaching here.
+        assertEq(taxed.balanceOf(address(exec)), 0, "the published output was spent exactly");
+        assertGt(tokenA.balanceOf(address(exec)), LOAN_AMOUNT, "the cycle closed above water");
+    }
+
     function test_flashV2_feeOnTransferInput_stillUnserviceable() public {
         MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", 18, 500);
 
