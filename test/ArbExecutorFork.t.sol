@@ -120,6 +120,7 @@ contract ArbExecutorForkTest is Test {
     /// amount}(callData)`. See `GenericSequenceLib.FLAG_NATIVE_IN` for the
     /// full containment/ceiling rationale.
     uint32 constant FLAG_NATIVE_IN = 1 << 5;
+    uint32 constant FLAG_WETH_WRAP = 1 << 10;
 
     uint8 constant FLASH_PROVIDER_BALANCER = 2;
     uint8 constant FLASH_PROVIDER_MORPHO = 3;
@@ -858,5 +859,73 @@ contract ArbExecutorForkTest is Test {
         // must match tightly. A gross routing mismatch (wrong pool, wrong
         // direction, wrong amount) would blow well past this bound.
         //        assertApproxEqRel(daiOutB, daiOutA, 0.001e18); // 0.1% tolerance
+    }
+
+    /// `FLAG_WETH_WRAP` on REAL pools: WETH -> USDC (V3 0.05%) -> native ETH
+    /// (V4 ETH/USDC 0.05%, currency0 == address(0)) -> WETH.
+    ///
+    /// This is the shape every native-output backrun sends, and it reverted
+    /// with 0x21f24259 (`InvalidPlan()`) in the builders' eth_callBundle on
+    /// 2026-09-13 (opps arb_25965650 / arb_25965688). The cause was the
+    /// native-srcToken admission rejecting a wrap op before it could reach its
+    /// own branch; the unit test in ArbGenericSequence.t.sol pins the revert
+    /// and the fix. This one proves the same sequence clears real liquidity.
+    ///
+    /// A real round trip pays real fees (0.05% + 0.05%), so the cycle ends
+    /// below where it began — `_runArbExpectingLoss` is the idiom for that:
+    /// REACHING the profit gate is the proof the ops ran, since containment
+    /// and the per-op ceilings revert with their own errors long before it.
+    function test_fork_wrapOp_closesNativeV4Cycle() public forkOnly {
+        uint256 loanAmount = 1e18;
+        // A real WETH -> USDC -> ETH -> WETH round trip pays 0.05% + 0.05%
+        // plus spread (measured: 1e18 in, 0.9914e18 back). Without a buffer
+        // the ABSOLUTE repay gate fires BEFORE the profit gate, and
+        // `_runArbExpectingLoss` asserts the profit gate. Fund the shortfall
+        // so the sequence reaches the gate this helper is about.
+        deal(WETH, address(exec), 0.05e18);
+
+        Op[] memory ops = new Op[](3);
+        ops[0] = Op({
+            target: UNI_V3_ROUTER,
+            value: 0,
+            amountIn: loanAmount,
+            fromAmountPos: V3_AMOUNT_POS,
+            returnAmountPos: 0,
+            flags: 0,
+            srcToken: WETH,
+            outToken: USDC,
+            callData: _v3ExactInSingle(WETH, USDC, 500, loanAmount, address(exec))
+        });
+        // Native OUT: tokenOut == address(0). PoolManager pays raw ETH via
+        // `take`; `_balOf` credits it as `address(this).balance`.
+        ops[1] = Op({
+            target: V4_POOL_MANAGER,
+            value: 0,
+            amountIn: 0,
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: FLAG_V4_UNLOCK | FLAG_V4_EXACT_IN | FLAG_USE_PREV_RETURN,
+            srcToken: USDC,
+            outToken: address(0),
+            callData: abi.encode(USDC, address(0), uint24(500), int24(10), address(0))
+        });
+        // The op under test: wrap exactly the ETH the pool just paid.
+        ops[2] = Op({
+            target: address(0),
+            value: 0,
+            amountIn: 0,
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: FLAG_WETH_WRAP | FLAG_USE_PREV_RETURN,
+            srcToken: address(0),
+            outToken: WETH,
+            callData: ""
+        });
+
+        uint256 ethBefore = address(exec).balance;
+        _runArbExpectingLoss(ops, WETH, loanAmount);
+        // The wrap consumed the ETH the cycle produced; standing ETH is not a
+        // funding source (the native containment bucket allows a spend of 0).
+        assertEq(address(exec).balance, ethBefore, "standing ETH untouched");
     }
 }

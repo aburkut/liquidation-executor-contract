@@ -33,6 +33,13 @@ contract MockNativeRouter {
 contract MockWETH9 is MockERC20 {
     constructor() MockERC20("Wrapped Ether", "WETH", 18) {}
 
+    /// `FLAG_WETH_WRAP` calls `IWETH(weth).deposit{value: ...}()`; the real
+    /// WETH9 mints 1:1 against the ETH it receives. Without this the wrap op
+    /// would revert on a missing selector rather than on what is under test.
+    function deposit() external payable {
+        _mint(msg.sender, msg.value);
+    }
+
     function withdraw(uint256 amount) external {
         _burn(msg.sender, amount);
         (bool ok,) = msg.sender.call{value: amount}("");
@@ -122,10 +129,12 @@ contract ArbGenericSequenceTest is Test {
     // `internal constant`s are re-declared locally per the codebase's
     // existing test convention — see `ExecutorGenericSequenceTest`).
     uint32 internal constant FLAG_USE_FULL_BALANCE = 1 << 0;
+    uint32 internal constant FLAG_USE_PREV_RETURN = 1 << 1;
     uint32 internal constant FLAG_V4_UNLOCK = 1 << 2;
     uint32 internal constant FLAG_WETH_UNWRAP = 1 << 3;
     uint32 internal constant FLAG_V4_EXACT_IN = 1 << 4;
     uint32 internal constant FLAG_NATIVE_IN = 1 << 5;
+    uint32 internal constant FLAG_WETH_WRAP = 1 << 10;
 
     MockERC20 loan;
     MockERC20 mid;
@@ -402,5 +411,66 @@ contract ArbGenericSequenceTest is Test {
             vm.expectRevert(GenericSequenceLib.InvalidPlan.selector);
             harness.exec(libAddr, ops, address(loan), 0, 0, address(0));
         }
+    }
+
+    /// ══════════════════════════════════════════════════════════════════
+    /// `FLAG_WETH_WRAP` — shipped in #38 with NO test, and dead on arrival.
+    ///
+    /// MEASURED 2026-09-13: every `v2->v4` backrun closing through a native
+    /// V4 pool reverted in the builders' `eth_callBundle` with 0x21f24259 =
+    /// `InvalidPlan()` (opps arb_25965650 / arb_25965688, blocks 25965651 /
+    /// 25965689, 02:56 and 03:04 UTC).
+    ///
+    /// The cause is an ordering bug, not the V4 leg: the native-srcToken
+    /// admission at the top of the op loop admits only `FLAG_V4_UNLOCK` and
+    /// `FLAG_NATIVE_IN`, and it runs BEFORE the wrap branch — which itself
+    /// REQUIRES `srcToken == address(0)`. So a wrap op can never reach its
+    /// own branch. `FLAG_WETH_WRAP` is in `FLAG_KNOWN_MASK`, so the mask
+    /// check passes it; the admission is the only thing rejecting it.
+    ///
+    /// This is the bot's step 3 verbatim: a leg pays raw ETH, the next op
+    /// wraps exactly that much off `prevReturn`.
+    function test_runArb_wrapOp_afterNativeOutput_wrapsExactlyWhatArrived() public {
+        MockWETH9 weth9 = new MockWETH9();
+        MockNativeRouter nativeRouter = new MockNativeRouter();
+        vm.deal(address(nativeRouter), 11 ether);
+
+        weth9.mint(address(harness), 100e18);
+        uint256 standingEth = 3 ether;
+        vm.deal(address(harness), standingEth); // must survive untouched
+
+        Op[] memory ops = new Op[](2);
+        // op0: sell 10 WETH, receive 11 raw ETH (outToken == address(0)).
+        ops[0] = Op({
+            target: address(nativeRouter),
+            value: 0,
+            amountIn: 10e18,
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: 0,
+            srcToken: address(weth9),
+            outToken: address(0),
+            callData: abi.encodeWithSelector(MockNativeRouter.swap.selector, address(weth9), 10e18, 11 ether)
+        });
+        // op1: wrap exactly what op0 produced.
+        ops[1] = Op({
+            target: address(0),
+            value: 0,
+            amountIn: 0,
+            fromAmountPos: 0,
+            returnAmountPos: 0,
+            flags: FLAG_WETH_WRAP | FLAG_USE_PREV_RETURN,
+            srcToken: address(0),
+            outToken: address(weth9),
+            callData: ""
+        });
+
+        uint256 wethBefore = weth9.balanceOf(address(harness));
+        harness.exec(libAddr, ops, address(weth9), 100e18, 100e18, address(weth9));
+
+        // Wrapped precisely the ETH that arrived: -10 sold, +11 wrapped.
+        assertEq(weth9.balanceOf(address(harness)), wethBefore - 10e18 + 11 ether, "wrapped what arrived");
+        // The standing ETH is not a funding source for the wrap.
+        assertEq(address(harness).balance, standingEth, "standing ETH untouched");
     }
 }

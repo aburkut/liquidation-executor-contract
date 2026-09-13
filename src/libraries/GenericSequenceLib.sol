@@ -377,14 +377,31 @@ library GenericSequenceLib {
             if (op.value != 0) revert InvalidPlan();
             // Every op must declare the token it spends, so the per-srcToken cap
             // snapshots it. srcToken == address(0) means NATIVE ETH and is only
-            // meaningful on a native-aware op — a V4 unlock leg (whose callback
-            // settles raw ETH via `settle{value}`) or a FLAG_NATIVE_IN leg
-            // (`target.call{value: amount}`). On any other op shape 0x0 would
-            // just mean "unset" (and the direct-call branch would try to
-            // forceApprove address(0)), so it stays rejected. A
-            // FLAG_WETH_UNWRAP op can never ride this exemption: its branch
-            // requires srcToken == weth (nonzero) explicitly.
-            if (op.srcToken == address(0) && op.flags & (FLAG_V4_UNLOCK | FLAG_NATIVE_IN) == 0) revert InvalidPlan();
+            // meaningful on a native-aware op, of which there are THREE: a V4
+            // unlock leg (whose callback settles raw ETH via `settle{value}`),
+            // a FLAG_NATIVE_IN leg (`target.call{value: amount}`), and a
+            // FLAG_WETH_WRAP op (`IWETH(weth).deposit{value: amount}`). On any
+            // other op shape 0x0 would just mean "unset" (and the direct-call
+            // branch would try to forceApprove address(0)), so it stays
+            // rejected. A FLAG_WETH_UNWRAP op can never ride this exemption:
+            // its branch requires srcToken == weth (nonzero) explicitly.
+            //
+            // FIXED 2026-09-13: FLAG_WETH_WRAP was absent from this admission
+            // while its own branch REQUIRES srcToken == address(0), so every
+            // wrap op reverted HERE before ever reaching that branch. The flag
+            // was unexecutable from the day it shipped (#38) and no test
+            // covered it. Measured as 0x21f24259 (`InvalidPlan()`) in the
+            // builders' eth_callBundle on every native-output backrun
+            // (arb_25965650 / arb_25965688, blocks 25965651 / 25965689,
+            // 2026-09-13 02:56 and 03:04 UTC). This blocked EVERY native
+            // payout route, not only V4. Admitting the flag is safe: the wrap
+            // branch pins flags to exactly WRAP|PREV_RETURN, srcToken to 0 and
+            // outToken to weth; a WRAP|DIRECT combo still dies on the
+            // direct-call srcToken check; and the native containment bucket
+            // still bounds what the op may spend.
+            if (op.srcToken == address(0) && op.flags & (FLAG_V4_UNLOCK | FLAG_NATIVE_IN | FLAG_WETH_WRAP) == 0) {
+                revert InvalidPlan();
+            }
             // Only the direct-call routing flags are supported; any other bit is
             // rejected so a stale plan can never silently mis-execute.
             if (op.flags & ~FLAG_KNOWN_MASK != 0) revert InvalidPlan();
@@ -747,14 +764,21 @@ library GenericSequenceLib {
         // tx produced (collateralDelta for the collateral asset, 0 otherwise).
         //
         // NATIVE ETH (snapTok == address(0)): allowed is ZERO, and zero is the
-        // EXACT bound, not a conservative one. The only ETH this tx
-        // legitimately produces is FLAG_WETH_UNWRAP converting THIS tx's
-        // seized WETH collateral — and that credit lands AFTER the snapshot
-        // above, so a legit unwrap-funded native leg nets >= 0 against the
-        // snapshot and passes with allowed = 0. Any net dip below the
-        // snapshot is, by construction, STANDING/DONATED ETH leaving the
-        // contract (there is no other pre-snapshot ETH source: Aave
-        // collateral is always ERC20, never native) and must revert.
+        // EXACT bound, not a conservative one. This tx legitimately produces
+        // ETH in exactly two ways, and BOTH land AFTER the snapshot above:
+        // FLAG_WETH_UNWRAP converting THIS tx's seized WETH collateral, and an
+        // op whose outToken is address(0) being paid raw ETH — a native-output
+        // leg (V4 / Fluid / Ekubo), which `_balOf` credits as
+        // `address(this).balance`. FLAG_WETH_WRAP is the matching SINK,
+        // spending that same in-tx ETH back into WETH. So a legitimately
+        // funded native sequence nets >= 0 against the snapshot and passes
+        // with allowed = 0. Any net dip below the snapshot is, by
+        // construction, STANDING/DONATED ETH leaving the contract (there is no
+        // other pre-snapshot ETH source: Aave collateral is always ERC20,
+        // never native) and must revert. This cap is also what bounds a wrap
+        // op: its own `wrapAmount <= address(this).balance` check would
+        // otherwise let it reach standing ETH, but over-wrapping dips below
+        // the snapshot and trips CollateralOverspent here.
         // Deliberately NOT `collateralDelta` when collateralAsset == weth:
         // the WETH bucket already grants collateralDelta to the unwrap spend,
         // so a second collateralDelta grant on the ETH bucket would
