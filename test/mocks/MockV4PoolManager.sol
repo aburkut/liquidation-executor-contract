@@ -142,6 +142,18 @@ contract MockV4PoolManager is IPoolManager {
         int256 d = _delta[currency];
         require(d >= int256(amount), "MockV4PM: insufficient credit");
         _delta[currency] = d - int256(amount);
+        // Native output (currency == address(0)): the real PoolManager sends
+        // raw ETH. Calling an ERC20 method on address(0) would revert (no code
+        // there), so a native-OUT leg could not be covered by a unit test at
+        // all before this branch existed.
+        if (currency == address(0)) {
+            (bool ok,) = to.call{value: amount}("");
+            require(ok, "MockV4PM: eth send");
+            return;
+        }
         IERC20(currency).safeTransfer(to, amount);
     }
+
+    /// Funded by the test via `vm.deal` so a native-OUT leg has ETH to pay.
+    receive() external payable {}
 }
