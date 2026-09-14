@@ -25,6 +25,7 @@ import {SwapValidationLib} from "./libraries/SwapValidationLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
 import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
 import {SwapMode, SwapLeg, Op, Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "./types/SwapTypes.sol";
+import {LiquidationExecutorStorage} from "./storage/LiquidationExecutorStorage.sol";
 
 // V10+ refactor: IWETH interface moved into CoinbasePaymentLib
 // (the only consumer of `IWETH.withdraw` after `_payCoinbase` migrated).
@@ -36,9 +37,7 @@ import {SwapMode, SwapLeg, Op, Action, AaveV3Action, AaveV2Liquidation, MorphoLi
 /// on-chain fallback swaps via Uniswap V2, V3 (SwapRouter02), and V4 (PoolManager
 /// unlock-callback pattern, strict single-hop exact-input mode only).
 contract LiquidationExecutor is
-    Ownable2Step,
-    Pausable,
-    ReentrancyGuardTransient,
+    LiquidationExecutorStorage,
     IFlashLoanRecipient,
     IMorphoFlashLoanCallback,
     IUnlockCallback
@@ -228,42 +227,23 @@ contract LiquidationExecutor is
     // constants, decoder shapes, and bounds-check commentary.
 
     // ─── State ───────────────────────────────────────────────────────
+    // Persistent state lives in `LiquidationExecutorStorage`; this contract
+    // adds none.
     address public immutable weth;
     /// @dev Constructor-pinned (no setters): immutables read for free where a
     /// storage slot cost 2.1k cold on every liquidation / repayment / swap.
     address public immutable aavePool;
     address public immutable morphoBlue;
     address public immutable paraswapAugustusV6;
-    address public aaveV2LendingPool;
     /// @dev Immutable — canonical Uniswap V2 Router02 (mainnet
-    /// 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D). Auto-whitelisted in
-    /// allowedTargets at construction. Rotating requires redeployment.
+    /// 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D). Rotating requires an
+    /// upgrade.
     address public immutable uniV2Router;
     /// @dev Immutable — canonical Uniswap V3 SwapRouter02 (mainnet
     /// 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45). SwapRouter02 struct omits
     /// deadline; the executor enforces its own via the per-leg `leg.deadline`
     /// field on `SwapLeg`.
     address public immutable uniV3Router;
-
-    mapping(uint8 => address) public allowedFlashProviders;
-    mapping(address => bool) public allowedTargets;
-    /// @dev Owner-curated whitelist of V4 hook contracts. A V4 swap whose
-    /// PoolKey references a hook that is neither address(0) nor allow-listed
-    /// reverts with `InvalidPlan`. Hooks run arbitrary code inside
-    /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
-    /// hook has been audited is the intended default.
-    mapping(address => bool) public blockedV4Hooks;
-    /// @dev Operator allowlist. Several operator EOAs may drive ONE executor
-    /// so sends spread over independent nonce streams — one stuck tx then
-    /// cannot jam the others, and same-nonce bid fan-out does not have to
-    /// fight its own replacements. Seeded with the constructor's `operator_`.
-    /// Owner-curated: an operator key is hot, so it may only SPEND under the
-    /// containment caps, never move standing funds (`withdraw` is onlyOwner).
-    /// LAYOUT: this mapping occupies slot 10, which pushes the V4 arming
-    /// fields to slots 11/12 — matching `GenericSequenceLib`'s pinned
-    /// V4_PM_SLOT/V4_TOKENIN_SLOT. `test_v4SlotConstantsMatchLayout` is the
-    /// authority; do not reorder without re-running it.
-    mapping(address => bool) public operators;
     // V10+ refactor: the dedicated `allowedExtSwapTargets` allowlist
     // for Curve V1 / Balancer V2 pool targets was removed. Fund safety
     // for an operator-supplied pool does NOT rest on "zero balance" —

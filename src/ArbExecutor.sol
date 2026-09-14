@@ -16,6 +16,7 @@ import {UniswapLib} from "./libraries/UniswapLib.sol";
 import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
 import {Op} from "./types/SwapTypes.sol";
+import {ArbExecutorStorage} from "./storage/ArbExecutorStorage.sol";
 
 /// @title ArbExecutor
 /// @notice Flashloan-driven N-hop atomic arbitrage executor. Sister
@@ -72,14 +73,7 @@ library ArbTypes {
     }
 }
 
-contract ArbExecutor is
-    Ownable2Step,
-    Pausable,
-    ReentrancyGuardTransient,
-    IFlashLoanRecipient,
-    IMorphoFlashLoanCallback,
-    IUnlockCallback
-{
+contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoanCallback, IUnlockCallback {
     using SafeERC20 for IERC20;
 
     // ─── Errors ──────────────────────────────────────────────────────
@@ -156,47 +150,14 @@ contract ArbExecutor is
     address public immutable uniV3Router;
 
     // ─── Storage ─────────────────────────────────────────────────────
-    // Layout NOTE: the V4 arming fields MUST land at slots 11/12 to match
-    // GenericSequenceLib's pinned V4_PM_SLOT/V4_TOKENIN_SLOT constants (the
-    // lib sstores into them via DELEGATECALL). test_v4SlotConstantsMatchLayout
-    // is the authority — if it fails, adjust the field order/padding below.
+    // Persistent state lives in `ArbExecutorStorage`; this contract adds none.
     /// @dev The two flash providers are constructor-pinned and read on the
     /// hot path (provider dispatch, callback caller checks): immutables cost
     /// nothing to read where a storage slot costs 2.1k cold. The
     /// `allowedFlashProviders` mapping stays for the ABI (getter, deploy
-    /// read-backs) and is written once, in the constructor.
+    /// read-backs) and is written once, at initialization.
     address public immutable morphoBlue;
     address public immutable balancerVault;
-    mapping(uint8 => address) public allowedFlashProviders;
-    /// @dev Generic allowlist for Bebop settlement / future protocol
-    /// targets that need owner-curated trust. Uni V2/V3 routers are
-    /// constructor-immutable; Curve / Balancer pool addresses are
-    /// trusted from the bot (sanity-gated inside their libraries).
-    mapping(address => bool) public allowedTargets;
-    /// @dev V4 hook BLOCKlist (parity with LiquidationExecutor). Any hook is
-    /// accepted unless the owner has blocked it; `unlockCallback` re-checks.
-    ///
-    /// This used to be an ALLOWlist, curated one owner transaction per hook.
-    /// It was dropped for the reason the Curve/Balancer target allowlist was
-    /// dropped before it (see LiquidationExecutor's `allowedTargets` notes):
-    /// the bot is the trusted source of pools, and a hostile hook can only
-    /// make the transaction revert, not take standing funds. What bounds it:
-    /// v4-core caps a `beforeSwap` delta at the swap's own amount
-    /// (`HookDeltaExceedsSwapAmount`), `runV4UnlockSwap` reverts on any
-    /// delta with the wrong sign, `owedIn` is read from the delta rather
-    /// than the plan, and `runArb` ends in `checkProfitStrict`, which
-    /// refuses a cycle that ended below where it started whatever the
-    /// plan's floor says (a zero floor included). Same slot as before, so
-    /// the V4 arming fields stay at 11/12. The blocklist remains for a hook
-    /// that reverts on us on purpose (gas griefing), which no floor can see.
-    mapping(address => bool) public blockedV4Hooks;
-    /// @dev Operator allowlist. Several operator EOAs may drive ONE executor
-    /// so sends spread over independent nonce streams — one stuck tx then
-    /// cannot jam the others, and same-nonce bid fan-out does not have to
-    /// fight its own replacements. Seeded with the constructor's `operator_`.
-    /// Owner-curated: an operator key is hot, so it may only SPEND under the
-    /// containment caps, never move standing funds (`withdraw` is onlyOwner).
-    mapping(address => bool) public operators;
 
     // No per-transaction execution state lives in persistent storage any
     // more: the plan hash, the phase and the V4 arming words (`V4_PM_TSLOT`,
