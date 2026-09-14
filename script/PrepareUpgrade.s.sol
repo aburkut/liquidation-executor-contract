@@ -13,10 +13,15 @@ import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 /// switches to it. The script never upgrades anything itself: the ProxyAdmin
 /// belongs to the Safe.
 ///
-///   arb:          FOUNDRY_PROFILE=arb PROXY=0x… EXECUTOR_KIND=arb \
+///   arb:          FOUNDRY_PROFILE=arb PROXY=0x… EXECUTOR_KIND=arb PRIVATE_KEY=<deployer key> \
 ///                   forge script script/PrepareUpgrade.s.sol --rpc-url $RPC --broadcast
-///   liquidation:  PROXY=0x… EXECUTOR_KIND=liquidation \
+///   liquidation:  PROXY=0x… EXECUTOR_KIND=liquidation PRIVATE_KEY=<deployer key> \
 ///                   forge script script/PrepareUpgrade.s.sol --rpc-url $RPC --broadcast
+///
+/// Dry-run on a local fork first: `anvil --fork-url <rpc> --chain-id 31337`.
+/// Without `--chain-id`, a fork keeps chain id 1 and `forge script --broadcast`
+/// overwrites the tracked broadcast/<script>/1/run-latest.json records of the
+/// real mainnet deploys.
 ///
 /// Before the Safe signs: run the fork gate (test/fork/ProxyReplay.t.sol and
 /// the liquidation fork test) against the new implementation.
