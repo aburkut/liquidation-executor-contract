@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {ExecutorDeploy} from "./support/ExecutorDeploy.sol";
 import {Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../src/types/SwapTypes.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -217,7 +218,7 @@ contract ExecutorTest is Test {
 
         // The harness only adds transient-state pokes for the tests that
         // used to `vm.store` the (now transient) execution state.
-        executor = new LiquidationExecutorHarness(
+        executor = ExecutorDeploy.liquidationHarness(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -1483,6 +1484,7 @@ contract ExecutorTest is Test {
 
     function test_constructorRevertsOnZeroOwner() public {
         address[] memory targets = new address[](0);
+        // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
         new LiquidationExecutor(
             address(0),
@@ -1673,6 +1675,7 @@ contract ExecutorTest is Test {
     /// V10+: constructor rejects a zero Morpho address.
     function test_constructorRejectsZeroMorpho() public {
         address[] memory targets = new address[](0);
+        // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         new LiquidationExecutor(
             owner,
@@ -1695,7 +1698,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(augustus);
         targets[1] = address(morphoBlue);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -2038,7 +2041,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(bebop);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -2251,7 +2254,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(aaveV2Pool);
-        LiquidationExecutor exec2 = new LiquidationExecutor(
+        LiquidationExecutor exec2 = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -2284,7 +2287,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(aaveV2Pool);
-        LiquidationExecutor exec2 = new LiquidationExecutor(
+        LiquidationExecutor exec2 = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -3513,7 +3516,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -3610,7 +3613,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -3694,7 +3697,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -3786,7 +3789,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -3886,7 +3889,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -4211,7 +4214,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -4714,7 +4717,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -4838,7 +4841,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5000,7 +5003,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5057,7 +5060,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(emptyPool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5170,7 +5173,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5218,7 +5221,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5269,7 +5272,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5338,7 +5341,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -6358,6 +6361,7 @@ contract ExecutorTest is Test {
 
     function test_constructor_rejectsZeroV2Router() public {
         address[] memory targets = new address[](0);
+        // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         new LiquidationExecutor(
             owner,
@@ -6375,6 +6379,7 @@ contract ExecutorTest is Test {
 
     function test_constructor_rejectsZeroV3Router() public {
         address[] memory targets = new address[](0);
+        // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         new LiquidationExecutor(
             owner,
@@ -8826,7 +8831,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor fresh = new LiquidationExecutor(
+        LiquidationExecutor fresh = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -9244,7 +9249,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[4] = address(morphoBlue);
         targets[5] = address(evilPm);
 
-        evilExec = new LiquidationExecutor(
+        evilExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -9594,7 +9599,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(curveLeg2);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -9711,7 +9716,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(balLeg2);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -10515,7 +10520,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(curvePool);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -10594,7 +10599,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(balPool);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -10812,7 +10817,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(balWeth);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -10954,7 +10959,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[8] = address(curveLeg1);
         targets[9] = address(balLeg2);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),

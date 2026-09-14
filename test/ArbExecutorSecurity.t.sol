@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ExecutorDeploy} from "./support/ExecutorDeploy.sol";
 
 import {ArbExecutor, ArbTypes} from "../src/ArbExecutor.sol";
 import {Op} from "../src/types/SwapTypes.sol";
@@ -80,7 +81,7 @@ contract ArbExecutorSecurityTest is Test {
         allowed[0] = address(v4pm);
 
         vm.prank(ownerAddr);
-        exec = new ArbExecutor(
+        exec = ExecutorDeploy.arb(
             ownerAddr,
             operatorAddr,
             address(weth),

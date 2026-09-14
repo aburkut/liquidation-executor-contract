@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ExecutorDeploy} from "./support/ExecutorDeploy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {ArbExecutor, ArbTypes} from "../src/ArbExecutor.sol";
@@ -199,7 +200,7 @@ contract ArbExecutorForkTest is Test {
         targets[4] = FLUID_USDC_ETH_POOL;
         targets[5] = V4_UNIVERSAL_ROUTER;
 
-        exec = new ArbExecutor(
+        exec = ExecutorDeploy.arb(
             owner,
             operatorAddr,
             WETH,
