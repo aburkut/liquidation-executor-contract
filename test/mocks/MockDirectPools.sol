@@ -108,7 +108,7 @@ contract MockUniV2Pair {
     address public token1;
     uint112 private reserve0;
     uint112 private reserve1;
-    uint256 public feeNumerator; // surviving share of the input, out of 1000
+    uint256 public feeNumerator; // surviving share of the input, out of 10_000
 
     constructor(address _token0, address _token1, uint256 _feeNumerator) {
         token0 = _token0;
@@ -138,9 +138,12 @@ contract MockUniV2Pair {
         uint256 amount0In = balance0 > reserve0 - amount0Out ? balance0 - (reserve0 - amount0Out) : 0;
         uint256 amount1In = balance1 > reserve1 - amount1Out ? balance1 - (reserve1 - amount1Out) : 0;
         require(amount0In > 0 || amount1In > 0, "mock: no input");
-        uint256 adj0 = balance0 * 1000 - amount0In * (1000 - feeNumerator);
-        uint256 adj1 = balance1 * 1000 - amount1In * (1000 - feeNumerator);
-        require(adj0 * adj1 >= uint256(reserve0) * uint256(reserve1) * 1000 ** 2, "mock: K");
+        // Same scale as `DirectSwapLib`: ten-thousandths. The mock reproduces
+        // the pair's own invariant, so if the two scales drift apart the tests
+        // go green on a pair of numbers that never meet on chain.
+        uint256 adj0 = balance0 * 10_000 - amount0In * (10_000 - feeNumerator);
+        uint256 adj1 = balance1 * 10_000 - amount1In * (10_000 - feeNumerator);
+        require(adj0 * adj1 >= uint256(reserve0) * uint256(reserve1) * 10_000 ** 2, "mock: K");
         reserve0 = uint112(balance0);
         reserve1 = uint112(balance1);
     }

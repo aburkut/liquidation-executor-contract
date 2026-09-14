@@ -18,6 +18,7 @@ import {Test} from "forge-std/Test.sol";
 ///   op flags    0x82 = FLAG_USE_PREV_RETURN | FLAG_V2_DIRECT
 ///   srcToken    FLOKI -> outToken WETH
 ///   callData    64 bytes: zeroForOne = false, feeNumerator = 997
+///               (rewritten to 9970 on replay — see `_plan`)
 /// Direction and fee are both CORRECT for this pair, so neither explains the
 /// revert.
 contract ForkDirectV2KTest is Test {
@@ -46,21 +47,43 @@ contract ForkDirectV2KTest is Test {
         vm.createSelectFork(rpc, FORK_BLOCK);
     }
 
-    function _plan() internal view returns (bytes memory) {
+    /// The recorded plan carries `feeNumerator = 997` — the scale the bot used
+    /// when it built this bundle, and the scale the DEPLOYED library still
+    /// reads. This branch moves `DirectSwapLib` to TEN-THOUSANDTHS, where 997
+    /// would mean a 99.9% fee, so the replay has to choose which scale it is
+    /// speaking:
+    ///
+    ///   * against the deployed code  -> leave 997 (thousandths)
+    ///   * against this branch's code -> rewrite to 9970
+    ///
+    /// Rewriting unconditionally makes the deployed-code test revert
+    /// `DirectSwapInvalid` at the `feeNumerator > 1000` guard — an early exit
+    /// at ~277k gas instead of the ~711k it takes to reach the pair — so it
+    /// would still be red, just for the wrong reason. The word's position is
+    /// asserted rather than assumed.
+    function _plan(bool tenThousandths) internal view returns (bytes memory) {
         bytes memory cd = vm.envOr("K_CALLDATA", bytes(""));
         require(cd.length > 4, "K_CALLDATA not set");
+        // selector (4) + word 52 -> byte offset 4 + 52*32, last two bytes.
+        uint256 hi = 4 + 52 * 32 + 30;
+        require(uint8(cd[hi]) == 0x03 && uint8(cd[hi + 1]) == 0xe5, "fee word moved");
+        if (tenThousandths) {
+            cd[hi] = bytes1(uint8(9970 >> 8));
+            cd[hi + 1] = bytes1(uint8(9970 & 0xff));
+        }
         return cd;
     }
 
-    function _run() internal returns (bool ok, bytes memory ret) {
+    function _run(bool tenThousandths) internal returns (bool ok, bytes memory ret) {
         vm.deal(OPERATOR, 1 ether);
         vm.prank(OPERATOR);
-        (ok, ret) = EXEC.call{value: BID_WEI}(_plan());
+        (ok, ret) = EXEC.call{value: BID_WEI}(_plan(tenThousandths));
     }
 
     /// Does the revert reproduce against the code that is actually on chain?
     function test_fork_deployed_reverts_with_K() public forkOnly {
-        (bool ok, bytes memory ret) = _run();
+        // Deployed code still reads thousandths: replay the plan verbatim.
+        (bool ok, bytes memory ret) = _run(false);
         emit log_named_bytes("revert", ret);
         assertFalse(ok, "expected the deployed executor to revert");
         assertTrue(_isK(ret), "expected UniswapV2: K");
@@ -85,7 +108,8 @@ contract ForkDirectV2KTest is Test {
     /// had none.
     function test_fork_the_pair_accepts_the_swap_after_the_fix() public forkOnly {
         vm.etch(LIB, vm.getDeployedCode("GenericSequenceLib.sol:GenericSequenceLib"));
-        (bool ok, bytes memory ret) = _run();
+        // This branch reads ten-thousandths: the fee word is rescaled to match.
+        (bool ok, bytes memory ret) = _run(true);
         emit log_named_bytes("ret", ret);
         assertFalse(_isK(ret), "the pair must no longer reject on K");
         assertFalse(ok, "this particular cycle is unprofitable and must be refused");
