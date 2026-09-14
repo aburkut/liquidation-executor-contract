@@ -268,8 +268,8 @@ contract LiquidationExecutor is
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
-    // V10+: FlashProviderUpdated dropped — both flash providers
-    // (Balancer Vault, Morpho Blue) are now constructor-pinned.
+    // V10+: FlashProviderUpdated dropped — both flash providers are
+    // seeded once into proxy storage by LiquidationExecutorGenesis.
     event RepayExecuted(
         uint8 indexed protocolId, bytes32 indexed positionKeyHash, address indexed asset, uint256 amount
     );
@@ -373,17 +373,6 @@ contract LiquidationExecutor is
     // in SwapValidationLib and keep this contract under the EIP-170 limit.
 
     // ─── Constructor ─────────────────────────────────────────────────
-    /// @dev V10+: `morpho_` is constructor-pinned (was post-deploy
-    /// `configureMorpho` in V9). Both `morphoBlue` (liquidation target
-    /// for PROTOCOL_MORPHO_BLUE actions) and
-    /// `allowedFlashProviders[FLASH_PROVIDER_MORPHO]` (flash source +
-    /// the only authorized `onMorphoFlashLoan` caller) are initialized
-    /// atomically here. Eliminates the post-deploy "did you call
-    /// configureMorpho?" footgun. Future Morpho address rotation
-    /// requires a redeploy — acceptable because Morpho Blue's mainnet
-    /// address `0xBBBBBb…EEFFCb` has been stable since launch.
-    /// Same rationale applies to `balancerVault_` which was already
-    /// constructor-pinned.
     /// Immutables only. Persistent state belongs to the proxy and is seeded by
     /// `LiquidationExecutorGenesis` (which also takes the Balancer vault this
     /// contract never stored); this contract's own storage is never used, so
@@ -450,20 +439,17 @@ contract LiquidationExecutor is
     }
 
     // V10+ refactor: `setFlashProvider` and `configureMorpho` removed.
-    // Both flashloan providers (Balancer Vault + Morpho Blue) are now
-    // constructor-pinned. Both have stable mainnet addresses
-    // (`0xBA12…BF2C8`, `0xBBBB…EEFFCb`) that have not rotated since
-    // launch. Future rotation requires a redeploy — acceptable cost
-    // for the simpler surface (one source of truth, no post-deploy
-    // "did you call configureMorpho?" footgun, no rotation-race
-    // hygiene around the dual `morphoBlue` / `allowedFlashProviders`
-    // slots).
+    // Morpho is an implementation immutable; the Balancer Vault address
+    // and both `allowedFlashProviders` entries are seeded once into
+    // proxy storage by `LiquidationExecutorGenesis`. Rotating either
+    // provider is an upgrade (new implementation via the ProxyAdmin),
+    // not a redeploy.
 
     /// @notice V10 audit fix — symmetry with ArbExecutor. Owner-curated
     /// post-deploy admin for the `allowedTargets` allowlist (Bebop
-    /// settlement targets, supplementary protocol addresses). Constructor
-    /// seeds the canonical set; this function lets the owner extend or
-    /// revoke without redeploying.
+    /// settlement targets, supplementary protocol addresses).
+    /// `LiquidationExecutorGenesis` seeds the canonical set; this function
+    /// lets the owner extend or revoke it afterward.
     function setAllowedTarget(address target, bool allowed) external onlyOwner {
         if (target == address(0)) revert ZeroAddress();
         allowedTargets[target] = allowed;
@@ -699,9 +685,9 @@ contract LiquidationExecutor is
                 }
                 // Being allowlisted is not enough for a target that can move
                 // value WITHOUT an allowance, or mint balance the containment
-                // cap then reads as income. AUDITED 2026-09-08: the
-                // constructor seeds the lending pools and the vault into
-                // `allowedTargets` because the liquidation and flash paths
+                // cap then reads as income. AUDITED 2026-09-08:
+                // LiquidationExecutorGenesis seeds the lending pools and the
+                // vault into `allowedTargets` because the liquidation and flash paths
                 // re-read that mapping as their own kill-switch — which also
                 // handed a generic op their whole function surface, with
                 // operator-authored calldata. Two shapes escape the cap
@@ -1714,8 +1700,8 @@ contract LiquidationExecutor is
                 action.collateralAsset, action.debtAsset, action.user, action.debtToCover, action.receiveAToken
             );
         // Aave pulls min(debtToCover, closeFactor * debt), so a deliberately
-        // padded cover amount leaves the difference standing to a target the
-        // constructor also seeds into `allowedTargets`.
+        // padded cover amount leaves the difference standing to a target
+        // LiquidationExecutorGenesis also seeds into `allowedTargets`.
         AllowanceLib.clear(action.debtAsset, pool);
     }
 

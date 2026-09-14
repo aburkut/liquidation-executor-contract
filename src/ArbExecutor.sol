@@ -106,7 +106,8 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         bytes32 indexed planHash, address indexed loanToken, uint256 realizedProfit, uint256 coinbasePaid
     );
     event AllowedTargetUpdated(address indexed target, bool allowed);
-    // V10+: FlashProviderUpdated dropped — both providers constructor-pinned.
+    // V10+: FlashProviderUpdated dropped — both providers are seeded
+    // once into proxy storage by ArbExecutorGenesis.
     event Withdraw(address indexed token, address indexed to, uint256 amount);
     event V4HookBlockedUpdated(address indexed hook, bool blocked);
     event OperatorUpdated(address indexed operator, bool allowed);
@@ -166,11 +167,6 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     // gone with them — nothing raw-`sstore`s into this contract.
 
     // ─── Constructor ─────────────────────────────────────────────────
-    /// @dev Both flash providers (Balancer Vault + Morpho Blue) are
-    /// constructor-pinned. Mainnet addresses (`0xBA12…BF2C8`,
-    /// `0xBBBB…EEFFCb`) have been stable since launch; rotation
-    /// requires redeploy. Eliminates the "did you call
-    /// configureMorpho?" post-deploy footgun.
     /// Immutables only. Persistent state belongs to the proxy and is seeded by
     /// `ArbExecutorGenesis`; this contract's own storage is never used, so it
     /// is left ownerless and its initializers are disabled.
@@ -207,8 +203,9 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
 
     // ─── Owner: admin ────────────────────────────────────────────────
     // V10+: `configureMorpho` and `setFlashProvider` removed. Both
-    // flash providers are constructor-pinned; rotation requires
-    // redeploy.
+    // flash providers are seeded once into proxy storage by
+    // ArbExecutorGenesis; rotating either is an upgrade (new
+    // implementation via the ProxyAdmin), not a redeploy.
 
     function setAllowedTarget(address target, bool allowed) external onlyOwner {
         if (target == address(0)) revert ZeroAddress();

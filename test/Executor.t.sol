@@ -1661,14 +1661,15 @@ contract ExecutorTest is Test {
         executor.onMorphoFlashLoan(LOAN_AMOUNT, planBytes);
     }
 
-    /// V10+: Morpho is now constructor-pinned. Verify both slots
-    /// (morphoBlue and the FLASH_PROVIDER_MORPHO entry) are populated
-    /// by the constructor without any post-deploy setter call.
+    /// V10+: `morphoBlue` is a constructor immutable; the
+    /// FLASH_PROVIDER_MORPHO entry is seeded once into proxy storage by
+    /// LiquidationExecutorGenesis. Verify both without any post-deploy
+    /// setter call.
     function test_constructorPinsBothMorphoSlots() public {
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
         assertEq(executor.morphoBlue(), address(morphoBlue));
         assertEq(executor.allowedFlashProviders(morphoFlashId), address(morphoBlue));
-        // morphoBlue is also auto-added to allowedTargets by the constructor.
+        // morphoBlue is also auto-added to allowedTargets by LiquidationExecutorGenesis.
         assertTrue(executor.allowedTargets(address(morphoBlue)));
     }
 
@@ -2237,9 +2238,10 @@ contract ExecutorTest is Test {
         loanToken.mint(address(liarVault), 100_000e18);
         collateralToken.mint(address(liarVault), 100_000e18);
 
-        // V10+: Balancer Vault is constructor-pinned, no post-deploy
-        // setter to swap in a liar. Deploy a fresh executor with the
-        // liar as the Balancer slot directly.
+        // V10+: the Balancer Vault address is seeded once into proxy
+        // storage by LiquidationExecutorGenesis, no post-deploy setter
+        // to swap in a liar. Deploy a fresh executor with the liar as
+        // the Balancer slot directly.
         address[] memory targets = new address[](3);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
@@ -2378,11 +2380,13 @@ contract ExecutorTest is Test {
         executor.setAaveV2LendingPool(address(0));
     }
 
-    // V10+: `setFlashProvider` and `configureMorpho` removed. Both
-    // flash providers (Balancer Vault + Morpho Blue) are now
-    // constructor-pinned. The dedicated setter-shape tests
-    // (`test_setFlashProvider*`, `test_configureMorpho*`) were
-    // deleted alongside the functions they exercised.
+    // V10+: `setFlashProvider` and `configureMorpho` removed. Morpho is
+    // an implementation immutable; the Balancer Vault address and both
+    // `allowedFlashProviders` entries are seeded once into proxy
+    // storage by LiquidationExecutorGenesis. The dedicated
+    // setter-shape tests (`test_setFlashProvider*`,
+    // `test_configureMorpho*`) were deleted alongside the functions
+    // they exercised.
 
     function test_setAaveV2LendingPoolRejectsNonWhitelisted() public {
         address notWhitelisted = address(0xDEAD2);
