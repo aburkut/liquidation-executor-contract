@@ -2,8 +2,11 @@
 pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
+import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
 import {ArbExecutor} from "../src/ArbExecutor.sol";
-import {ArbExecutorSeeded} from "../src/deploy/SeededExecutors.sol";
+import {ArbExecutorGenesis} from "../src/proxy/ArbExecutorGenesis.sol";
+import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 
 /// @title ArbExecutor deploy
 /// @notice Deploys `ArbExecutor` fully configured. Nothing needs to be called
@@ -190,27 +193,24 @@ contract DeployArb is Script {
         // PRIVATE_KEY and falls back to Foundry's default sender, so the
         // documented invocation simulated fine and then refused to broadcast.
         vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
-        address[] memory operators = new address[](2);
-        operators[0] = OPERATOR_2;
-        operators[1] = OPERATOR_3;
+        address[] memory operators = new address[](3);
+        operators[0] = OPERATOR;
+        operators[1] = OPERATOR_2;
+        operators[2] = OPERATOR_3;
         // V4 hooks are accepted by default now (blocklist, not allowlist);
         // nothing to seed. The two hooks that used to be allowed here are
         // kept as constants only for the read-back below.
         address[] memory hooks = new address[](0);
-        ArbExecutor exec = new ArbExecutorSeeded(
+        ArbExecutor impl =
+            new ArbExecutor(WETH, BALANCER_VAULT, MORPHO_BLUE, PARASWAP_AUGUSTUS, UNI_V2_ROUTER, UNI_V3_ROUTER);
+        ArbExecutorGenesis genesis = new ArbExecutorGenesis();
+        ExecutorProxy proxy = new ExecutorProxy(
+            address(genesis),
             OWNER,
-            OPERATOR,
-            WETH,
-            BALANCER_VAULT,
-            MORPHO_BLUE,
-            PARASWAP_AUGUSTUS,
-            UNI_V2_ROUTER,
-            UNI_V3_ROUTER,
-            allowed,
-            operators,
-            hooks
+            abi.encodeCall(ArbExecutorGenesis.initialize, (OWNER, operators, allowed, hooks, address(impl)))
         );
         vm.stopBroadcast();
+        ArbExecutor exec = ArbExecutor(payable(address(proxy)));
 
         // ─── Readback: prove nothing is left to configure ────────────
         // Every venue the bot can route through must answer true HERE. If one
@@ -233,9 +233,23 @@ contract DeployArb is Script {
         require(
             !exec.blockedV4Hooks(LAUNCH_HOOK) && !exec.blockedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks open"
         );
+        require(
+            address(uint160(uint256(vm.load(address(proxy), ERC1967Utils.IMPLEMENTATION_SLOT)))) == address(impl),
+            "readback: implementation"
+        );
+        ProxyAdmin admin = ProxyAdmin(address(uint160(uint256(vm.load(address(proxy), ERC1967Utils.ADMIN_SLOT)))));
+        require(admin.owner() == OWNER, "readback: ProxyAdmin owner");
+        require(exec.weth() == WETH, "readback: weth");
+        require(exec.balancerVault() == BALANCER_VAULT, "readback: balancer vault immutable");
+        require(exec.morphoBlue() == MORPHO_BLUE, "readback: morpho immutable");
+        require(exec.allowedFlashProviders(2) == BALANCER_VAULT, "readback: balancer flash provider");
+        require(exec.allowedFlashProviders(3) == MORPHO_BLUE, "readback: morpho flash provider");
+        require(!exec.allowedTargets(MORPHO_BLUE), "readback: Morpho must NOT be a target");
         require(exec.owner() == OWNER, "readback: owner");
 
-        console2.log("ArbExecutor:", address(exec));
+        console2.log("ArbExecutor proxy (permanent address):", address(exec));
+        console2.log("implementation:", address(impl));
+        console2.log("ProxyAdmin (upgrade target for the Safe):", address(admin));
         console2.log("allowlisted targets:", allowed.length + 4);
         return address(exec);
     }
