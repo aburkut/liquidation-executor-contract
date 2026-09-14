@@ -1,0 +1,44 @@
+[
+  {
+    "slot": "0",
+    "offset": 0,
+    "label": "_owner",
+    "type": "address"
+  },
+  {
+    "slot": "1",
+    "offset": 0,
+    "label": "_pendingOwner",
+    "type": "address"
+  },
+  {
+    "slot": "1",
+    "offset": 20,
+    "label": "_paused",
+    "type": "bool"
+  },
+  {
+    "slot": "2",
+    "offset": 0,
+    "label": "allowedFlashProviders",
+    "type": "mapping(uint8 => address)"
+  },
+  {
+    "slot": "3",
+    "offset": 0,
+    "label": "allowedTargets",
+    "type": "mapping(address => bool)"
+  },
+  {
+    "slot": "4",
+    "offset": 0,
+    "label": "blockedV4Hooks",
+    "type": "mapping(address => bool)"
+  },
+  {
+    "slot": "5",
+    "offset": 0,
+    "label": "operators",
+    "type": "mapping(address => bool)"
+  }
+]

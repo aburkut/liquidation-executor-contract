@@ -45,5 +45,8 @@ jobs:
       - name: Check executor sizes against the EIP-170 threshold
         run: script/check_sizes.sh 24200
 
+      - name: Check executor storage layouts against the committed snapshots
+        run: script/check_layout.sh
+
       - name: Run Forge tests
         run: forge test -vvv
