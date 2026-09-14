@@ -384,29 +384,25 @@ contract LiquidationExecutor is
     /// address `0xBBBBBb…EEFFCb` has been stable since launch.
     /// Same rationale applies to `balancerVault_` which was already
     /// constructor-pinned.
+    /// Immutables only. Persistent state belongs to the proxy and is seeded by
+    /// `LiquidationExecutorGenesis` (which also takes the Balancer vault this
+    /// contract never stored); this contract's own storage is never used, so
+    /// it is left ownerless and its initializers are disabled.
     constructor(
-        address owner_,
-        address operator_,
         address weth_,
         address aavePool_,
-        address balancerVault_,
         address morpho_,
         address paraswapAugustus_,
         address uniV2Router_,
-        address uniV3Router_,
-        address[] memory allowedTargets_
-    ) Ownable(owner_) {
-        if (operator_ == address(0)) revert ZeroAddress();
+        address uniV3Router_
+    ) Ownable(address(0xdEaD)) {
         if (weth_ == address(0)) revert ZeroAddress();
         if (aavePool_ == address(0)) revert ZeroAddress();
-        if (balancerVault_ == address(0)) revert ZeroAddress();
         if (morpho_ == address(0)) revert ZeroAddress();
         if (paraswapAugustus_ == address(0)) revert ZeroAddress();
         if (uniV2Router_ == address(0)) revert ZeroAddress();
         if (uniV3Router_ == address(0)) revert ZeroAddress();
 
-        operators[operator_] = true;
-        emit OperatorUpdated(operator_, true);
         weth = weth_;
         uniV2Router = uniV2Router_;
         uniV3Router = uniV3Router_;
@@ -414,20 +410,7 @@ contract LiquidationExecutor is
         paraswapAugustusV6 = paraswapAugustus_;
         morphoBlue = morpho_;
 
-        allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
-        allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho_;
-
-        allowedTargets[aavePool_] = true;
-        allowedTargets[balancerVault_] = true;
-        allowedTargets[morpho_] = true;
-        allowedTargets[paraswapAugustus_] = true;
-        allowedTargets[uniV2Router_] = true;
-        allowedTargets[uniV3Router_] = true;
-
-        for (uint256 i = 0; i < allowedTargets_.length; i++) {
-            if (allowedTargets_[i] == address(0)) revert ZeroAddress();
-            allowedTargets[allowedTargets_[i]] = true;
-        }
+        _disableInitializers();
     }
 
     // ─── Modifiers ───────────────────────────────────────────────────

@@ -11,6 +11,8 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
+import {LiquidationExecutorGenesis} from "../src/proxy/LiquidationExecutorGenesis.sol";
+import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 import {UniswapLib} from "../src/libraries/UniswapLib.sol";
 import {SwapMode, SwapLeg, Op} from "../src/types/SwapTypes.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
@@ -1483,21 +1485,19 @@ contract ExecutorTest is Test {
     }
 
     function test_constructorRevertsOnZeroOwner() public {
-        address[] memory targets = new address[](0);
-        // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new LiquidationExecutor(
-            address(0),
-            address(1),
-            address(2),
-            address(3),
-            address(4),
-            address(5),
-            address(6),
-            address(7),
-            address(8),
-            targets
+        // Ownership lives in the proxy: Genesis refuses a zero owner while the
+        // proxy is being constructed.
+        LiquidationExecutor impl =
+            new LiquidationExecutor(address(2), address(3), address(5), address(6), address(7), address(8));
+        LiquidationExecutorGenesis genesis = new LiquidationExecutorGenesis();
+        address[] memory operators = new address[](1);
+        operators[0] = address(1);
+        bytes memory init = abi.encodeCall(
+            LiquidationExecutorGenesis.initialize,
+            (address(0), operators, new address[](0), new address[](0), address(4), address(0), address(impl))
         );
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
+        new ExecutorProxy(address(genesis), address(9), init);
     }
 
     function test_rescueERC20() public {
@@ -1674,20 +1674,10 @@ contract ExecutorTest is Test {
 
     /// V10+: constructor rejects a zero Morpho address.
     function test_constructorRejectsZeroMorpho() public {
-        address[] memory targets = new address[](0);
         // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(aavePool),
-            address(balancerVault),
-            address(0), // morpho_ == 0 → revert
-            address(augustus),
-            address(uniV2Mock),
-            address(uniV3Mock),
-            targets
+            address(mockWeth), address(aavePool), address(0), address(augustus), address(uniV2Mock), address(uniV3Mock)
         );
     }
 
@@ -6360,38 +6350,18 @@ contract ExecutorTest is Test {
     }
 
     function test_constructor_rejectsZeroV2Router() public {
-        address[] memory targets = new address[](0);
         // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(aavePool),
-            address(balancerVault),
-            address(morphoBlue),
-            address(augustus),
-            address(0),
-            address(uniV3Mock),
-            targets
+            address(mockWeth), address(aavePool), address(morphoBlue), address(augustus), address(0), address(uniV3Mock)
         );
     }
 
     function test_constructor_rejectsZeroV3Router() public {
-        address[] memory targets = new address[](0);
         // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(aavePool),
-            address(balancerVault),
-            address(morphoBlue),
-            address(augustus),
-            address(uniV2Mock),
-            address(0),
-            targets
+            address(mockWeth), address(aavePool), address(morphoBlue), address(augustus), address(uniV2Mock), address(0)
         );
     }
 

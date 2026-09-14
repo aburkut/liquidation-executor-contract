@@ -37,15 +37,12 @@ contract ExecutorProxyTest is Test {
         out[0] = a;
     }
 
-    /// Changes shape in Task 5 (immutables-only constructor).
     function _arbImpl() internal returns (ArbExecutor) {
-        return new ArbExecutor(owner, operator, weth, balancer, morpho, paraswap, v2, v3, new address[](0));
+        return new ArbExecutor(weth, balancer, morpho, paraswap, v2, v3);
     }
 
-    /// Changes shape in Task 5 (immutables-only constructor).
     function _liqImpl() internal returns (LiquidationExecutor) {
-        return
-            new LiquidationExecutor(owner, operator, weth, aave, balancer, morpho, paraswap, v2, v3, new address[](0));
+        return new LiquidationExecutor(weth, aave, morpho, paraswap, v2, v3);
     }
 
     function _arb() internal returns (ArbExecutor) {
@@ -90,6 +87,18 @@ contract ExecutorProxyTest is Test {
         ArbExecutorGenesis genesis = new ArbExecutorGenesis();
         vm.expectRevert(Initializable.InvalidInitialization.selector);
         genesis.initialize(owner, _one(operator), new address[](0), new address[](0), impl);
+    }
+
+    function test_implementationsAreOwnerlessAndLocked() public {
+        ArbExecutor arbImpl = _arbImpl();
+        assertEq(arbImpl.owner(), address(0xdEaD), "an implementation's own storage is never used");
+        assertFalse(arbImpl.operators(operator));
+        assertFalse(arbImpl.allowedTargets(balancer));
+
+        LiquidationExecutor liqImpl = _liqImpl();
+        assertEq(liqImpl.owner(), address(0xdEaD));
+        assertFalse(liqImpl.operators(operator));
+        assertFalse(liqImpl.allowedTargets(aave));
     }
 
     function test_arbGenesis_refusesAZeroOwner() public {

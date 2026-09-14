@@ -171,19 +171,17 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     /// `0xBBBB…EEFFCb`) have been stable since launch; rotation
     /// requires redeploy. Eliminates the "did you call
     /// configureMorpho?" post-deploy footgun.
+    /// Immutables only. Persistent state belongs to the proxy and is seeded by
+    /// `ArbExecutorGenesis`; this contract's own storage is never used, so it
+    /// is left ownerless and its initializers are disabled.
     constructor(
-        address owner_,
-        address operator_,
         address weth_,
         address balancerVault_,
         address morpho_,
         address paraswapAugustus_,
         address uniV2Router_,
-        address uniV3Router_,
-        address[] memory allowedTargets_
-    ) Ownable(owner_) {
-        if (owner_ == address(0)) revert ZeroAddress();
-        if (operator_ == address(0)) revert ZeroAddress();
+        address uniV3Router_
+    ) Ownable(address(0xdEaD)) {
         if (weth_ == address(0)) revert ZeroAddress();
         if (balancerVault_ == address(0)) revert ZeroAddress();
         if (morpho_ == address(0)) revert ZeroAddress();
@@ -191,8 +189,6 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         if (uniV2Router_ == address(0)) revert ZeroAddress();
         if (uniV3Router_ == address(0)) revert ZeroAddress();
 
-        operators[operator_] = true;
-        emit OperatorUpdated(operator_, true);
         weth = weth_;
         paraswapAugustusV6 = paraswapAugustus_;
         uniV2Router = uniV2Router_;
@@ -200,30 +196,7 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         morphoBlue = morpho_;
         balancerVault = balancerVault_;
 
-        allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
-        allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho_;
-        // Seed allowedTargets with the routers + Paraswap so Bebop
-        // dispatch can re-check `allowedTargets[bebopTarget]` if used.
-        // Balancer Vault is ALSO seeded here because it doubles as a
-        // legitimate swap venue in the cross-venue routing (not just a
-        // flash-loan source), so a generic `Op` may legitimately target it.
-        // Morpho Blue is deliberately NOT seeded here (audit fix, N-Task 5
-        // fix 1): the flash-repay path never needs `allowedTargets` — it is
-        // reached exclusively via `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`,
-        // and repayment is a `forceApprove(msg.sender=Morpho, flashRepay)`
-        // that bypasses this mapping entirely. Seeding it here would only
-        // expose Morpho Blue's full function surface as a generic `Op`
-        // target, contradicting this contract's own "no liquidation
-        // actions" scope (see the contract NatSpec above).
-        allowedTargets[balancerVault_] = true;
-        allowedTargets[paraswapAugustus_] = true;
-        allowedTargets[uniV2Router_] = true;
-        allowedTargets[uniV3Router_] = true;
-
-        for (uint256 i = 0; i < allowedTargets_.length; ++i) {
-            if (allowedTargets_[i] == address(0)) revert ZeroAddress();
-            allowedTargets[allowedTargets_[i]] = true;
-        }
+        _disableInitializers();
     }
 
     // ─── Modifiers ───────────────────────────────────────────────────

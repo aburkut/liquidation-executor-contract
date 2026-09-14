@@ -31,15 +31,7 @@ library ExecutorDeploy {
         address[] memory allowedTargets_
     ) internal returns (ArbExecutor) {
         ArbExecutor impl = new ArbExecutor(
-            owner_,
-            operator_,
-            weth_,
-            balancerVault_,
-            morpho_,
-            paraswapAugustus_,
-            uniV2Router_,
-            uniV3Router_,
-            new address[](0)
+            weth_, balancerVault_, morpho_, paraswapAugustus_, uniV2Router_, uniV3Router_
         );
         return arbProxy(address(impl), owner_, operator_, allowedTargets_);
     }
@@ -67,16 +59,7 @@ library ExecutorDeploy {
         address[] memory allowedTargets_
     ) internal returns (LiquidationExecutor) {
         LiquidationExecutor impl = new LiquidationExecutor(
-            owner_,
-            operator_,
-            weth_,
-            aavePool_,
-            balancerVault_,
-            morpho_,
-            paraswapAugustus_,
-            uniV2Router_,
-            uniV3Router_,
-            new address[](0)
+            weth_, aavePool_, morpho_, paraswapAugustus_, uniV2Router_, uniV3Router_
         );
         return LiquidationExecutor(
             payable(liquidationProxy(address(impl), owner_, operator_, balancerVault_, allowedTargets_))
@@ -96,16 +79,7 @@ library ExecutorDeploy {
         address[] memory allowedTargets_
     ) internal returns (LiquidationExecutorHarness) {
         LiquidationExecutorHarness impl = new LiquidationExecutorHarness(
-            owner_,
-            operator_,
-            weth_,
-            aavePool_,
-            balancerVault_,
-            morpho_,
-            paraswapAugustus_,
-            uniV2Router_,
-            uniV3Router_,
-            new address[](0)
+            weth_, aavePool_, morpho_, paraswapAugustus_, uniV2Router_, uniV3Router_
         );
         return LiquidationExecutorHarness(
             payable(liquidationProxy(address(impl), owner_, operator_, balancerVault_, allowedTargets_))
