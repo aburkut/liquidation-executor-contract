@@ -175,10 +175,15 @@ A merged contract PR is not a reason to deploy. Each contract PR states
 "needs upgrade: yes/no" and what it unblocks; upgrades are batched, go out on
 the owner's word, and only after the fork gate is green.
 
-## Open items for the implementation plan
+## Decisions settled after review
 
-- Exact `Genesis` parameter encoding for `LiquidationExecutor`'s Aave V2 pool
-  and Fluid pool seeding (today split between `DeployArb.s.sol` and
-  `SeededExecutors`).
-- Which recorded production plans the fork gate replays (at least one arb
-  plan with a V3 callback and one liquidation plan with a WETH unwrap).
+- **Genesis seeding.** The deploy scripts build exactly the lists they build
+  today (base targets, extra targets, Fluid pools, operators, blocked hooks)
+  and pass them to `Genesis.initialize` in one call; `aaveV2Pool == address(0)`
+  means none. Seeding moves from the constructor, `SeededExecutors` and
+  `DeployArb.s.sol` into that one call; the seeded values do not change.
+- **Fork-gate replays.** Three recorded production transactions, taken from
+  landing logs: an arb landing with a V3 pool callback (a pool calls the proxy),
+  a liquidation with a WETH unwrap and a coinbase payment (ETH arrives through
+  the proxy), and the FLOKI `UniswapV2: K` revert already pinned by
+  `ForkDirectV2K` (proves #45 and #46 on the proxy).
