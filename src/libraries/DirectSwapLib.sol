@@ -130,7 +130,7 @@ library DirectSwapLib {
     /// `data` = `abi.encode(bool zeroForOne, uint16 feeNumerator)` where the
     /// numerator is the surviving share of the input out of 10_000 — the same
     /// `fee_numerator` the bot's V2 fork table quotes with (9970 Uniswap /
-    /// Sushi, 998 Pancake V2), so quote and execution agree to the wei.
+    /// Sushi, 9975 Pancake V2), so quote and execution agree to the wei.
     /// @dev Prices from what the pair ACTUALLY RECEIVED, not from `amount`.
     ///
     /// A fee-on-transfer token delivers less than it is sent, so the reserve
@@ -168,7 +168,8 @@ library DirectSwapLib {
         // 25971664, c1e0917f 25971659, d9cbacb9 25971649, all gas ~684k).
         // The same route landed 8 times the day before through the ROUTER
         // path. Direction and fee in those plans were both correct
-        // (zeroForOne false, feeNumerator 997 for a Uniswap V2 pair), and
+        // (zeroForOne false, feeNumerator 997 for a Uniswap V2 pair — the
+        // per-1000 scale of the time, 9970 today), and
         // the pair held no unsynced surplus — the stale reserves were the
         // only thing left.
         //

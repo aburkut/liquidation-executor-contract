@@ -1325,7 +1325,7 @@ contract ArbExecutorTest is Test {
             0,
             GenericSequenceLib.FLAG_USE_PREV_RETURN
         );
-        ops[1].callData = abi.encode(false, uint16(998));
+        ops[1].callData = abi.encode(false, uint16(9975));
         bytes memory packed = _pack(3, 0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa, 1_000e18, 100e18, ops);
         assertEq(packed.length, 71 + 82 + 21 + 82 + 3, "layout: header + op + V3 params + op + V2 params");
         // Generated with `cast abi-encode --packed`, field by field:
@@ -1335,7 +1335,7 @@ contract ArbExecutorTest is Test {
             packed,
             hex"0103aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000000000003635c9adc5dea0000000000000000000056bc75e2d631000000000000000000000000000000000000002"
             hex"11111111111111111111111111111111111111110100000000000000003635c9adc5dea0000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0100000000000000000000000000000001000276a4"
-            hex"222222222222222222222222222222222222222200820000000000000000000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0003e6",
+            hex"222222222222222222222222222222222222222200820000000000000000000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0026f7",
             "packed vector"
         );
     }
