@@ -20,6 +20,14 @@ optimizer = true
 # deployed contract stays under EIP-170 (24,576 bytes).
 optimizer_runs = 1
 via_ir = true
+# Emit storageLayout in build artifacts so `forge inspect <Contract>
+# storageLayout` works under the profile CI actually builds with —
+# `script/check_layout.sh` (the authoritative offline check that V4 arming
+# fields, GenericSequenceLib's hardcoded V4_PM_SLOT/V4_TOKENIN_SLOT, land at
+# the right slots in both LiquidationExecutor and ArbExecutor) runs `forge
+# inspect` against whatever profile last built. Output selection is not part
+# of the solc metadata hash, so this does not change deployed bytecode.
+extra_output = ["storageLayout"]
 
 # ArbExecutor and its libraries are deployed from this profile
 # (`FOUNDRY_PROFILE=arb forge script script/DeployArb.s.sol`): runtime gas
