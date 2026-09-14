@@ -20,6 +20,7 @@ optimizer = true
 # deployed contract stays under EIP-170 (24,576 bytes).
 optimizer_runs = 1
 via_ir = true
+fs_permissions = [{ access = "read", path = "./test/fixtures" }]
 # Emit storageLayout in build artifacts so `script/check_layout.sh` runs after
 # CI's default-profile build. That script compares the PERSISTENT storage
 # layout of the executors (and, later, their Genesis contracts) with the

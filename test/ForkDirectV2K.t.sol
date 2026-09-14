@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ArbExecutor} from "../src/ArbExecutor.sol";
+import {ProxyEtch} from "./support/ProxyEtch.sol";
 
 /// Replays the exact `execute` calldata that reverted `UniswapV2: K` in the
 /// builders' simulations, against the REAL deployed executor at the real
@@ -120,6 +122,26 @@ contract ForkDirectV2KTest is Test {
         assertEq(needed, 0.25 ether, "the flash principal");
         assertEq(got, 249_869_766_973_738_772, "what the cycle returned");
         assertLt(got, needed);
+    }
+
+    /// The same plan through the migration's proxy: proxy code at the live
+    /// address, delegating to a new implementation, which carries #45 and #46.
+    /// `K_CALLDATA` is not in the repository; without it this skips.
+    function test_fork_the_pair_accepts_the_swap_through_the_proxy() public forkOnly {
+        if (vm.envOr("K_CALLDATA", bytes("")).length == 0) {
+            vm.skip(true);
+            return;
+        }
+        ArbExecutor impl = ProxyEtch.arbImplementationLike(EXEC);
+        ProxyEtch.etchArbProxy(EXEC, address(impl));
+        (bool ok, bytes memory ret) = _run(true);
+        emit log_named_bytes("ret", ret);
+        assertFalse(_isK(ret), "the pair must no longer reject on K");
+        assertFalse(ok, "this particular cycle is unprofitable and must be refused");
+        assertEq(bytes4(ret), bytes4(0x75ce3dc6), "expected the flash-repay gate");
+        (uint256 got, uint256 needed) = abi.decode(_args(ret), (uint256, uint256));
+        assertEq(needed, 0.25 ether, "the flash principal");
+        assertEq(got, 249_869_766_973_738_772, "what the cycle returned");
     }
 
     /// Strip the 4-byte selector so the two arguments can be decoded.
