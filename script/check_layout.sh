@@ -21,4 +21,7 @@ fi
 status=0
 layout ArbExecutor | python3 script/layout_compare.py layout/ArbExecutor.json ArbExecutor || status=1
 layout LiquidationExecutor | python3 script/layout_compare.py layout/LiquidationExecutor.json LiquidationExecutor || status=1
+# A Genesis writes the proxy's storage before the implementation reads it: it must match EXACTLY.
+layout ArbExecutorGenesis | python3 script/layout_compare.py layout/ArbExecutor.json ArbExecutorGenesis --exact || status=1
+layout LiquidationExecutorGenesis | python3 script/layout_compare.py layout/LiquidationExecutor.json LiquidationExecutorGenesis --exact || status=1
 exit $status
