@@ -151,11 +151,34 @@ library DirectSwapLib {
     /// measurement point. A fee-on-transfer token simply cannot be flash-swapped.
     function swapV2(address pair, address tokenIn, uint256 amount, bytes memory data) internal returns (uint256 out) {
         (bool zeroForOne, uint16 feeNumerator) = _v2Params(amount, data);
-        (uint256 reserveIn, uint256 reserveOut) = _v2Reserves(pair, zeroForOne);
         IERC20(tokenIn).safeTransfer(pair, amount);
-        // What the pair holds beyond its reserve IS the input it will measure
-        // in its own K check. A donation only makes this larger, which is safe:
-        // more input permits more output and K still holds.
+        // Reserves are read AFTER the transfer, together with the balance.
+        //
+        // #41 moved the INPUT measurement past the transfer but left the
+        // reserves where they were, read before it. That is only safe while
+        // the transfer cannot move them — and the very token #41 was written
+        // for moves them: FLOKI's tax handler TRADES THIS SAME PAIR inside
+        // our `transfer`, which runs `swap` and resyncs the reserves. The
+        // output was then priced against a `reserveOut` that no longer
+        // existed, so the pair was asked for more than its own K allows.
+        //
+        // MEASURED 2026-09-14 with ARB_DIRECT_V2_SWAPS=1: 52 of 54
+        // post-mortem sims on `hashflow>v2` rings closing through the
+        // WETH/FLOKI pair reverted `UniswapV2: K` (sims 547fed5a block
+        // 25971664, c1e0917f 25971659, d9cbacb9 25971649, all gas ~684k).
+        // The same route landed 8 times the day before through the ROUTER
+        // path. Direction and fee in those plans were both correct
+        // (zeroForOne false, feeNumerator 997 for a Uniswap V2 pair), and
+        // the pair held no unsynced surplus — the stale reserves were the
+        // only thing left.
+        //
+        // Reading both together costs one extra `getReserves` on the quiet
+        // path and is a no-op there: a plain ERC20 transfer never touches
+        // reserves, so post-transfer values equal pre-transfer ones. What
+        // the pair holds beyond its (current) reserve IS the input it will
+        // measure in its own K check. A donation only makes this larger,
+        // which is safe: more input permits more output and K still holds.
+        (uint256 reserveIn, uint256 reserveOut) = _v2Reserves(pair, zeroForOne);
         uint256 received = IERC20(tokenIn).balanceOf(pair) - reserveIn;
         out = _v2AmountOut(received, feeNumerator, reserveIn, reserveOut);
         if (zeroForOne) {
