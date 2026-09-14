@@ -13,9 +13,11 @@ import {LiquidationExecutorHarness} from "./LiquidationExecutorHarness.sol";
 /// every existing test runs through the proxy without rewriting its call site.
 /// The ProxyAdmin owner is the executor owner, as on mainnet.
 ///
-/// The implementation is always the FIRST contract created, so a test that
-/// expects an implementation-constructor revert (`vm.expectRevert` then one of
-/// these calls) still sees it.
+/// A test that expects an implementation-constructor revert must NOT use these
+/// helpers: `vm.expectRevert` covers a single revert and lets execution
+/// continue, and each helper creates three contracts, so the next create
+/// reverts unexpectedly. Construct the implementation directly instead, as the
+/// constructor-revert tests in `test/Executor.t.sol` do.
 library ExecutorDeploy {
     function arb(
         address owner_,
