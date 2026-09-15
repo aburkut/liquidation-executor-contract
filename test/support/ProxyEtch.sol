@@ -25,10 +25,16 @@ library ProxyEtch {
         );
     }
 
+    /// `ExecutorProxy` runtime whose immutable admin is a throwaway ProxyAdmin.
+    /// Building it calls `implementation` (Genesis reads its immutables).
+    function arbProxyRuntime(address implementation) internal returns (bytes memory) {
+        ArbExecutor model = ExecutorDeploy.arbProxy(implementation, address(0xA11CE), address(0xB0B), new address[](0));
+        return address(model).code;
+    }
+
     /// Put `ExecutorProxy` runtime at `live`, delegating to `implementation`.
     function etchArbProxy(address live, address implementation) internal {
-        ArbExecutor model = ExecutorDeploy.arbProxy(implementation, address(0xA11CE), address(0xB0B), new address[](0));
-        VM.etch(live, address(model).code);
+        VM.etch(live, arbProxyRuntime(implementation));
         VM.store(live, ERC1967Utils.IMPLEMENTATION_SLOT, bytes32(uint256(uint160(implementation))));
     }
 }
