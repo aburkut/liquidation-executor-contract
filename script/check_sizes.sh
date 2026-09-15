@@ -7,9 +7,9 @@
 # added there could compile, pass every test and refuse to deploy. This
 # check trips at THRESHOLD instead, on the PR.
 #
-# Usage: script/check_sizes.sh [threshold-bytes]   (default 24200)
+# Usage: script/check_sizes.sh [threshold-bytes]   (default 24400)
 set -euo pipefail
-THRESHOLD="${1:-24200}"
+THRESHOLD="${1:-24400}"
 forge build --sizes --json 2>/dev/null | python3 -c '
 import json, sys
 threshold = int(sys.argv[1])

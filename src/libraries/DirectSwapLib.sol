@@ -128,9 +128,9 @@ library DirectSwapLib {
 
     /// @notice Exact-input swap against a V2-style pair, input sent first.
     /// `data` = `abi.encode(bool zeroForOne, uint16 feeNumerator)` where the
-    /// numerator is the surviving share of the input out of 1000 — the same
-    /// `fee_numerator` the bot's V2 fork table quotes with (997 Uniswap /
-    /// Sushi, 998 Pancake V2), so quote and execution agree to the wei.
+    /// numerator is the surviving share of the input out of 10_000 — the same
+    /// `fee_numerator` the bot's V2 fork table quotes with (9970 Uniswap /
+    /// Sushi, 9975 Pancake V2), so quote and execution agree to the wei.
     /// @dev Prices from what the pair ACTUALLY RECEIVED, not from `amount`.
     ///
     /// A fee-on-transfer token delivers less than it is sent, so the reserve
@@ -168,7 +168,8 @@ library DirectSwapLib {
         // 25971664, c1e0917f 25971659, d9cbacb9 25971649, all gas ~684k).
         // The same route landed 8 times the day before through the ROUTER
         // path. Direction and fee in those plans were both correct
-        // (zeroForOne false, feeNumerator 997 for a Uniswap V2 pair), and
+        // (zeroForOne false, feeNumerator 997 for a Uniswap V2 pair — the
+        // per-1000 scale of the time, 9970 today), and
         // the pair held no unsynced surplus — the stale reserves were the
         // only thing left.
         //
@@ -298,7 +299,22 @@ library DirectSwapLib {
     function _v2Params(uint256 amount, bytes memory data) private pure returns (bool zeroForOne, uint16 feeNumerator) {
         if (amount == 0 || data.length != 64) revert DirectSwapInvalid();
         (zeroForOne, feeNumerator) = abi.decode(data, (bool, uint16));
-        if (feeNumerator == 0 || feeNumerator > 1000) revert DirectSwapInvalid();
+        // Ten-thousandths, not thousandths. MEASURED on chain 2026-09-14 by
+        // asking each fork's own router for `getAmountOut(1 ether, …)` and
+        // solving for the numerator:
+        //
+        //   uniswap_v2 0xb4e16d01…  9970/10000
+        //   sushi_v2   0x397ff154…  9970/10000
+        //   shibaswap  0x20e95253…  9970/10000
+        //   pancake_v2 0x2e8135be…  9975/10000   <- 0.25%, not 0.20%
+        //
+        // PancakeSwap V2 charges 0.25%, which is 997.5 per 1000 and therefore
+        // NOT expressible on the old scale. The bot was sending 998, which
+        // understates the fee, overstates the output, and makes the pair
+        // revert `UniswapV2: K` on every pancake_v2 leg. A pair exposes no fee
+        // getter at all (`swapFee()`, `fee()`, `feeRate()` all absent), which
+        // is why the number is passed in rather than read.
+        if (feeNumerator == 0 || feeNumerator > 10_000) revert DirectSwapInvalid();
     }
 
     function _v2Reserves(address pair, bool zeroForOne) private view returns (uint256 reserveIn, uint256 reserveOut) {
@@ -314,7 +330,7 @@ library DirectSwapLib {
     {
         if (amountIn == 0) revert DirectSwapInvalid();
         uint256 inWithFee = amountIn * feeNumerator;
-        out = (inWithFee * reserveOut) / (reserveIn * 1000 + inWithFee);
+        out = (inWithFee * reserveOut) / (reserveIn * 10_000 + inWithFee);
         if (out == 0) revert DirectSwapInvalid();
     }
 

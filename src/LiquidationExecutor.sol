@@ -25,6 +25,7 @@ import {SwapValidationLib} from "./libraries/SwapValidationLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
 import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
 import {SwapMode, SwapLeg, Op, Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "./types/SwapTypes.sol";
+import {LiquidationExecutorStorage} from "./storage/LiquidationExecutorStorage.sol";
 
 // V10+ refactor: IWETH interface moved into CoinbasePaymentLib
 // (the only consumer of `IWETH.withdraw` after `_payCoinbase` migrated).
@@ -36,9 +37,7 @@ import {SwapMode, SwapLeg, Op, Action, AaveV3Action, AaveV2Liquidation, MorphoLi
 /// on-chain fallback swaps via Uniswap V2, V3 (SwapRouter02), and V4 (PoolManager
 /// unlock-callback pattern, strict single-hop exact-input mode only).
 contract LiquidationExecutor is
-    Ownable2Step,
-    Pausable,
-    ReentrancyGuardTransient,
+    LiquidationExecutorStorage,
     IFlashLoanRecipient,
     IMorphoFlashLoanCallback,
     IUnlockCallback
@@ -228,42 +227,23 @@ contract LiquidationExecutor is
     // constants, decoder shapes, and bounds-check commentary.
 
     // ─── State ───────────────────────────────────────────────────────
+    // Persistent state lives in `LiquidationExecutorStorage`; this contract
+    // adds none.
     address public immutable weth;
     /// @dev Constructor-pinned (no setters): immutables read for free where a
     /// storage slot cost 2.1k cold on every liquidation / repayment / swap.
     address public immutable aavePool;
     address public immutable morphoBlue;
     address public immutable paraswapAugustusV6;
-    address public aaveV2LendingPool;
     /// @dev Immutable — canonical Uniswap V2 Router02 (mainnet
-    /// 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D). Auto-whitelisted in
-    /// allowedTargets at construction. Rotating requires redeployment.
+    /// 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D). Rotating requires an
+    /// upgrade.
     address public immutable uniV2Router;
     /// @dev Immutable — canonical Uniswap V3 SwapRouter02 (mainnet
     /// 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45). SwapRouter02 struct omits
     /// deadline; the executor enforces its own via the per-leg `leg.deadline`
     /// field on `SwapLeg`.
     address public immutable uniV3Router;
-
-    mapping(uint8 => address) public allowedFlashProviders;
-    mapping(address => bool) public allowedTargets;
-    /// @dev Owner-curated whitelist of V4 hook contracts. A V4 swap whose
-    /// PoolKey references a hook that is neither address(0) nor allow-listed
-    /// reverts with `InvalidPlan`. Hooks run arbitrary code inside
-    /// `beforeSwap`/`afterSwap` — keeping this list empty unless a specific
-    /// hook has been audited is the intended default.
-    mapping(address => bool) public blockedV4Hooks;
-    /// @dev Operator allowlist. Several operator EOAs may drive ONE executor
-    /// so sends spread over independent nonce streams — one stuck tx then
-    /// cannot jam the others, and same-nonce bid fan-out does not have to
-    /// fight its own replacements. Seeded with the constructor's `operator_`.
-    /// Owner-curated: an operator key is hot, so it may only SPEND under the
-    /// containment caps, never move standing funds (`withdraw` is onlyOwner).
-    /// LAYOUT: this mapping occupies slot 10, which pushes the V4 arming
-    /// fields to slots 11/12 — matching `GenericSequenceLib`'s pinned
-    /// V4_PM_SLOT/V4_TOKENIN_SLOT. `test_v4SlotConstantsMatchLayout` is the
-    /// authority; do not reorder without re-running it.
-    mapping(address => bool) public operators;
     // V10+ refactor: the dedicated `allowedExtSwapTargets` allowlist
     // for Curve V1 / Balancer V2 pool targets was removed. Fund safety
     // for an operator-supplied pool does NOT rest on "zero balance" —
@@ -288,8 +268,9 @@ contract LiquidationExecutor is
 
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
-    // V10+: FlashProviderUpdated dropped — both flash providers
-    // (Balancer Vault, Morpho Blue) are now constructor-pinned.
+    // V10+: FlashProviderUpdated dropped — both flash providers are
+    // seeded once into proxy storage by LiquidationExecutorGenesis. A plain
+    // upgrade does not rewrite them; rotating one is a migrator upgrade.
     event RepayExecuted(
         uint8 indexed protocolId, bytes32 indexed positionKeyHash, address indexed asset, uint256 amount
     );
@@ -300,10 +281,10 @@ contract LiquidationExecutor is
     // pools' events carry the same facts), and together they cost 6-10k gas
     // per liquidation plus bytecode in a size-constrained contract.
     event V4HookBlockedUpdated(address indexed hook, bool blocked);
-    /// @dev V10 audit fix: emitted by `setAllowedTarget` and by the
-    /// provider-rotation revocation paths (`setFlashProvider`,
-    /// `configureMorpho`) when the old provider's allowlist entry is
-    /// cleared on rotation.
+    /// @dev V10 audit fix: emitted by `setAllowedTarget`, its only emitter.
+    /// The provider-rotation paths that also emitted it (`setFlashProvider`,
+    /// `configureMorpho`) were removed in V10+; Genesis seeds the allowlist
+    /// without emitting it.
     event AllowedTargetUpdated(address indexed target, bool allowed);
     event OperatorUpdated(address indexed operator, bool allowed);
 
@@ -393,40 +374,25 @@ contract LiquidationExecutor is
     // in SwapValidationLib and keep this contract under the EIP-170 limit.
 
     // ─── Constructor ─────────────────────────────────────────────────
-    /// @dev V10+: `morpho_` is constructor-pinned (was post-deploy
-    /// `configureMorpho` in V9). Both `morphoBlue` (liquidation target
-    /// for PROTOCOL_MORPHO_BLUE actions) and
-    /// `allowedFlashProviders[FLASH_PROVIDER_MORPHO]` (flash source +
-    /// the only authorized `onMorphoFlashLoan` caller) are initialized
-    /// atomically here. Eliminates the post-deploy "did you call
-    /// configureMorpho?" footgun. Future Morpho address rotation
-    /// requires a redeploy — acceptable because Morpho Blue's mainnet
-    /// address `0xBBBBBb…EEFFCb` has been stable since launch.
-    /// Same rationale applies to `balancerVault_` which was already
-    /// constructor-pinned.
+    /// Immutables only. Persistent state belongs to the proxy and is seeded by
+    /// `LiquidationExecutorGenesis` (which also takes the Balancer vault this
+    /// contract never stored); this contract's own storage is never used, so
+    /// it is left ownerless and its initializers are disabled.
     constructor(
-        address owner_,
-        address operator_,
         address weth_,
         address aavePool_,
-        address balancerVault_,
         address morpho_,
         address paraswapAugustus_,
         address uniV2Router_,
-        address uniV3Router_,
-        address[] memory allowedTargets_
-    ) Ownable(owner_) {
-        if (operator_ == address(0)) revert ZeroAddress();
+        address uniV3Router_
+    ) Ownable(address(0xdEaD)) {
         if (weth_ == address(0)) revert ZeroAddress();
         if (aavePool_ == address(0)) revert ZeroAddress();
-        if (balancerVault_ == address(0)) revert ZeroAddress();
         if (morpho_ == address(0)) revert ZeroAddress();
         if (paraswapAugustus_ == address(0)) revert ZeroAddress();
         if (uniV2Router_ == address(0)) revert ZeroAddress();
         if (uniV3Router_ == address(0)) revert ZeroAddress();
 
-        operators[operator_] = true;
-        emit OperatorUpdated(operator_, true);
         weth = weth_;
         uniV2Router = uniV2Router_;
         uniV3Router = uniV3Router_;
@@ -434,20 +400,7 @@ contract LiquidationExecutor is
         paraswapAugustusV6 = paraswapAugustus_;
         morphoBlue = morpho_;
 
-        allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
-        allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho_;
-
-        allowedTargets[aavePool_] = true;
-        allowedTargets[balancerVault_] = true;
-        allowedTargets[morpho_] = true;
-        allowedTargets[paraswapAugustus_] = true;
-        allowedTargets[uniV2Router_] = true;
-        allowedTargets[uniV3Router_] = true;
-
-        for (uint256 i = 0; i < allowedTargets_.length; i++) {
-            if (allowedTargets_[i] == address(0)) revert ZeroAddress();
-            allowedTargets[allowedTargets_[i]] = true;
-        }
+        _disableInitializers();
     }
 
     // ─── Modifiers ───────────────────────────────────────────────────
@@ -457,14 +410,16 @@ contract LiquidationExecutor is
     }
 
     // ─── Owner Config Functions ──────────────────────────────────────
-    // setMorphoBlue removed — the Morpho role is two independent storage
-    // slots (`morphoBlue` + `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`)
+    // setMorphoBlue removed — the Morpho role is two independent values
+    // (`morphoBlue` + `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`)
     // whose desync produces an exploitable mismatch (callback authority
     // pinned to old Morpho while liquidation routes through new Morpho).
-    // The atomic helper `configureMorpho` writes both slots in one call;
-    // removing the single-slot setter eliminates the desync window
-    // entirely and forces all Morpho re-configuration through the
-    // atomic path.
+    // No setter writes either any more: `morphoBlue` is an implementation
+    // immutable and the mapping entry is written once by
+    // LiquidationExecutorGenesis. Changing Morpho is a migrator upgrade that
+    // rewrites the entry in the same transaction that installs the new
+    // implementation (docs/PROXY_OPERATIONS.md); PrepareUpgrade refuses a
+    // plain upgrade whose `morphoBlue()` differs from the proxy's entry.
 
     /// @notice Add or remove an operator EOA authorised to call `execute`.
     /// @dev Deliberately NOT self-service: only the owner may rotate keys.
@@ -487,20 +442,21 @@ contract LiquidationExecutor is
     }
 
     // V10+ refactor: `setFlashProvider` and `configureMorpho` removed.
-    // Both flashloan providers (Balancer Vault + Morpho Blue) are now
-    // constructor-pinned. Both have stable mainnet addresses
-    // (`0xBA12…BF2C8`, `0xBBBB…EEFFCb`) that have not rotated since
-    // launch. Future rotation requires a redeploy — acceptable cost
-    // for the simpler surface (one source of truth, no post-deploy
-    // "did you call configureMorpho?" footgun, no rotation-race
-    // hygiene around the dual `morphoBlue` / `allowedFlashProviders`
-    // slots).
+    // Morpho is an implementation immutable; the Balancer Vault address
+    // and both `allowedFlashProviders` entries live in proxy storage,
+    // written once by `LiquidationExecutorGenesis`. A plain upgrade does
+    // not rewrite them, so rotating either provider needs
+    // `ProxyAdmin.upgradeAndCall(proxy, migrator, data)`: the migrator runs
+    // under `reinitializer(2)`, rewrites the entries (and the allowlist /
+    // standing allowances as needed) and hands off with
+    // `ERC1967Utils.upgradeToAndCall(implementation, "")` — the Genesis
+    // pattern. See docs/PROXY_OPERATIONS.md.
 
     /// @notice V10 audit fix — symmetry with ArbExecutor. Owner-curated
     /// post-deploy admin for the `allowedTargets` allowlist (Bebop
-    /// settlement targets, supplementary protocol addresses). Constructor
-    /// seeds the canonical set; this function lets the owner extend or
-    /// revoke without redeploying.
+    /// settlement targets, supplementary protocol addresses).
+    /// `LiquidationExecutorGenesis` seeds the canonical set; this function
+    /// lets the owner extend or revoke it afterward.
     function setAllowedTarget(address target, bool allowed) external onlyOwner {
         if (target == address(0)) revert ZeroAddress();
         allowedTargets[target] = allowed;
@@ -705,7 +661,7 @@ contract LiquidationExecutor is
                 // itself. Merged into one condition, and the wrap side uses a
                 // masked equality, purely for the EIP-170 budget — the naive
                 // form cost 86 bytes and pushed this contract past the
-                // project's own headroom guard at 24200.
+                // project's own headroom guard at 24400.
                 //
                 // Still EXACT on both sides: `flags & ~PREV == WRAP` accepts
                 // the two shapes GenericSequenceLib accepts and rejects
@@ -736,9 +692,9 @@ contract LiquidationExecutor is
                 }
                 // Being allowlisted is not enough for a target that can move
                 // value WITHOUT an allowance, or mint balance the containment
-                // cap then reads as income. AUDITED 2026-09-08: the
-                // constructor seeds the lending pools and the vault into
-                // `allowedTargets` because the liquidation and flash paths
+                // cap then reads as income. AUDITED 2026-09-08:
+                // LiquidationExecutorGenesis seeds the lending pools and the
+                // vault into `allowedTargets` because the liquidation and flash paths
                 // re-read that mapping as their own kill-switch — which also
                 // handed a generic op their whole function surface, with
                 // operator-authored calldata. Two shapes escape the cap
@@ -1068,7 +1024,8 @@ contract LiquidationExecutor is
         returns (uint256 realizedProfit, uint256 totalCoinbasePayment, bool shortfall)
     {
         // Pre-execution: verify flash loan funds received
-        if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
+        uint256 loanBefore = IERC20(plan.loanToken).balanceOf(address(this));
+        if (loanBefore < plan.loanAmount) revert InvalidFlashLoan();
 
         // Derive collateralAsset and trackingToken for delta check and swap plan
         (address collateralAsset, address trackingToken) =
@@ -1099,6 +1056,8 @@ contract LiquidationExecutor is
         for (uint256 i = 0; i < plan.actions.length; ++i) {
             _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
         }
+        // Invariant: actions spend at most the flash principal, never standing loanToken.
+        SwapValidationLib.assertActionsWithinLoan(plan.loanToken, loanBefore, plan.loanAmount);
 
         // Post-action: verify liquidation produced collateral AND
         // optionally unwrap aTokens to underlying in the same block.
@@ -1198,8 +1157,9 @@ contract LiquidationExecutor is
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
 
         if (vault == address(0)) {
-            // Morpho pulls the repayment after the callback; the provider is
-            // constructor-pinned, so the allowance stands (AllowanceLib).
+            // Morpho pulls the repayment after the callback; the provider
+            // does not rotate without a migrator upgrade (which must also
+            // clear this allowance), so the allowance stands (AllowanceLib).
             AllowanceLib.ensure(asset, msg.sender, repayAmount);
         } else {
             IERC20(asset).safeTransfer(vault, repayAmount);
@@ -1410,7 +1370,12 @@ contract LiquidationExecutor is
         // Closes the operator-coinbase dipping vector surfaced by re-audit;
         // production bot already keeps amountIn ≤ 0.99 * collateral_to_receive
         // (worker.rs:2153), so the cap has no operational impact.
-        if (leg1.srcToken == collateralAsset && leg1AmountIn > collateralDelta) revert InvalidPlan();
+        // A Bebop leg instead fills short at the seized collateral (never the
+        // standing balance); without a fill offset the library reverts.
+        if (leg1.srcToken == collateralAsset && leg1AmountIn > collateralDelta) {
+            if (leg1.mode != SwapMode.BEBOP_MULTI) revert InvalidPlan();
+            leg1AmountIn = collateralDelta;
+        }
 
         _dispatchLeg(leg1, leg1AmountIn, leg1RepayBefore);
 
@@ -1429,8 +1394,6 @@ contract LiquidationExecutor is
         uint256 finalRepayAfter = IERC20(finalRepayToken).balanceOf(address(this));
         uint256 repayDelta = finalRepayAfter > finalRepayBefore ? finalRepayAfter - finalRepayBefore : 0;
         if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
-
-        if (plan.hasLeg2) {}
     }
 
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
@@ -1439,7 +1402,7 @@ contract LiquidationExecutor is
             if (!allowedTargets[paraswapAugustusV6]) revert TargetNotAllowed();
             SwapLegExecutorLib.executeParaswapLeg(leg, paraswapAugustusV6);
         } else if (m == SwapMode.BEBOP_MULTI) {
-            SwapLegExecutorLib.executeBebopLeg(leg, outBefore, allowedTargets[leg.bebopTarget]);
+            SwapLegExecutorLib.executeBebopLeg(leg, outBefore, allowedTargets[leg.bebopTarget], amountIn);
         } else if (m == SwapMode.UNI_V2 || m == SwapMode.UNI_V2_BUY) {
             if (!allowedTargets[uniV2Router]) revert TargetNotAllowed();
             UniswapLib.executeUniV2Leg(leg, amountIn, uniV2Router);
@@ -1736,23 +1699,23 @@ contract LiquidationExecutor is
     function _executeAaveV3Liquidation(bytes memory actionData) internal {
         AaveV3Action memory action = abi.decode(actionData, (AaveV3Action));
 
-        address pool = aavePool;
-        if (pool == address(0)) revert ZeroAddress();
+        address pool = aavePool; // constructor rejects zero
         if (!allowedTargets[pool]) revert TargetNotAllowed();
-        if (action.actionType != 4) revert UnsupportedActionType(action.actionType);
+        // actionType == 4 and debtToCover != 0: enforced earlier by SwapValidationLib.validateActions.
         if (action.user == address(0)) revert ZeroAddress();
-        if (action.debtToCover == 0) revert InvalidPlan();
 
-        // The pool is constructor-pinned and allowlisted; the allowance is
-        // bounded by exactly the debt this call repays (AllowanceLib).
+        // The pool is an implementation immutable and allowlisted; the
+        // allowance is bounded by exactly the debt this call repays
+        // (AllowanceLib). This assumes the pool does not change without a
+        // migrator upgrade that also clears the old allowance.
         AllowanceLib.ensure(action.debtAsset, pool, action.debtToCover);
         IAaveV3Pool(pool)
             .liquidationCall(
                 action.collateralAsset, action.debtAsset, action.user, action.debtToCover, action.receiveAToken
             );
         // Aave pulls min(debtToCover, closeFactor * debt), so a deliberately
-        // padded cover amount leaves the difference standing to a target the
-        // constructor also seeds into `allowedTargets`.
+        // padded cover amount leaves the difference standing to a target
+        // LiquidationExecutorGenesis also seeds into `allowedTargets`.
         AllowanceLib.clear(action.debtAsset, pool);
     }
 
@@ -1772,15 +1735,10 @@ contract LiquidationExecutor is
     function _executeMorphoLiquidation(bytes memory actionData) internal {
         MorphoLiquidation memory liq = abi.decode(actionData, (MorphoLiquidation));
 
-        address morpho = morphoBlue;
-        if (morpho == address(0)) revert ZeroAddress();
+        address morpho = morphoBlue; // constructor rejects zero
         if (!allowedTargets[morpho]) revert TargetNotAllowed();
         if (liq.borrower == address(0)) revert ZeroAddress();
-        if (liq.seizedAssets == 0) revert MorphoShareModeUnsupported();
-        if (liq.repaidShares != 0) revert MorphoMixedModeUnsupported();
-        if (liq.maxRepayAssets == 0) revert InvalidPlan();
-        if (liq.marketParams.loanToken == address(0)) revert MorphoInvalidMarketParams();
-        if (liq.marketParams.collateralToken == address(0)) revert MorphoInvalidMarketParams();
+        // seizedAssets, repaidShares, maxRepayAssets, marketParams tokens: enforced earlier by SwapValidationLib.validateActions.
 
         // Approve maxRepayAssets — loan-token denominated bound (NOT collateral-side seizedAssets).
         // seizedAssets is collateral units; assetsRepaid (what Morpho actually pulls) is loan-token units.

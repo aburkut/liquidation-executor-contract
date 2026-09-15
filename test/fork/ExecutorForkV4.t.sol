@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {ExecutorDeploy} from "../support/ExecutorDeploy.sol";
 import {Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../../src/types/SwapTypes.sol";
 import {LiquidationExecutor} from "../../src/LiquidationExecutor.sol";
 import {SwapMode, SwapLeg, Op} from "../../src/types/SwapTypes.sol";
@@ -128,7 +129,7 @@ contract ExecutorForkV4Test is Test {
         address[] memory targets = new address[](1);
         targets[0] = V4_POOL_MANAGER;
 
-        executor = new LiquidationExecutor(
+        executor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             WETH,
@@ -393,7 +394,7 @@ contract ExecutorForkV4Test is Test {
         address[] memory targets = new address[](2);
         targets[0] = V4_POOL_MANAGER;
         targets[1] = CURVE_3POOL;
-        LiquidationExecutor exec = new LiquidationExecutor(
+        LiquidationExecutor exec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             WETH,

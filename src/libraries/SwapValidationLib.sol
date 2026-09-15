@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SwapMode, SwapLeg, Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../types/SwapTypes.sol";
 
 /// @title SwapValidationLib
@@ -49,6 +50,7 @@ library SwapValidationLib {
     error ATokenAddressRequired();
     error MixedReceiveAToken();
     error NoLiquidationAction();
+    error ActionsSpentStandingLoan(uint256 spent, uint256 loanAmount);
 
     // ─── Protocol ids (must match LiquidationExecutor) ───────────────────
     uint8 internal constant PROTOCOL_AAVE_V3 = 1;
@@ -150,6 +152,15 @@ library SwapValidationLib {
 
         // Set trackingToken: aToken when receiveAToken=true, underlying otherwise
         trackingToken = (receiveAToken && aTokenAddr != address(0)) ? aTokenAddr : collateralAsset;
+    }
+
+    /// @notice Invariant: liquidation actions spend at most the flash
+    /// principal of `loanToken`, never the executor's standing balance.
+    /// Measured (DELEGATECALL, so `this` is the executor): a padded
+    /// `debtToCover` that the pool trims to within `loanAmount` passes.
+    function assertActionsWithinLoan(address loanToken, uint256 loanBefore, uint256 loanAmount) external view {
+        uint256 balance = IERC20(loanToken).balanceOf(address(this));
+        if (balance + loanAmount < loanBefore) revert ActionsSpentStandingLoan(loanBefore - balance, loanAmount);
     }
 
     /// @dev Pre-flashloan validation for every SwapMode except V4.

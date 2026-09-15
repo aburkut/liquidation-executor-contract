@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ExecutorDeploy} from "./support/ExecutorDeploy.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -134,7 +135,7 @@ contract ArbExecutorTest is Test {
         address[] memory allowed = new address[](0);
 
         vm.prank(ownerAddr);
-        exec = new ArbExecutor(
+        exec = ExecutorDeploy.arb(
             ownerAddr,
             operatorAddr,
             address(weth),
@@ -804,7 +805,7 @@ contract ArbExecutorTest is Test {
         HostileMorpho hostile = new HostileMorpho();
         address[] memory allowed = new address[](0);
         vm.prank(ownerAddr);
-        ArbExecutor exec2 = new ArbExecutor(
+        ArbExecutor exec2 = ExecutorDeploy.arb(
             ownerAddr,
             operatorAddr,
             address(weth),
@@ -864,7 +865,7 @@ contract ArbExecutorTest is Test {
         op.outToken = dst;
         op.amountIn = amountIn;
         op.flags = GenericSequenceLib.FLAG_V2_DIRECT | extra;
-        op.callData = abi.encode(zeroForOne, uint16(997));
+        op.callData = abi.encode(zeroForOne, uint16(9970));
     }
 
     function _v3Pool() internal returns (MockUniV3Pool pool) {
@@ -941,14 +942,14 @@ contract ArbExecutorTest is Test {
     }
 
     /// A→B on a pair priced 2 B/A, B→A on a pair priced 2 A/B: the executor
-    /// computes both outputs from the reserves with the 997/1000 fee and the
+    /// computes both outputs from the reserves with the 9970/10000 fee and the
     /// pairs' own K checks accept them.
     function test_directV2_cycle_lands_with_reserve_formula() public {
-        MockUniV2Pair cheapB = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        MockUniV2Pair cheapB = new MockUniV2Pair(address(tokenA), address(tokenB), 9970);
         tokenA.mint(address(cheapB), 100 * LOAN_AMOUNT);
         tokenB.mint(address(cheapB), 200 * LOAN_AMOUNT);
         cheapB.sync();
-        MockUniV2Pair cheapA = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        MockUniV2Pair cheapA = new MockUniV2Pair(address(tokenA), address(tokenB), 9970);
         tokenA.mint(address(cheapA), 200 * LOAN_AMOUNT);
         tokenB.mint(address(cheapA), 100 * LOAN_AMOUNT);
         cheapA.sync();
@@ -991,14 +992,14 @@ contract ArbExecutorTest is Test {
 
         // taxed -> A, cheap in taxed. The INPUT is taxed: the pair receives
         // 5% less than the op sends, which is exactly the production shape.
-        MockUniV2Pair sell = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        MockUniV2Pair sell = new MockUniV2Pair(address(tokenA), address(taxed), 9970);
         tokenA.mint(address(sell), 400 * LOAN_AMOUNT);
         taxed.mint(address(sell), 100 * LOAN_AMOUNT);
         sell.sync();
 
         // A -> taxed, cheap in A, so the cycle closes above water even after
         // the 5% on the way in and another 5% on the way back out.
-        MockUniV2Pair buy = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        MockUniV2Pair buy = new MockUniV2Pair(address(tokenA), address(taxed), 9970);
         tokenA.mint(address(buy), 100 * LOAN_AMOUNT);
         taxed.mint(address(buy), 400 * LOAN_AMOUNT);
         buy.sync();
@@ -1042,14 +1043,14 @@ contract ArbExecutorTest is Test {
         MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", 18, 500); // 5%
 
         // A -> taxed, taxed cheap here, so the buy leg gets plenty.
-        MockUniV2Pair buy = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        MockUniV2Pair buy = new MockUniV2Pair(address(tokenA), address(taxed), 9970);
         tokenA.mint(address(buy), 100 * LOAN_AMOUNT);
         taxed.mint(address(buy), 400 * LOAN_AMOUNT);
         buy.sync();
 
         // taxed -> A, taxed expensive here, so the sell leg closes above water
         // even after 5% on the way out of the first pair and 5% into this one.
-        MockUniV2Pair sell = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        MockUniV2Pair sell = new MockUniV2Pair(address(tokenA), address(taxed), 9970);
         tokenA.mint(address(sell), 400 * LOAN_AMOUNT);
         taxed.mint(address(sell), 100 * LOAN_AMOUNT);
         sell.sync();
@@ -1079,7 +1080,7 @@ contract ArbExecutorTest is Test {
     function test_flashV2_feeOnTransferInput_stillUnserviceable() public {
         MockFeeOnTransferERC20 taxed = new MockFeeOnTransferERC20("Taxed", "TAX", 18, 500);
 
-        MockUniV2Pair pair = new MockUniV2Pair(address(tokenA), address(taxed), 997);
+        MockUniV2Pair pair = new MockUniV2Pair(address(tokenA), address(taxed), 9970);
         tokenA.mint(address(pair), 400 * LOAN_AMOUNT);
         taxed.mint(address(pair), 100 * LOAN_AMOUNT);
         pair.sync();
@@ -1175,11 +1176,11 @@ contract ArbExecutorTest is Test {
     /// for A on the second pair, the first pair is sent its 1000 A last and
     /// runs its own K check.
     function test_flashV2_selfFunded_cycle() public {
-        MockUniV2Pair cheapB = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        MockUniV2Pair cheapB = new MockUniV2Pair(address(tokenA), address(tokenB), 9970);
         tokenA.mint(address(cheapB), 100 * LOAN_AMOUNT);
         tokenB.mint(address(cheapB), 200 * LOAN_AMOUNT);
         cheapB.sync();
-        MockUniV2Pair cheapA = new MockUniV2Pair(address(tokenA), address(tokenB), 997);
+        MockUniV2Pair cheapA = new MockUniV2Pair(address(tokenA), address(tokenB), 9970);
         tokenA.mint(address(cheapA), 200 * LOAN_AMOUNT);
         tokenB.mint(address(cheapA), 100 * LOAN_AMOUNT);
         cheapA.sync();
@@ -1325,7 +1326,7 @@ contract ArbExecutorTest is Test {
             0,
             GenericSequenceLib.FLAG_USE_PREV_RETURN
         );
-        ops[1].callData = abi.encode(false, uint16(998));
+        ops[1].callData = abi.encode(false, uint16(9975));
         bytes memory packed = _pack(3, 0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa, 1_000e18, 100e18, ops);
         assertEq(packed.length, 71 + 82 + 21 + 82 + 3, "layout: header + op + V3 params + op + V2 params");
         // Generated with `cast abi-encode --packed`, field by field:
@@ -1335,7 +1336,7 @@ contract ArbExecutorTest is Test {
             packed,
             hex"0103aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000000000003635c9adc5dea0000000000000000000056bc75e2d631000000000000000000000000000000000000002"
             hex"11111111111111111111111111111111111111110100000000000000003635c9adc5dea0000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0100000000000000000000000000000001000276a4"
-            hex"222222222222222222222222222222222222222200820000000000000000000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0003e6",
+            hex"222222222222222222222222222222222222222200820000000000000000000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0026f7",
             "packed vector"
         );
     }

@@ -135,7 +135,7 @@ library GenericSequenceLib {
     uint32 internal constant FLAG_V3_DIRECT = 1 << 6;
     /// Exact-input swap straight against a V2-style pair: `target` is the
     /// PAIR, `callData` = `abi.encode(bool zeroForOne, uint16 feeNumerator)`
-    /// (surviving input share out of 1000: 997 Uniswap/Sushi, 998 Pancake).
+    /// (surviving input share out of 10_000: 9970 Uniswap/Sushi, 9975 Pancake).
     /// The executor sends `amount` to the pair and asks for what the reserve
     /// formula yields. Not allowlisted either.
     uint32 internal constant FLAG_V2_DIRECT = 1 << 7;

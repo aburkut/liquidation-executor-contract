@@ -16,30 +16,13 @@ contract LiquidationExecutorHarness is LiquidationExecutor {
     uint256 private constant T_V4_TOKENIN = 12;
 
     constructor(
-        address owner_,
-        address operator_,
         address weth_,
         address aavePool_,
-        address balancerVault_,
         address morpho_,
         address paraswapAugustus_,
         address uniV2Router_,
-        address uniV3Router_,
-        address[] memory allowedTargets_
-    )
-        LiquidationExecutor(
-            owner_,
-            operator_,
-            weth_,
-            aavePool_,
-            balancerVault_,
-            morpho_,
-            paraswapAugustus_,
-            uniV2Router_,
-            uniV3Router_,
-            allowedTargets_
-        )
-    {}
+        address uniV3Router_
+    ) LiquidationExecutor(weth_, aavePool_, morpho_, paraswapAugustus_, uniV2Router_, uniV3Router_) {}
 
     function tSetPlan(bytes32 planHash, bool phaseActive) external {
         assembly {
