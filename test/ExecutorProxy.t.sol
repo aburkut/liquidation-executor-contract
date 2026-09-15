@@ -80,13 +80,63 @@ contract ExecutorProxyTest is Test {
     function test_genesis_isOneShot() public {
         ArbExecutor exec = _arb();
         address impl = _implementationOf(address(exec));
-        // Through the proxy there is no initializer left: it runs the implementation.
-        vm.expectRevert();
+        // Through the proxy there is no initializer left: it runs the implementation,
+        // which has no `initialize` and no fallback, so the call reverts with empty data.
+        vm.expectRevert(bytes(""));
         ArbExecutorGenesis(address(exec)).initialize(owner, _one(operator), new address[](0), new address[](0), impl);
         // A Genesis contract used directly is locked.
         ArbExecutorGenesis genesis = new ArbExecutorGenesis();
         vm.expectRevert(Initializable.InvalidInitialization.selector);
         genesis.initialize(owner, _one(operator), new address[](0), new address[](0), impl);
+    }
+
+    function test_genesisCannotReseedAnInitialisedProxy() public {
+        ArbExecutor exec = _arb();
+        address impl = _implementationOf(address(exec));
+        ArbExecutorGenesis genesis = new ArbExecutorGenesis();
+
+        // Even the owner pointing the proxy back at a fresh Genesis cannot seed it again:
+        // the proxy's own Initializable storage already records version 1.
+        vm.prank(owner);
+        _adminOf(address(exec)).upgradeAndCall(ITransparentUpgradeableProxy(address(exec)), address(genesis), "");
+        assertEq(_implementationOf(address(exec)), address(genesis));
+
+        address intruder = makeAddr("intruder");
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        ArbExecutorGenesis(address(exec)).initialize(intruder, _one(intruder), _one(intruder), new address[](0), impl);
+    }
+
+    function test_genesisSeedsEveryListEntry() public {
+        ArbExecutor impl = _arbImpl();
+        address[] memory ops = new address[](3);
+        ops[0] = makeAddr("op0");
+        ops[1] = makeAddr("op1");
+        ops[2] = makeAddr("op2");
+        address[] memory targets = new address[](3);
+        targets[0] = makeAddr("target0");
+        targets[1] = makeAddr("target1");
+        targets[2] = makeAddr("target2");
+        address[] memory hooks = new address[](2);
+        hooks[0] = makeAddr("hook0");
+        hooks[1] = makeAddr("hook1");
+
+        bytes memory init = abi.encodeCall(ArbExecutorGenesis.initialize, (owner, ops, targets, hooks, address(impl)));
+        ArbExecutor exec =
+            ArbExecutor(payable(address(new ExecutorProxy(address(new ArbExecutorGenesis()), owner, init))));
+
+        for (uint256 i = 0; i < ops.length; ++i) {
+            assertTrue(exec.operators(ops[i]), "every operator seeded");
+        }
+        for (uint256 i = 0; i < targets.length; ++i) {
+            assertTrue(exec.allowedTargets(targets[i]), "every extra target seeded");
+        }
+        for (uint256 i = 0; i < hooks.length; ++i) {
+            assertTrue(exec.blockedV4Hooks(hooks[i]), "every hook blocked");
+        }
+        address unlisted = makeAddr("unlisted");
+        assertFalse(exec.operators(unlisted), "an unlisted address is not an operator");
+        assertFalse(exec.allowedTargets(unlisted), "an unlisted address is not a target");
+        assertFalse(exec.blockedV4Hooks(unlisted), "an unlisted address is not a blocked hook");
     }
 
     function test_implementationsAreOwnerlessAndLocked() public {
@@ -141,9 +191,10 @@ contract ExecutorProxyTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
         admin.upgradeAndCall(ITransparentUpgradeableProxy(address(exec)), address(next), "");
 
-        // The owner calling the proxy directly reaches the implementation, which has no upgrade entry point.
+        // The owner calling the proxy directly reaches the implementation, which has no upgrade entry point
+        // and no fallback: empty revert data.
         vm.prank(owner);
-        vm.expectRevert();
+        vm.expectRevert(bytes(""));
         ITransparentUpgradeableProxy(address(exec)).upgradeToAndCall(address(next), "");
 
         assertEq(_implementationOf(address(exec)), before);
