@@ -107,7 +107,8 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     );
     event AllowedTargetUpdated(address indexed target, bool allowed);
     // V10+: FlashProviderUpdated dropped — both providers are seeded
-    // once into proxy storage by ArbExecutorGenesis.
+    // once into proxy storage by ArbExecutorGenesis. A plain upgrade does
+    // not rewrite them; rotating one is a migrator upgrade (see below).
     event Withdraw(address indexed token, address indexed to, uint256 amount);
     event V4HookBlockedUpdated(address indexed hook, bool blocked);
     event OperatorUpdated(address indexed operator, bool allowed);
@@ -156,7 +157,8 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     /// hot path (provider dispatch, callback caller checks): immutables cost
     /// nothing to read where a storage slot costs 2.1k cold. The
     /// `allowedFlashProviders` mapping stays for the ABI (getter, deploy
-    /// read-backs) and is written once, at initialization.
+    /// read-backs) and is written once, at initialization; an upgrade must
+    /// keep these immutables equal to its entries (PrepareUpgrade checks).
     address public immutable morphoBlue;
     address public immutable balancerVault;
 
@@ -202,10 +204,14 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     }
 
     // ─── Owner: admin ────────────────────────────────────────────────
-    // V10+: `configureMorpho` and `setFlashProvider` removed. Both
-    // flash providers are seeded once into proxy storage by
-    // ArbExecutorGenesis; rotating either is an upgrade (new
-    // implementation via the ProxyAdmin), not a redeploy.
+    // V10+: `configureMorpho` and `setFlashProvider` removed. Both flash
+    // providers live in proxy storage (`allowedFlashProviders`), written
+    // once by ArbExecutorGenesis. A plain upgrade does not rewrite them, so
+    // rotating a provider needs `ProxyAdmin.upgradeAndCall(proxy, migrator,
+    // data)`: the migrator runs under `reinitializer(2)`, rewrites the
+    // entries (and the allowlist / standing allowances as needed) and hands
+    // off with `ERC1967Utils.upgradeToAndCall(implementation, "")` — the
+    // Genesis pattern. See docs/PROXY_OPERATIONS.md.
 
     function setAllowedTarget(address target, bool allowed) external onlyOwner {
         if (target == address(0)) revert ZeroAddress();
@@ -740,7 +746,8 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
             // Own principal: nothing to repay.
         } else if (vault == address(0)) {
             // Morpho pulls the repayment from us after the callback returns;
-            // the provider is constructor-pinned, so the allowance stands
+            // the provider does not rotate without a migrator upgrade (which
+            // must also clear this allowance), so the allowance stands
             // (AllowanceLib) instead of being re-written from zero per cycle.
             AllowanceLib.ensure(loanToken, msg.sender, flashRepay);
         } else {

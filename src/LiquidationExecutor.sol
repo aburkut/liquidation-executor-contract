@@ -269,7 +269,8 @@ contract LiquidationExecutor is
     // ─── Events ──────────────────────────────────────────────────────
     event ConfigUpdated(bytes32 indexed key, address indexed oldValue, address indexed newValue);
     // V10+: FlashProviderUpdated dropped — both flash providers are
-    // seeded once into proxy storage by LiquidationExecutorGenesis.
+    // seeded once into proxy storage by LiquidationExecutorGenesis. A plain
+    // upgrade does not rewrite them; rotating one is a migrator upgrade.
     event RepayExecuted(
         uint8 indexed protocolId, bytes32 indexed positionKeyHash, address indexed asset, uint256 amount
     );
@@ -280,10 +281,10 @@ contract LiquidationExecutor is
     // pools' events carry the same facts), and together they cost 6-10k gas
     // per liquidation plus bytecode in a size-constrained contract.
     event V4HookBlockedUpdated(address indexed hook, bool blocked);
-    /// @dev V10 audit fix: emitted by `setAllowedTarget` and by the
-    /// provider-rotation revocation paths (`setFlashProvider`,
-    /// `configureMorpho`) when the old provider's allowlist entry is
-    /// cleared on rotation.
+    /// @dev V10 audit fix: emitted by `setAllowedTarget`, its only emitter.
+    /// The provider-rotation paths that also emitted it (`setFlashProvider`,
+    /// `configureMorpho`) were removed in V10+; Genesis seeds the allowlist
+    /// without emitting it.
     event AllowedTargetUpdated(address indexed target, bool allowed);
     event OperatorUpdated(address indexed operator, bool allowed);
 
@@ -409,14 +410,16 @@ contract LiquidationExecutor is
     }
 
     // ─── Owner Config Functions ──────────────────────────────────────
-    // setMorphoBlue removed — the Morpho role is two independent storage
-    // slots (`morphoBlue` + `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`)
+    // setMorphoBlue removed — the Morpho role is two independent values
+    // (`morphoBlue` + `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`)
     // whose desync produces an exploitable mismatch (callback authority
     // pinned to old Morpho while liquidation routes through new Morpho).
-    // The atomic helper `configureMorpho` writes both slots in one call;
-    // removing the single-slot setter eliminates the desync window
-    // entirely and forces all Morpho re-configuration through the
-    // atomic path.
+    // No setter writes either any more: `morphoBlue` is an implementation
+    // immutable and the mapping entry is written once by
+    // LiquidationExecutorGenesis. Changing Morpho is a migrator upgrade that
+    // rewrites the entry in the same transaction that installs the new
+    // implementation (docs/PROXY_OPERATIONS.md); PrepareUpgrade refuses a
+    // plain upgrade whose `morphoBlue()` differs from the proxy's entry.
 
     /// @notice Add or remove an operator EOA authorised to call `execute`.
     /// @dev Deliberately NOT self-service: only the owner may rotate keys.
@@ -440,10 +443,14 @@ contract LiquidationExecutor is
 
     // V10+ refactor: `setFlashProvider` and `configureMorpho` removed.
     // Morpho is an implementation immutable; the Balancer Vault address
-    // and both `allowedFlashProviders` entries are seeded once into
-    // proxy storage by `LiquidationExecutorGenesis`. Rotating either
-    // provider is an upgrade (new implementation via the ProxyAdmin),
-    // not a redeploy.
+    // and both `allowedFlashProviders` entries live in proxy storage,
+    // written once by `LiquidationExecutorGenesis`. A plain upgrade does
+    // not rewrite them, so rotating either provider needs
+    // `ProxyAdmin.upgradeAndCall(proxy, migrator, data)`: the migrator runs
+    // under `reinitializer(2)`, rewrites the entries (and the allowlist /
+    // standing allowances as needed) and hands off with
+    // `ERC1967Utils.upgradeToAndCall(implementation, "")` — the Genesis
+    // pattern. See docs/PROXY_OPERATIONS.md.
 
     /// @notice V10 audit fix — symmetry with ArbExecutor. Owner-curated
     /// post-deploy admin for the `allowedTargets` allowlist (Bebop
@@ -1147,8 +1154,9 @@ contract LiquidationExecutor is
         if (balance < repayAmount) revert InsufficientRepayBalance(repayAmount, balance);
 
         if (vault == address(0)) {
-            // Morpho pulls the repayment after the callback; the provider is
-            // constructor-pinned, so the allowance stands (AllowanceLib).
+            // Morpho pulls the repayment after the callback; the provider
+            // does not rotate without a migrator upgrade (which must also
+            // clear this allowance), so the allowance stands (AllowanceLib).
             AllowanceLib.ensure(asset, msg.sender, repayAmount);
         } else {
             IERC20(asset).safeTransfer(vault, repayAmount);
@@ -1692,8 +1700,10 @@ contract LiquidationExecutor is
         if (action.user == address(0)) revert ZeroAddress();
         if (action.debtToCover == 0) revert InvalidPlan();
 
-        // The pool is constructor-pinned and allowlisted; the allowance is
-        // bounded by exactly the debt this call repays (AllowanceLib).
+        // The pool is an implementation immutable and allowlisted; the
+        // allowance is bounded by exactly the debt this call repays
+        // (AllowanceLib). This assumes the pool does not change without a
+        // migrator upgrade that also clears the old allowance.
         AllowanceLib.ensure(action.debtAsset, pool, action.debtToCover);
         IAaveV3Pool(pool)
             .liquidationCall(

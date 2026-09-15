@@ -8,6 +8,13 @@ import {ITransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transp
 import {ArbExecutor} from "../src/ArbExecutor.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 
+/// The getters both executors share for their flash providers.
+interface IFlashProviderView {
+    function morphoBlue() external view returns (address);
+    function balancerVault() external view returns (address);
+    function allowedFlashProviders(uint8 id) external view returns (address);
+}
+
 /// Deploy a new implementation for an existing executor proxy, built with the
 /// immutables the proxy runs with today, and print the Safe transaction that
 /// switches to it. The script never upgrades anything itself: the ProxyAdmin
@@ -57,6 +64,23 @@ contract PrepareUpgrade is Script {
             revert("EXECUTOR_KIND must be arb or liquidation");
         }
         vm.stopBroadcast();
+
+        // The flash providers live in proxy storage (`allowedFlashProviders`,
+        // written once by Genesis), and a plain upgrade does not rewrite them.
+        // The new implementation must name the same providers; changing one is
+        // a migrator upgrade, not this script.
+        IFlashProviderView current_ = IFlashProviderView(proxy);
+        IFlashProviderView next = IFlashProviderView(implementation);
+        require(
+            next.morphoBlue() == current_.allowedFlashProviders(3),
+            "morphoBlue differs from allowedFlashProviders(3): a provider change needs a migrator upgrade (docs/PROXY_OPERATIONS.md)"
+        );
+        if (kind == keccak256("arb")) {
+            require(
+                next.balancerVault() == current_.allowedFlashProviders(2),
+                "balancerVault differs from allowedFlashProviders(2): a provider change needs a migrator upgrade (docs/PROXY_OPERATIONS.md)"
+            );
+        }
 
         console2.log("proxy:", proxy);
         console2.log("ProxyAdmin (Safe transaction target):", admin);
