@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {ExecutorDeploy} from "./support/ExecutorDeploy.sol";
 import {Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../src/types/SwapTypes.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -10,7 +11,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
+import {LiquidationExecutorGenesis} from "../src/proxy/LiquidationExecutorGenesis.sol";
+import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 import {UniswapLib} from "../src/libraries/UniswapLib.sol";
+import {SwapValidationLib} from "../src/libraries/SwapValidationLib.sol";
 import {SwapMode, SwapLeg, Op} from "../src/types/SwapTypes.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
 import {MarketParams} from "../src/interfaces/IMorphoBlue.sol";
@@ -20,7 +24,7 @@ import {MockSwapRouter} from "./mocks/MockSwapRouter.sol";
 import {MockBalancerVault} from "./mocks/MockBalancerVault.sol";
 import {MockParaswapAugustus} from "./mocks/MockParaswapAugustus.sol";
 import {MockAaveV2LendingPool} from "./mocks/MockAaveV2LendingPool.sol";
-import {MockBebopSettlement} from "./mocks/MockBebopSettlement.sol";
+import {MockBebopSettlement, MockBebopPartialFillSettlement} from "./mocks/MockBebopSettlement.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockUniV2Router} from "./mocks/MockUniV2Router.sol";
 import {MockUniV3Router} from "./mocks/MockUniV3Router.sol";
@@ -217,7 +221,7 @@ contract ExecutorTest is Test {
 
         // The harness only adds transient-state pokes for the tests that
         // used to `vm.store` the (now transient) execution state.
-        executor = new LiquidationExecutorHarness(
+        executor = ExecutorDeploy.liquidationHarness(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -1482,20 +1486,19 @@ contract ExecutorTest is Test {
     }
 
     function test_constructorRevertsOnZeroOwner() public {
-        address[] memory targets = new address[](0);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new LiquidationExecutor(
-            address(0),
-            address(1),
-            address(2),
-            address(3),
-            address(4),
-            address(5),
-            address(6),
-            address(7),
-            address(8),
-            targets
+        // Ownership lives in the proxy: Genesis refuses a zero owner while the
+        // proxy is being constructed.
+        LiquidationExecutor impl =
+            new LiquidationExecutor(address(2), address(3), address(5), address(6), address(7), address(8));
+        LiquidationExecutorGenesis genesis = new LiquidationExecutorGenesis();
+        address[] memory operators = new address[](1);
+        operators[0] = address(1);
+        bytes memory init = abi.encodeCall(
+            LiquidationExecutorGenesis.initialize,
+            (address(0), operators, new address[](0), new address[](0), address(4), address(0), address(impl))
         );
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
+        new ExecutorProxy(address(genesis), address(9), init);
     }
 
     function test_rescueERC20() public {
@@ -1659,32 +1662,24 @@ contract ExecutorTest is Test {
         executor.onMorphoFlashLoan(LOAN_AMOUNT, planBytes);
     }
 
-    /// V10+: Morpho is now constructor-pinned. Verify both slots
-    /// (morphoBlue and the FLASH_PROVIDER_MORPHO entry) are populated
-    /// by the constructor without any post-deploy setter call.
+    /// V10+: `morphoBlue` is a constructor immutable; the
+    /// FLASH_PROVIDER_MORPHO entry is seeded once into proxy storage by
+    /// LiquidationExecutorGenesis. Verify both without any post-deploy
+    /// setter call.
     function test_constructorPinsBothMorphoSlots() public {
         uint8 morphoFlashId = executor.FLASH_PROVIDER_MORPHO();
         assertEq(executor.morphoBlue(), address(morphoBlue));
         assertEq(executor.allowedFlashProviders(morphoFlashId), address(morphoBlue));
-        // morphoBlue is also auto-added to allowedTargets by the constructor.
+        // morphoBlue is also auto-added to allowedTargets by LiquidationExecutorGenesis.
         assertTrue(executor.allowedTargets(address(morphoBlue)));
     }
 
     /// V10+: constructor rejects a zero Morpho address.
     function test_constructorRejectsZeroMorpho() public {
-        address[] memory targets = new address[](0);
+        // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(aavePool),
-            address(balancerVault),
-            address(0), // morpho_ == 0 → revert
-            address(augustus),
-            address(uniV2Mock),
-            address(uniV3Mock),
-            targets
+            address(mockWeth), address(aavePool), address(0), address(augustus), address(uniV2Mock), address(uniV3Mock)
         );
     }
 
@@ -1695,7 +1690,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(augustus);
         targets[1] = address(morphoBlue);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -2038,7 +2033,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(bebop);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -2244,14 +2239,15 @@ contract ExecutorTest is Test {
         loanToken.mint(address(liarVault), 100_000e18);
         collateralToken.mint(address(liarVault), 100_000e18);
 
-        // V10+: Balancer Vault is constructor-pinned, no post-deploy
-        // setter to swap in a liar. Deploy a fresh executor with the
-        // liar as the Balancer slot directly.
+        // V10+: the Balancer Vault address is seeded once into proxy
+        // storage by LiquidationExecutorGenesis, no post-deploy setter
+        // to swap in a liar. Deploy a fresh executor with the liar as
+        // the Balancer slot directly.
         address[] memory targets = new address[](3);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(aaveV2Pool);
-        LiquidationExecutor exec2 = new LiquidationExecutor(
+        LiquidationExecutor exec2 = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -2284,7 +2280,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(aaveV2Pool);
-        LiquidationExecutor exec2 = new LiquidationExecutor(
+        LiquidationExecutor exec2 = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -2385,11 +2381,13 @@ contract ExecutorTest is Test {
         executor.setAaveV2LendingPool(address(0));
     }
 
-    // V10+: `setFlashProvider` and `configureMorpho` removed. Both
-    // flash providers (Balancer Vault + Morpho Blue) are now
-    // constructor-pinned. The dedicated setter-shape tests
-    // (`test_setFlashProvider*`, `test_configureMorpho*`) were
-    // deleted alongside the functions they exercised.
+    // V10+: `setFlashProvider` and `configureMorpho` removed. Morpho is
+    // an implementation immutable; the Balancer Vault address and both
+    // `allowedFlashProviders` entries are seeded once into proxy
+    // storage by LiquidationExecutorGenesis. The dedicated
+    // setter-shape tests (`test_setFlashProvider*`,
+    // `test_configureMorpho*`) were deleted alongside the functions
+    // they exercised.
 
     function test_setAaveV2LendingPoolRejectsNonWhitelisted() public {
         address notWhitelisted = address(0xDEAD2);
@@ -3513,7 +3511,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -3610,7 +3608,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -3694,7 +3692,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -3786,7 +3784,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -3886,7 +3884,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -4211,7 +4209,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -4714,7 +4712,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -4838,7 +4836,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExecutor = new LiquidationExecutor(
+        LiquidationExecutor freshExecutor = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5000,7 +4998,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5057,7 +5055,7 @@ contract ExecutorTest is Test {
         address[] memory targets = new address[](2);
         targets[0] = address(emptyPool);
         targets[1] = address(augustus);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5170,7 +5168,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5218,7 +5216,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5269,7 +5267,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5338,7 +5336,7 @@ contract ExecutorTest is Test {
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
         targets[2] = address(morphoBlue);
-        LiquidationExecutor freshExec = new LiquidationExecutor(
+        LiquidationExecutor freshExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -5489,6 +5487,177 @@ contract ExecutorTest is Test {
         plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
         vm.prank(operatorAddr);
         executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LIQUIDATION ACTIONS vs THE STANDING loanToken BALANCE
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // `validateActions` never bounds `debtToCover` / `maxRepayAssets` by
+    // `loanAmount`, the single-leg repay gate only measures the swap's output,
+    // and `computeRealizedProfit` sees a loanToken loss only when
+    // profitToken == loanToken. So a 1-wei loan could repay a large debt out of
+    // the executor's standing loanToken and route the seized collateral away.
+
+    /// A UNI_V2 collateral → loanToken leg whose output covers the flash
+    /// repay, with a profit token that is NOT the loan token.
+    function _standingLoanSwapPlan() internal view returns (LiquidationExecutor.SwapPlan memory swapPlan) {
+        swapPlan = _buildUniV2SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 1, 0);
+        swapPlan.profitToken = address(profitToken);
+    }
+
+    function test_liquidation_actionsCannotSpendStandingLoanToken() public {
+        // setUp leaves LOAN_AMOUNT + FLASH_FEE + 100e18 loanToken standing.
+        uint256 loanAmount = 10e18;
+        uint256 debtToCover = 400e18;
+        assertGt(loanToken.balanceOf(address(executor)), debtToCover, "precondition: standing loanToken");
+
+        bytes memory plan = _buildPlan(
+            2, address(loanToken), loanAmount, FLASH_FEE, _defaultLiqAction(debtToCover), _standingLoanSwapPlan()
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(SwapValidationLib.ActionsSpentStandingLoan.selector, debtToCover, loanAmount)
+        );
+        executor.execute(plan);
+    }
+
+    function test_morphoLiquidation_cannotSpendStandingLoanToken() public {
+        uint256 loanAmount = 10e18;
+        uint256 repaid = 800e18;
+        // The mock pulls `repaid` loanToken and reports it as assetsRepaid.
+        morphoBlue.setLiquidationDebtAmount(repaid);
+        bytes memory action = _buildMorphoLiquidationActionFull(
+            address(collateralToken), address(loanToken), address(0x1234), 400e18, repaid
+        );
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), loanAmount, FLASH_FEE, _singleAction(2, action), _standingLoanSwapPlan());
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(SwapValidationLib.ActionsSpentStandingLoan.selector, repaid, loanAmount));
+        executor.execute(plan);
+    }
+
+    /// The bound is on what the pool PULLED, not on the declared cover: Aave
+    /// trims a padded `debtToCover` to min(debtToCover, closeFactor × debt).
+    function test_liquidation_paddedDebtToCover_withinLoan_passes() public {
+        // Boundary: the pull equals the loan exactly.
+        aavePool.setLiquidationDebtCap(LOAN_AMOUNT);
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        bytes memory plan = _buildPlan(
+            2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(5_000e18), _standingLoanSwapPlan()
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // + swap output − debt pulled − flash fee.
+        uint256 swapOut = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18;
+        assertEq(loanToken.balanceOf(address(executor)), loanBefore + swapOut - LOAN_AMOUNT - FLASH_FEE);
+        assertEq(loanToken.allowance(address(executor), address(aavePool)), 0, "padded cover leaves no allowance");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // BEBOP PARTIAL FILL — the block seized less collateral than the quote
+    // ═══════════════════════════════════════════════════════════════════
+
+    uint256 internal constant BEBOP_QUOTE_IN = 1_200e18; // Q; realised R = COLLATERAL_REWARD
+    uint256 internal constant BEBOP_QUOTE_OUT = 1_320e18; // pays 1_100e18 at R
+    uint256 internal constant BEBOP_FILL_WORD = 1;
+
+    function _partialFillSettlement() internal returns (MockBebopPartialFillSettlement s) {
+        s = new MockBebopPartialFillSettlement(
+            address(collateralToken), address(loanToken), BEBOP_QUOTE_IN, BEBOP_QUOTE_OUT, BEBOP_FILL_WORD
+        );
+        loanToken.mint(address(s), BEBOP_QUOTE_OUT);
+        vm.prank(owner);
+        executor.setAllowedTarget(address(s), true);
+    }
+
+    function _partialFillPlan(address settlement, uint256 offset, uint256 minOut) internal view returns (bytes memory) {
+        // The quote carries its own amount (Q) at the fill word; an unpatched
+        // order would ask the settlement for all of it.
+        bytes memory cd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(7), BEBOP_QUOTE_IN);
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildBebopMultiSwapPlan(
+            address(collateralToken), BEBOP_QUOTE_IN, settlement, cd, address(loanToken), address(loanToken), 0
+        );
+        swapPlan.leg1.bebopPartialFillOffset = offset;
+        swapPlan.leg1.minAmountOut = minOut;
+        return _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
+    }
+
+    function test_bebop_partialFill_whenCollateralBelowQuote() public {
+        MockBebopPartialFillSettlement s = _partialFillSettlement();
+        uint256 r = COLLATERAL_REWARD;
+        uint256 delivered = BEBOP_QUOTE_OUT * r / BEBOP_QUOTE_IN; // 1_100e18
+
+        // A floor written for the full quote, scaled pro-rata, lands just
+        // above what R delivers — the leg floor must fire on the SCALED value.
+        uint256 tooHigh = 1_321e18;
+        uint256 scaledTooHigh = (tooHigh * r + BEBOP_QUOTE_IN - 1) / BEBOP_QUOTE_IN;
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.InsufficientRepayOutput.selector, delivered, scaledTooHigh)
+        );
+        executor.execute(_partialFillPlan(address(s), BEBOP_FILL_WORD, tooHigh));
+
+        // 1_300e18 > delivered, so only a pro-rata floor (1_083.3e18) passes.
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(_partialFillPlan(address(s), BEBOP_FILL_WORD, 1_300e18));
+
+        // The settlement pulls the word at the offset (0 would mean all of Q):
+        // it received exactly R, so the word was patched to R.
+        assertEq(collateralToken.balanceOf(address(s)), r, "fill word == realised collateral");
+        // + settlement output − debt the liquidation pulled − flash fee.
+        assertEq(loanToken.balanceOf(address(executor)), loanBefore + delivered - 400e18 - FLASH_FEE);
+        assertEq(collateralToken.allowance(address(executor), address(s)), 0);
+    }
+
+    function test_bebop_collateralBelowQuote_withoutOffset_reverts() public {
+        MockBebopPartialFillSettlement s = _partialFillSettlement();
+
+        // The executor caps the fill at R; with no offset the library refuses
+        // to fill short (no partial fill without an offset).
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.InsufficientSrcBalance.selector, BEBOP_QUOTE_IN, COLLATERAL_REWARD
+            )
+        );
+        executor.execute(_partialFillPlan(address(s), 0, 1));
+    }
+
+    function test_bebop_partialFill_doesNotTouchStandingCollateral() public {
+        MockBebopPartialFillSettlement s = _partialFillSettlement();
+        // Enough standing collateral that srcBal alone would cover all of Q.
+        collateralToken.mint(address(executor), 5_000e18);
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(_partialFillPlan(address(s), BEBOP_FILL_WORD, 1));
+
+        assertEq(collateralToken.balanceOf(address(s)), COLLATERAL_REWARD, "fill == R, not Q");
+        assertEq(collateralToken.balanceOf(address(executor)), collBefore, "standing collateral untouched");
+    }
+
+    function test_bebop_collateralBelowQuote_withoutOffset_reportsTheFill() public {
+        MockBebopPartialFillSettlement s = _partialFillSettlement();
+        // Standing collateral lifts the balance above Q, so the fill was capped
+        // by the seized R (`maxIn`), not by the balance. The revert names that
+        // fill, not a balance that never limited anything.
+        collateralToken.mint(address(executor), 5_000e18);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.InsufficientSrcBalance.selector, BEBOP_QUOTE_IN, COLLATERAL_REWARD
+            )
+        );
+        executor.execute(_partialFillPlan(address(s), 0, 1));
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -6357,36 +6526,18 @@ contract ExecutorTest is Test {
     }
 
     function test_constructor_rejectsZeroV2Router() public {
-        address[] memory targets = new address[](0);
+        // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(aavePool),
-            address(balancerVault),
-            address(morphoBlue),
-            address(augustus),
-            address(0),
-            address(uniV3Mock),
-            targets
+            address(mockWeth), address(aavePool), address(morphoBlue), address(augustus), address(0), address(uniV3Mock)
         );
     }
 
     function test_constructor_rejectsZeroV3Router() public {
-        address[] memory targets = new address[](0);
+        // Built directly: vm.expectRevert covers one revert and lets execution continue, and the proxy helper creates three contracts.
         vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
         new LiquidationExecutor(
-            owner,
-            operatorAddr,
-            address(mockWeth),
-            address(aavePool),
-            address(balancerVault),
-            address(morphoBlue),
-            address(augustus),
-            address(uniV2Mock),
-            address(0),
-            targets
+            address(mockWeth), address(aavePool), address(morphoBlue), address(augustus), address(uniV2Mock), address(0)
         );
     }
 
@@ -8826,7 +8977,7 @@ contract ExecutorNoSwapTest is ExecutorTest {
         address[] memory targets = new address[](2);
         targets[0] = address(aavePool);
         targets[1] = address(augustus);
-        LiquidationExecutor fresh = new LiquidationExecutor(
+        LiquidationExecutor fresh = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -9244,7 +9395,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[4] = address(morphoBlue);
         targets[5] = address(evilPm);
 
-        evilExec = new LiquidationExecutor(
+        evilExec = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -9594,7 +9745,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(curveLeg2);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -9711,7 +9862,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(balLeg2);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -10515,7 +10666,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(curvePool);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -10594,7 +10745,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(balPool);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -10812,7 +10963,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[7] = address(balancerSwapMock);
         targets[8] = address(balWeth);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),
@@ -10954,7 +11105,7 @@ contract ExecutorV4SecurityTest is ExecutorTest {
         targets[8] = address(curveLeg1);
         targets[9] = address(balLeg2);
 
-        LiquidationExecutor execLocal = new LiquidationExecutor(
+        LiquidationExecutor execLocal = ExecutorDeploy.liquidation(
             owner,
             operatorAddr,
             address(mockWeth),

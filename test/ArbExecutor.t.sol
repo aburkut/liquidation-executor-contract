@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ExecutorDeploy} from "./support/ExecutorDeploy.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -134,7 +135,7 @@ contract ArbExecutorTest is Test {
         address[] memory allowed = new address[](0);
 
         vm.prank(ownerAddr);
-        exec = new ArbExecutor(
+        exec = ExecutorDeploy.arb(
             ownerAddr,
             operatorAddr,
             address(weth),
@@ -804,7 +805,7 @@ contract ArbExecutorTest is Test {
         HostileMorpho hostile = new HostileMorpho();
         address[] memory allowed = new address[](0);
         vm.prank(ownerAddr);
-        ArbExecutor exec2 = new ArbExecutor(
+        ArbExecutor exec2 = ExecutorDeploy.arb(
             ownerAddr,
             operatorAddr,
             address(weth),

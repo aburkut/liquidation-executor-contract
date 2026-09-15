@@ -2,12 +2,17 @@
 pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
+import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
-import {LiquidationExecutorSeeded} from "../src/deploy/SeededExecutors.sol";
+import {LiquidationExecutorGenesis} from "../src/proxy/LiquidationExecutorGenesis.sol";
+import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
+import {FluidPools} from "./FluidPools.sol";
 
 /// @title V10 Deploy
-/// @notice Deploys `LiquidationExecutor` V10 against canonical mainnet
-/// protocol addresses. Forge auto-deploys + links the six shared
+/// @notice Deploys `LiquidationExecutor` V10 behind an `ExecutorProxy`
+/// (implementation → `LiquidationExecutorGenesis` → proxy) against canonical
+/// mainnet protocol addresses. Forge auto-deploys + links the six shared
 /// external libraries (`SwapValidationLib`, `CoinbasePaymentLib`,
 /// `UniswapLib`, `CurveV1Lib`, `BalancerV2Lib`, `SwapLegExecutorLib`)
 /// on first use.
@@ -16,8 +21,14 @@ import {LiquidationExecutorSeeded} from "../src/deploy/SeededExecutors.sol";
 /// separate run when bot-side arb integration is ready.
 ///
 /// Usage:
-///   PRIVATE_KEY=<owner> forge script script/Deploy.s.sol:Deploy \
+///   PRIVATE_KEY=<deployer key> forge script script/Deploy.s.sol:Deploy \
 ///     --rpc-url $ETHEREUM_RPC_URL --broadcast --legacy
+/// The key only pays for the deploy; the executor and its ProxyAdmin belong to
+/// the Safe `OWNER`.
+///
+/// Dry-run on a local fork started with `anvil --fork-url <rpc> --chain-id 31337`:
+/// a fork keeps chain id 1 otherwise, and `--broadcast` overwrites the tracked
+/// broadcast/<script>/1/run-latest.json records (docs/PROXY_OPERATIONS.md).
 ///
 /// Executor address + auto-deployed library addresses land in
 /// `broadcast/Deploy.s.sol/1/run-latest.json`.
@@ -48,7 +59,7 @@ contract Deploy is Script {
     // ─── Everything the owner added to the LIVE liquidator after deploy ───
     // Read from the contract's own events on 0x7800c252… (blocks
     // 25730434..25919383 via scripts/executor_config_events.py in the bot
-    // repo, 2026-09-06), so a redeploy through the seeded constructor needs
+    // repo, 2026-09-06), so a redeploy seeded through Genesis needs
     // NO Safe transaction afterwards. The live liquidator NEVER had its Aave
     // V2 lending pool set (no ConfigUpdated("aaveV2Pool") event), so it stays
     // unset here too — pass AAVE_V2_POOL to `aaveV2LendingPool_` below only if
@@ -70,8 +81,9 @@ contract Deploy is Script {
         // lending pool + Uni V4 PoolManager + the GENERIC_SEQUENCE
         // direct-call routers (V3 SwapRouter01, V2 Router02, Curve
         // RouterNG, Balancer Vault) the knapsack split generator emits
-        // ops against. Morpho is constructor-pinned (not in `allowed[]`).
-        address[] memory liqAllowed = new address[](14);
+        // ops against. Morpho is an implementation immutable that Genesis
+        // allowlists itself (not in `allowed[]`). Then the Fluid DEX pools.
+        address[] memory liqAllowed = new address[](14 + FluidPools.COUNT);
         liqAllowed[0] = BEBOP_SETTLEMENT;
         liqAllowed[1] = AAVE_V2_POOL;
         liqAllowed[2] = UNI_V4_POOL_MANAGER;
@@ -87,44 +99,50 @@ contract Deploy is Script {
         liqAllowed[11] = HASHFLOW_ROUTER;
         liqAllowed[12] = EKUBO_ROUTER;
         liqAllowed[13] = SWAAP_ROUTER;
+        // The same Fluid DEX pools the arb executor seeds. Fluid has no router,
+        // so selling seized collateral into a Fluid pool needs the pool itself
+        // allowlisted. 2026-09-15, block 25_980_901: a competitor liquidated an
+        // rsETH/WETH whale by selling the rsETH into the rsETH/ETH pool, which
+        // the live liquidator did not allow (test/fork/LiquidationViaFluid.t.sol).
+        address[] memory fluid = FluidPools.all();
+        for (uint256 i = 0; i < fluid.length; ++i) {
+            liqAllowed[14 + i] = fluid[i];
+        }
 
-        address[] memory operators = new address[](2);
-        operators[0] = OPERATOR_2;
-        operators[1] = OPERATOR_3;
+        address[] memory operators = new address[](3);
+        operators[0] = OPERATOR;
+        operators[1] = OPERATOR_2;
+        operators[2] = OPERATOR_3;
         // V4 hooks are accepted by default now (blocklist, not allowlist);
         // nothing to seed. The two hooks that used to be allowed here are
         // kept as constants only for the read-back below.
         address[] memory hooks = new address[](0);
 
-        vm.startBroadcast();
-
-        liqExecutor = address(
-            new LiquidationExecutorSeeded(
-                OWNER,
-                OPERATOR,
-                WETH,
-                AAVE_V3_POOL,
-                BALANCER_VAULT,
-                MORPHO_BLUE,
-                PARASWAP_AUGUSTUS,
-                UNI_V2_ROUTER,
-                UNI_V3_ROUTER,
-                liqAllowed,
-                operators,
-                hooks,
-                // The live liquidator never set its Aave V2 lending pool
-                // (no event); leave it unset. Pass AAVE_V2_POOL to enable V2.
-                address(0)
+        // Broadcast with the key from the environment; a bare
+        // `vm.startBroadcast()` falls back to Foundry's default sender.
+        vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
+        LiquidationExecutor impl =
+            new LiquidationExecutor(WETH, AAVE_V3_POOL, MORPHO_BLUE, PARASWAP_AUGUSTUS, UNI_V2_ROUTER, UNI_V3_ROUTER);
+        LiquidationExecutorGenesis genesis = new LiquidationExecutorGenesis();
+        ExecutorProxy proxy = new ExecutorProxy(
+            address(genesis),
+            OWNER,
+            abi.encodeCall(
+                LiquidationExecutorGenesis.initialize,
+                // The live liquidator never set its Aave V2 lending pool (no
+                // event); leave it unset. Pass AAVE_V2_POOL to enable V2.
+                (OWNER, operators, liqAllowed, hooks, BALANCER_VAULT, address(0), address(impl))
             )
         );
-
         vm.stopBroadcast();
+        liqExecutor = address(proxy);
 
         // Post-deploy read-back assertions (deploy plan §1.2): the
-        // constructor takes 9 same-type `address` params, each only
-        // != 0 checked — a positional swap deploys a mis-wired,
-        // non-reverting contract. Verify every role landed where
-        // intended before trusting the deployment.
+        // implementation constructor takes six same-type `address` params
+        // and Genesis `initialize` four more, each only != 0 checked — a
+        // positional swap deploys a mis-wired, non-reverting contract.
+        // Verify every role landed where intended before trusting the
+        // deployment.
         LiquidationExecutor ex = LiquidationExecutor(payable(liqExecutor));
         require(ex.owner() == OWNER, "readback: owner");
         require(ex.operators(OPERATOR), "readback: operator");
@@ -149,9 +167,28 @@ contract Deploy is Script {
         require(ex.allowedTargets(SUSHI_V2_ROUTER), "readback: sushi v2 allowed");
         require(ex.allowedTargets(PANCAKE_V2_ROUTER), "readback: pancake v2 allowed");
         require(ex.allowedTargets(SHIBASWAP_ROUTER), "readback: shibaswap allowed");
+        for (uint256 i = 0; i < fluid.length; ++i) {
+            require(ex.allowedTargets(fluid[i]), "readback: fluid pool allowed");
+        }
+        require(ex.allowedTargets(FluidPools.RSETH_ETH), "readback: fluid rsETH/ETH allowed");
         require(ex.operators(OPERATOR_2) && ex.operators(OPERATOR_3), "readback: extra operators");
         require(!ex.blockedV4Hooks(LAUNCH_HOOK) && !ex.blockedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks open");
+        require(
+            address(uint160(uint256(vm.load(liqExecutor, ERC1967Utils.IMPLEMENTATION_SLOT)))) == address(impl),
+            "readback: implementation"
+        );
+        ProxyAdmin admin = ProxyAdmin(address(uint160(uint256(vm.load(liqExecutor, ERC1967Utils.ADMIN_SLOT)))));
+        require(admin.owner() == OWNER, "readback: ProxyAdmin owner");
+        require(ex.allowedFlashProviders(2) == BALANCER_VAULT, "readback: balancer flash provider");
+        require(ex.allowedFlashProviders(3) == MORPHO_BLUE, "readback: morpho flash provider");
+        require(ex.allowedTargets(AAVE_V3_POOL), "readback: aave v3 allowed");
+        require(ex.allowedTargets(MORPHO_BLUE), "readback: morpho allowed");
+        require(ex.allowedTargets(PARASWAP_AUGUSTUS), "readback: paraswap allowed");
+        require(ex.allowedTargets(UNI_V3_ROUTER), "readback: v3 router allowed");
+        require(ex.aaveV2LendingPool() == address(0), "readback: aave v2 pool unset");
 
-        console2.log("LiquidationExecutor V10:", liqExecutor);
+        console2.log("LiquidationExecutor proxy (permanent address):", liqExecutor);
+        console2.log("implementation:", address(impl));
+        console2.log("ProxyAdmin (upgrade target for the Safe):", address(admin));
     }
 }

@@ -16,6 +16,7 @@ import {UniswapLib} from "./libraries/UniswapLib.sol";
 import {GenericSequenceLib} from "./libraries/GenericSequenceLib.sol";
 import {CoinbasePaymentLib} from "./libraries/CoinbasePaymentLib.sol";
 import {Op} from "./types/SwapTypes.sol";
+import {ArbExecutorStorage} from "./storage/ArbExecutorStorage.sol";
 
 /// @title ArbExecutor
 /// @notice Flashloan-driven N-hop atomic arbitrage executor. Sister
@@ -72,14 +73,7 @@ library ArbTypes {
     }
 }
 
-contract ArbExecutor is
-    Ownable2Step,
-    Pausable,
-    ReentrancyGuardTransient,
-    IFlashLoanRecipient,
-    IMorphoFlashLoanCallback,
-    IUnlockCallback
-{
+contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoanCallback, IUnlockCallback {
     using SafeERC20 for IERC20;
 
     // ─── Errors ──────────────────────────────────────────────────────
@@ -112,7 +106,9 @@ contract ArbExecutor is
         bytes32 indexed planHash, address indexed loanToken, uint256 realizedProfit, uint256 coinbasePaid
     );
     event AllowedTargetUpdated(address indexed target, bool allowed);
-    // V10+: FlashProviderUpdated dropped — both providers constructor-pinned.
+    // V10+: FlashProviderUpdated dropped — both providers are seeded
+    // once into proxy storage by ArbExecutorGenesis. A plain upgrade does
+    // not rewrite them; rotating one is a migrator upgrade (see below).
     event Withdraw(address indexed token, address indexed to, uint256 amount);
     event V4HookBlockedUpdated(address indexed hook, bool blocked);
     event OperatorUpdated(address indexed operator, bool allowed);
@@ -156,47 +152,15 @@ contract ArbExecutor is
     address public immutable uniV3Router;
 
     // ─── Storage ─────────────────────────────────────────────────────
-    // Layout NOTE: the V4 arming fields MUST land at slots 11/12 to match
-    // GenericSequenceLib's pinned V4_PM_SLOT/V4_TOKENIN_SLOT constants (the
-    // lib sstores into them via DELEGATECALL). test_v4SlotConstantsMatchLayout
-    // is the authority — if it fails, adjust the field order/padding below.
+    // Persistent state lives in `ArbExecutorStorage`; this contract adds none.
     /// @dev The two flash providers are constructor-pinned and read on the
     /// hot path (provider dispatch, callback caller checks): immutables cost
     /// nothing to read where a storage slot costs 2.1k cold. The
     /// `allowedFlashProviders` mapping stays for the ABI (getter, deploy
-    /// read-backs) and is written once, in the constructor.
+    /// read-backs) and is written once, at initialization; an upgrade must
+    /// keep these immutables equal to its entries (PrepareUpgrade checks).
     address public immutable morphoBlue;
     address public immutable balancerVault;
-    mapping(uint8 => address) public allowedFlashProviders;
-    /// @dev Generic allowlist for Bebop settlement / future protocol
-    /// targets that need owner-curated trust. Uni V2/V3 routers are
-    /// constructor-immutable; Curve / Balancer pool addresses are
-    /// trusted from the bot (sanity-gated inside their libraries).
-    mapping(address => bool) public allowedTargets;
-    /// @dev V4 hook BLOCKlist (parity with LiquidationExecutor). Any hook is
-    /// accepted unless the owner has blocked it; `unlockCallback` re-checks.
-    ///
-    /// This used to be an ALLOWlist, curated one owner transaction per hook.
-    /// It was dropped for the reason the Curve/Balancer target allowlist was
-    /// dropped before it (see LiquidationExecutor's `allowedTargets` notes):
-    /// the bot is the trusted source of pools, and a hostile hook can only
-    /// make the transaction revert, not take standing funds. What bounds it:
-    /// v4-core caps a `beforeSwap` delta at the swap's own amount
-    /// (`HookDeltaExceedsSwapAmount`), `runV4UnlockSwap` reverts on any
-    /// delta with the wrong sign, `owedIn` is read from the delta rather
-    /// than the plan, and `runArb` ends in `checkProfitStrict`, which
-    /// refuses a cycle that ended below where it started whatever the
-    /// plan's floor says (a zero floor included). Same slot as before, so
-    /// the V4 arming fields stay at 11/12. The blocklist remains for a hook
-    /// that reverts on us on purpose (gas griefing), which no floor can see.
-    mapping(address => bool) public blockedV4Hooks;
-    /// @dev Operator allowlist. Several operator EOAs may drive ONE executor
-    /// so sends spread over independent nonce streams — one stuck tx then
-    /// cannot jam the others, and same-nonce bid fan-out does not have to
-    /// fight its own replacements. Seeded with the constructor's `operator_`.
-    /// Owner-curated: an operator key is hot, so it may only SPEND under the
-    /// containment caps, never move standing funds (`withdraw` is onlyOwner).
-    mapping(address => bool) public operators;
 
     // No per-transaction execution state lives in persistent storage any
     // more: the plan hash, the phase and the V4 arming words (`V4_PM_TSLOT`,
@@ -205,24 +169,17 @@ contract ArbExecutor is
     // gone with them — nothing raw-`sstore`s into this contract.
 
     // ─── Constructor ─────────────────────────────────────────────────
-    /// @dev Both flash providers (Balancer Vault + Morpho Blue) are
-    /// constructor-pinned. Mainnet addresses (`0xBA12…BF2C8`,
-    /// `0xBBBB…EEFFCb`) have been stable since launch; rotation
-    /// requires redeploy. Eliminates the "did you call
-    /// configureMorpho?" post-deploy footgun.
+    /// Immutables only. Persistent state belongs to the proxy and is seeded by
+    /// `ArbExecutorGenesis`; this contract's own storage is never used, so it
+    /// is left ownerless and its initializers are disabled.
     constructor(
-        address owner_,
-        address operator_,
         address weth_,
         address balancerVault_,
         address morpho_,
         address paraswapAugustus_,
         address uniV2Router_,
-        address uniV3Router_,
-        address[] memory allowedTargets_
-    ) Ownable(owner_) {
-        if (owner_ == address(0)) revert ZeroAddress();
-        if (operator_ == address(0)) revert ZeroAddress();
+        address uniV3Router_
+    ) Ownable(address(0xdEaD)) {
         if (weth_ == address(0)) revert ZeroAddress();
         if (balancerVault_ == address(0)) revert ZeroAddress();
         if (morpho_ == address(0)) revert ZeroAddress();
@@ -230,8 +187,6 @@ contract ArbExecutor is
         if (uniV2Router_ == address(0)) revert ZeroAddress();
         if (uniV3Router_ == address(0)) revert ZeroAddress();
 
-        operators[operator_] = true;
-        emit OperatorUpdated(operator_, true);
         weth = weth_;
         paraswapAugustusV6 = paraswapAugustus_;
         uniV2Router = uniV2Router_;
@@ -239,30 +194,7 @@ contract ArbExecutor is
         morphoBlue = morpho_;
         balancerVault = balancerVault_;
 
-        allowedFlashProviders[FLASH_PROVIDER_BALANCER] = balancerVault_;
-        allowedFlashProviders[FLASH_PROVIDER_MORPHO] = morpho_;
-        // Seed allowedTargets with the routers + Paraswap so Bebop
-        // dispatch can re-check `allowedTargets[bebopTarget]` if used.
-        // Balancer Vault is ALSO seeded here because it doubles as a
-        // legitimate swap venue in the cross-venue routing (not just a
-        // flash-loan source), so a generic `Op` may legitimately target it.
-        // Morpho Blue is deliberately NOT seeded here (audit fix, N-Task 5
-        // fix 1): the flash-repay path never needs `allowedTargets` — it is
-        // reached exclusively via `allowedFlashProviders[FLASH_PROVIDER_MORPHO]`,
-        // and repayment is a `forceApprove(msg.sender=Morpho, flashRepay)`
-        // that bypasses this mapping entirely. Seeding it here would only
-        // expose Morpho Blue's full function surface as a generic `Op`
-        // target, contradicting this contract's own "no liquidation
-        // actions" scope (see the contract NatSpec above).
-        allowedTargets[balancerVault_] = true;
-        allowedTargets[paraswapAugustus_] = true;
-        allowedTargets[uniV2Router_] = true;
-        allowedTargets[uniV3Router_] = true;
-
-        for (uint256 i = 0; i < allowedTargets_.length; ++i) {
-            if (allowedTargets_[i] == address(0)) revert ZeroAddress();
-            allowedTargets[allowedTargets_[i]] = true;
-        }
+        _disableInitializers();
     }
 
     // ─── Modifiers ───────────────────────────────────────────────────
@@ -272,9 +204,14 @@ contract ArbExecutor is
     }
 
     // ─── Owner: admin ────────────────────────────────────────────────
-    // V10+: `configureMorpho` and `setFlashProvider` removed. Both
-    // flash providers are constructor-pinned; rotation requires
-    // redeploy.
+    // V10+: `configureMorpho` and `setFlashProvider` removed. Both flash
+    // providers live in proxy storage (`allowedFlashProviders`), written
+    // once by ArbExecutorGenesis. A plain upgrade does not rewrite them, so
+    // rotating a provider needs `ProxyAdmin.upgradeAndCall(proxy, migrator,
+    // data)`: the migrator runs under `reinitializer(2)`, rewrites the
+    // entries (and the allowlist / standing allowances as needed) and hands
+    // off with `ERC1967Utils.upgradeToAndCall(implementation, "")` — the
+    // Genesis pattern. See docs/PROXY_OPERATIONS.md.
 
     function setAllowedTarget(address target, bool allowed) external onlyOwner {
         if (target == address(0)) revert ZeroAddress();
@@ -487,7 +424,7 @@ contract ArbExecutor is
             // compare fails) and a bare PREV (leaves 0). Written this way for
             // the EIP-170 budget — the pair of equality checks cost 86 bytes
             // and pushed LiquidationExecutor past the project's own headroom
-            // guard at 24200.
+            // guard at 24400.
             if (plan.ops[i].flags & ~GenericSequenceLib.FLAG_USE_PREV_RETURN == GenericSequenceLib.FLAG_WETH_WRAP) {
                 continue;
             }
@@ -809,7 +746,8 @@ contract ArbExecutor is
             // Own principal: nothing to repay.
         } else if (vault == address(0)) {
             // Morpho pulls the repayment from us after the callback returns;
-            // the provider is constructor-pinned, so the allowance stands
+            // the provider does not rotate without a migrator upgrade (which
+            // must also clear this allowance), so the allowance stands
             // (AllowanceLib) instead of being re-written from zero per cycle.
             AllowanceLib.ensure(loanToken, msg.sender, flashRepay);
         } else {

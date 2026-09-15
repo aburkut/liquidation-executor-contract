@@ -20,6 +20,14 @@ optimizer = true
 # deployed contract stays under EIP-170 (24,576 bytes).
 optimizer_runs = 1
 via_ir = true
+fs_permissions = [{ access = "read", path = "./test/fixtures" }]
+# Emit storageLayout in build artifacts so `script/check_layout.sh` runs after
+# CI's default-profile build. That script compares the PERSISTENT storage
+# layout of the executors (and, later, their Genesis contracts) with the
+# snapshots in layout/. Transient slots do not appear in that output; their
+# constants are guarded by test_v4SlotConstantsMatchLayout. Output selection
+# is not part of the solc metadata hash, so deployed bytecode is unchanged.
+extra_output = ["storageLayout"]
 
 # ArbExecutor and its libraries are deployed from this profile
 # (`FOUNDRY_PROFILE=arb forge script script/DeployArb.s.sol`): runtime gas
@@ -32,11 +40,7 @@ optimizer_runs = 1_000_000
 # deployed contract comfortably under the EIP-170 24,576-byte limit.
 bytecode_hash = "none"
 cbor_metadata = false
-# Emit storageLayout in build artifacts so `forge inspect <Contract>
-# storageLayout` works — the authoritative offline check that V4 arming
-# fields (GenericSequenceLib's hardcoded V4_PM_SLOT/V4_TOKENIN_SLOT) land at
-# the right slots in both LiquidationExecutor and ArbExecutor.
-extra_output = ["storageLayout"]
+# `extra_output = ["storageLayout"]` is inherited from [profile.default].
 
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",

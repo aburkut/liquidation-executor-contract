@@ -14,8 +14,15 @@ contract MockAavePool {
     bool public liquidationReverts;
     uint256 public liquidationCollateralReward;
     address public aToken;
+    /// @dev Aave pulls min(debtToCover, closeFactor × debt). Zero = no cap
+    /// (pull exactly `debtToCover`, the historical mock behaviour).
+    uint256 public liquidationDebtCap;
 
     constructor(uint256) {}
+
+    function setLiquidationDebtCap(uint256 _cap) external {
+        liquidationDebtCap = _cap;
+    }
 
     function setRepayReverts(bool _reverts) external {
         repayReverts = _reverts;
@@ -29,7 +36,9 @@ contract MockAavePool {
         bool receiveAToken
     ) external {
         require(!liquidationReverts, "MockAavePool: liquidation reverts");
-        IERC20(debtAsset).safeTransferFrom(msg.sender, address(this), debtToCover);
+        uint256 cap = liquidationDebtCap;
+        uint256 pull = cap != 0 && cap < debtToCover ? cap : debtToCover;
+        IERC20(debtAsset).safeTransferFrom(msg.sender, address(this), pull);
         if (receiveAToken && aToken != address(0)) {
             IERC20(aToken).safeTransfer(msg.sender, liquidationCollateralReward);
         } else {

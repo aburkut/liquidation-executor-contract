@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ExecutorDeploy} from "./support/ExecutorDeploy.sol";
+import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
 
 import {ArbExecutor, ArbTypes} from "../src/ArbExecutor.sol";
 import {Op} from "../src/types/SwapTypes.sol";
@@ -80,7 +82,7 @@ contract ArbExecutorSecurityTest is Test {
         allowed[0] = address(v4pm);
 
         vm.prank(ownerAddr);
-        exec = new ArbExecutor(
+        exec = ExecutorDeploy.arb(
             ownerAddr,
             operatorAddr,
             address(weth),
@@ -299,7 +301,8 @@ contract ArbExecutorSecurityTest is Test {
     // ═══════════════════════════════════════════════════════════════
 
     function test_arb_deployedBytecode_underEip170() public view {
-        bytes memory code = address(exec).code;
-        assertLt(code.length, 24576, "ArbExecutor exceeds EIP-170");
+        address impl = address(uint160(uint256(vm.load(address(exec), ERC1967Utils.IMPLEMENTATION_SLOT))));
+        assertTrue(impl != address(exec) && impl.code.length > 0, "exec is a proxy: measure its implementation");
+        assertLt(impl.code.length, 24576, "ArbExecutor exceeds EIP-170");
     }
 }
