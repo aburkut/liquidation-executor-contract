@@ -7,6 +7,7 @@ import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.s
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
 import {LiquidationExecutorGenesis} from "../src/proxy/LiquidationExecutorGenesis.sol";
 import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
+import {FluidPools} from "./FluidPools.sol";
 
 /// @title V10 Deploy
 /// @notice Deploys `LiquidationExecutor` V10 behind an `ExecutorProxy`
@@ -81,8 +82,8 @@ contract Deploy is Script {
         // direct-call routers (V3 SwapRouter01, V2 Router02, Curve
         // RouterNG, Balancer Vault) the knapsack split generator emits
         // ops against. Morpho is an implementation immutable that Genesis
-        // allowlists itself (not in `allowed[]`).
-        address[] memory liqAllowed = new address[](14);
+        // allowlists itself (not in `allowed[]`). Then the Fluid DEX pools.
+        address[] memory liqAllowed = new address[](14 + FluidPools.COUNT);
         liqAllowed[0] = BEBOP_SETTLEMENT;
         liqAllowed[1] = AAVE_V2_POOL;
         liqAllowed[2] = UNI_V4_POOL_MANAGER;
@@ -98,6 +99,15 @@ contract Deploy is Script {
         liqAllowed[11] = HASHFLOW_ROUTER;
         liqAllowed[12] = EKUBO_ROUTER;
         liqAllowed[13] = SWAAP_ROUTER;
+        // The same Fluid DEX pools the arb executor seeds. Fluid has no router,
+        // so selling seized collateral into a Fluid pool needs the pool itself
+        // allowlisted. 2026-09-15, block 25_980_901: a competitor liquidated an
+        // rsETH/WETH whale by selling the rsETH into the rsETH/ETH pool, which
+        // the live liquidator did not allow (test/fork/LiquidationViaFluid.t.sol).
+        address[] memory fluid = FluidPools.all();
+        for (uint256 i = 0; i < fluid.length; ++i) {
+            liqAllowed[14 + i] = fluid[i];
+        }
 
         address[] memory operators = new address[](3);
         operators[0] = OPERATOR;
@@ -157,6 +167,10 @@ contract Deploy is Script {
         require(ex.allowedTargets(SUSHI_V2_ROUTER), "readback: sushi v2 allowed");
         require(ex.allowedTargets(PANCAKE_V2_ROUTER), "readback: pancake v2 allowed");
         require(ex.allowedTargets(SHIBASWAP_ROUTER), "readback: shibaswap allowed");
+        for (uint256 i = 0; i < fluid.length; ++i) {
+            require(ex.allowedTargets(fluid[i]), "readback: fluid pool allowed");
+        }
+        require(ex.allowedTargets(FluidPools.RSETH_ETH), "readback: fluid rsETH/ETH allowed");
         require(ex.operators(OPERATOR_2) && ex.operators(OPERATOR_3), "readback: extra operators");
         require(!ex.blockedV4Hooks(LAUNCH_HOOK) && !ex.blockedV4Hooks(LBP_MIGRATION_HOOK), "readback: v4 hooks open");
         require(

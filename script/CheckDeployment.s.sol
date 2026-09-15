@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Script, console2} from "forge-std/Script.sol";
 import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
 import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import {FluidPools} from "./FluidPools.sol";
 
 /// The getters both executors expose.
 interface IExecutorView {
@@ -123,11 +124,14 @@ contract CheckDeployment is Script {
         } else {
             require(exec.allowedTargets(AAVE_V3_POOL), "liquidation: Aave V3 pool must be a target");
             require(exec.allowedTargets(MORPHO_BLUE), "liquidation: Morpho must be a target");
+            require(exec.allowedTargets(FluidPools.RSETH_ETH), "liquidation: Fluid rsETH/ETH pool must be a target");
             require(
                 ILiquidationExecutorView(proxy).aaveV2LendingPool() == address(0),
                 "liquidation: aaveV2LendingPool must be unset"
             );
-            console2.log("ok liquidation allowlist: Aave V3 pool and Morpho are targets, Aave V2 pool unset");
+            console2.log(
+                "ok liquidation allowlist: Aave V3 pool, Morpho and Fluid rsETH/ETH are targets, Aave V2 pool unset"
+            );
         }
 
         console2.log(
