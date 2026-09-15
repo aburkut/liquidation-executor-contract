@@ -14,6 +14,7 @@ import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.s
 import {LiquidationExecutorGenesis} from "../src/proxy/LiquidationExecutorGenesis.sol";
 import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 import {UniswapLib} from "../src/libraries/UniswapLib.sol";
+import {SwapValidationLib} from "../src/libraries/SwapValidationLib.sol";
 import {SwapMode, SwapLeg, Op} from "../src/types/SwapTypes.sol";
 import {IFlashLoanRecipient} from "../src/interfaces/IBalancerVault.sol";
 import {MarketParams} from "../src/interfaces/IMorphoBlue.sol";
@@ -5486,6 +5487,77 @@ contract ExecutorTest is Test {
         plan = _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(debtToCover), swapPlan);
         vm.prank(operatorAddr);
         executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LIQUIDATION ACTIONS vs THE STANDING loanToken BALANCE
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // `validateActions` never bounds `debtToCover` / `maxRepayAssets` by
+    // `loanAmount`, the single-leg repay gate only measures the swap's output,
+    // and `computeRealizedProfit` sees a loanToken loss only when
+    // profitToken == loanToken. So a 1-wei loan could repay a large debt out of
+    // the executor's standing loanToken and route the seized collateral away.
+
+    /// A UNI_V2 collateral → loanToken leg whose output covers the flash
+    /// repay, with a profit token that is NOT the loan token.
+    function _standingLoanSwapPlan() internal view returns (LiquidationExecutor.SwapPlan memory swapPlan) {
+        swapPlan = _buildUniV2SwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 1, 0);
+        swapPlan.profitToken = address(profitToken);
+    }
+
+    function test_liquidation_actionsCannotSpendStandingLoanToken() public {
+        // setUp leaves LOAN_AMOUNT + FLASH_FEE + 100e18 loanToken standing.
+        uint256 loanAmount = 10e18;
+        uint256 debtToCover = 400e18;
+        assertGt(loanToken.balanceOf(address(executor)), debtToCover, "precondition: standing loanToken");
+
+        bytes memory plan = _buildPlan(
+            2, address(loanToken), loanAmount, FLASH_FEE, _defaultLiqAction(debtToCover), _standingLoanSwapPlan()
+        );
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(SwapValidationLib.ActionsSpentStandingLoan.selector, debtToCover, loanAmount)
+        );
+        executor.execute(plan);
+    }
+
+    function test_morphoLiquidation_cannotSpendStandingLoanToken() public {
+        uint256 loanAmount = 10e18;
+        uint256 repaid = 800e18;
+        // The mock pulls `repaid` loanToken and reports it as assetsRepaid.
+        morphoBlue.setLiquidationDebtAmount(repaid);
+        bytes memory action = _buildMorphoLiquidationActionFull(
+            address(collateralToken), address(loanToken), address(0x1234), 400e18, repaid
+        );
+
+        bytes memory plan =
+            _buildPlan(2, address(loanToken), loanAmount, FLASH_FEE, _singleAction(2, action), _standingLoanSwapPlan());
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(SwapValidationLib.ActionsSpentStandingLoan.selector, repaid, loanAmount));
+        executor.execute(plan);
+    }
+
+    /// The bound is on what the pool PULLED, not on the declared cover: Aave
+    /// trims a padded `debtToCover` to min(debtToCover, closeFactor × debt).
+    function test_liquidation_paddedDebtToCover_withinLoan_passes() public {
+        // Boundary: the pull equals the loan exactly.
+        aavePool.setLiquidationDebtCap(LOAN_AMOUNT);
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+
+        bytes memory plan = _buildPlan(
+            2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(5_000e18), _standingLoanSwapPlan()
+        );
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        // + swap output − debt pulled − flash fee.
+        uint256 swapOut = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18;
+        assertEq(loanToken.balanceOf(address(executor)), loanBefore + swapOut - LOAN_AMOUNT - FLASH_FEE);
+        assertEq(loanToken.allowance(address(executor), address(aavePool)), 0, "padded cover leaves no allowance");
     }
 
     // ═══════════════════════════════════════════════════════════════════

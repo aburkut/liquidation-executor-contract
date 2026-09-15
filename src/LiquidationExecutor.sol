@@ -1024,7 +1024,8 @@ contract LiquidationExecutor is
         returns (uint256 realizedProfit, uint256 totalCoinbasePayment, bool shortfall)
     {
         // Pre-execution: verify flash loan funds received
-        if (IERC20(plan.loanToken).balanceOf(address(this)) < plan.loanAmount) revert InvalidFlashLoan();
+        uint256 loanBefore = IERC20(plan.loanToken).balanceOf(address(this));
+        if (loanBefore < plan.loanAmount) revert InvalidFlashLoan();
 
         // Derive collateralAsset and trackingToken for delta check and swap plan
         (address collateralAsset, address trackingToken) =
@@ -1055,6 +1056,8 @@ contract LiquidationExecutor is
         for (uint256 i = 0; i < plan.actions.length; ++i) {
             _executeTargetAction(plan.actions[i].protocolId, plan.actions[i].data);
         }
+        // Invariant: actions spend at most the flash principal, never standing loanToken.
+        SwapValidationLib.assertActionsWithinLoan(plan.loanToken, loanBefore, plan.loanAmount);
 
         // Post-action: verify liquidation produced collateral AND
         // optionally unwrap aTokens to underlying in the same block.
