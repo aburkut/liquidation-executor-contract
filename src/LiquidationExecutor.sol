@@ -1394,8 +1394,6 @@ contract LiquidationExecutor is
         uint256 finalRepayAfter = IERC20(finalRepayToken).balanceOf(address(this));
         uint256 repayDelta = finalRepayAfter > finalRepayBefore ? finalRepayAfter - finalRepayBefore : 0;
         if (repayDelta < flashRepayAmount) revert InsufficientRepayOutput(repayDelta, flashRepayAmount);
-
-        if (plan.hasLeg2) {}
     }
 
     function _dispatchLeg(SwapLeg memory leg, uint256 amountIn, uint256 outBefore) internal {
@@ -1701,12 +1699,10 @@ contract LiquidationExecutor is
     function _executeAaveV3Liquidation(bytes memory actionData) internal {
         AaveV3Action memory action = abi.decode(actionData, (AaveV3Action));
 
-        address pool = aavePool;
-        if (pool == address(0)) revert ZeroAddress();
+        address pool = aavePool; // constructor rejects zero
         if (!allowedTargets[pool]) revert TargetNotAllowed();
-        if (action.actionType != 4) revert UnsupportedActionType(action.actionType);
+        // actionType == 4 and debtToCover != 0: enforced earlier by SwapValidationLib.validateActions.
         if (action.user == address(0)) revert ZeroAddress();
-        if (action.debtToCover == 0) revert InvalidPlan();
 
         // The pool is an implementation immutable and allowlisted; the
         // allowance is bounded by exactly the debt this call repays
@@ -1739,15 +1735,10 @@ contract LiquidationExecutor is
     function _executeMorphoLiquidation(bytes memory actionData) internal {
         MorphoLiquidation memory liq = abi.decode(actionData, (MorphoLiquidation));
 
-        address morpho = morphoBlue;
-        if (morpho == address(0)) revert ZeroAddress();
+        address morpho = morphoBlue; // constructor rejects zero
         if (!allowedTargets[morpho]) revert TargetNotAllowed();
         if (liq.borrower == address(0)) revert ZeroAddress();
-        if (liq.seizedAssets == 0) revert MorphoShareModeUnsupported();
-        if (liq.repaidShares != 0) revert MorphoMixedModeUnsupported();
-        if (liq.maxRepayAssets == 0) revert InvalidPlan();
-        if (liq.marketParams.loanToken == address(0)) revert MorphoInvalidMarketParams();
-        if (liq.marketParams.collateralToken == address(0)) revert MorphoInvalidMarketParams();
+        // seizedAssets, repaidShares, maxRepayAssets, marketParams tokens: enforced earlier by SwapValidationLib.validateActions.
 
         // Approve maxRepayAssets — loan-token denominated bound (NOT collateral-side seizedAssets).
         // seizedAssets is collateral units; assetsRepaid (what Morpho actually pulls) is loan-token units.
