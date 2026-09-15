@@ -1370,7 +1370,12 @@ contract LiquidationExecutor is
         // Closes the operator-coinbase dipping vector surfaced by re-audit;
         // production bot already keeps amountIn ≤ 0.99 * collateral_to_receive
         // (worker.rs:2153), so the cap has no operational impact.
-        if (leg1.srcToken == collateralAsset && leg1AmountIn > collateralDelta) revert InvalidPlan();
+        // A Bebop leg instead fills short at the seized collateral (never the
+        // standing balance); without a fill offset the library reverts.
+        if (leg1.srcToken == collateralAsset && leg1AmountIn > collateralDelta) {
+            if (leg1.mode != SwapMode.BEBOP_MULTI) revert InvalidPlan();
+            leg1AmountIn = collateralDelta;
+        }
 
         _dispatchLeg(leg1, leg1AmountIn, leg1RepayBefore);
 
@@ -1399,7 +1404,7 @@ contract LiquidationExecutor is
             if (!allowedTargets[paraswapAugustusV6]) revert TargetNotAllowed();
             SwapLegExecutorLib.executeParaswapLeg(leg, paraswapAugustusV6);
         } else if (m == SwapMode.BEBOP_MULTI) {
-            SwapLegExecutorLib.executeBebopLeg(leg, outBefore, allowedTargets[leg.bebopTarget]);
+            SwapLegExecutorLib.executeBebopLeg(leg, outBefore, allowedTargets[leg.bebopTarget], amountIn);
         } else if (m == SwapMode.UNI_V2 || m == SwapMode.UNI_V2_BUY) {
             if (!allowedTargets[uniV2Router]) revert TargetNotAllowed();
             UniswapLib.executeUniV2Leg(leg, amountIn, uniV2Router);

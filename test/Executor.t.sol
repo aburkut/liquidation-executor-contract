@@ -24,7 +24,7 @@ import {MockSwapRouter} from "./mocks/MockSwapRouter.sol";
 import {MockBalancerVault} from "./mocks/MockBalancerVault.sol";
 import {MockParaswapAugustus} from "./mocks/MockParaswapAugustus.sol";
 import {MockAaveV2LendingPool} from "./mocks/MockAaveV2LendingPool.sol";
-import {MockBebopSettlement} from "./mocks/MockBebopSettlement.sol";
+import {MockBebopSettlement, MockBebopPartialFillSettlement} from "./mocks/MockBebopSettlement.sol";
 import {MockMorphoBlue} from "./mocks/MockMorphoBlue.sol";
 import {MockUniV2Router} from "./mocks/MockUniV2Router.sol";
 import {MockUniV3Router} from "./mocks/MockUniV3Router.sol";
@@ -5558,6 +5558,90 @@ contract ExecutorTest is Test {
         uint256 swapOut = DEFAULT_SWAP_AMOUNT * SWAP_RATE / 1e18;
         assertEq(loanToken.balanceOf(address(executor)), loanBefore + swapOut - LOAN_AMOUNT - FLASH_FEE);
         assertEq(loanToken.allowance(address(executor), address(aavePool)), 0, "padded cover leaves no allowance");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // BEBOP PARTIAL FILL — the block seized less collateral than the quote
+    // ═══════════════════════════════════════════════════════════════════
+
+    uint256 internal constant BEBOP_QUOTE_IN = 1_200e18; // Q; realised R = COLLATERAL_REWARD
+    uint256 internal constant BEBOP_QUOTE_OUT = 1_320e18; // pays 1_100e18 at R
+    uint256 internal constant BEBOP_FILL_WORD = 1;
+
+    function _partialFillSettlement() internal returns (MockBebopPartialFillSettlement s) {
+        s = new MockBebopPartialFillSettlement(
+            address(collateralToken), address(loanToken), BEBOP_QUOTE_IN, BEBOP_QUOTE_OUT, BEBOP_FILL_WORD
+        );
+        loanToken.mint(address(s), BEBOP_QUOTE_OUT);
+        vm.prank(owner);
+        executor.setAllowedTarget(address(s), true);
+    }
+
+    function _partialFillPlan(address settlement, uint256 offset, uint256 minOut) internal view returns (bytes memory) {
+        // The quote carries its own amount (Q) at the fill word; an unpatched
+        // order would ask the settlement for all of it.
+        bytes memory cd = abi.encodeWithSelector(bytes4(0xdeadbeef), uint256(7), BEBOP_QUOTE_IN);
+        LiquidationExecutor.SwapPlan memory swapPlan = _buildBebopMultiSwapPlan(
+            address(collateralToken), BEBOP_QUOTE_IN, settlement, cd, address(loanToken), address(loanToken), 0
+        );
+        swapPlan.leg1.bebopPartialFillOffset = offset;
+        swapPlan.leg1.minAmountOut = minOut;
+        return _buildPlan(2, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(400e18), swapPlan);
+    }
+
+    function test_bebop_partialFill_whenCollateralBelowQuote() public {
+        MockBebopPartialFillSettlement s = _partialFillSettlement();
+        uint256 r = COLLATERAL_REWARD;
+        uint256 delivered = BEBOP_QUOTE_OUT * r / BEBOP_QUOTE_IN; // 1_100e18
+
+        // A floor written for the full quote, scaled pro-rata, lands just
+        // above what R delivers — the leg floor must fire on the SCALED value.
+        uint256 tooHigh = 1_321e18;
+        uint256 scaledTooHigh = (tooHigh * r + BEBOP_QUOTE_IN - 1) / BEBOP_QUOTE_IN;
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(LiquidationExecutor.InsufficientRepayOutput.selector, delivered, scaledTooHigh)
+        );
+        executor.execute(_partialFillPlan(address(s), BEBOP_FILL_WORD, tooHigh));
+
+        // 1_300e18 > delivered, so only a pro-rata floor (1_083.3e18) passes.
+        uint256 loanBefore = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(_partialFillPlan(address(s), BEBOP_FILL_WORD, 1_300e18));
+
+        // The settlement pulls the word at the offset (0 would mean all of Q):
+        // it received exactly R, so the word was patched to R.
+        assertEq(collateralToken.balanceOf(address(s)), r, "fill word == realised collateral");
+        // + settlement output − debt the liquidation pulled − flash fee.
+        assertEq(loanToken.balanceOf(address(executor)), loanBefore + delivered - 400e18 - FLASH_FEE);
+        assertEq(collateralToken.allowance(address(executor), address(s)), 0);
+    }
+
+    function test_bebop_collateralBelowQuote_withoutOffset_reverts() public {
+        MockBebopPartialFillSettlement s = _partialFillSettlement();
+
+        // The executor caps the fill at R; with no offset the library refuses
+        // to fill short (no partial fill without an offset).
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.InsufficientSrcBalance.selector, BEBOP_QUOTE_IN, COLLATERAL_REWARD
+            )
+        );
+        executor.execute(_partialFillPlan(address(s), 0, 1));
+    }
+
+    function test_bebop_partialFill_doesNotTouchStandingCollateral() public {
+        MockBebopPartialFillSettlement s = _partialFillSettlement();
+        // Enough standing collateral that srcBal alone would cover all of Q.
+        collateralToken.mint(address(executor), 5_000e18);
+        uint256 collBefore = collateralToken.balanceOf(address(executor));
+
+        vm.prank(operatorAddr);
+        executor.execute(_partialFillPlan(address(s), BEBOP_FILL_WORD, 1));
+
+        assertEq(collateralToken.balanceOf(address(s)), COLLATERAL_REWARD, "fill == R, not Q");
+        assertEq(collateralToken.balanceOf(address(executor)), collBefore, "standing collateral untouched");
     }
 
     // ═══════════════════════════════════════════════════════════════════

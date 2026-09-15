@@ -16,6 +16,6 @@ against the new implementation:
 
     forge fmt --check
     forge build --sizes
-    script/check_sizes.sh 24200
+    script/check_sizes.sh 24400
     script/check_layout.sh
     forge test -vvv

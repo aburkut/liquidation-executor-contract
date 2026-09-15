@@ -139,7 +139,14 @@ library SwapLegExecutorLib {
     ///
     /// Security model unchanged: allowlist re-check + exact-approval pair
     /// + output delta floor.
-    function executeBebopLeg(SwapLeg memory leg, uint256 repayBefore, bool isTargetAllowed) external {
+    ///
+    /// `maxIn` is the most `srcToken` this leg may sell, as sized by the
+    /// caller. `LiquidationExecutor` passes the collateral this transaction
+    /// seized when a single leg's quote exceeds it, and `leg.amountIn`
+    /// otherwise, so the fill never reaches a standing balance. The fill is
+    /// `min(leg.amountIn, maxIn, srcBal)`; a fill below `leg.amountIn` needs a
+    /// `bebopPartialFillOffset`, else `InsufficientSrcBalance`.
+    function executeBebopLeg(SwapLeg memory leg, uint256 repayBefore, bool isTargetAllowed, uint256 maxIn) external {
         address target = leg.bebopTarget;
         if (target.code.length == 0) revert BebopTargetNotContract();
         if (!isTargetAllowed) revert TargetNotAllowed();
@@ -148,16 +155,17 @@ library SwapLegExecutorLib {
 
         // A signed RFQ order is written for an exact amount, but a
         // liquidation's realised collateral is only known on-chain and moves
-        // with the block. When we hold less than the quote was written for,
-        // Bebop lets the taker fill part of it by writing the amount at the
-        // word its quote names — the alternative is the settlement rejecting
-        // the order outright, which is what used to happen.
+        // with the block. When the block seized less than the quote was
+        // written for (`maxIn`), or we hold less, Bebop lets the taker fill
+        // part of it by writing the amount at the word its quote names — the
+        // alternative is the settlement rejecting the order outright.
         uint256 fill = leg.amountIn;
-        if (srcBal < fill) {
+        if (maxIn < fill) fill = maxIn;
+        if (srcBal < fill) fill = srcBal;
+        if (fill < leg.amountIn) {
             if (leg.bebopPartialFillOffset == 0) {
                 revert InsufficientSrcBalance(leg.amountIn, srcBal);
             }
-            fill = srcBal;
             _writeBebopFill(leg.bebopCalldata, leg.bebopPartialFillOffset, fill);
         }
 

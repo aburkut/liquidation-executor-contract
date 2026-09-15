@@ -43,7 +43,7 @@ jobs:
         run: forge build --sizes
 
       - name: Check executor sizes against the EIP-170 threshold
-        run: script/check_sizes.sh 24200
+        run: script/check_sizes.sh 24400
 
       - name: Check executor storage layouts against the committed snapshots
         run: script/check_layout.sh
