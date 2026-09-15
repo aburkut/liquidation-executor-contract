@@ -242,6 +242,9 @@ contract DeployArb is Script {
         require(exec.weth() == WETH, "readback: weth");
         require(exec.balancerVault() == BALANCER_VAULT, "readback: balancer vault immutable");
         require(exec.morphoBlue() == MORPHO_BLUE, "readback: morpho immutable");
+        require(exec.paraswapAugustusV6() == PARASWAP_AUGUSTUS, "readback: paraswap immutable");
+        require(exec.uniV2Router() == UNI_V2_ROUTER, "readback: v2 router immutable");
+        require(exec.uniV3Router() == UNI_V3_ROUTER, "readback: v3 router immutable");
         require(exec.allowedFlashProviders(2) == BALANCER_VAULT, "readback: balancer flash provider");
         require(exec.allowedFlashProviders(3) == MORPHO_BLUE, "readback: morpho flash provider");
         require(!exec.allowedTargets(MORPHO_BLUE), "readback: Morpho must NOT be a target");
