@@ -5644,6 +5644,22 @@ contract ExecutorTest is Test {
         assertEq(collateralToken.balanceOf(address(executor)), collBefore, "standing collateral untouched");
     }
 
+    function test_bebop_collateralBelowQuote_withoutOffset_reportsTheFill() public {
+        MockBebopPartialFillSettlement s = _partialFillSettlement();
+        // Standing collateral lifts the balance above Q, so the fill was capped
+        // by the seized R (`maxIn`), not by the balance. The revert names that
+        // fill, not a balance that never limited anything.
+        collateralToken.mint(address(executor), 5_000e18);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LiquidationExecutor.InsufficientSrcBalance.selector, BEBOP_QUOTE_IN, COLLATERAL_REWARD
+            )
+        );
+        executor.execute(_partialFillPlan(address(s), 0, 1));
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // P1 FIX REGRESSION TESTS
     // ═══════════════════════════════════════════════════════════════════

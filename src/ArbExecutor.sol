@@ -424,7 +424,7 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
             // compare fails) and a bare PREV (leaves 0). Written this way for
             // the EIP-170 budget — the pair of equality checks cost 86 bytes
             // and pushed LiquidationExecutor past the project's own headroom
-            // guard at 24200.
+            // guard at 24400.
             if (plan.ops[i].flags & ~GenericSequenceLib.FLAG_USE_PREV_RETURN == GenericSequenceLib.FLAG_WETH_WRAP) {
                 continue;
             }

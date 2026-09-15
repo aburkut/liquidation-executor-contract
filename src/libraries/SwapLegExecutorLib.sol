@@ -164,7 +164,7 @@ library SwapLegExecutorLib {
         if (srcBal < fill) fill = srcBal;
         if (fill < leg.amountIn) {
             if (leg.bebopPartialFillOffset == 0) {
-                revert InsufficientSrcBalance(leg.amountIn, srcBal);
+                revert InsufficientSrcBalance(leg.amountIn, fill);
             }
             _writeBebopFill(leg.bebopCalldata, leg.bebopPartialFillOffset, fill);
         }

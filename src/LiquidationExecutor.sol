@@ -661,7 +661,7 @@ contract LiquidationExecutor is
                 // itself. Merged into one condition, and the wrap side uses a
                 // masked equality, purely for the EIP-170 budget — the naive
                 // form cost 86 bytes and pushed this contract past the
-                // project's own headroom guard at 24200.
+                // project's own headroom guard at 24400.
                 //
                 // Still EXACT on both sides: `flags & ~PREV == WRAP` accepts
                 // the two shapes GenericSequenceLib accepts and rejects
