@@ -9,8 +9,9 @@ import {LiquidationExecutorGenesis} from "../src/proxy/LiquidationExecutorGenesi
 import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 
 /// @title V10 Deploy
-/// @notice Deploys `LiquidationExecutor` V10 against canonical mainnet
-/// protocol addresses. Forge auto-deploys + links the six shared
+/// @notice Deploys `LiquidationExecutor` V10 behind an `ExecutorProxy`
+/// (implementation → `LiquidationExecutorGenesis` → proxy) against canonical
+/// mainnet protocol addresses. Forge auto-deploys + links the six shared
 /// external libraries (`SwapValidationLib`, `CoinbasePaymentLib`,
 /// `UniswapLib`, `CurveV1Lib`, `BalancerV2Lib`, `SwapLegExecutorLib`)
 /// on first use.
@@ -19,8 +20,14 @@ import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 /// separate run when bot-side arb integration is ready.
 ///
 /// Usage:
-///   PRIVATE_KEY=<owner> forge script script/Deploy.s.sol:Deploy \
+///   PRIVATE_KEY=<deployer key> forge script script/Deploy.s.sol:Deploy \
 ///     --rpc-url $ETHEREUM_RPC_URL --broadcast --legacy
+/// The key only pays for the deploy; the executor and its ProxyAdmin belong to
+/// the Safe `OWNER`.
+///
+/// Dry-run on a local fork started with `anvil --fork-url <rpc> --chain-id 31337`:
+/// a fork keeps chain id 1 otherwise, and `--broadcast` overwrites the tracked
+/// broadcast/<script>/1/run-latest.json records (docs/PROXY_OPERATIONS.md).
 ///
 /// Executor address + auto-deployed library addresses land in
 /// `broadcast/Deploy.s.sol/1/run-latest.json`.
@@ -51,7 +58,7 @@ contract Deploy is Script {
     // ─── Everything the owner added to the LIVE liquidator after deploy ───
     // Read from the contract's own events on 0x7800c252… (blocks
     // 25730434..25919383 via scripts/executor_config_events.py in the bot
-    // repo, 2026-09-06), so a redeploy through the seeded constructor needs
+    // repo, 2026-09-06), so a redeploy seeded through Genesis needs
     // NO Safe transaction afterwards. The live liquidator NEVER had its Aave
     // V2 lending pool set (no ConfigUpdated("aaveV2Pool") event), so it stays
     // unset here too — pass AAVE_V2_POOL to `aaveV2LendingPool_` below only if
@@ -73,7 +80,8 @@ contract Deploy is Script {
         // lending pool + Uni V4 PoolManager + the GENERIC_SEQUENCE
         // direct-call routers (V3 SwapRouter01, V2 Router02, Curve
         // RouterNG, Balancer Vault) the knapsack split generator emits
-        // ops against. Morpho is constructor-pinned (not in `allowed[]`).
+        // ops against. Morpho is an implementation immutable that Genesis
+        // allowlists itself (not in `allowed[]`).
         address[] memory liqAllowed = new address[](14);
         liqAllowed[0] = BEBOP_SETTLEMENT;
         liqAllowed[1] = AAVE_V2_POOL;
@@ -120,10 +128,11 @@ contract Deploy is Script {
         liqExecutor = address(proxy);
 
         // Post-deploy read-back assertions (deploy plan §1.2): the
-        // constructor takes 9 same-type `address` params, each only
-        // != 0 checked — a positional swap deploys a mis-wired,
-        // non-reverting contract. Verify every role landed where
-        // intended before trusting the deployment.
+        // implementation constructor takes six same-type `address` params
+        // and Genesis `initialize` four more, each only != 0 checked — a
+        // positional swap deploys a mis-wired, non-reverting contract.
+        // Verify every role landed where intended before trusting the
+        // deployment.
         LiquidationExecutor ex = LiquidationExecutor(payable(liqExecutor));
         require(ex.owner() == OWNER, "readback: owner");
         require(ex.operators(OPERATOR), "readback: operator");

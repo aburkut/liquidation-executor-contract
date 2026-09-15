@@ -28,11 +28,13 @@ import {SwapLeg} from "../types/SwapTypes.sol";
 /// SECURITY NOTE — removed allowlist check: the main contract's pre-
 /// library `_executeParaswapCall` used to re-assert
 /// `allowedTargets[augustus]` before the external call.
-/// `paraswapAugustusV6` is pinned in the constructor and has no setter,
-/// and the constructor seeds `allowedTargets[paraswapAugustusV6] = true`
-/// with no flip path, so the check is a constant-true at every reachable
-/// callsite. The library omits it to shave bytecode without changing
-/// behavior.
+/// `paraswapAugustusV6` is an implementation immutable with no setter.
+/// Its `allowedTargets` entry lives in proxy storage: Genesis seeds it
+/// true, and the owner CAN flip it with `setAllowedTarget`. The caller
+/// (`LiquidationExecutor`) therefore re-checks
+/// `allowedTargets[paraswapAugustusV6]` immediately before calling this
+/// library, and the library omits the duplicate check to shave bytecode
+/// without changing behavior.
 library SwapLegExecutorLib {
     using SafeERC20 for IERC20;
 

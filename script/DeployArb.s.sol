@@ -9,15 +9,17 @@ import {ArbExecutorGenesis} from "../src/proxy/ArbExecutorGenesis.sol";
 import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 
 /// @title ArbExecutor deploy
-/// @notice Deploys `ArbExecutor` fully configured. Nothing needs to be called
-/// on the contract afterwards — no `setAllowedTarget`, no `setOperator`.
-/// Every target the bot can emit an `Op` against is seeded
-/// in the constructor, and the run asserts each one back before returning, so a
+/// @notice Deploys `ArbExecutor` behind an `ExecutorProxy`, fully configured:
+/// implementation → `ArbExecutorGenesis` → proxy, whose constructor runs
+/// Genesis `initialize` and hands the proxy to the implementation. Nothing
+/// needs to be called afterwards — no `setAllowedTarget`, no `setOperator`.
+/// Every target the bot can emit an `Op` against is seeded by Genesis into
+/// proxy storage, and the run asserts each one back before returning, so a
 /// partially-seeded deploy fails here instead of at the first arb.
 ///
 /// Why that matters: an admin transaction after deploy is a second window in
 /// which the contract exists but cannot trade, and a second chance to forget
-/// something. The whole allowlist is therefore constructor state.
+/// something. The whole allowlist is therefore written at deploy, by Genesis.
 ///
 /// FLUID is the reason this list is long. Fluid has no router — every pool is
 /// its own contract, so each must be allowlisted by address. The 48 below were
@@ -34,15 +36,21 @@ import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 ///
 /// Usage (the `arb` profile compiles for runtime gas, not size — ArbExecutor
 /// has 12 KB of EIP-170 headroom; see foundry.toml):
-///   FOUNDRY_PROFILE=arb PRIVATE_KEY=<owner> forge script script/DeployArb.s.sol:DeployArb \
+///   FOUNDRY_PROFILE=arb PRIVATE_KEY=<deployer key> forge script script/DeployArb.s.sol:DeployArb \
 ///     --rpc-url $ETHEREUM_RPC_URL --broadcast --legacy
+/// The key only pays for the deploy; the executor and its ProxyAdmin belong to
+/// the Safe `OWNER`.
+///
+/// Dry-run on a local fork started with `anvil --fork-url <rpc> --chain-id 31337`:
+/// a fork keeps chain id 1 otherwise, and `--broadcast` overwrites the tracked
+/// broadcast/<script>/1/run-latest.json records (docs/PROXY_OPERATIONS.md).
 contract DeployArb is Script {
     // ─── Ownership / operation ──────────────────────────────────────
     address constant OWNER = 0xC338094Bb79AA610E9c57166fc4FA959db6234Ab;
     /// The bot's live signer — same key that runs LiquidationExecutor.
     address constant OPERATOR = 0x1e9e18152552609175826f3ee6F8bFD639532E37;
 
-    // ─── Constructor-pinned protocol addresses ──────────────────────
+    // ─── Implementation immutables (implementation constructor) ─────
     address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
     address constant MORPHO_BLUE = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
@@ -148,8 +156,8 @@ contract DeployArb is Script {
         fluid[47] = 0xb9b87A1B79891A8C9251F501B1b5d71bC7c8aA24;
 
         // Non-Fluid targets. Balancer Vault, Paraswap, the V2 router and the
-        // V3 router are seeded by the constructor itself, so they are absent
-        // here and asserted below all the same.
+        // V3 router are seeded by Genesis from the implementation's
+        // immutables, so they are absent here and asserted below all the same.
         address[] memory extra = new address[](14);
         extra[6] = SUSHI_V2_ROUTER;
         extra[7] = PANCAKE_V2_ROUTER;
