@@ -135,7 +135,9 @@ Pinned layout today (`forge inspect … storageLayout`):
      receipt holds a Uniswap V4 swap (the PoolManager calls the executor's
      `unlockCallback`) and two WETH `Withdrawal`s to the executor (ETH under the
      2300-gas stipend). It must succeed with the same balances as the bare
-     implementation, and the gas difference is the proxy overhead.
+     implementation, and the gas difference is the proxy overhead — measured
+     at 6 321 gas (arb profile); the owner set the 10 000-gas ceiling on
+     2026-09-15.
   2. **Liquidation.** `test_fork_jackpot_unwrap_v4_curve_liquidate` — a real
      Aave V3 `liquidationCall` on a fork, then a WETH unwrap whose ETH lands in
      `receive`, a V4 swap and a Curve swap — runs through the proxy.
@@ -197,8 +199,9 @@ from simulation (`worker.rs`, `base_sim.gas_used`).
 **Gas.** Arb gas comes from constants: `ARB_GAS_UNITS = 500_000` (profit
 model), `ESTIMATED_GAS_PER_LEG = 175_000`, `ARB_GAS_LIMIT = 1_500_000`;
 liquidation `EXECUTOR_GAS_LIMIT = 800_000`. The landing replay measures the
-proxy overhead and fails above 5 000 gas (1% of `ARB_GAS_UNITS`); above that
-the bot constants move in the same change.
+proxy overhead and fails above 10 000 gas (2% of `ARB_GAS_UNITS`) — measured
+cold overhead is 6 321 gas (arb profile), and the owner set that ceiling on
+2026-09-15; above it the bot constants move in the same change.
 
 **Contract tests.**
 1. The whole existing suite runs through the proxy: every construction goes

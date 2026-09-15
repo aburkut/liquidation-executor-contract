@@ -28,9 +28,14 @@ contract ProxyReplayTest is Test {
     address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     bytes32 constant LANDING_TX = 0xc444fb52c2a1db3bb4df85cf6f73627a6dc0768beb5dffeff81a7f8605cd9889;
     uint256 constant BID_WEI = 5000;
-    /// 1% of the bot's `ARB_GAS_UNITS` (500_000, src/arbitrage/detector.rs in
-    /// the bot repo). Above it, the bot's gas constants move in the same change.
-    uint256 constant MAX_PROXY_OVERHEAD_GAS = 5_000;
+    /// Cold overhead measured on this replay: 6321 gas (arb profile), 6453
+    /// (default) — a cold SLOAD of the ERC-1967 slot plus a cold DELEGATECALL
+    /// to the implementation, paid once per transaction. The owner set the
+    /// ceiling at 10 000 gas (2% of the bot's `ARB_GAS_UNITS` = 500_000,
+    /// src/arbitrage/detector.rs in the bot repo) on 2026-09-15. A result
+    /// above it means the proxy path got materially more expensive and must
+    /// be investigated before any upgrade.
+    uint256 constant MAX_PROXY_OVERHEAD_GAS = 10_000;
 
     bool internal forked;
     address internal impl;
@@ -102,6 +107,6 @@ contract ProxyReplayTest is Test {
         emit log_named_uint("gas bare", gasBare);
         emit log_named_uint("gas proxy", gasProxy);
         emit log_named_uint("proxy overhead", gasProxy - gasBare);
-        assertLt(gasProxy - gasBare, MAX_PROXY_OVERHEAD_GAS, "proxy overhead above 1% of ARB_GAS_UNITS");
+        assertLt(gasProxy - gasBare, MAX_PROXY_OVERHEAD_GAS, "proxy overhead above 2% of ARB_GAS_UNITS");
     }
 }

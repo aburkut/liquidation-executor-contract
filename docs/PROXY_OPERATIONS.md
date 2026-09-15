@@ -70,7 +70,7 @@ Every check prints an `ok …` line. A mismatch reverts with its reason.
 
 The replay runs under the `arb` profile because that is the bytecode that ships.
 It fails if the proxy overhead (implementation address and slot cold) reaches
-5000 gas. No green, no signature.
+10000 gas. No green, no signature.
 
 ## 5. Upgrade
 
