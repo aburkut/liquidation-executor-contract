@@ -1155,6 +1155,119 @@ contract ArbExecutorTest is Test {
         assertEq(tokenA.balanceOf(address(exec)), 210e18, "profit kept, principal came from the pool");
     }
 
+    // ─── FLAG_USE_PRODUCED: spend what the plan produced ───
+
+    /// The closing hop split across two pools INSIDE a flash continuation:
+    /// the first part is a literal 400 B, the second takes what the plan
+    /// produced of B and the first part left — exactly 700 of the 1100 the
+    /// flash pool paid out — with no literal that a one-wei shortfall would
+    /// revert. The continuation runs in the pool's callback, so this is also
+    /// the frame the start-of-plan snapshots must be readable from.
+    function test_produced_lastPartOfASplitTakesTheRest_insideAFlash() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        MockUniV3Pool pool3 = _v3Pool();
+        uint256 bBefore3 = tokenB.balanceOf(address(pool3));
+        Op[] memory ops = new Op[](3);
+        ops[0] = _flashV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(address(pool2), address(tokenB), address(tokenA), false, 400e18, 0);
+        ops[2] = _directV3Op(
+            address(pool3), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PRODUCED
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertEq(tokenB.balanceOf(address(pool3)) - bBefore3, 700e18, "the second part took the rest");
+        assertEq(tokenB.balanceOf(address(exec)), 0, "nothing of B left behind");
+        assertEq(tokenA.balanceOf(address(exec)), 210e18, "440 + 770 A back, 1000 A paid to the flash pool");
+    }
+
+    /// A hop split across two pools in the MIDDLE of the path: the hop after
+    /// it spends the SUM of both parts' output (440 + 660 B), which the
+    /// previous op's return alone (660) would have short-changed.
+    function test_produced_hopAfterASplitSpendsTheSumOfItsParts() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        MockUniV3Pool pool3 = _v3Pool();
+        uint256 bBefore3 = tokenB.balanceOf(address(pool3));
+        Op[] memory ops = new Op[](3);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, 400e18, 0);
+        ops[1] = _directV3Op(address(pool2), address(tokenA), address(tokenB), true, 600e18, 0);
+        ops[2] = _directV3Op(
+            address(pool3), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PRODUCED
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertEq(tokenB.balanceOf(address(pool3)) - bBefore3, 1100e18, "both parts' output, not the last's");
+        assertEq(tokenA.balanceOf(address(exec)), 210e18, "1210 A back, the 1000 A loan repaid");
+    }
+
+    /// What the executor held before the plan is below the snapshot, so the
+    /// flag can never reach it: 500 B standing stay put.
+    function test_produced_neverReachesAStandingBalance() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        tokenB.mint(address(exec), 500e18);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(
+            address(pool2), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PRODUCED
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 100e18);
+
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+        assertEq(tokenB.balanceOf(address(exec)), 500e18, "the standing balance is untouched");
+        assertEq(tokenA.balanceOf(address(exec)), 210e18);
+    }
+
+    /// Nothing produced — the parts before took everything — is refused
+    /// rather than read as a zero-size swap.
+    function test_produced_nothingProduced_reverts() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        MockUniV3Pool pool3 = _v3Pool();
+        Op[] memory ops = new Op[](3);
+        ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+        ops[1] = _directV3Op(address(pool2), address(tokenB), address(tokenA), false, 1100e18, 0);
+        ops[2] = _directV3Op(
+            address(pool3), address(tokenB), address(tokenA), false, 0, GenericSequenceLib.FLAG_USE_PRODUCED
+        );
+        bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(GenericSequenceLib.NothingProduced.selector, address(tokenB)));
+        exec.execute(plan);
+    }
+
+    /// One source for the amount, and not on an op that fixes or forwards its
+    /// own size.
+    function test_produced_refusesAnotherAmountSourceAndAFlash() public {
+        MockUniV3Pool pool = _v3Pool();
+        MockUniV3Pool pool2 = _v3Pool();
+        uint32[3] memory extras = [
+            GenericSequenceLib.FLAG_USE_PRODUCED | GenericSequenceLib.FLAG_USE_PREV_RETURN,
+            GenericSequenceLib.FLAG_USE_PRODUCED | GenericSequenceLib.FLAG_USE_FULL_BALANCE,
+            GenericSequenceLib.FLAG_USE_PRODUCED
+        ];
+        for (uint256 k = 0; k < extras.length; ++k) {
+            Op[] memory ops = new Op[](2);
+            ops[0] = _directV3Op(address(pool), address(tokenA), address(tokenB), true, LOAN_AMOUNT, 0);
+            ops[1] = _directV3Op(address(pool2), address(tokenB), address(tokenA), false, 0, extras[k]);
+            if (k == 2) {
+                // The flag on a flash swap: a flash op fixes its own size.
+                ops[1] = _flashV3Op(address(pool2), address(tokenB), address(tokenA), false, 0, extras[k]);
+            }
+            bytes memory plan = _planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0);
+            vm.prank(operatorAddr);
+            vm.expectRevert(GenericSequenceLib.InvalidPlan.selector);
+            exec.execute(plan);
+        }
+    }
+
     /// A flash swap whose continuation holds another flash swap: the inner
     /// pool is paid inside the outer callback, the outer pool last.
     function test_flashV3_nested_flash_in_continuation() public {
