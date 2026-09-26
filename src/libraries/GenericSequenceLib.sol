@@ -55,6 +55,9 @@ library GenericSequenceLib {
     error InsufficientRepayOutput(uint256 actual, uint256 required);
     error CollateralOverspent(uint256 spent, uint256 allowed);
     error V4InputOverspent(uint256 consumed, uint256 amount);
+    /// A `FLAG_USE_PRODUCED` op found nothing of its `srcToken` produced by
+    /// the plan so far: the parts before it delivered less than they took.
+    error NothingProduced(address token);
 
     /// GENERIC_SEQUENCE op flags — direct-call routing only.
     uint32 internal constant FLAG_USE_FULL_BALANCE = 1 << 0; // inject balanceOf(srcToken) at fromAmountPos
@@ -166,9 +169,36 @@ library GenericSequenceLib {
     uint32 internal constant FLAG_WETH_WRAP = 1 << 10;
     uint32 internal constant FLAG_V3_FLASH = 1 << 8;
     uint32 internal constant FLAG_V2_FLASH = 1 << 9;
+    /// Spend what THIS plan has produced of `srcToken`: its balance now minus
+    /// its balance when the plan started (`_produced`).
+    ///
+    /// The two other derived sizes cannot express a hop split across pools.
+    /// `FLAG_USE_PREV_RETURN` is the output of ONE op, so the hop after a
+    /// split sees only its last part; `FLAG_USE_FULL_BALANCE` is the whole
+    /// balance and is admitted only for the cap token, because a whole
+    /// balance of any other token includes what the executor held before
+    /// the plan. This flag is the part of the balance the plan made, so:
+    ///   * the last part of a split hop takes exactly what the earlier parts
+    ///     left, and
+    ///   * the hop after a split takes the SUM of every part's output,
+    /// both without a literal that reverts on a one-wei shortfall. It can
+    /// never reach a standing balance — that is below the start-of-plan
+    /// snapshot by construction — and the per-srcToken containment cap
+    /// bounds it like any other spend.
+    ///
+    /// An ERC20 `srcToken` only; no other amount source (`FULL_BALANCE`,
+    /// `PREV_RETURN`), and not on an op that fixes or forwards its own size
+    /// (`WETH_UNWRAP`, `WETH_WRAP`, `NATIVE_IN`, a flash swap). On a V4 leg,
+    /// exact-in only.
+    uint32 internal constant FLAG_USE_PRODUCED = 1 << 11;
     uint32 internal constant FLAG_DIRECT_ANY = FLAG_V3_DIRECT | FLAG_V2_DIRECT | FLAG_V3_FLASH | FLAG_V2_FLASH;
     uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK
-        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN | FLAG_DIRECT_ANY | FLAG_WETH_WRAP;
+        | FLAG_WETH_UNWRAP | FLAG_V4_EXACT_IN | FLAG_NATIVE_IN | FLAG_DIRECT_ANY | FLAG_WETH_WRAP | FLAG_USE_PRODUCED;
+
+    /// @dev Tag for the transient slot of a token's balance at the start of
+    /// the plan (`_planStartSlot`). Hashed per token, so it cannot meet the
+    /// small fixed transient slots the executors and `DirectSwapLib` use.
+    bytes32 private constant PLAN_START_TAG = keccak256("GenericSequenceLib.planStartBalance");
     uint16 internal constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     /// @dev `LiquidationExecutor` storage slots for the V4 unlock arming
@@ -333,10 +363,24 @@ library GenericSequenceLib {
                 ++nSnap;
             }
         }
+        // The same snapshots, where `FLAG_USE_PRODUCED` can read them from any
+        // frame of this plan — a flash swap's continuation runs inside the
+        // pool's callback, which receives no arguments of ours to carry them.
+        // Stored plus one, so an unset slot (0) is told from a zero balance.
+        for (uint256 k = 0; k < nSnap; ++k) {
+            _setPlanStart(snapTok[k], snapBal[k] + 1);
+        }
 
         _runOps(ops, 0, 0, capToken, capAmount, weth);
 
         _finishOps(loanToken, loanBefore, flashRepayAmount, repayGate, capToken, capAmount, snapTok, snapBal, nSnap);
+
+        // Nothing of this plan may be read by anything after it in the same
+        // transaction: transient storage would otherwise keep it until the
+        // transaction ends.
+        for (uint256 k = 0; k < nSnap; ++k) {
+            _setPlanStart(snapTok[k], 0);
+        }
     }
 
     /// @notice Continue a sequence from inside a FLASH-swap callback: the
@@ -422,6 +466,24 @@ library GenericSequenceLib {
                     revert InvalidPlan();
                 }
             }
+            // FLAG_USE_PRODUCED admission: an ERC20 to measure, one source for
+            // the amount, and an op that takes its size from `amount` rather
+            // than fixing or forwarding its own.
+            if (op.flags & FLAG_USE_PRODUCED != 0) {
+                if (op.srcToken == address(0)) revert InvalidPlan();
+                if (
+                    op.flags
+                            & (FLAG_USE_FULL_BALANCE
+                                | FLAG_USE_PREV_RETURN
+                                | FLAG_WETH_UNWRAP
+                                | FLAG_WETH_WRAP
+                                | FLAG_NATIVE_IN
+                                | FLAG_V3_FLASH
+                                | FLAG_V2_FLASH) != 0
+                ) {
+                    revert InvalidPlan();
+                }
+            }
             // Direct pool swaps: an ERC20 input, no calldata patching (the
             // amount goes to the pool as a typed argument), none of the flags
             // that reinterpret `amount` or the op shape, and not both at once.
@@ -496,6 +558,8 @@ library GenericSequenceLib {
                 amount = bal < capAmount ? bal : capAmount;
             } else if (op.flags & FLAG_USE_PREV_RETURN != 0) {
                 amount = prevReturn;
+            } else if (op.flags & FLAG_USE_PRODUCED != 0) {
+                amount = _produced(op.srcToken);
             }
 
             if (op.flags & (FLAG_V3_FLASH | FLAG_V2_FLASH) != 0) {
@@ -562,8 +626,10 @@ library GenericSequenceLib {
                 // exactly right. Forbidding it outright barred V4 from every
                 // step but the first, since each later leg must spend the
                 // previous leg's output — which is what PREV_RETURN means.
-                if (op.flags & FLAG_V4_EXACT_IN == 0 && op.flags & (FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN) != 0)
-                {
+                if (
+                    op.flags & FLAG_V4_EXACT_IN == 0
+                        && op.flags & (FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_USE_PRODUCED) != 0
+                ) {
                     revert InvalidPlan();
                 }
                 // Positive int256 discriminates exact-out in the callback;
@@ -735,6 +801,38 @@ library GenericSequenceLib {
             prevReturn = outDelta;
         }
         return prevReturn;
+    }
+
+    /// @dev The transient slot holding `token`'s balance at the start of the
+    /// running plan, plus one (0 = not snapshotted).
+    function _planStartSlot(address token) private pure returns (bytes32) {
+        return keccak256(abi.encode(PLAN_START_TAG, token));
+    }
+
+    function _setPlanStart(address token, uint256 valuePlusOne) private {
+        bytes32 slot = _planStartSlot(token);
+        assembly ("memory-safe") {
+            tstore(slot, valuePlusOne)
+        }
+    }
+
+    /// @dev What the running plan has produced of `token` so far: its balance
+    /// now minus its balance when the plan started. Every op's `srcToken` is
+    /// snapshotted before the first op runs, so an unset slot means the token
+    /// is not one this plan spends — refused. Nothing produced (the balance is
+    /// at or below the snapshot) is refused too: the parts before this op
+    /// took more than they delivered, and there is no size to spend.
+    function _produced(address token) private view returns (uint256) {
+        bytes32 slot = _planStartSlot(token);
+        uint256 startPlusOne;
+        assembly ("memory-safe") {
+            startPlusOne := tload(slot)
+        }
+        if (startPlusOne == 0) revert InvalidPlan();
+        uint256 start = startPlusOne - 1;
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (bal <= start) revert NothingProduced(token);
+        return bal - start;
     }
 
     /// @dev End-of-sequence gates: the repay gate and the per-srcToken

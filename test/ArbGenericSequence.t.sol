@@ -119,6 +119,15 @@ contract ArbSeqHarness {
         }
     }
 
+    /// What the library left in the transient slot holding `token`'s
+    /// start-of-plan balance (the harness is the delegatecall context).
+    function planStartSlotValue(address token) external view returns (uint256 v) {
+        bytes32 slot = keccak256(abi.encode(keccak256("GenericSequenceLib.planStartBalance"), token));
+        assembly {
+            v := tload(slot)
+        }
+    }
+
     /// Accepts native ETH sent back by a native-output op (e.g.
     /// `MockNativeRouter.swap`) — the executor's own `receive()` equivalent.
     receive() external payable {}
@@ -180,6 +189,19 @@ contract ArbGenericSequenceTest is Test {
         ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
         harness.exec(libAddr, ops, address(loan), 100e18, 100e18, address(0));
         assertEq(loan.balanceOf(address(harness)), 110e18, "profit retained");
+    }
+
+    /// The start-of-plan snapshots `FLAG_USE_PRODUCED` reads are gone when
+    /// the plan returns: nothing after it in the same transaction may read
+    /// them. (A forge test is one transaction, so a leftover would show.)
+    function test_runArb_planStartSnapshotsAreClearedAfterThePlan() public {
+        loan.mint(address(harness), 100e18);
+        Op[] memory ops = new Op[](2);
+        ops[0] = _swapOp(address(loan), 100e18, address(mid), 100e18);
+        ops[1] = _swapOp(address(mid), 100e18, address(loan), 110e18);
+        harness.exec(libAddr, ops, address(loan), 100e18, 100e18, address(0));
+        assertEq(harness.planStartSlotValue(address(loan)), 0);
+        assertEq(harness.planStartSlotValue(address(mid)), 0);
     }
 
     /// Standing intermediate-token spend must revert: op0 spends MID the
