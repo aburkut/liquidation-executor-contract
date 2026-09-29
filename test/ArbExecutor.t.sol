@@ -21,6 +21,7 @@ import {MockParaswapAugustus} from "./mocks/MockParaswapAugustus.sol";
 import {MockRouter} from "./support/Mocks.sol";
 import {MockUniV3Pool, MockUniV2Pair, TamperingV3Pool} from "./mocks/MockDirectPools.sol";
 import {MockFeeOnTransferERC20} from "./mocks/MockFeeOnTransferERC20.sol";
+import {MockSwapBackERC20} from "./mocks/MockSwapBackERC20.sol";
 import {DirectSwapLib} from "../src/libraries/DirectSwapLib.sol";
 
 contract MockWETH is MockERC20 {
@@ -1075,6 +1076,57 @@ contract ArbExecutorTest is Test {
         // the balance and the transfer would have reverted before reaching here.
         assertEq(taxed.balanceOf(address(exec)), 0, "the published output was spent exactly");
         assertGt(tokenA.balanceOf(address(exec)), LOAN_AMOUNT, "the cycle closed above water");
+    }
+
+    /// The FLOKI shape through the executor: the input token's transfer SELLS
+    /// the token's accumulated tax into the very pair we are paying, before
+    /// our input is credited (FLOKI's `beforeTransferHandler`). The pair's
+    /// reserves therefore move inside our own transfer.
+    ///
+    /// MEASURED 2026-09-14 with `ARB_DIRECT_V2_SWAPS=1`: 52 of 54
+    /// `hashflow>v2` sims through the WETH/FLOKI pair reverted `UniswapV2: K`
+    /// on library code that read reserves before the transfer (#41). #45 reads
+    /// them after it; `DirectSwapV2OrderingTest` pins both old orderings to
+    /// K on this same mock, and `test/fork/ForkDirectV2PostTransfer.t.sol`
+    /// runs the real FLOKI pair through the deployed executor.
+    ///
+    /// Inventory path, as in the fee-on-transfer case above: the hooked token
+    /// is the cap token and its principal is held, so no flash transfer is
+    /// taxed and the test measures the swap.
+    function test_directV2_transferHookTradesThePair_pricesAfterTheHook() public {
+        MockSwapBackERC20 hooked = new MockSwapBackERC20("SwapBack", "SWB", 18, 30); // FLOKI's 0.3%
+
+        // hooked -> A, hooked expensive here. This is the pair the hook sells into.
+        MockUniV2Pair sell = new MockUniV2Pair(address(tokenA), address(hooked), 9970);
+        tokenA.mint(address(sell), 400 * LOAN_AMOUNT);
+        hooked.mint(address(sell), 100 * LOAN_AMOUNT);
+        sell.sync();
+        hooked.setPool(address(sell), 9970, address(0x7EA5));
+
+        // A -> hooked, hooked cheap here.
+        MockUniV2Pair buy = new MockUniV2Pair(address(tokenA), address(hooked), 9970);
+        tokenA.mint(address(buy), 100 * LOAN_AMOUNT);
+        hooked.mint(address(buy), 400 * LOAN_AMOUNT);
+        buy.sync();
+
+        // Tax on hand, so our sell triggers the swap-back; principal held.
+        hooked.mint(address(hooked), LOAN_AMOUNT / 10);
+        hooked.mint(address(exec), LOAN_AMOUNT);
+
+        Op[] memory ops = new Op[](2);
+        ops[0] = _directV2Op(address(sell), address(hooked), address(tokenA), false, LOAN_AMOUNT, 0);
+        ops[1] = _directV2Op(
+            address(buy), address(tokenA), address(hooked), true, 0, GenericSequenceLib.FLAG_USE_PREV_RETURN
+        );
+        bytes memory plan = _planMorpho(address(hooked), LOAN_AMOUNT, ops, 0);
+
+        vm.expectCall(address(morpho), abi.encodeWithSelector(MockMorphoBlue.flashLoan.selector), 0);
+        vm.prank(operatorAddr);
+        exec.execute(plan);
+
+        assertEq(hooked.swapBacks(), 1, "the hook traded the pair inside our transfer");
+        assertGt(tokenA.balanceOf(address(0x7EA5)), 0, "the swap-back was paid");
+        assertGt(hooked.balanceOf(address(exec)), LOAN_AMOUNT, "the cycle closed above water");
     }
 
     function test_flashV2_feeOnTransferInput_stillUnserviceable() public {

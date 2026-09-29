@@ -203,6 +203,20 @@ library DirectSwapLib {
 
     /// @notice V2 flash swap: the pair pays the reserve-formula output first
     /// and calls `uniswapV2Call`, which runs `cont` and then sends `amount`.
+    /// @dev Not for a token with a transfer tax or hook, on either side.
+    /// MEASURED on a mainnet fork 2026-09-29 (block 26_081_000, FLOKI's WETH
+    /// pair, `test/fork/ForkDirectV2PostTransfer.t.sol`):
+    ///   * a hooked INPUT cannot settle. The input is paid inside the pair's
+    ///     `swap`, while the pair is locked, and FLOKI's transfer first sells
+    ///     its tax into that same pair: `UniswapV2: LOCKED`. No pricing change
+    ///     reaches this, so `swapV2`'s post-transfer read does not apply here.
+    ///   * a taxed OUTPUT is overstated to the continuation. The executor's
+    ///     callbacks seed it with what the pair SENT (`amount0`/`amount1`,
+    ///     `receivedV3` for V3), not the balance that arrived, so the next op
+    ///     spends 0.3% more FLOKI than is held and the token reverts. The
+    ///     direct path measures the balance delta (#43); the flash path does
+    ///     not. Fixing it is a contract change and a redeploy; until then the
+    ///     bot must not promote a taxed-token leg to flash.
     function flashV2(address pair, uint256 amount, bytes memory data, bytes memory cont) internal {
         (bool zeroForOne, uint256 out) = _v2Out(pair, amount, data);
         _armContinuation(pair, cont);
