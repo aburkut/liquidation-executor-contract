@@ -22,7 +22,8 @@ import {SwapMode, SwapLeg} from "../types/SwapTypes.sol";
 /// Coverage:
 ///   * UNI_V2  / UNI_V2_BUY                 (single-hop & multihop)
 ///   * UNI_V3  / UNI_V3_BUY                 (single-hop & multihop via path bytes)
-///   * UNI_V4  / UNI_V4_BUY  single-hop     (`runV4UnlockSwap`)
+///   * UNI_V4  / UNI_V4_BUY  single-hop     (`runV4UnlockSwap`; arb ops with a
+///     caller price limit: `runV4UnlockSwapLimited`)
 ///   * UNI_V4  / UNI_V4_BUY  multihop       (`runV4UnlockMultihop`)
 ///
 /// Paraswap orchestration stays in `SwapLegExecutorLib` (sister
@@ -267,6 +268,47 @@ library UniswapLib {
         address hook,
         int256 amountSpec
     ) external {
+        _runV4Single(pm, tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec, 0);
+    }
+
+    /// @dev `runV4UnlockSwap` with the caller's `sqrtPriceLimitX96`; zero
+    /// means none (MIN/MAX, exactly `runV4UnlockSwap`). Reached only from
+    /// `ArbExecutor.unlockCallback` for a 192-byte single-hop tuple, which
+    /// `GenericSequenceLib` admits on exact-in ops alone.
+    ///
+    /// An exact-in swap with a limit stops where the price reaches it: the
+    /// pool takes less than `-amountSpec` and the deltas say how much. The
+    /// settlement below already pays the delta (`owedIn`) and takes the
+    /// delta, so nothing else changes: the untaken input stays with the
+    /// executor, the per-op input ceiling (`consumed <= amount`) holds, and
+    /// the next op chains off the output it really received. A limit on the
+    /// wrong side of the price is refused by the PoolManager itself
+    /// (`PriceLimitAlreadyExceeded`, `PriceLimitOutOfBounds`).
+    ///
+    /// `runV4UnlockSwap` stays as it was: `LiquidationExecutor` links it.
+    function runV4UnlockSwapLimited(
+        IPoolManager pm,
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        int24 tickSpacing,
+        address hook,
+        int256 amountSpec,
+        uint160 sqrtPriceLimitX96
+    ) external {
+        _runV4Single(pm, tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec, sqrtPriceLimitX96);
+    }
+
+    function _runV4Single(
+        IPoolManager pm,
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        int24 tickSpacing,
+        address hook,
+        int256 amountSpec,
+        uint160 limit
+    ) private {
         bool zeroForOne = tokenIn < tokenOut;
         PoolKey memory key = PoolKey({
             currency0: zeroForOne ? tokenIn : tokenOut,
@@ -279,7 +321,7 @@ library UniswapLib {
         SwapParams memory params = SwapParams({
             zeroForOne: zeroForOne,
             amountSpecified: amountSpec,
-            sqrtPriceLimitX96: zeroForOne ? V4_MIN_SQRT_PRICE_LIMIT : V4_MAX_SQRT_PRICE_LIMIT
+            sqrtPriceLimitX96: limit != 0 ? limit : (zeroForOne ? V4_MIN_SQRT_PRICE_LIMIT : V4_MAX_SQRT_PRICE_LIMIT)
         });
 
         int256 swapDelta = pm.swap(key, params, "");

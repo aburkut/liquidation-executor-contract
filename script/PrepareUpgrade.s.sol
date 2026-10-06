@@ -21,7 +21,8 @@ interface IFlashProviderView {
 /// belongs to the Safe.
 ///
 ///   arb:          FOUNDRY_PROFILE=arb PROXY=0x… EXECUTOR_KIND=arb PRIVATE_KEY=<deployer key> \
-///                   forge script script/PrepareUpgrade.s.sol --rpc-url $RPC --broadcast
+///                   [SALT=0x…] forge script script/PrepareUpgrade.s.sol --rpc-url $RPC --broadcast
+///                 (with SALT the implementation address is deterministic: see below)
 ///   liquidation:  PROXY=0x… EXECUTOR_KIND=liquidation PRIVATE_KEY=<deployer key> \
 ///                   forge script script/PrepareUpgrade.s.sol --rpc-url $RPC --broadcast
 ///
@@ -40,19 +41,39 @@ contract PrepareUpgrade is Script {
         address current = address(uint160(uint256(vm.load(proxy, ERC1967Utils.IMPLEMENTATION_SLOT))));
         require(admin != address(0) && current != address(0), "PROXY is not an ERC-1967 proxy");
 
+        // Optional SALT: deploy the arb implementation through the canonical
+        // CREATE2 deployer instead of from the deployer's nonce. The address is
+        // then a function of the bytecode (arb profile, no metadata hash, the
+        // libraries' own CREATE2 addresses) and the salt alone, so a fork
+        // dry-run prints the EXACT implementation — and the exact Safe calldata
+        // — that the mainnet run will produce. Unset, nothing changes.
+        bytes32 salt = vm.envOr("SALT", bytes32(0));
         vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
         if (kind == keccak256("arb")) {
             ArbExecutor p = ArbExecutor(payable(proxy));
-            implementation = address(
-                new ArbExecutor(
-                    p.weth(),
-                    p.balancerVault(),
-                    p.morphoBlue(),
-                    p.paraswapAugustusV6(),
-                    p.uniV2Router(),
-                    p.uniV3Router()
-                )
-            );
+            if (salt != bytes32(0)) {
+                implementation = address(
+                    new ArbExecutor{salt: salt}(
+                        p.weth(),
+                        p.balancerVault(),
+                        p.morphoBlue(),
+                        p.paraswapAugustusV6(),
+                        p.uniV2Router(),
+                        p.uniV3Router()
+                    )
+                );
+            } else {
+                implementation = address(
+                    new ArbExecutor(
+                        p.weth(),
+                        p.balancerVault(),
+                        p.morphoBlue(),
+                        p.paraswapAugustusV6(),
+                        p.uniV2Router(),
+                        p.uniV3Router()
+                    )
+                );
+            }
         } else if (kind == keccak256("liquidation")) {
             LiquidationExecutor p = LiquidationExecutor(payable(proxy));
             implementation = address(

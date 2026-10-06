@@ -255,6 +255,21 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         emit V4HookBlockedUpdated(hook, blocked);
     }
 
+    /// @notice Implementation capability version, bumped when the plan shapes
+    /// the executor ACCEPTS change. The bot reads this on chain at start and
+    /// refuses to send a shape an older implementation would revert.
+    ///   * absent (the call reverts — no such function, no fallback) → the
+    ///     deployed b48587a build, which the bot treats as 1;
+    ///   * 2 → this build: V4 exact-in with a caller `sqrtPriceLimitX96`
+    ///     (192-byte single-hop blob), native re-wrap of what the plan produced
+    ///     (`FLAG_WETH_WRAP | FLAG_USE_PRODUCED`, srcToken address(0)), and a V2
+    ///     direct/flash swap to a target price (96-byte callData).
+    /// Pure, no storage: it survives a plain proxy upgrade with no migrator and
+    /// cannot disagree with the code it is compiled into.
+    function version() external pure returns (uint256) {
+        return 2;
+    }
+
     function pause() external onlyOwner {
         _pause();
     }
@@ -413,19 +428,22 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
             // with the flag off the op names WETH, which this deploy removed
             // from the allowlist on purpose.
             //
-            // EXACT equality, same discipline as the unwrap above, on the two
-            // shapes the library itself accepts (its guard is
-            // `op.flags & ~(FLAG_WETH_WRAP | FLAG_USE_PREV_RETURN) != 0` ->
-            // InvalidPlan). A combined-flag op carrying a real target stays
-            // gated.
-            // Masked equality, not two comparisons: `flags & ~PREV == WRAP`
-            // accepts exactly the two shapes the library accepts and still
-            // rejects WRAP|V4_UNLOCK (mask leaves the unlock bit, so the
-            // compare fails) and a bare PREV (leaves 0). Written this way for
-            // the EIP-170 budget — the pair of equality checks cost 86 bytes
-            // and pushed LiquidationExecutor past the project's own headroom
-            // guard at 24400.
-            if (plan.ops[i].flags & ~GenericSequenceLib.FLAG_USE_PREV_RETURN == GenericSequenceLib.FLAG_WETH_WRAP) {
+            // EXACT equality, same discipline as the unwrap above, on the
+            // shapes the library itself accepts (its wrap guard admits WRAP with
+            // exactly one extra bit — FLAG_USE_PREV_RETURN to wrap what the
+            // previous op paid, or FLAG_USE_PRODUCED to re-wrap the native ETH a
+            // short-filled leg left). A combined-flag op carrying a real target
+            // stays gated.
+            // Masked equality, not three comparisons: `flags & ~(PREV|PRODUCED)
+            // == WRAP` accepts exactly those shapes and still rejects
+            // WRAP|V4_UNLOCK (the mask leaves the unlock bit, so the compare
+            // fails) and a bare PREV/PRODUCED (leaves 0). Written this way for
+            // the EIP-170 budget — a comparison per shape cost bytes and pushed
+            // LiquidationExecutor past the project's own headroom guard at 24400.
+            if (
+                plan.ops[i].flags & ~(GenericSequenceLib.FLAG_USE_PREV_RETURN | GenericSequenceLib.FLAG_USE_PRODUCED)
+                    == GenericSequenceLib.FLAG_WETH_WRAP
+            ) {
                 continue;
             }
             // Direct pool swaps name the pool itself as the target: pools are
@@ -612,12 +630,28 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         // arming path. inner.length distinguishes the modes:
         //   == V4_SWAP_DATA_LENGTH (160) → single-hop 5-tuple inside
         //   >  V4_SWAP_DATA_LENGTH       → multihop V4Hop[] inside
+        //   == V4_SWAP_DATA_LENGTH + 32 (192)   → single-hop WITH a caller
+        //                                         sqrtPriceLimitX96 (6th word);
+        //                                         exact-in only (armed by
+        //                                         GenericSequenceLib). The
+        //                                         price limit `runV4UnlockSwap`
+        //                                         otherwise pins to MIN/MAX,
+        //                                         which sizes a blind opening.
+        // A valid multihop blob is >= 320 bytes (>= 2 V4Hop structs), so 192
+        // never collides with multihop.
         (bytes memory inner, int256 amountSpec) = abi.decode(data, (bytes, int256));
         if (inner.length == V4_SWAP_DATA_LENGTH) {
             (, address tokenOut, uint24 fee, int24 tickSpacing, address hook) =
                 abi.decode(inner, (address, address, uint24, int24, address));
             if (blockedV4Hooks[hook]) revert InvalidV4CallbackHook();
             UniswapLib.runV4UnlockSwap(IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec);
+        } else if (inner.length == V4_SWAP_DATA_LENGTH + 32) {
+            (, address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint160 limit) =
+                abi.decode(inner, (address, address, uint24, int24, address, uint160));
+            if (blockedV4Hooks[hook]) revert InvalidV4CallbackHook();
+            UniswapLib.runV4UnlockSwapLimited(
+                IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec, limit
+            );
         } else {
             UniswapLib.runV4UnlockMultihop(IPoolManager(msg.sender), tokenIn, data);
         }
