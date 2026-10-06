@@ -34,6 +34,21 @@ contract MockV4PoolManager is IPoolManager {
         inputInflateBps = bps;
     }
 
+    /// @dev The sqrtPriceLimitX96 of the most recent `swap` — lets a test
+    /// assert the caller limit on a 192-byte single-hop blob reached the pool
+    /// (0 on the 160-byte shape, where the executor pins MIN/MAX).
+    uint160 public lastSqrtPriceLimitX96;
+
+    /// @dev When non-zero, an EXACT-IN swap fills at most this much INPUT and
+    /// reports deltas for that reduced amount — a short fill modelling a price
+    /// limit the pool hit before the requested input was spent. The leftover
+    /// input stays with the executor, exactly as on a real limited V4 swap.
+    uint256 public exactInLimitFill;
+
+    function setExactInLimitFill(uint256 cap) external {
+        exactInLimitFill = cap;
+    }
+
     /// @dev Native-ETH value received across all `settle{value: ...}()`
     /// calls in this test — lets tests assert the exact wei forwarded for
     /// a native-tokenIn V4 leg (currency `address(0)` in the delta map).
@@ -68,11 +83,17 @@ contract MockV4PoolManager is IPoolManager {
 
     function swap(PoolKey memory key, SwapParams memory params, bytes calldata) external returns (int256 swapDelta) {
         require(params.amountSpecified != 0, "MockV4PM: amountSpec=0");
+        lastSqrtPriceLimitX96 = params.sqrtPriceLimitX96;
         uint256 amountIn;
         uint256 amountOut;
         if (params.amountSpecified < 0) {
             // Exact-input (SELL): caller fixes input, output = input * rate.
             amountIn = uint256(-params.amountSpecified);
+            // A price-limit short fill: take at most `exactInLimitFill` of the
+            // requested input and report deltas for that much only.
+            if (exactInLimitFill != 0 && amountIn > exactInLimitFill) {
+                amountIn = exactInLimitFill;
+            }
             // Adversarial over-pull: report a larger tokenInDelta than asked.
             if (inputInflateBps != 10_000) {
                 amountIn = amountIn * inputInflateBps / 10_000;

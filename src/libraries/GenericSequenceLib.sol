@@ -188,8 +188,12 @@ library GenericSequenceLib {
     ///
     /// An ERC20 `srcToken` only; no other amount source (`FULL_BALANCE`,
     /// `PREV_RETURN`), and not on an op that fixes or forwards its own size
-    /// (`WETH_UNWRAP`, `WETH_WRAP`, `NATIVE_IN`, a flash swap). On a V4 leg,
-    /// exact-in only.
+    /// (`WETH_UNWRAP`, `NATIVE_IN`, a flash swap). On a V4 leg, exact-in only.
+    ///
+    /// The ONE exception is `FLAG_WETH_WRAP | FLAG_USE_PRODUCED` with
+    /// `srcToken == address(0)`: there PRODUCED measures the NATIVE ETH the
+    /// plan has produced (the leftover a short-filled native-in leg left), and
+    /// the wrap branch owns that shape — see there and `_producedNative`.
     uint32 internal constant FLAG_USE_PRODUCED = 1 << 11;
     uint32 internal constant FLAG_DIRECT_ANY = FLAG_V3_DIRECT | FLAG_V2_DIRECT | FLAG_V3_FLASH | FLAG_V2_FLASH;
     uint32 internal constant FLAG_KNOWN_MASK = FLAG_USE_FULL_BALANCE | FLAG_USE_PREV_RETURN | FLAG_V4_UNLOCK
@@ -468,8 +472,11 @@ library GenericSequenceLib {
             }
             // FLAG_USE_PRODUCED admission: an ERC20 to measure, one source for
             // the amount, and an op that takes its size from `amount` rather
-            // than fixing or forwarding its own.
-            if (op.flags & FLAG_USE_PRODUCED != 0) {
+            // than fixing or forwarding its own. The one native-ETH pairing —
+            // `FLAG_WETH_WRAP | FLAG_USE_PRODUCED`, which re-wraps the ETH a
+            // short-filled native-in leg left — is admitted and validated in
+            // the wrap branch below, so it skips this ERC20-only gate.
+            if (op.flags & FLAG_USE_PRODUCED != 0 && op.flags & FLAG_WETH_WRAP == 0) {
                 if (op.srcToken == address(0)) revert InvalidPlan();
                 if (
                     op.flags
@@ -503,14 +510,37 @@ library GenericSequenceLib {
                 // The exact mirror of the unwrap below, and pinned just as
                 // hard: the only address this can call is the executor's own
                 // `weth`, and the only thing it can do there is `deposit`.
-                // `amount` is either the literal or the previous op's return,
-                // which is how a pool that paid raw ETH is wrapped without the
-                // plan naming any target at all.
-                if (op.flags & ~(FLAG_WETH_WRAP | FLAG_USE_PREV_RETURN) != 0) revert InvalidPlan();
+                // Exactly one extra bit is allowed with the wrap:
+                //   * FLAG_USE_PREV_RETURN — wrap what the previous op paid raw
+                //     (a native-output V4 / Fluid / Ekubo leg), the literal
+                //     fallback being `op.amountIn`;
+                //   * FLAG_USE_PRODUCED — wrap the native ETH THIS plan has
+                //     produced and not yet spent. It closes a native-in cycle
+                //     whose opening leg SHORT-FILLED behind a price limit: an
+                //     opening `FLAG_WETH_UNWRAP` converts a literal L of WETH to
+                //     ETH, the limited V4 leg sells only part of it, and the
+                //     leftover `L − consumed` native ETH has no op to re-wrap —
+                //     a fixed literal would revert on the exact wei left. With
+                //     nothing left (the leg took it all) this is a NO-OP, not a
+                //     revert, so the same plan shape works whatever the fill.
+                uint32 extra = op.flags & ~FLAG_WETH_WRAP;
+                bool producedWrap = extra == FLAG_USE_PRODUCED;
+                if (extra != 0 && extra != FLAG_USE_PREV_RETURN && !producedWrap) revert InvalidPlan();
                 if (op.srcToken != address(0)) revert InvalidPlan();
                 if (op.outToken != weth) revert InvalidPlan();
-                uint256 wrapAmount = op.flags & FLAG_USE_PREV_RETURN != 0 ? prevReturn : op.amountIn;
-                if (wrapAmount == 0) revert InvalidPlan();
+                uint256 wrapAmount;
+                if (producedWrap) {
+                    wrapAmount = _producedNative();
+                    if (wrapAmount == 0) {
+                        // Nothing left to re-wrap: a full fill. The op carries
+                        // no output of its own, so leave `prevReturn` as the
+                        // previous op's and move on.
+                        continue;
+                    }
+                } else {
+                    wrapAmount = op.flags & FLAG_USE_PREV_RETURN != 0 ? prevReturn : op.amountIn;
+                    if (wrapAmount == 0) revert InvalidPlan();
+                }
                 // Bounded by what the executor actually holds: a plan cannot
                 // name more native ETH than the cycle produced.
                 if (wrapAmount > address(this).balance) revert InvalidPlan();
@@ -616,7 +646,19 @@ library GenericSequenceLib {
                 // approve/reset pair is skipped. The shared outToken delta
                 // check below still pins the swap output to the executor, and
                 // the per-srcToken containment cap bounds what the op spends.
-                if (op.callData.length != V4_SWAP_DATA_LENGTH) revert InvalidPlan();
+                // Today's exact-out/exact-in single hop is the 160-byte tuple
+                // `(tokenIn, tokenOut, fee, tickSpacing, hook)`. An exact-IN op
+                // may ALSO carry a caller `sqrtPriceLimitX96` as a sixth word
+                // (192 bytes) — the opening-hop price limit the bot sizes a
+                // blind backrun with, which `runV4UnlockSwap`'s MIN/MAX pin
+                // otherwise forbids on V4. The extra word is meaningless for an
+                // exact-OUT buy (the output is fixed), so it is admitted only
+                // with FLAG_V4_EXACT_IN; the executor's `unlockCallback` reads
+                // the sixth word and routes to `runV4UnlockSwapLimited`. The
+                // raw blob travels verbatim, so no multihop blob (>= 2 hops,
+                // >= 320 bytes) can collide with 192.
+                bool v4Limited = op.callData.length == V4_SWAP_DATA_LENGTH + 32 && op.flags & FLAG_V4_EXACT_IN != 0;
+                if (op.callData.length != V4_SWAP_DATA_LENGTH && !v4Limited) revert InvalidPlan();
                 // FULL_BALANCE / PREV_RETURN make `amount` an INPUT amount.
                 // That contradicts an exact-OUT V4 op, whose `amount` is the
                 // output spec — reject there instead of mis-signing the swap.
@@ -833,6 +875,26 @@ library GenericSequenceLib {
         uint256 bal = IERC20(token).balanceOf(address(this));
         if (bal <= start) revert NothingProduced(token);
         return bal - start;
+    }
+
+    /// @dev The native ETH this plan has produced and not yet spent — the
+    /// executor's ETH balance now minus its balance when the plan started —
+    /// for the `FLAG_WETH_WRAP | FLAG_USE_PRODUCED` re-wrap. Unlike
+    /// `_produced`, returns 0 (a no-op wrap) rather than reverting when none
+    /// is left: a native-in leg behind a price limit may consume all of the
+    /// opening unwrap or only part of it, and both are valid. The native
+    /// bucket is always snapshotted (the wrap op's own `srcToken` is
+    /// address(0)), so an unset slot is a real malformation and still reverts.
+    function _producedNative() private view returns (uint256) {
+        bytes32 slot = _planStartSlot(address(0));
+        uint256 startPlusOne;
+        assembly ("memory-safe") {
+            startPlusOne := tload(slot)
+        }
+        if (startPlusOne == 0) revert InvalidPlan();
+        uint256 start = startPlusOne - 1;
+        uint256 bal = address(this).balance;
+        return bal > start ? bal - start : 0;
     }
 
     /// @dev End-of-sequence gates: the repay gate and the per-srcToken

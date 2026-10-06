@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IUniV3PoolMinimal, IUniV2PairMinimal} from "../interfaces/IDirectPools.sol";
 import {Op} from "../types/SwapTypes.sol";
@@ -52,6 +53,9 @@ library DirectSwapLib {
     error DirectSwapCallbackUnarmed();
     error DirectSwapCallbackOverpull(uint256 owed, uint256 max);
     error DirectSwapContinuationMismatch();
+    /// A V2 direct swap carried a `sqrtPriceLimitX96` the pair's price is
+    /// already at or past: there is no input that moves it toward the limit.
+    error DirectSwapPriceLimit();
 
     /// @dev TRANSIENT words. Shared convention with the executors (which
     /// expose the callbacks and delegate here); numbers continue the
@@ -150,7 +154,16 @@ library DirectSwapLib {
     /// pays FIRST, from pre-transfer reserves, so there is no post-transfer
     /// measurement point. A fee-on-transfer token simply cannot be flash-swapped.
     function swapV2(address pair, address tokenIn, uint256 amount, bytes memory data) internal returns (uint256 out) {
-        (bool zeroForOne, uint16 feeNumerator) = _v2Params(amount, data);
+        (bool zeroForOne, uint16 feeNumerator, uint160 limit) = _v2ParamsLimited(amount, data);
+        // A price limit (opening-hop on-chain sizing, the V2 mirror of a V3
+        // `sqrtPriceLimitX96`): send only as much input as moves the pair's
+        // price to the limit, at most `amount`. The pair has no limit argument,
+        // so the clamp is computed from its reserves before the transfer and
+        // the untaken input stays with the executor — the same short-fill the
+        // profit/repay gates already count back to the wei.
+        if (limit != 0) {
+            amount = _v2LimitedInput(pair, zeroForOne, amount, limit);
+        }
         IERC20(tokenIn).safeTransfer(pair, amount);
         // Reserves are read AFTER the transfer, together with the balance.
         //
@@ -294,6 +307,58 @@ library DirectSwapLib {
         (zeroForOne, feeNumerator) = _v2Params(amount, data);
         (uint256 reserveIn, uint256 reserveOut) = _v2Reserves(pair, zeroForOne);
         out = _v2AmountOut(amount, feeNumerator, reserveIn, reserveOut);
+    }
+
+    /// @dev `_v2Params`, and ALSO the 96-byte form a V2 DIRECT swap may carry:
+    /// `(bool zeroForOne, uint16 feeNumerator, uint160 sqrtPriceLimitX96)`, 0 =
+    /// no limit. Only `swapV2` reads this; `flashV2` prices pre-transfer and the
+    /// pair pays out first, so a limit cannot clamp its input cleanly — its
+    /// `_v2Out` keeps the strict 64-byte `_v2Params` and a 96-byte flash
+    /// callData reverts `DirectSwapInvalid`.
+    function _v2ParamsLimited(uint256 amount, bytes memory data)
+        private
+        pure
+        returns (bool zeroForOne, uint16 feeNumerator, uint160 limit)
+    {
+        if (amount == 0 || (data.length != 64 && data.length != 96)) revert DirectSwapInvalid();
+        if (data.length == 96) {
+            (zeroForOne, feeNumerator, limit) = abi.decode(data, (bool, uint16, uint160));
+        } else {
+            (zeroForOne, feeNumerator) = abi.decode(data, (bool, uint16));
+        }
+        if (feeNumerator == 0 || feeNumerator > 10_000) revert DirectSwapInvalid();
+    }
+
+    /// @dev How much `tokenIn` to send so the pair's price reaches `limit`
+    /// (a sqrtPriceX96, token1 per token0 like V3), capped at `amount`. With
+    /// `k = r0·r1` held by the constant product and `rootK = √k`, the reserve
+    /// of the input token at the limit is `rootK·2⁹⁶/limit` when selling
+    /// token0 (price falls) and `rootK·limit/2⁹⁶` when selling token1 (price
+    /// rises); the room to there is that minus the current input reserve.
+    /// Reverts when the price is already at or past the limit (no room). The
+    /// fee is ignored in the bound — it only makes the realised move smaller,
+    /// so the clamp never overshoots the limit.
+    function _v2LimitedInput(address pair, bool zeroForOne, uint256 amount, uint160 limit)
+        private
+        view
+        returns (uint256)
+    {
+        (uint112 r0, uint112 r1,) = IUniV2PairMinimal(pair).getReserves();
+        if (r0 == 0 || r1 == 0) revert DirectSwapInvalid();
+        uint256 rootK = Math.sqrt(uint256(r0) * uint256(r1));
+        uint256 q96 = 1 << 96;
+        uint256 target;
+        uint256 reserveIn;
+        if (zeroForOne) {
+            target = Math.mulDiv(rootK, q96, limit);
+            reserveIn = r0;
+        } else {
+            target = Math.mulDiv(rootK, limit, q96);
+            reserveIn = r1;
+        }
+        if (target <= reserveIn) revert DirectSwapPriceLimit();
+        uint256 room = target - reserveIn;
+        return amount < room ? amount : room;
     }
 
     function _v2Params(uint256 amount, bytes memory data) private pure returns (bool zeroForOne, uint16 feeNumerator) {
