@@ -131,7 +131,7 @@ contract ArbUpgradeStateTest is Test {
         assertEq(exec.allowedFlashProviders(3), live.morphoBlue(), "provider 3");
         assertFalse(exec.allowedTargets(WETH), "WETH is not a target");
         assertFalse(exec.allowedTargets(0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb), "Morpho is not a target");
-        assertEq(exec.version(), 2, "new implementation");
+        assertEq(exec.version(), 3, "new implementation");
         assertEq(ProxyAdmin(admin).owner(), SAFE, "ProxyAdmin still owned by the Safe");
     }
 }
