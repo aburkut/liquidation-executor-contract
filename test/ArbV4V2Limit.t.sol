@@ -448,8 +448,10 @@ contract ArbV4V2LimitTest is Test {
     // ═══════════════════════════════════════════════════════════════
 
     /// The bot reads `version()` on chain and refuses the new shapes to an
-    /// implementation that does not answer 2.
-    function test_version_is_2() public view {
-        assertEq(exec.version(), 2);
+    /// implementation that does not answer at least 2.
+    function test_version_is_3() public view {
+        // 3 since the V4 multihop op (ArbV4Multihop.t.sol); the #50 shapes
+        // tested here are all still admitted.
+        assertEq(exec.version(), 3);
     }
 }

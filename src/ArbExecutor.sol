@@ -260,14 +260,19 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     /// refuses to send a shape an older implementation would revert.
     ///   * absent (the call reverts — no such function, no fallback) → the
     ///     deployed b48587a build, which the bot treats as 1;
-    ///   * 2 → this build: V4 exact-in with a caller `sqrtPriceLimitX96`
+    ///   * 2 → the #50 build: V4 exact-in with a caller `sqrtPriceLimitX96`
     ///     (192-byte single-hop blob), native re-wrap of what the plan produced
     ///     (`FLAG_WETH_WRAP | FLAG_USE_PRODUCED`, srcToken address(0)), and a V2
-    ///     direct/flash swap to a target price (96-byte callData).
+    ///     direct/flash swap to a target price (96-byte callData);
+    ///   * 3 → this build: everything in 2, plus a V4 exact-in MULTIHOP op —
+    ///     `abi.encode(V4Hop[])`, 2..10 hops in ONE unlock, each hop's hook
+    ///     checked against `blockedV4Hooks`, native-ETH input settled by value.
+    ///     The tokens between the hops never leave the PoolManager, which is the
+    ///     only way to trade a token that refuses every transfer out of it.
     /// Pure, no storage: it survives a plain proxy upgrade with no migrator and
     /// cannot disagree with the code it is compiled into.
     function version() external pure returns (uint256) {
-        return 2;
+        return 3;
     }
 
     function pause() external onlyOwner {
@@ -653,6 +658,13 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
                 IPoolManager(msg.sender), tokenIn, tokenOut, fee, tickSpacing, hook, amountSpec, limit
             );
         } else {
+            // Multihop (admitted by GenericSequenceLib on exact-in ops only, 2..10
+            // hops): every hop's hook meets the same blocklist a single hop
+            // does — the library cannot see `blockedV4Hooks`.
+            UniswapLib.V4Hop[] memory hops = abi.decode(inner, (UniswapLib.V4Hop[]));
+            for (uint256 i = 0; i < hops.length; i++) {
+                if (blockedV4Hooks[hops[i].hook]) revert InvalidV4CallbackHook();
+            }
             UniswapLib.runV4UnlockMultihop(IPoolManager(msg.sender), tokenIn, data);
         }
         return "";

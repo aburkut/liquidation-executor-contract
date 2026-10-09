@@ -73,7 +73,7 @@ contract ArbV4V2LimitForkTest is Test {
         vm.prank(SAFE);
         ProxyAdmin(admin).upgradeAndCall(ITransparentUpgradeableProxy(PROXY), impl, "");
         exec = ArbExecutor(payable(PROXY));
-        assertEq(exec.version(), 2, "the proxy must run the new implementation");
+        assertEq(exec.version(), 3, "the proxy must run the new implementation");
         return true;
     }
 

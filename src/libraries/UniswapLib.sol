@@ -525,9 +525,15 @@ library UniswapLib {
 
         // Settle the leg's input and take the leg's output. Intermediate
         // tokens net out via PoolManager's per-currency credit ledger.
-        pm.sync(tokenIn);
-        IERC20(tokenIn).safeTransfer(address(pm), owedIn);
-        pm.settle();
+        if (tokenIn == address(0)) {
+            // Native-ETH input, as in `_runV4Single`: credited through
+            // msg.value on `settle`, never sync + ERC20 transfer.
+            pm.settle{value: owedIn}();
+        } else {
+            pm.sync(tokenIn);
+            IERC20(tokenIn).safeTransfer(address(pm), owedIn);
+            pm.settle();
+        }
         pm.take(tokens[nHops], address(this), finalGainedOut);
     }
 

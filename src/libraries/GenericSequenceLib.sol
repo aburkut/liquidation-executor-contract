@@ -241,6 +241,14 @@ library GenericSequenceLib {
     /// @dev Strict size of a single-hop v4SwapData tuple — 5 × 32-byte words.
     /// Mirrors `LiquidationExecutor.V4_SWAP_DATA_LENGTH`.
     uint256 private constant V4_SWAP_DATA_LENGTH = 160;
+    /// A multihop blob `abi.encode(V4Hop[])`: offset + length words, then one
+    /// 4-word `V4Hop` (tokenOut, fee, tickSpacing, hook) per hop. Two hops at
+    /// least (320 bytes — never the 160/192 single-hop shapes) and ten at most,
+    /// the bound `decodeAndValidateV4MultihopShape` already sets.
+    uint256 private constant V4_MULTIHOP_HEAD_LENGTH = 64;
+    uint256 private constant V4_HOP_LENGTH = 128;
+    uint256 private constant V4_MULTIHOP_MIN_LENGTH = V4_MULTIHOP_HEAD_LENGTH + 2 * V4_HOP_LENGTH;
+    uint256 private constant V4_MULTIHOP_MAX_LENGTH = V4_MULTIHOP_HEAD_LENGTH + 10 * V4_HOP_LENGTH;
 
     /// @notice Execute a flat `Op[]` sequence with per-srcToken containment
     /// (liquidation semantics: cap = collateral, delta repay gate). MUST be
@@ -657,8 +665,23 @@ library GenericSequenceLib {
                 // the sixth word and routes to `runV4UnlockSwapLimited`. The
                 // raw blob travels verbatim, so no multihop blob (>= 2 hops,
                 // >= 320 bytes) can collide with 192.
+                //
+                // An exact-in op may instead carry a V4 MULTIHOP blob,
+                // `abi.encode(V4Hop[])` of 2..10 hops (64 + 128·n bytes), which
+                // the callback runs inside ONE unlock (`runV4UnlockMultihop`):
+                // only the first input is settled and only the last output
+                // taken, the tokens between net to zero in the PoolManager's
+                // ledger and never move. A token that refuses every transfer
+                // out of the PoolManager (CLAUS, 0x1b54e762…: `InvalidTransfer`
+                // from any `take`) can be traded ONLY this way — as two single
+                // hops the first `take` reverts. The callback re-checks every
+                // hop's hook; the outToken delta check below pins the final
+                // output exactly as for a single hop.
                 bool v4Limited = op.callData.length == V4_SWAP_DATA_LENGTH + 32 && op.flags & FLAG_V4_EXACT_IN != 0;
-                if (op.callData.length != V4_SWAP_DATA_LENGTH && !v4Limited) revert InvalidPlan();
+                bool v4Multihop = op.flags & FLAG_V4_EXACT_IN != 0 && op.callData.length >= V4_MULTIHOP_MIN_LENGTH
+                    && op.callData.length <= V4_MULTIHOP_MAX_LENGTH
+                    && (op.callData.length - V4_MULTIHOP_HEAD_LENGTH) % V4_HOP_LENGTH == 0;
+                if (op.callData.length != V4_SWAP_DATA_LENGTH && !v4Limited && !v4Multihop) revert InvalidPlan();
                 // FULL_BALANCE / PREV_RETURN make `amount` an INPUT amount.
                 // That contradicts an exact-OUT V4 op, whose `amount` is the
                 // output spec — reject there instead of mis-signing the swap.
