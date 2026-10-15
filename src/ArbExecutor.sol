@@ -71,6 +71,26 @@ library ArbTypes {
         Op[] ops;
         uint256 minProfitAmount;
     }
+
+    /// @dev What an `executeBatch` plan must see on chain before it runs, for
+    /// a plan whose opening venue the built-in check (a V3 `slot0` / V4
+    /// `extsload` price against the plan's own limit) does not read — a V2
+    /// pair, a Curve pool, a 1inch order, any venue with a view quote.
+    /// `staticcall(target, data)`, then the return's 32-byte word `word`,
+    /// shifted right by `shift` and ANDed with `mask` (0 = no mask), must be
+    /// above `threshold` (`above`) or below it. `target == address(0)` keeps
+    /// the built-in check. The bot builds it: a probe quote (`getAmountsOut`,
+    /// `get_dy`) against the output that makes the plan pay, a reserve, an
+    /// order's remaining amount.
+    struct BatchGate {
+        address target;
+        bytes data;
+        uint16 word;
+        uint8 shift;
+        uint256 mask;
+        uint256 threshold;
+        bool above;
+    }
 }
 
 contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoanCallback, IUnlockCallback {
@@ -300,8 +320,9 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     ///       `executePacked` with a block deadline, for a transaction sent
     ///       where it may be included late (a public mempool send);
     ///     - `executeBatch`: several packed WETH plans in one transaction,
-    ///       each gated on its opening pool's price, each failing alone, one
-    ///       coinbase payment from their combined profit.
+    ///       each gated before it runs (its opening pool's price, or a view
+    ///       check of the caller's — `ArbTypes.BatchGate`), each failing
+    ///       alone, one coinbase payment from their combined profit.
     function version() external pure returns (uint256) {
         return 4;
     }
@@ -426,16 +447,17 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     /// `NoOpportunity`, so a builder drops it and it costs nothing; one that
     /// keeps less than `minTotalProfit` after the bid reverts
     /// `InsufficientProfit`.
-    function executeBatch(uint256 deadline, uint256 minTotalProfit, bytes[] calldata plans)
-        external
-        payable
-        notAfter(deadline)
-        onlyOperator
-        whenNotPaused
-        nonReentrant
-    {
+    function executeBatch(
+        uint256 deadline,
+        uint256 minTotalProfit,
+        bytes[] calldata plans,
+        ArbTypes.BatchGate[] calldata gates
+    ) external payable notAfter(deadline) onlyOperator whenNotPaused nonReentrant {
         uint256 n = plans.length;
         if (n == 0 || n > MAX_BATCH) revert InvalidPlan();
+        // No gates at all, or one per plan (`target == 0` keeps that plan's
+        // built-in check).
+        if (gates.length != 0 && gates.length != n) revert InvalidPlan();
         uint256 bidBps = msg.value;
         if (bidBps > 10_000) revert InvalidPlan();
 
@@ -443,7 +465,12 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         uint256 ran;
         uint256 landed;
         for (uint256 i = 0; i < n; ++i) {
-            if (!_worthRunning(plans[i])) continue;
+            if (!_isBatchPlan(plans[i])) continue;
+            if (gates.length != 0 && gates[i].target != address(0)) {
+                if (!_gatePasses(gates[i])) continue;
+            } else if (!_worthRunning(plans[i])) {
+                continue;
+            }
             ++ran;
             try this.runBatchLeg(plans[i]) {
                 ++landed;
@@ -470,6 +497,29 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         if (msg.sender != address(this)) revert OnlySelf();
         ArbTypes.ArbPlan memory plan = _decodePacked(packed);
         _execute(plan, abi.encode(plan));
+    }
+
+    /// @dev A plan a batch can run at all: packed, and borrowing WETH (the
+    /// batch measures its profit in WETH).
+    function _isBatchPlan(bytes calldata p) private view returns (bool) {
+        return p.length >= 153 && uint8(p[0]) == PACKED_VERSION && address(bytes20(p[2:22])) == weth;
+    }
+
+    /// @dev The caller's view check (`ArbTypes.BatchGate`). A gate that cannot
+    /// be read — the call reverts, or answers fewer words than asked — does
+    /// NOT pass: the caller asked for that check because the plan should not
+    /// run without it.
+    function _gatePasses(ArbTypes.BatchGate calldata g) private view returns (bool) {
+        (bool ok, bytes memory r) = g.target.staticcall(g.data);
+        uint256 at = uint256(g.word) * 32;
+        if (!ok || r.length < at + 32) return false;
+        uint256 v;
+        assembly ("memory-safe") {
+            v := mload(add(add(r, 32), at))
+        }
+        v >>= g.shift;
+        if (g.mask != 0) v &= g.mask;
+        return g.above ? v > g.threshold : v < g.threshold;
     }
 
     /// @dev Is there anything for this plan to take? Read off its opening op

@@ -29,20 +29,22 @@ contract ArbBatchGasTest is ArbBatchTest {
         vm.revertToState(s);
         bytes[] memory one = new bytes[](1);
         one[0] = win;
-        uint256 batch1 = _gas(abi.encodeWithSelector(exec.executeBatch.selector, type(uint64).max, 0, one));
+        uint256 batch1 = _gas(abi.encodeWithSelector(exec.executeBatch.selector, type(uint64).max, 0, one, _noGates()));
         vm.revertToState(s);
         bytes[] memory two = new bytes[](2);
         two[0] = idle;
         two[1] = win;
-        uint256 batchIdle = _gas(abi.encodeWithSelector(exec.executeBatch.selector, type(uint64).max, 0, two));
+        uint256 batchIdle =
+            _gas(abi.encodeWithSelector(exec.executeBatch.selector, type(uint64).max, 0, two, _noGates()));
         vm.revertToState(s);
         two[0] = lose;
-        uint256 batchLose = _gas(abi.encodeWithSelector(exec.executeBatch.selector, type(uint64).max, 0, two));
+        uint256 batchLose =
+            _gas(abi.encodeWithSelector(exec.executeBatch.selector, type(uint64).max, 0, two, _noGates()));
         vm.revertToState(s);
         bytes[] memory wins = new bytes[](2);
         wins[0] = win;
         wins[1] = _cycle(address(_pool(WIN)), address(_pool(WIN)), 0, 0);
-        uint256 batch2 = _gas(abi.encodeWithSelector(exec.executeBatch.selector, type(uint64).max, 0, wins));
+        uint256 batch2 = _gas(abi.encodeWithSelector(exec.executeBatch.selector, type(uint64).max, 0, wins, _noGates()));
         vm.revertToState(s);
         vm.roll(100);
         vm.prank(operatorAddr);

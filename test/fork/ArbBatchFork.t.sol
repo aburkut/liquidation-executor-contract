@@ -8,7 +8,7 @@ import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.s
 import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
 import {ITransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 
-import {ArbExecutor} from "../../src/ArbExecutor.sol";
+import {ArbExecutor, ArbTypes} from "../../src/ArbExecutor.sol";
 
 interface IV3PoolSlot0 {
     function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool);
@@ -150,7 +150,7 @@ contract ArbBatchForkTest is Test {
         uint256 b0 = builder.balance;
         vm.recordLogs();
         vm.prank(OPERATOR);
-        exec.executeBatch{value: 9_000}(block.number, 0, plans);
+        exec.executeBatch{value: 9_000}(block.number, 0, plans, _noGates());
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bytes32 topic = keccak256("BatchExecuted(uint256,uint256,uint256,uint256,uint256)");
@@ -183,6 +183,58 @@ contract ArbBatchForkTest is Test {
         exec.executePackedBefore(FORK_BLOCK, win);
     }
 
+    function _noGates() internal pure returns (ArbTypes.BatchGate[] memory g) {
+        g = new ArbTypes.BatchGate[](0);
+    }
+
+    /// The generic gate against real views: a Uniswap V2 router quote
+    /// (`getAmountsOut`, a dynamic array — word 3 is the last amount of a
+    /// two-token path) and a Curve 3pool quote (`get_dy`, word 0). Each gates
+    /// the winner in or out by its threshold.
+    function test_fork_generic_gates_read_real_v2_and_curve_quotes() public {
+        if (!_fork()) return;
+        uint160 before = _price(POOL_A);
+        _dislocate(5_000_000e6);
+        bytes memory win = _cycle(POOL_A, POOL_B, before);
+
+        address v2Router = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+        address[] memory path = new address[](2);
+        path[0] = WETH;
+        path[1] = USDC;
+        bytes memory v2 = abi.encodeWithSignature("getAmountsOut(uint256,address[])", 1 ether, path);
+        (, bytes memory r) = v2Router.staticcall(v2);
+        uint256 v2Out = abi.decode(r, (uint256[]))[1];
+        assertGt(v2Out, 0, "a real V2 quote");
+
+        address threePool = 0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7; // DAI 0, USDC 1, USDT 2
+        bytes memory curve =
+            abi.encodeWithSignature("get_dy(int128,int128,uint256)", int128(1), int128(2), uint256(1e6 * 1000));
+        (, r) = threePool.staticcall(curve);
+        uint256 curveOut = abi.decode(r, (uint256));
+        assertGt(curveOut, 0, "a real Curve quote");
+
+        ArbTypes.BatchGate[] memory gates = new ArbTypes.BatchGate[](2);
+        bytes[] memory plans = new bytes[](2);
+        plans[0] = win;
+        plans[1] = win;
+        // V2 gate passes (its own quote is above one wei under it), Curve's
+        // fails (the threshold is one wei over its quote): one plan runs.
+        gates[0] = ArbTypes.BatchGate(v2Router, v2, 3, 0, 0, v2Out - 1, true);
+        gates[1] = ArbTypes.BatchGate(threePool, curve, 0, 0, 0, curveOut, true);
+        uint256 w0 = IERC20(WETH).balanceOf(PROXY);
+        vm.recordLogs();
+        vm.prank(OPERATOR);
+        exec.executeBatch(block.number, 0, plans, gates);
+        assertGt(IERC20(WETH).balanceOf(PROXY), w0, "the V2-gated plan ran and paid");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 topic = keccak256("BatchExecuted(uint256,uint256,uint256,uint256,uint256)");
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].emitter != PROXY || logs[i].topics[0] != topic) continue;
+            (, uint256 ran,,,) = abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint256));
+            assertEq(ran, 1, "the Curve gate kept the second plan out");
+        }
+    }
+
     function test_fork_batch_with_nothing_to_take_reverts() public {
         if (!_fork()) return;
         bytes[] memory plans = new bytes[](2);
@@ -190,6 +242,6 @@ contract ArbBatchForkTest is Test {
         plans[1] = _cycle(POOL_A, POOL_B, _price(POOL_A) - 1);
         vm.prank(OPERATOR);
         vm.expectRevert(ArbExecutor.NoOpportunity.selector);
-        exec.executeBatch{value: 9_000}(block.number, 0, plans);
+        exec.executeBatch{value: 9_000}(block.number, 0, plans, _noGates());
     }
 }
