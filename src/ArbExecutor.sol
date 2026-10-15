@@ -100,6 +100,9 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     error CoinbaseExceedsProfit(uint256 coinbase, uint256 profit);
     error InsufficientProfit(uint256 realized, uint256 min);
     error InvalidV4CallbackHook();
+    error DeadlinePassed(uint256 deadline, uint256 blockNumber);
+    error NoOpportunity();
+    error OnlySelf();
 
     // ─── Events ──────────────────────────────────────────────────────
     event ArbExecuted(
@@ -112,10 +115,22 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     event Withdraw(address indexed token, address indexed to, uint256 amount);
     event V4HookBlockedUpdated(address indexed hook, bool blocked);
     event OperatorUpdated(address indexed operator, bool allowed);
+    /// One `executeBatch`: how many plans it carried, how many passed the
+    /// price gate and ran, how many of those landed, the WETH they made
+    /// together and the one coinbase payment taken from it.
+    event BatchExecuted(uint256 plans, uint256 ran, uint256 landed, uint256 profit, uint256 coinbasePaid);
 
     // ─── Constants ───────────────────────────────────────────────────
     uint8 public constant FLASH_PROVIDER_BALANCER = 2;
     uint8 public constant FLASH_PROVIDER_MORPHO = 3;
+    /// @dev Most plans one `executeBatch` may carry. Each idle plan costs a
+    /// price read (~3k gas) and each one that runs a full cycle; the cap keeps
+    /// a batch inside one block's gas with room to spare.
+    uint256 public constant MAX_BATCH = 32;
+    /// @dev Uniswap V4 `PoolManager` keeps `mapping(PoolId => Pool.State)` at
+    /// this slot; `Pool.State`'s first word is `slot0`, whose low 160 bits are
+    /// `sqrtPriceX96` (v4-core `StateLibrary.POOLS_SLOT`).
+    uint256 private constant V4_POOLS_SLOT = 6;
     uint256 private constant V4_SWAP_DATA_LENGTH = 160;
     /// @dev TRANSIENT-storage slot (EIP-1153) holding this tx's coinbase bid
     /// in basis points, captured from `msg.value` in `execute` and read back
@@ -203,6 +218,15 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         _;
     }
 
+    /// @dev A transaction that may land later than the block it was priced
+    /// for refuses to run once `block.number` is past `deadline`. Listed FIRST
+    /// on every entry point that takes it, so a late transaction reverts
+    /// before the operator check reads storage — the cheapest revert there is.
+    modifier notAfter(uint256 deadline) {
+        if (block.number > deadline) revert DeadlinePassed(deadline, block.number);
+        _;
+    }
+
     // ─── Owner: admin ────────────────────────────────────────────────
     // V10+: `configureMorpho` and `setFlashProvider` removed. Both flash
     // providers live in proxy storage (`allowedFlashProviders`), written
@@ -271,8 +295,15 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     ///     only way to trade a token that refuses every transfer out of it.
     /// Pure, no storage: it survives a plain proxy upgrade with no migrator and
     /// cannot disagree with the code it is compiled into.
+    ///   * 4 → this build: everything in 3, plus
+    ///     - `executeBefore` / `executePackedBefore`: `execute` and
+    ///       `executePacked` with a block deadline, for a transaction sent
+    ///       where it may be included late (a public mempool send);
+    ///     - `executeBatch`: several packed WETH plans in one transaction,
+    ///       each gated on its opening pool's price, each failing alone, one
+    ///       coinbase payment from their combined profit.
     function version() external pure returns (uint256) {
-        return 3;
+        return 4;
     }
 
     function pause() external onlyOwner {
@@ -345,6 +376,147 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     function executePacked(bytes calldata packed) external payable onlyOperator whenNotPaused nonReentrant {
         ArbTypes.ArbPlan memory plan = _decodePacked(packed);
         _execute(plan, abi.encode(plan));
+    }
+
+    /// @notice `execute` with a block deadline: reverts `DeadlinePassed` once
+    /// `block.number > deadline`. For a plan sent where it can be included
+    /// after the block it was priced for — the public mempool — where without
+    /// it a stale transaction would still run, against prices that moved, and
+    /// pay for the swaps before failing.
+    function executeBefore(uint256 deadline, bytes calldata planData)
+        external
+        payable
+        notAfter(deadline)
+        onlyOperator
+        whenNotPaused
+        nonReentrant
+    {
+        _execute(abi.decode(planData, (ArbTypes.ArbPlan)), planData);
+    }
+
+    /// @notice `executePacked` with a block deadline (see `executeBefore`).
+    function executePackedBefore(uint256 deadline, bytes calldata packed)
+        external
+        payable
+        notAfter(deadline)
+        onlyOperator
+        whenNotPaused
+        nonReentrant
+    {
+        ArbTypes.ArbPlan memory plan = _decodePacked(packed);
+        _execute(plan, abi.encode(plan));
+    }
+
+    /// @notice Run several packed WETH plans in one transaction and pay the
+    /// builder once, from what they made together.
+    ///
+    /// Built for a transaction placed at the END of a block, after flow we
+    /// cannot see: which rings that flow dislocated, and by how much, is
+    /// unknown when the transaction is signed. So each plan opens on a pool
+    /// with a price limit (the opening-limit sizing, see `version` 2) and:
+    ///   * is skipped for the cost of one price read when its opening pool
+    ///     has not moved past that limit (`_worthRunning`);
+    ///   * otherwise runs exactly as `executePacked` would — its own loan, its
+    ///     own `minProfitAmount` — in a self-call whose revert is swallowed, so
+    ///     a plan that does not pay (or that an earlier plan in the batch spoiled
+    ///     by moving a shared pool) undoes only itself.
+    /// Every plan must borrow WETH: the batch's profit is this contract's WETH
+    /// balance delta, and the coinbase bid (`msg.value`, wei == bps, as in
+    /// `execute`) is a share of it. A batch that made nothing reverts
+    /// `NoOpportunity`, so a builder drops it and it costs nothing; one that
+    /// keeps less than `minTotalProfit` after the bid reverts
+    /// `InsufficientProfit`.
+    function executeBatch(uint256 deadline, uint256 minTotalProfit, bytes[] calldata plans)
+        external
+        payable
+        notAfter(deadline)
+        onlyOperator
+        whenNotPaused
+        nonReentrant
+    {
+        uint256 n = plans.length;
+        if (n == 0 || n > MAX_BATCH) revert InvalidPlan();
+        uint256 bidBps = msg.value;
+        if (bidBps > 10_000) revert InvalidPlan();
+
+        uint256 before = IERC20(weth).balanceOf(address(this));
+        uint256 ran;
+        uint256 landed;
+        for (uint256 i = 0; i < n; ++i) {
+            if (!_worthRunning(plans[i])) continue;
+            ++ran;
+            try this.runBatchLeg(plans[i]) {
+                ++landed;
+            } catch {}
+        }
+
+        uint256 held = IERC20(weth).balanceOf(address(this));
+        uint256 profit = held > before ? held - before : 0;
+        if (profit == 0) revert NoOpportunity();
+        uint256 coinbasePaid = profit * bidBps / 10_000;
+        if (coinbasePaid > 0) {
+            CoinbasePaymentLib.payCoinbase(coinbasePaid, weth);
+        }
+        if (profit - coinbasePaid < minTotalProfit) revert InsufficientProfit(profit - coinbasePaid, minTotalProfit);
+        emit BatchExecuted(n, ran, landed, profit, coinbasePaid);
+    }
+
+    /// @notice One plan of an `executeBatch`, as a call of its own so its
+    /// revert can be caught. Callable by this contract only: the operator
+    /// check, the pause and the reentrancy lock were taken by `executeBatch`,
+    /// which is the only way here. The bid is zero inside (`msg.value` of
+    /// this call), so the plan pays no coinbase of its own; the batch pays.
+    function runBatchLeg(bytes calldata packed) external {
+        if (msg.sender != address(this)) revert OnlySelf();
+        ArbTypes.ArbPlan memory plan = _decodePacked(packed);
+        _execute(plan, abi.encode(plan));
+    }
+
+    /// @dev Is there anything for this plan to take? Read off its opening op
+    /// in the packed bytes, before anything is decoded or called:
+    ///   * not a packed WETH plan → false (the batch measures WETH);
+    ///   * a V3 direct/flash opening, or a V4 exact-in opening carrying the
+    ///     192-byte limited tuple, with a non-zero `sqrtPriceLimitX96` → true
+    ///     only while the pool's price is on the far side of the limit from
+    ///     where the swap pushes it (zeroForOne lowers the price: room while
+    ///     price > limit; the other way, while price < limit);
+    ///   * anything else (no limit, another venue, a price that cannot be read)
+    ///     → true: the plan runs and its own profit check decides.
+    function _worthRunning(bytes calldata p) private view returns (bool) {
+        if (p.length < 153 || uint8(p[0]) != PACKED_VERSION) return false;
+        if (address(bytes20(p[2:22])) != weth) return false;
+        address target = address(bytes20(p[71:91]));
+        uint256 flags = uint16(bytes2(p[91:93]));
+        bool zeroForOne;
+        uint160 limit;
+        bytes memory read;
+        if (flags & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V3_FLASH) != 0) {
+            if (p.length < 174) return true;
+            zeroForOne = uint8(p[153]) != 0;
+            limit = uint160(bytes20(p[154:174]));
+            if (limit == 0) return true;
+            read = abi.encodeWithSelector(0x3850c7bd); // slot0()
+        } else if (
+            flags & GenericSequenceLib.FLAG_V4_UNLOCK != 0 && flags & GenericSequenceLib.FLAG_V4_EXACT_IN != 0
+                && p.length >= 155 + V4_SWAP_DATA_LENGTH + 32 && uint16(bytes2(p[153:155])) == V4_SWAP_DATA_LENGTH + 32
+        ) {
+            (address tokenIn, address tokenOut, uint24 fee, int24 tickSpacing, address hook, uint160 lim) =
+                abi.decode(p[155:155 + V4_SWAP_DATA_LENGTH + 32], (address, address, uint24, int24, address, uint160));
+            if (lim == 0) return true;
+            limit = lim;
+            zeroForOne = tokenIn < tokenOut;
+            bytes32 id = keccak256(
+                abi.encode(zeroForOne ? tokenIn : tokenOut, zeroForOne ? tokenOut : tokenIn, fee, tickSpacing, hook)
+            );
+            read = abi.encodeWithSelector(0x1e2eaeaf, keccak256(abi.encode(id, V4_POOLS_SLOT))); // extsload(bytes32)
+        } else {
+            return true;
+        }
+        (bool ok, bytes memory r) = target.staticcall(read);
+        if (!ok || r.length < 32) return true;
+        uint160 price = uint160(uint256(bytes32(r)));
+        if (price == 0) return false;
+        return zeroForOne ? price > limit : price < limit;
     }
 
     uint8 private constant PACKED_VERSION = 1;
