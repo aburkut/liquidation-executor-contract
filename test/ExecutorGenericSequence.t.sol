@@ -7,6 +7,7 @@ import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.s
 import {Op} from "../src/types/SwapTypes.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockV4PoolManager} from "./mocks/MockV4PoolManager.sol";
+import {MockBalancerVault} from "./mocks/MockBalancerVault.sol";
 
 interface IMiniERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -763,5 +764,213 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         vm.prank(operatorAddr);
         vm.expectRevert(abi.encodeWithSelector(LiquidationExecutor.CollateralOverspent.selector, donation, 0));
         executor.execute(plan);
+    }
+
+    // ── the Balancer vault as a swap venue ───────────────────────────
+    //
+    // On mainnet the vault is both the Balancer flash provider and an
+    // allowlisted target. A generic op may call it for `swap` with `funds`
+    // pinned to this executor, and only when the flash is not Balancer's.
+
+    uint32 internal constant FLAG_V3_DIRECT = 1 << 6;
+    uint32 internal constant FLAG_USE_PRODUCED = 1 << 11;
+    /// `SingleSwap.amount`: 7 head words, then the tuple's 5th word.
+    uint16 internal constant VAULT_SWAP_AMOUNT_POS = 4 + 7 * 32 + 4 * 32;
+    address internal constant STRANGER = address(0xBAD);
+
+    function _vaultCall(address src, address dst, address sender, bool fromInternal, address recipient, bool toInternal)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodeCall(
+            MockBalancerVault.swap,
+            (
+                MockBalancerVault.SingleSwap(bytes32(uint256(1)), 0, src, dst, 0, ""),
+                MockBalancerVault.FundManagement(sender, fromInternal, payable(recipient), toInternal),
+                0,
+                type(uint256).max
+            )
+        );
+    }
+
+    function _vaultOp(uint32 flags) internal view returns (Op memory op) {
+        op.target = address(balancerVault);
+        op.srcToken = address(collateralToken);
+        op.outToken = address(loanToken);
+        op.flags = flags;
+        op.fromAmountPos = VAULT_SWAP_AMOUNT_POS;
+        op.callData = _vaultCall(
+            address(collateralToken), address(loanToken), address(executor), false, address(executor), false
+        );
+    }
+
+    function _planUnder(uint8 flashProviderId, Op memory op) internal view returns (bytes memory) {
+        LiquidationExecutor.SwapPlan memory sp;
+        sp.hasGenericSequence = true;
+        sp.ops = _oneOp(op);
+        sp.profitToken = address(loanToken);
+        return _buildPlan(flashProviderId, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+    }
+
+    function _allowVault() internal {
+        vm.prank(owner);
+        executor.setAllowedTarget(address(balancerVault), true);
+    }
+
+    function _expectRefusedUnderMorpho(Op memory op) internal {
+        bytes memory plan = _planUnder(3, op);
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
+        executor.execute(plan);
+    }
+
+    /// The mock speaks the vault's ABI: the selector the contract pins.
+    function test_VaultSwapOp_MockSelectorIsTheVaults() public pure {
+        assertEq(MockBalancerVault.swap.selector, bytes4(0x52bbbe29));
+    }
+
+    /// The shape the bot builds for a Balancer slice of a split: a vault
+    /// swap under a Morpho flash. Every one reverted TargetNotAllowed.
+    function test_VaultSwapOp_UnderMorphoFlash_Runs() public {
+        _allowVault();
+        bytes memory plan = _planUnder(3, _vaultOp(FLAG_FULL_BALANCE));
+
+        uint256 before = loanToken.balanceOf(address(executor));
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+
+        assertEq(balancerVault.swapCalls(), 1, "the vault swapped");
+        assertGt(loanToken.balanceOf(address(executor)), before, "profit retained after the Morpho repay");
+        assertEq(
+            collateralToken.allowance(address(executor), address(balancerVault)), 0, "no allowance survives the op"
+        );
+    }
+
+    /// A chained hop takes the previous op's output (PREV_RETURN) — the
+    /// other amount source the bot puts on a vault op.
+    function test_VaultSwapOp_ChainedAfterADex_Runs() public {
+        _allowVault();
+        Op[] memory ops = new Op[](2);
+        ops[0] = _swapOp(address(collateralToken), address(interToken), 1e18, FLAG_FULL_BALANCE);
+        ops[1] = _vaultOp(FLAG_PREV_RETURN);
+        ops[1].srcToken = address(interToken);
+        ops[1].callData =
+            _vaultCall(address(interToken), address(loanToken), address(executor), false, address(executor), false);
+        LiquidationExecutor.SwapPlan memory sp;
+        sp.hasGenericSequence = true;
+        sp.ops = ops;
+        sp.profitToken = address(loanToken);
+        bytes memory plan = _buildPlan(3, address(loanToken), LOAN_AMOUNT, FLASH_FEE, _defaultLiqAction(500e18), sp);
+
+        vm.prank(operatorAddr);
+        executor.execute(plan);
+        assertEq(balancerVault.swapCalls(), 1, "the vault swapped the hop");
+    }
+
+    /// Under a Balancer flash the vault's lock is held: a swap could only
+    /// revert BAL#400, so the plan is refused up front.
+    function test_VaultSwapOp_UnderBalancerFlash_Refused() public {
+        _allowVault();
+        bytes memory plan = _planUnder(2, _vaultOp(FLAG_FULL_BALANCE));
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
+        executor.execute(plan);
+    }
+
+    /// Any other vault call stays refused. `setRelayerApproval(this, x,
+    /// true)` would let `x` spend for this executor in every later tx; the
+    /// calldata is padded past the funds words so the selector alone decides.
+    function test_VaultSwapOp_OtherVaultCall_Refused() public {
+        _allowVault();
+        Op memory op = _vaultOp(0);
+        op.amountIn = 1;
+        op.fromAmountPos = 0;
+        op.callData = abi.encodePacked(
+            abi.encodeWithSignature("setRelayerApproval(address,address,bool)", address(executor), STRANGER, true),
+            new bytes(256)
+        );
+        _expectRefusedUnderMorpho(op);
+    }
+
+    /// Each `funds` field pinned: the vault must take from and pay to this
+    /// executor's own external balance.
+    function test_VaultSwapOp_FundsNotOwn_Refused() public {
+        _allowVault();
+        address c = address(collateralToken);
+        address l = address(loanToken);
+        address me = address(executor);
+        bytes[4] memory calls = [
+            _vaultCall(c, l, STRANGER, false, me, false),
+            _vaultCall(c, l, me, true, me, false),
+            _vaultCall(c, l, me, false, STRANGER, false),
+            _vaultCall(c, l, me, false, me, true)
+        ];
+        for (uint256 k = 0; k < 4; ++k) {
+            Op memory op = _vaultOp(FLAG_FULL_BALANCE);
+            op.callData = calls[k];
+            _expectRefusedUnderMorpho(op);
+        }
+    }
+
+    /// The library writes 32 bytes at a patch slot after this walk, so a slot
+    /// overlapping the selector or a funds word could rewrite it once checked.
+    function test_VaultSwapOp_PatchSlotOverHead_Refused() public {
+        _allowVault();
+        uint16[3] memory slots = [uint16(1), 100, 163];
+        for (uint256 k = 0; k < 3; ++k) {
+            Op memory op = _vaultOp(FLAG_FULL_BALANCE);
+            op.fromAmountPos = slots[k];
+            _expectRefusedUnderMorpho(op);
+
+            op = _vaultOp(FLAG_PREV_RETURN);
+            op.returnAmountPos = slots[k];
+            _expectRefusedUnderMorpho(op);
+        }
+    }
+
+    /// Only an amount source may ride in `flags`: a direct, V4 or native shape
+    /// would call the vault some other way.
+    function test_VaultSwapOp_OtherShapeFlags_Refused() public {
+        _allowVault();
+        uint32[3] memory shapes = [FLAG_V3_DIRECT, FLAG_V4_UNLOCK, FLAG_NATIVE_IN];
+        for (uint256 k = 0; k < 3; ++k) {
+            _expectRefusedUnderMorpho(_vaultOp(shapes[k]));
+        }
+    }
+
+    /// Calldata too short to carry the funds words.
+    function test_VaultSwapOp_ShortCalldata_Refused() public {
+        _allowVault();
+        Op memory op = _vaultOp(FLAG_FULL_BALANCE);
+        op.fromAmountPos = 0;
+        op.callData = abi.encodePacked(bytes4(0x52bbbe29), uint256(32), uint256(uint160(address(executor))));
+        _expectRefusedUnderMorpho(op);
+    }
+
+    /// The lending targets stay refused whatever the calldata, the vault swap
+    /// shape included.
+    function test_GenericSequence_LendingTargets_StillRefused() public {
+        address[3] memory lenders = [address(aavePool), address(morphoBlue), address(aaveV2Pool)];
+        for (uint256 k = 0; k < 3; ++k) {
+            Op memory op = _vaultOp(FLAG_FULL_BALANCE);
+            op.target = lenders[k];
+            _expectRefusedUnderMorpho(op);
+        }
+    }
+
+    /// FLAG_USE_PRODUCED is the third amount source; it is admitted like the
+    /// other two (the library then bounds it).
+    function test_VaultSwapOp_ProducedFlag_PassesTheWalk() public {
+        _allowVault();
+        bytes memory plan = _planUnder(3, _vaultOp(FLAG_USE_PRODUCED));
+        vm.prank(operatorAddr);
+        try executor.execute(plan) {}
+        catch (bytes memory reason) {
+            assertTrue(
+                bytes4(reason) != LiquidationExecutor.TargetNotAllowed.selector,
+                "a PRODUCED vault op must pass the target walk"
+            );
+        }
     }
 }
