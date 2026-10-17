@@ -348,7 +348,6 @@ contract LiquidationExecutor is
     // offchain. (Raw-V3-pool-callback and V4 op variants were removed to stay
     // under the EIP-170 code-size limit; structured UNI_V4 swap legs remain
     // fully supported.) Op flags live in `GenericSequenceLib`.
-    uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     struct Plan {
         uint8 flashProviderId;
@@ -640,91 +639,19 @@ contract LiquidationExecutor is
         // runtime re-checks each target too). The has* shape blocks below all
         // self-skip (their flags are false, enforced by the XOR guard above).
         if (plan.swapPlan.hasGenericSequence) {
-            uint256 nOps = plan.swapPlan.ops.length;
-            if (nOps == 0) revert EmptyOps();
-            if (nOps > MAX_OPS) revert TooManyOps();
-            for (uint256 i = 0; i < nOps; ++i) {
-                // WETH-unwrap ops carry no external `target` — they only invoke
-                // `IWETH(weth).withdraw` on the contract-pinned `weth` inside the
-                // lib (which enforces `srcToken == weth` and the exact-flag
-                // shape), so there is nothing to allowlist. Exempt them from the
-                // target gate; every other op's target must be allowlisted.
-                // EXACT equality, not bit presence. A combined-flag op
-                // (FLAG_WETH_UNWRAP | FLAG_V4_UNLOCK, or | FLAG_V3_FLASH)
-                // DOES carry an external target, so bit-presence skipped
-                // this contract's own allowlist gate — and, sitting above
-                // the flash rejection below, the flash gate too. Only a
-                // library backstop stood behind them. `ArbExecutor` has
-                // always used equality here; the two now agree.
-                // Neither an unwrap nor a wrap carries an external target: the
-                // library calls the pinned `weth.withdraw` / `weth.deposit`
-                // itself. Merged into one condition, and the wrap side uses a
-                // masked equality, purely for the EIP-170 budget — the naive
-                // form cost 86 bytes and pushed this contract past the
-                // project's own headroom guard at 24400.
-                //
-                // Still EXACT on both sides: `flags & ~PREV == WRAP` accepts
-                // the two shapes GenericSequenceLib accepts and rejects
-                // WRAP|V4_UNLOCK (the unlock bit survives the mask) and a bare
-                // PREV (leaves 0). The unwrap keeps plain equality, as before.
-                //
-                // #38 taught the library FLAG_WETH_WRAP and left both
-                // executors' walks behind it; the arb path hit that in
-                // production on 2026-09-11 and this walk carries the identical
-                // gap, latent only because the bot emits no wrap here yet.
-                //
-                // Safe above the dangerous-target check for the same reason
-                // the unwrap always was: the library never calls `op.target`
-                // for either shape. NOT because the target is address(0) —
-                // this walk runs BEFORE the library, so a plan may carry
-                // `flags == FLAG_WETH_WRAP` with any target it likes. It
-                // simply never gets called.
-                uint32 f = plan.swapPlan.ops[i].flags;
-                if (
-                    f == GenericSequenceLib.FLAG_WETH_UNWRAP
-                        || f & ~GenericSequenceLib.FLAG_USE_PREV_RETURN == GenericSequenceLib.FLAG_WETH_WRAP
-                ) continue;
-                // FLASH swaps run the rest of the sequence inside a pool
-                // callback; this executor only implements the immediate-pay
-                // callbacks (size budget), so a flash op cannot run here.
-                if (f & (GenericSequenceLib.FLAG_V3_FLASH | GenericSequenceLib.FLAG_V2_FLASH) != 0) {
-                    revert InvalidPlan();
-                }
-                // Being allowlisted is not enough for a target that can move
-                // value WITHOUT an allowance, or mint balance the containment
-                // cap then reads as income. AUDITED 2026-09-08:
-                // LiquidationExecutorGenesis seeds the lending pools and the
-                // vault into `allowedTargets` because the liquidation and flash paths
-                // re-read that mapping as their own kill-switch — which also
-                // handed a generic op their whole function surface, with
-                // operator-authored calldata. Two shapes escape the cap
-                // outright: `borrow(asset, Y, 2, 0, this)` RAISES the balance
-                // the cap measures, so the borrowed principal routes out and
-                // the cap sees nothing; and `withdraw(asset, max, attacker)`
-                // burns the executor's own aTokens with no allowance and no
-                // `srcToken`, so the token is never bucketed at all.
-                // `ArbExecutor` refuses to seed Morpho for this reason and
-                // says so; this is the same refusal, kept narrow so the
-                // liquidation paths still work.
-                //
-                // ABOVE the direct-pool exemption below, not after it: a
-                // direct-pool op names its pool freely, and the check has to
-                // see every op.
-                if (
-                    plan.swapPlan.ops[i].target == aavePool || plan.swapPlan.ops[i].target == morphoBlue
-                        || plan.swapPlan.ops[i].target == aaveV2LendingPool
-                        || plan.swapPlan.ops[i].target == allowedFlashProviders[FLASH_PROVIDER_BALANCER]
-                ) revert TargetNotAllowed();
-                // Direct pool swaps name the pool itself: permissionless and
-                // bounded by construction (DirectSwapLib), not allowlisted.
-                if (f & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V2_DIRECT) != 0) {
-                    continue;
-                }
-                // Every op target must be allowlisted. This is the authoritative
-                // target gate — GenericSequenceLib runs the ops via DELEGATECALL
-                // and cannot re-read `allowedTargets`, so it trusts this check.
-                if (!allowedTargets[plan.swapPlan.ops[i].target]) revert TargetNotAllowed();
-            }
+            // The op walk lives in SwapValidationLib (EIP-170 budget). It is
+            // still the authoritative target gate: GenericSequenceLib runs the
+            // ops via DELEGATECALL and cannot re-read `allowedTargets`, so it
+            // trusts this check.
+            SwapValidationLib.validateGenericOps(
+                plan.swapPlan.ops,
+                allowedTargets,
+                aavePool,
+                morphoBlue,
+                aaveV2LendingPool,
+                allowedFlashProviders[FLASH_PROVIDER_BALANCER],
+                plan.flashProviderId == FLASH_PROVIDER_BALANCER
+            );
         } else {
             // Validate leg1 (may be any mode). NO_SWAP is only meaningful as
             // a single-leg plan — combined with hasLeg2 / hasMixedSplit it

@@ -2,7 +2,16 @@
 pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SwapMode, SwapLeg, Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../types/SwapTypes.sol";
+import {
+    SwapMode,
+    SwapLeg,
+    Op,
+    Action,
+    AaveV3Action,
+    AaveV2Liquidation,
+    MorphoLiquidation
+} from "../types/SwapTypes.sol";
+import {GenericSequenceLib} from "./GenericSequenceLib.sol";
 
 /// @title SwapValidationLib
 /// @notice Per-mode pre-flashloan validation of `SwapLeg`. Single
@@ -36,6 +45,11 @@ library SwapValidationLib {
     error InvalidV3Fee(uint24 fee);
     error InvalidSwapMode();
 
+    // ─── validateGenericOps errors (selectors match LiquidationExecutor) ─
+    error EmptyOps();
+    error TooManyOps();
+    error TargetNotAllowed();
+
     // ─── validateActions errors (selectors match LiquidationExecutor) ────
     error UnsupportedActionType(uint8 actionType);
     error InvalidCollateralAsset();
@@ -56,6 +70,8 @@ library SwapValidationLib {
     uint8 internal constant PROTOCOL_AAVE_V3 = 1;
     uint8 internal constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 internal constant PROTOCOL_AAVE_V2 = 3;
+
+    uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
     /// @notice Pure plan-shape validation, moved out of LiquidationExecutor to
     /// keep the executor under the EIP-170 runtime-size limit. Called via
@@ -152,6 +168,168 @@ library SwapValidationLib {
 
         // Set trackingToken: aToken when receiveAToken=true, underlying otherwise
         trackingToken = (receiveAToken && aTokenAddr != address(0)) ? aTokenAddr : collateralAsset;
+    }
+
+    /// @notice The generic-sequence op walk, run once before the flash loan.
+    /// Moved out of LiquidationExecutor for the EIP-170 budget, unchanged in
+    /// order and in error selectors, plus the Balancer vault as a swap venue
+    /// (`_isOwnVaultSwap`). It is the authoritative target gate:
+    /// GenericSequenceLib runs the ops via DELEGATECALL and cannot re-read
+    /// `allowedTargets`, so it trusts this check.
+    /// @param vault the executor's Balancer flash provider, also a target
+    /// @param balancerFlash the plan borrows from that vault
+    function validateGenericOps(
+        Op[] memory ops,
+        mapping(address => bool) storage allowedTargets,
+        address aavePool,
+        address morphoBlue,
+        address aaveV2LendingPool,
+        address vault,
+        bool balancerFlash
+    ) external view {
+        uint256 nOps = ops.length;
+        if (nOps == 0) revert EmptyOps();
+        if (nOps > MAX_OPS) revert TooManyOps();
+        for (uint256 i = 0; i < nOps; ++i) {
+            Op memory op = ops[i];
+            // WETH-unwrap ops carry no external `target` — they only invoke
+            // `IWETH(weth).withdraw` on the contract-pinned `weth` inside the
+            // lib (which enforces `srcToken == weth` and the exact-flag
+            // shape), so there is nothing to allowlist. Exempt them from the
+            // target gate; every other op's target must be allowlisted.
+            // EXACT equality, not bit presence. A combined-flag op
+            // (FLAG_WETH_UNWRAP | FLAG_V4_UNLOCK, or | FLAG_V3_FLASH)
+            // DOES carry an external target, so bit-presence skipped
+            // the executor's own allowlist gate — and, sitting above
+            // the flash rejection below, the flash gate too. Only a
+            // library backstop stood behind them. `ArbExecutor` has
+            // always used equality here; the two now agree.
+            // Neither an unwrap nor a wrap carries an external target: the
+            // library calls the pinned `weth.withdraw` / `weth.deposit`
+            // itself. Merged into one condition, and the wrap side uses a
+            // masked equality, purely for the EIP-170 budget — the naive
+            // form cost 86 bytes and pushed the executor past the
+            // project's own headroom guard at 24400.
+            //
+            // Still EXACT on both sides: `flags & ~PREV == WRAP` accepts
+            // the two shapes GenericSequenceLib accepts and rejects
+            // WRAP|V4_UNLOCK (the unlock bit survives the mask) and a bare
+            // PREV (leaves 0). The unwrap keeps plain equality, as before.
+            //
+            // #38 taught the library FLAG_WETH_WRAP and left both
+            // executors' walks behind it; the arb path hit that in
+            // production on 2026-09-11 and this walk carries the identical
+            // gap, latent only because the bot emits no wrap here yet.
+            //
+            // Safe above the dangerous-target check for the same reason
+            // the unwrap always was: the library never calls `op.target`
+            // for either shape. NOT because the target is address(0) —
+            // this walk runs BEFORE the library, so a plan may carry
+            // `flags == FLAG_WETH_WRAP` with any target it likes. It
+            // simply never gets called.
+            uint32 f = op.flags;
+            if (
+                f == GenericSequenceLib.FLAG_WETH_UNWRAP
+                    || f & ~GenericSequenceLib.FLAG_USE_PREV_RETURN == GenericSequenceLib.FLAG_WETH_WRAP
+            ) continue;
+            // FLASH swaps run the rest of the sequence inside a pool
+            // callback; the executor only implements the immediate-pay
+            // callbacks (size budget), so a flash op cannot run here.
+            if (f & (GenericSequenceLib.FLAG_V3_FLASH | GenericSequenceLib.FLAG_V2_FLASH) != 0) {
+                revert InvalidPlan();
+            }
+            // Being allowlisted is not enough for a target that can move
+            // value WITHOUT an allowance, or mint balance the containment
+            // cap then reads as income. AUDITED 2026-09-08:
+            // LiquidationExecutorGenesis seeds the lending pools and the
+            // vault into `allowedTargets` because the liquidation and flash paths
+            // re-read that mapping as their own kill-switch — which also
+            // handed a generic op their whole function surface, with
+            // operator-authored calldata. Two shapes escape the cap
+            // outright: `borrow(asset, Y, 2, 0, this)` RAISES the balance
+            // the cap measures, so the borrowed principal routes out and
+            // the cap sees nothing; and `withdraw(asset, max, attacker)`
+            // burns the executor's own aTokens with no allowance and no
+            // `srcToken`, so the token is never bucketed at all.
+            // `ArbExecutor` refuses to seed Morpho for this reason and
+            // says so; this is the same refusal, kept narrow so the
+            // liquidation paths still work.
+            //
+            // ABOVE the direct-pool exemption below, not after it: a
+            // direct-pool op names its pool freely, and the check has to
+            // see every op.
+            //
+            // The Balancer vault is a swap venue too, so it passes as
+            // exactly one call (`_isOwnVaultSwap`), and never under a
+            // Balancer flash, where its lock is held. Refusing it whole cost
+            // every split that priced a Balancer pool: the bot builds those
+            // under a Morpho flash, and the chain reverted each one here
+            // (TargetNotAllowed, measured 2026-10-16 replaying the 15.10
+            // liquidations).
+            address t = op.target;
+            if (
+                t == aavePool || t == morphoBlue || t == aaveV2LendingPool
+                    || (t == vault && (balancerFlash || !_isOwnVaultSwap(op)))
+            ) revert TargetNotAllowed();
+            // Direct pool swaps name the pool itself: permissionless and
+            // bounded by construction (DirectSwapLib), not allowlisted.
+            if (f & (GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_V2_DIRECT) != 0) {
+                continue;
+            }
+            // Every op target must be allowlisted.
+            if (!allowedTargets[t]) revert TargetNotAllowed();
+        }
+    }
+
+    /// @dev The one Balancer-vault call a generic op may make:
+    /// `swap(SingleSwap, FundManagement, uint256 limit, uint256 deadline)`,
+    /// paid from and to the executor's own external balances. DELEGATECALL,
+    /// so `address(this)` is the executor.
+    ///
+    /// Not the whole vault, because an op's calldata is the operator's and
+    /// the vault has calls that move value with no allowance:
+    /// `setRelayerApproval(this, x, true)` lets `x` spend for the executor in
+    /// every later transaction, `manageUserBalance` moves internal balances,
+    /// `flashLoan` lends. A `swap` with `funds` pinned does none of that: the
+    /// vault pulls `assetIn` through the allowance GenericSequenceLib grants
+    /// for this op and takes back after it, and pays `assetOut` to the
+    /// executor, where the library's output check requires it.
+    ///
+    /// Pinned here:
+    ///   * the selector, 0x52bbbe29;
+    ///   * `funds` = (this, false, this, false): head words 1..4, calldata
+    ///     bytes [36, 164). `SingleSwap` is dynamic and lives in the tail, so
+    ///     its offset word cannot move them;
+    ///   * no patch slot inside bytes [0, 164): GenericSequenceLib writes 32
+    ///     bytes at `fromAmountPos` / `returnAmountPos` AFTER this check, so a
+    ///     slot there could rewrite the selector or a `funds` word once
+    ///     checked. The bot's amount slot is 356 (`SingleSwap.amount`);
+    ///   * nothing in `flags` but an amount source: no direct, V4, native or
+    ///     flash shape.
+    function _isOwnVaultSwap(Op memory op) private view returns (bool ok) {
+        if (
+            op.flags
+                    & ~(GenericSequenceLib.FLAG_USE_FULL_BALANCE
+                        | GenericSequenceLib.FLAG_USE_PREV_RETURN
+                        | GenericSequenceLib.FLAG_USE_PRODUCED) != 0
+        ) return false;
+        if ((op.fromAmountPos != 0 && op.fromAmountPos < 164) || (op.returnAmountPos != 0 && op.returnAmountPos < 164))
+        {
+            return false;
+        }
+        bytes memory d = op.callData;
+        // p = the selector; word k of the head starts at p + 4 + 32k. Word 0
+        // is the SingleSwap offset, words 1..4 are `funds`.
+        assembly ("memory-safe") {
+            let p := add(d, 0x20)
+            ok := and(
+                and(gt(mload(d), 163), eq(shr(224, mload(p)), 0x52bbbe29)),
+                and(
+                    and(eq(mload(add(p, 36)), address()), iszero(mload(add(p, 68)))),
+                    and(eq(mload(add(p, 100)), address()), iszero(mload(add(p, 132))))
+                )
+            )
+        }
     }
 
     /// @notice Invariant: liquidation actions spend at most the flash

@@ -36,4 +36,44 @@ contract MockBalancerVault {
             require(bal >= expected, "MockBalancerVault: insufficient repayment");
         }
     }
+
+    // ─── The vault as a swap venue ───────────────────────────────────
+    // Same ABI as Vault.swap (selector 0x52bbbe29; `kind` is the SwapKind
+    // enum, a uint8 on the wire). GIVEN_IN only: pulls `amount` of `assetIn`
+    // from `funds.sender`, pays `amount * swapRate / 1e18` of `assetOut` to
+    // `funds.recipient`.
+    struct SingleSwap {
+        bytes32 poolId;
+        uint8 kind;
+        address assetIn;
+        address assetOut;
+        uint256 amount;
+        bytes userData;
+    }
+
+    struct FundManagement {
+        address sender;
+        bool fromInternalBalance;
+        address payable recipient;
+        bool toInternalBalance;
+    }
+
+    uint256 public swapRate = 1.1e18;
+    uint256 public swapCalls;
+
+    function setSwapRate(uint256 rate) external {
+        swapRate = rate;
+    }
+
+    function swap(SingleSwap memory singleSwap, FundManagement memory funds, uint256 limit, uint256)
+        external
+        payable
+        returns (uint256 out)
+    {
+        swapCalls++;
+        IERC20(singleSwap.assetIn).safeTransferFrom(funds.sender, address(this), singleSwap.amount);
+        out = (singleSwap.amount * swapRate) / 1e18;
+        require(out >= limit, "MockBalancerVault: limit");
+        IERC20(singleSwap.assetOut).safeTransfer(funds.recipient, out);
+    }
 }
