@@ -458,6 +458,171 @@ contract ArbExecutorTest is Test {
         exec.execute{value: 5_000}(plan);
     }
 
+    // ─── Profit tail (version 5): a non-WETH cycle pays the builder in WETH ───
+
+    /// tokenA → tokenB → tokenA at 1.1× per hop (1000 → 1210, 210 A made),
+    /// then the TAIL: a literal `tailIn` of tokenA → WETH (1.1×). The loan,
+    /// the cycle and the flash repayment stay in tokenA.
+    function _tailPlan(uint256 tailIn, uint256 minProfitWeth) internal view returns (bytes memory) {
+        Op[] memory ops = new Op[](3);
+        ops[0] = _v2Op(address(tokenA), address(tokenB), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        ops[2] = _v2Op(address(tokenA), address(weth), tailIn, 0);
+        return _planMorpho(address(tokenA), LOAN_AMOUNT, ops, minProfitWeth);
+    }
+
+    /// The bid is a share of the WETH the tail bought, paid from it; the loan
+    /// token's leftover profit stays on the contract; the event reports the
+    /// profit in WETH, the token it is counted in.
+    function test_profitTail_paysTheBuilderFromTheWethItBought() public {
+        address coinbaseAddr = address(0xC0FFEE);
+        vm.coinbase(coinbaseAddr);
+        bytes memory plan = _tailPlan(100e18, 50e18); // 100 A → 110 WETH
+
+        uint256 aBefore = tokenA.balanceOf(address(exec));
+        vm.recordLogs();
+        vm.prank(operatorAddr);
+        exec.execute{value: 5_000}(plan);
+
+        assertEq(coinbaseAddr.balance, 55e18, "50% of the 110 WETH the tail bought");
+        assertEq(tokenA.balanceOf(address(exec)) - aBefore, 110e18, "the 210 A made, less the 100 sold");
+        assertEq(weth.balanceOf(address(exec)), 55e18 + 5_000, "the kept WETH (and the bid dust it spared)");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("ArbExecuted(bytes32,address,uint256,uint256)");
+        bool found;
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].topics.length > 0 && logs[i].topics[0] == sig) {
+                found = true;
+                assertEq(address(uint160(uint256(logs[i].topics[2]))), address(weth), "profit counted in WETH");
+                (uint256 realized, uint256 paid) = abi.decode(logs[i].data, (uint256, uint256));
+                assertEq(realized, 110e18, "realized = the WETH bought");
+                assertEq(paid, 55e18, "coinbase paid");
+            }
+        }
+        assertTrue(found, "ArbExecuted emitted");
+    }
+
+    /// The floor is in WETH and is checked after the builder's share: 110
+    /// WETH at 50% keeps 55, so a 56 WETH floor reverts — the bundle is not
+    /// included and nothing is paid.
+    function test_profitTail_floorIsInWethAfterTheBid() public {
+        vm.coinbase(address(0xC0FFEE));
+        bytes memory plan = _tailPlan(100e18, 56e18);
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(ArbExecutor.InsufficientProfit.selector, 55e18, 56e18));
+        exec.execute{value: 5_000}(plan);
+    }
+
+    /// The tail may sell only what the cycle made: selling 211 A of the 210
+    /// made leaves the flash unrepayable.
+    function test_profitTail_cannotSellMoreThanTheCycleMade() public {
+        bytes memory plan = _tailPlan(211e18, 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(GenericSequenceLib.InsufficientRepayOutput.selector, 999e18, 1_000e18));
+        exec.execute{value: 5_000}(plan);
+    }
+
+    /// On the inventory path (no flash) the loan token must not shrink: a tail
+    /// past the cycle's profit reverts there too.
+    function test_profitTail_inventoryCannotShrink() public {
+        tokenA.mint(address(exec), LOAN_AMOUNT);
+        bytes memory plan = _tailPlan(211e18, 0);
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(ArbExecutor.InsufficientRepayBalance.selector, 1_000e18, 999e18));
+        exec.execute{value: 5_000}(plan);
+    }
+
+    /// Inventory path, a tail within the profit: same WETH accounting.
+    function test_profitTail_inventoryPaysFromWeth() public {
+        address coinbaseAddr = address(0xC0FFEE);
+        vm.coinbase(coinbaseAddr);
+        tokenA.mint(address(exec), LOAN_AMOUNT);
+        vm.prank(operatorAddr);
+        exec.execute{value: 2_000}(_tailPlan(100e18, 80e18));
+        assertEq(coinbaseAddr.balance, 22e18, "20% of 110 WETH");
+        assertEq(tokenA.balanceOf(address(exec)), LOAN_AMOUNT + 110e18, "inventory plus the A left");
+    }
+
+    /// No bid: nothing paid, the WETH floor still holds.
+    function test_profitTail_withoutABidKeepsItAll() public {
+        address coinbaseAddr = address(0xC0FFEE);
+        vm.coinbase(coinbaseAddr);
+        vm.prank(operatorAddr);
+        exec.execute(_tailPlan(100e18, 110e18));
+        assertEq(coinbaseAddr.balance, 0, "no bid, no payment");
+        assertEq(weth.balanceOf(address(exec)), 110e18, "all the WETH kept");
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(abi.encodeWithSelector(ArbExecutor.InsufficientProfit.selector, 110e18, 110e18 + 1));
+        exec.execute(_tailPlan(100e18, 110e18 + 1));
+    }
+
+    /// A non-WETH plan whose last op does NOT buy WETH still cannot bid
+    /// (`test_bidViaMsgValue_requiresWethLoan`), and one whose WETH op is not
+    /// last is not a tail: the cycle after it ends in the loan token.
+    function test_profitTail_onlyTheLastOpMakesATail() public {
+        Op[] memory ops = new Op[](3);
+        ops[0] = _v2Op(address(tokenA), address(weth), LOAN_AMOUNT, 0);
+        ops[1] = _v2Op(address(weth), address(tokenB), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        ops[2] = _v2Op(address(tokenB), address(tokenA), 0, GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        vm.prank(operatorAddr);
+        vm.expectRevert(ArbExecutor.CoinbaseRequiresWethLoan.selector);
+        exec.execute{value: 5_000}(_planMorpho(address(tokenA), LOAN_AMOUNT, ops, 0));
+    }
+
+    /// The packed entry point decodes to the same plan and takes the same path.
+    function test_profitTail_packed() public {
+        address coinbaseAddr = address(0xC0FFEE);
+        vm.coinbase(coinbaseAddr);
+        MockUniV3Pool ab = _v3Pool();
+        MockUniV3Pool aw = new MockUniV3Pool(address(tokenA), address(weth), SWAP_RATE);
+        weth.mint(address(aw), 10 * LOAN_AMOUNT);
+        tokenA.mint(address(morpho), 10 * LOAN_AMOUNT);
+        uint16 d = uint16(GenericSequenceLib.FLAG_V3_DIRECT);
+        uint16 dp = uint16(GenericSequenceLib.FLAG_V3_DIRECT | GenericSequenceLib.FLAG_USE_PREV_RETURN);
+        bytes memory packed = abi.encodePacked(
+            abi.encodePacked(
+                uint8(1), uint8(3), address(tokenA), uint128(LOAN_AMOUNT), uint128(50e18), uint128(0), uint8(3)
+            ),
+            abi.encodePacked(
+                address(ab),
+                d,
+                uint128(LOAN_AMOUNT),
+                uint16(0),
+                uint16(0),
+                address(tokenA),
+                address(tokenB),
+                uint8(1),
+                uint160(0)
+            ),
+            abi.encodePacked(
+                address(ab),
+                dp,
+                uint128(0),
+                uint16(0),
+                uint16(0),
+                address(tokenB),
+                address(tokenA),
+                uint8(0),
+                uint160(0)
+            ),
+            abi.encodePacked(
+                address(aw),
+                d,
+                uint128(100e18),
+                uint16(0),
+                uint16(0),
+                address(tokenA),
+                address(weth),
+                uint8(1),
+                uint160(0)
+            )
+        );
+        vm.prank(operatorAddr);
+        exec.executePacked{value: 5_000}(packed);
+        assertEq(coinbaseAddr.balance, 55e18, "50% of the 110 WETH bought, packed");
+    }
+
     /// WETH → tokenB → WETH at the mock's 1.1× per hop: 1000 in, 1210 out,
     /// 210 weth realized profit. Shared by the bid tests above.
     function _wethCycplePlan() internal view returns (bytes memory) {

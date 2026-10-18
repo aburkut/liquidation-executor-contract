@@ -593,6 +593,6 @@ contract ArbBatchTest is Test {
     }
 
     function test_version_is_4() public view {
-        assertEq(exec.version(), 4);
+        assertEq(exec.version(), 5);
     }
 }

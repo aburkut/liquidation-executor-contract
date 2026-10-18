@@ -35,7 +35,9 @@ import {ArbExecutorStorage} from "./storage/ArbExecutorStorage.sol";
 ///     `GenericSequenceLib.runArb`'s ABSOLUTE repay gate
 ///     (`loanAfter >= flashRepay`), not by static leg-chain validation.
 ///   * Optional `coinbaseBps` slice of realized profit → `block.coinbase`
-///     as a builder bribe (only valid when `loanToken == weth`).
+///     as a builder bribe (valid when `loanToken == weth`, or — version 5 —
+///     when the plan's LAST op buys WETH: the profit tail, see
+///     `_paysInWeth`).
 ///   * Remaining loan-token balance stays on the contract until the
 ///     owner calls `withdraw(...)`.
 ///
@@ -61,8 +63,11 @@ library ArbTypes {
     /// (wei == basis points) — see `ArbExecutor.execute`. Keeping it out of
     /// the plan is the point: identical plan bytes, and therefore an
     /// identical plan hash, can be re-bid by patching only the tx value.
-    /// The bid still requires `loanToken == weth` (the chain must land in
-    /// WETH for the coinbase auto-unwrap to have something to convert).
+    /// The bid still requires the profit to land in WETH (the coinbase
+    /// auto-unwrap needs something to convert): either `loanToken == weth`,
+    /// or the last op buys WETH with part of a non-WETH cycle's profit — the
+    /// profit tail (`ArbExecutor._paysInWeth`), where `minProfitAmount` is
+    /// then in WETH too.
     struct ArbPlan {
         uint8 flashProviderId;
         address loanToken;
@@ -323,8 +328,13 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
     ///       each gated before it runs (its opening pool's price, or a view
     ///       check of the caller's — `ArbTypes.BatchGate`), each failing
     ///       alone, one coinbase payment from their combined profit.
+    ///   * 5 → this build: everything in 4, plus the PROFIT TAIL — a plan that
+    ///     borrows a token other than WETH and whose last op buys WETH with
+    ///     part of the loan token (`_paysInWeth`) bids, keeps its floor and
+    ///     reports its profit in WETH. Below 5 such a plan's bid reverts
+    ///     `CoinbaseRequiresWethLoan`, so the bot sends none.
     function version() external pure returns (uint256) {
-        return 4;
+        return 5;
     }
 
     function pause() external onlyOwner {
@@ -622,7 +632,7 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
 
         uint256 bidBps = msg.value;
         if (bidBps > 10_000) revert InvalidPlan();
-        if (bidBps > 0 && plan.loanToken != weth) revert CoinbaseRequiresWethLoan();
+        if (bidBps > 0 && plan.loanToken != weth && !_paysInWeth(plan)) revert CoinbaseRequiresWethLoan();
         // Written UNCONDITIONALLY, zero included: transient storage lives for
         // the whole TRANSACTION, not one call frame, so a second `execute` in
         // the same tx would otherwise inherit the previous call's bid.
@@ -735,6 +745,30 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
 
         _setPlanHash(bytes32(0));
         _setPhase(false);
+    }
+
+    /// @dev The PROFIT TAIL (version 5): a plan that borrows a token other
+    /// than WETH and whose LAST op buys WETH. The cycle runs in the loan token
+    /// and the last op sells a literal part of what it made for WETH, so the
+    /// builder can be paid from profit — in WETH, the only thing
+    /// `CoinbasePaymentLib.payCoinbase` converts — without opening and
+    /// closing the whole cycle in WETH, which costs two more swaps on the
+    /// full size. MEASURED 2026-10-18 (bot logs, 2.7 h): 8 distinct cycles
+    /// with no WETH on them (USDT, USDC, WBTC loans), $50 net, were all
+    /// refused for want of this; the largest a 382,714 USDT MEV-Share
+    /// backrun at $31.18 gross.
+    ///
+    /// For such a plan the profit is what the run added to this contract's
+    /// WETH: the coinbase share is taken of it and `minProfitAmount` is
+    /// checked against it, both in WETH. The loan token must still not end
+    /// below where it started (`computeRealizedProfit`'s shortfall, checked
+    /// strictly), so the tail can sell at most what the cycle made, and
+    /// whatever of the loan token it did not sell stays here as retained
+    /// profit. A cycle in the loan token cannot end on WETH any other way:
+    /// its last op must return the loan token, so no plan shape that ran
+    /// before version 5 is read differently.
+    function _paysInWeth(ArbTypes.ArbPlan memory plan) private view returns (bool) {
+        return plan.loanToken != weth && plan.ops[plan.ops.length - 1].outToken == weth;
     }
 
     // ─── Transient execution state ───────────────────────────────────
@@ -968,6 +1002,10 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         // sides and does not distort `realizedProfit` (traced in
         // task-5-report.md).
         uint256 profitBefore = IERC20(loanToken).balanceOf(address(this));
+        // The profit tail's profit is counted in WETH (`_paysInWeth`). WETH is
+        // never the loan here, so nothing borrowed or repaid moves it.
+        bool tail = _paysInWeth(plan);
+        uint256 wethBefore = tail ? IERC20(weth).balanceOf(address(this)) : 0;
 
         // Op targets were validated allowlisted in execute(); the op loop +
         // per-srcToken containment (cap = loanToken/loanAmount, absolute
@@ -989,6 +1027,14 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
         if (inventory) {
             uint256 held = IERC20(loanToken).balanceOf(address(this));
             if (held < profitBefore) revert InsufficientRepayBalance(profitBefore, held);
+        }
+        // Profit tail: the bid and the floor are on the WETH the run bought.
+        // Measured before the coinbase payment unwraps any of it. `shortfall`
+        // stays the loan token's: a tail that sold more than the cycle made
+        // reverts `CycleEndedBelowItsStart` below.
+        if (tail) {
+            uint256 wethNow = IERC20(weth).balanceOf(address(this));
+            realizedProfit = wethNow > wethBefore ? wethNow - wethBefore : 0;
         }
 
         // Coinbase bribe — bid read back from transient storage (`execute`
@@ -1024,6 +1070,8 @@ contract ArbExecutor is ArbExecutorStorage, IFlashLoanRecipient, IMorphoFlashLoa
 
         CoinbasePaymentLib.checkProfitStrict(realizedProfit, coinbasePaid, plan.minProfitAmount, shortfall);
 
-        emit ArbExecuted(planHash, loanToken, realizedProfit, coinbasePaid);
+        // The event names the token `realizedProfit` is counted in: WETH for a
+        // profit tail. The bot prices the landing by it.
+        emit ArbExecuted(planHash, tail ? weth : loanToken, realizedProfit, coinbasePaid);
     }
 }

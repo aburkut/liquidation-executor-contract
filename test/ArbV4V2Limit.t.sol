@@ -452,6 +452,6 @@ contract ArbV4V2LimitTest is Test {
     function test_version_is_3() public view {
         // 3 since the V4 multihop op (ArbV4Multihop.t.sol); the #50 shapes
         // tested here are all still admitted.
-        assertEq(exec.version(), 4);
+        assertEq(exec.version(), 5);
     }
 }
