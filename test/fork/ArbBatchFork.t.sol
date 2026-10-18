@@ -78,7 +78,7 @@ contract ArbBatchForkTest is Test {
         vm.prank(SAFE);
         ProxyAdmin(admin).upgradeAndCall(ITransparentUpgradeableProxy(PROXY), impl, "");
         exec = ArbExecutor(payable(PROXY));
-        assertEq(exec.version(), 4);
+        assertEq(exec.version(), 5);
         vm.coinbase(builder);
         vm.deal(OPERATOR, 1 ether);
         return true;
