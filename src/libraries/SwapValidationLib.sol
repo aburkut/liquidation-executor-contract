@@ -70,6 +70,7 @@ library SwapValidationLib {
     uint8 internal constant PROTOCOL_AAVE_V3 = 1;
     uint8 internal constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 internal constant PROTOCOL_AAVE_V2 = 3;
+    uint8 internal constant PROTOCOL_SPARKLEND = 4;
 
     uint16 private constant MAX_OPS = 32; // gas-grief bound on sequence length
 
@@ -109,7 +110,8 @@ library SwapValidationLib {
                 actionAmount = a.debtToCover;
                 actionReceiveAToken = a.receiveAToken;
                 actionATokenAddress = a.aTokenAddress;
-            } else if (protocolId == PROTOCOL_AAVE_V2) {
+            } else if (protocolId == PROTOCOL_AAVE_V2 || protocolId == PROTOCOL_SPARKLEND) {
+                // SparkLend's action has Aave V2's shape (see the executor).
                 AaveV2Liquidation memory a = abi.decode(data, (AaveV2Liquidation));
                 if (a.receiveAToken) revert ReceiveATokenV2Unsupported();
                 if (a.collateralAsset == address(0)) revert InvalidCollateralAsset();
@@ -184,6 +186,7 @@ library SwapValidationLib {
         address aavePool,
         address morphoBlue,
         address aaveV2LendingPool,
+        address sparkLendPool,
         address vault,
         bool balancerFlash
     ) external view {
@@ -268,7 +271,7 @@ library SwapValidationLib {
             // liquidations).
             address t = op.target;
             if (
-                t == aavePool || t == morphoBlue || t == aaveV2LendingPool
+                t == aavePool || t == morphoBlue || t == aaveV2LendingPool || t == sparkLendPool
                     || (t == vault && (balancerFlash || !_isOwnVaultSwap(op)))
             ) revert TargetNotAllowed();
             // Direct pool swaps name the pool itself: permissionless and

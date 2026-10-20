@@ -176,6 +176,10 @@ contract LiquidationExecutor is
     uint8 public constant PROTOCOL_AAVE_V3 = 1;
     uint8 public constant PROTOCOL_MORPHO_BLUE = 2;
     uint8 public constant PROTOCOL_AAVE_V2 = 3;
+    /// @dev SparkLend (an Aave V3.0 fork): `liquidationCall` takes the same
+    /// five arguments as Aave V2's, so its action is an `AaveV2Liquidation`
+    /// and it runs through the same function against `sparkLendPool`.
+    uint8 public constant PROTOCOL_SPARKLEND = 4;
     // `PROTOCOL_INTERNAL = 100` / `ACTION_PAY_COINBASE = 1` REMOVED: the
     // coinbase bid no longer travels as an action. It rides in `msg.value`
     // (wei == bps) — see `execute`. Its position in `actions[]` never
@@ -440,6 +444,14 @@ contract LiquidationExecutor is
         emit ConfigUpdated("aaveV2Pool", old, pool);
     }
 
+    function setSparkLendPool(address pool) external onlyOwner {
+        if (pool == address(0)) revert ZeroAddress();
+        if (!allowedTargets[pool]) revert TargetNotAllowed();
+        address old = sparkLendPool;
+        sparkLendPool = pool;
+        emit ConfigUpdated("sparkLendPool", old, pool);
+    }
+
     // V10+ refactor: `setFlashProvider` and `configureMorpho` removed.
     // Morpho is an implementation immutable; the Balancer Vault address
     // and both `allowedFlashProviders` entries live in proxy storage,
@@ -514,6 +526,8 @@ contract LiquidationExecutor is
     /// │ AAVE_V2 (3)       │ false        │ n/a            │ SUPPORTED                │
     /// │ AAVE_V2 (3)       │ true         │ —              │ BLOCKED (no on-chain     │
     /// │                   │              │                │ verification available)  │
+    /// │ SPARKLEND (4)     │ false        │ n/a            │ SUPPORTED                │
+    /// │ SPARKLEND (4)     │ true         │ —              │ BLOCKED (as AAVE_V2)     │
     /// │ MORPHO_BLUE (2)   │ n/a          │ n/a            │ SUPPORTED                │
     /// │ Other             │ —            │ —              │ REVERTS InvalidProtocolId│
     /// └───────────────────┴──────────────┴────────────────┴──────────────────────────┘
@@ -649,6 +663,7 @@ contract LiquidationExecutor is
                 aavePool,
                 morphoBlue,
                 aaveV2LendingPool,
+                sparkLendPool,
                 allowedFlashProviders[FLASH_PROVIDER_BALANCER],
                 plan.flashProviderId == FLASH_PROVIDER_BALANCER
             );
@@ -1615,7 +1630,9 @@ contract LiquidationExecutor is
         if (protocolId == PROTOCOL_AAVE_V3) {
             _executeAaveV3Liquidation(actionData);
         } else if (protocolId == PROTOCOL_AAVE_V2) {
-            _executeAaveV2Liquidation(actionData);
+            _executeAaveV2Liquidation(aaveV2LendingPool, actionData);
+        } else if (protocolId == PROTOCOL_SPARKLEND) {
+            _executeAaveV2Liquidation(sparkLendPool, actionData);
         } else if (protocolId == PROTOCOL_MORPHO_BLUE) {
             _executeMorphoLiquidation(actionData);
         } else {
@@ -1646,10 +1663,11 @@ contract LiquidationExecutor is
         AllowanceLib.clear(action.debtAsset, pool);
     }
 
-    function _executeAaveV2Liquidation(bytes memory actionData) internal {
+    /// @dev Aave V2's LendingPool or SparkLend's Pool: both are called as
+    /// `liquidationCall(collateral, debt, user, debtToCover, receiveAToken)`.
+    function _executeAaveV2Liquidation(address pool, bytes memory actionData) internal {
         AaveV2Liquidation memory liq = abi.decode(actionData, (AaveV2Liquidation));
 
-        address pool = aaveV2LendingPool;
         if (pool == address(0)) revert ZeroAddress();
         if (!allowedTargets[pool]) revert TargetNotAllowed();
 

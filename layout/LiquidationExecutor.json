@@ -46,5 +46,11 @@
     "offset": 0,
     "label": "operators",
     "type": "mapping(address => bool)"
+  },
+  {
+    "slot": "7",
+    "offset": 0,
+    "label": "sparkLendPool",
+    "type": "address"
   }
 ]

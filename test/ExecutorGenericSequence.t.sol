@@ -959,6 +959,21 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
         }
     }
 
+    /// SparkLend's pool, once set, is refused as a generic target like the
+    /// other lenders: an allowlisted lending pool would hand an op its whole
+    /// surface (borrow / withdraw) with operator-authored calldata.
+    function test_GenericSequence_SparkLendPool_Refused() public {
+        address spark = address(0x5BA4C);
+        vm.etch(spark, hex"00");
+        vm.startPrank(owner);
+        executor.setAllowedTarget(spark, true);
+        executor.setSparkLendPool(spark);
+        vm.stopPrank();
+        Op memory op = _vaultOp(FLAG_FULL_BALANCE);
+        op.target = spark;
+        _expectRefusedUnderMorpho(op);
+    }
+
     /// FLAG_USE_PRODUCED is the third amount source; it is admitted like the
     /// other two (the library then bounds it).
     function test_VaultSwapOp_ProducedFlag_PassesTheWalk() public {

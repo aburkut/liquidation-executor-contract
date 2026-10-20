@@ -26,4 +26,7 @@ abstract contract LiquidationExecutorStorage is Ownable2Step, Pausable, Reentran
     /// it may only SPEND under the containment caps, never move standing
     /// funds.
     mapping(address => bool) public operators;
+    /// @dev SparkLend's Pool (protocol 4). Zero until the owner sets it
+    /// (`setSparkLendPool`); a plan for protocol 4 reverts while it is.
+    address public sparkLendPool;
 }
