@@ -10,7 +10,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
-import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
+import {LiquidationExecutorHarness, HarnessTransient} from "./support/LiquidationExecutorHarness.sol";
 import {LiquidationExecutorGenesis} from "../src/proxy/LiquidationExecutorGenesis.sol";
 import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 import {UniswapLib} from "../src/libraries/UniswapLib.sol";
@@ -90,6 +90,8 @@ struct TestBalancerV2Data {
     bytes32 metadata;
     uint256 beneficiaryAndApproveFlag;
 }
+
+using HarnessTransient for LiquidationExecutorHarness;
 
 contract ExecutorTest is Test {
     LiquidationExecutor public executor;
@@ -1408,6 +1410,12 @@ contract ExecutorTest is Test {
         executor.setAaveV2LendingPool(address(0x123));
     }
 
+    function test_onlyOwnerCanSetSparkLendPool() public {
+        vm.prank(attacker);
+        vm.expectRevert();
+        executor.setSparkLendPool(address(0x123));
+    }
+
     function test_onlyOwnerCanPause() public {
         vm.prank(attacker);
         vm.expectRevert();
@@ -2171,6 +2179,86 @@ contract ExecutorTest is Test {
         vm.prank(operatorAddr);
         vm.expectRevert();
         executor.execute(plan);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SPARKLEND LIQUIDATION (protocol 4: the V2 path, its own pool)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// A SparkLend pool mock (same `liquidationCall` as V2's), allowlisted and
+    /// set on the executor.
+    function _sparkPool() internal returns (MockAaveV2LendingPool spark) {
+        spark = new MockAaveV2LendingPool(COLLATERAL_REWARD);
+        collateralToken.mint(address(spark), 100_000e18);
+        vm.startPrank(owner);
+        executor.setAllowedTarget(address(spark), true);
+        executor.setSparkLendPool(address(spark));
+        vm.stopPrank();
+    }
+
+    function _sparkPlan(bool receiveAToken) internal view returns (bytes memory) {
+        return _buildPlan(
+            2,
+            address(loanToken),
+            LOAN_AMOUNT,
+            FLASH_FEE,
+            _singleAction(
+                4,
+                _buildAaveV2LiquidationAction(
+                    address(collateralToken), address(loanToken), address(0x1234), 500e18, receiveAToken
+                )
+            ),
+            _buildParaswapSingleSwapPlan(address(collateralToken), address(loanToken), DEFAULT_SWAP_AMOUNT, 0)
+        );
+    }
+
+    function test_sparkLendLiquidation_happyPath_callsTheSparkPoolNotV2() public {
+        MockAaveV2LendingPool spark = _sparkPool();
+        uint256 v2DebtBefore = loanToken.balanceOf(address(aaveV2Pool));
+        uint256 sparkDebtBefore = loanToken.balanceOf(address(spark));
+
+        vm.prank(operatorAddr);
+        executor.execute(_sparkPlan(false));
+
+        assertEq(loanToken.balanceOf(address(spark)) - sparkDebtBefore, 500e18, "the debt went to SparkLend");
+        assertEq(loanToken.balanceOf(address(aaveV2Pool)), v2DebtBefore, "the V2 pool was not called");
+        assertEq(loanToken.allowance(address(executor), address(spark)), 0, "allowance cleared");
+    }
+
+    function test_sparkLendLiquidation_withoutThePoolSet_reverts() public {
+        // A proxy that never had `setSparkLendPool` called: protocol 4 must
+        // not fall through to any other pool.
+        assertEq(executor.sparkLendPool(), address(0));
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.execute(_sparkPlan(false));
+    }
+
+    function test_sparkLendLiquidation_receiveAToken_true_reverts() public {
+        _sparkPool();
+        vm.prank(operatorAddr);
+        vm.expectRevert(LiquidationExecutor.ReceiveATokenV2Unsupported.selector);
+        executor.execute(_sparkPlan(true));
+    }
+
+    function test_sparkLendLiquidation_reverts_whenThePoolDoes() public {
+        MockAaveV2LendingPool spark = _sparkPool();
+        spark.setLiquidationReverts(true);
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        executor.execute(_sparkPlan(false));
+    }
+
+    function test_setSparkLendPoolZeroReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.ZeroAddress.selector);
+        executor.setSparkLendPool(address(0));
+    }
+
+    function test_setSparkLendPoolRejectsNonWhitelisted() public {
+        vm.prank(owner);
+        vm.expectRevert(LiquidationExecutor.TargetNotAllowed.selector);
+        executor.setSparkLendPool(address(0xDEAD3));
     }
 
     // ═══════════════════════════════════════════════════════════════════

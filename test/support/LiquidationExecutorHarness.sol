@@ -9,12 +9,14 @@ import {LiquidationExecutor} from "../../src/LiquidationExecutor.sol";
 /// through these helpers are still there when the test then calls the real
 /// callbacks directly — the same "prime the mid-unlock state" the tests
 /// used to do with `vm.store` on persistent slots.
+///
+/// The harness adds only a raw transient read and write: it is the executor
+/// plus these two functions, and the executor sits close to EIP-170, so
+/// every byte added here is a byte the harness goes over it with
+/// (`forge build --sizes` fails the build on ANY contract over the limit).
+/// The named helpers the tests call live in `HarnessTransient` below and
+/// compile into the tests instead.
 contract LiquidationExecutorHarness is LiquidationExecutor {
-    uint256 private constant T_PLAN_HASH = 1;
-    uint256 private constant T_PHASE = 2;
-    uint256 private constant T_V4_PM = 11;
-    uint256 private constant T_V4_TOKENIN = 12;
-
     constructor(
         address weth_,
         address aavePool_,
@@ -24,32 +26,45 @@ contract LiquidationExecutorHarness is LiquidationExecutor {
         address uniV3Router_
     ) LiquidationExecutor(weth_, aavePool_, morpho_, paraswapAugustus_, uniV2Router_, uniV3Router_) {}
 
-    function tSetPlan(bytes32 planHash, bool phaseActive) external {
+    function tStore(uint256 slot, bytes32 value) external {
         assembly {
-            tstore(T_PLAN_HASH, planHash)
-            tstore(T_PHASE, phaseActive)
+            tstore(slot, value)
         }
+    }
+
+    function tLoad(uint256 slot) external view returns (bytes32 value) {
+        assembly {
+            value := tload(slot)
+        }
+    }
+}
+
+/// The executor's transient slots, primed and read through the harness.
+/// Attach with `using HarnessTransient for LiquidationExecutorHarness;`.
+library HarnessTransient {
+    uint256 private constant T_PLAN_HASH = 1;
+    uint256 private constant T_PHASE = 2;
+    uint256 private constant T_V4_PM = 11;
+    uint256 private constant T_V4_TOKENIN = 12;
+
+    function tSetPlan(LiquidationExecutorHarness h, bytes32 planHash, bool phaseActive) internal {
+        h.tStore(T_PLAN_HASH, planHash);
+        h.tStore(T_PHASE, bytes32(uint256(phaseActive ? 1 : 0)));
     }
 
     /// Prime the V4 arming words as `_executeUniV4Leg` would mid-unlock.
-    function tArmV4(address pm, address tokenIn, bool armed, bool phaseActive) external {
+    function tArmV4(LiquidationExecutorHarness h, address pm, address tokenIn, bool armed, bool phaseActive) internal {
         uint256 word = uint256(uint160(tokenIn)) | (armed ? (uint256(1) << 160) : 0);
-        assembly {
-            tstore(T_V4_PM, pm)
-            tstore(T_V4_TOKENIN, word)
-            tstore(T_PHASE, phaseActive)
-        }
+        h.tStore(T_V4_PM, bytes32(uint256(uint160(pm))));
+        h.tStore(T_V4_TOKENIN, bytes32(word));
+        h.tStore(T_PHASE, bytes32(uint256(phaseActive ? 1 : 0)));
     }
 
-    function tV4Pm() external view returns (bytes32 w) {
-        assembly {
-            w := tload(T_V4_PM)
-        }
+    function tV4Pm(LiquidationExecutorHarness h) internal view returns (bytes32) {
+        return h.tLoad(T_V4_PM);
     }
 
-    function tV4TokenIn() external view returns (bytes32 w) {
-        assembly {
-            w := tload(T_V4_TOKENIN)
-        }
+    function tV4TokenIn(LiquidationExecutorHarness h) internal view returns (bytes32) {
+        return h.tLoad(T_V4_TOKENIN);
     }
 }

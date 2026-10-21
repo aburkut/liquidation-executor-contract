@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {ExecutorTest} from "./Executor.t.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
-import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
+import {LiquidationExecutorHarness, HarnessTransient} from "./support/LiquidationExecutorHarness.sol";
 import {Op} from "../src/types/SwapTypes.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockV4PoolManager} from "./mocks/MockV4PoolManager.sol";
@@ -59,6 +59,8 @@ contract MockPayableRouter {
 ///   * validation gates (revert before flashloan) — no DEX needed.
 ///   * runtime gates (revert inside _runGenericSequence / outer pipeline) —
 ///     exercised end-to-end through a direct-call MockGenericDex.
+using HarnessTransient for LiquidationExecutorHarness;
+
 contract ExecutorGenericSequenceTest is ExecutorTest {
     MockGenericDex internal dex;
     MockERC20 internal interToken; // intermediate hop token for chaining
@@ -957,6 +959,21 @@ contract ExecutorGenericSequenceTest is ExecutorTest {
             op.target = lenders[k];
             _expectRefusedUnderMorpho(op);
         }
+    }
+
+    /// SparkLend's pool, once set, is refused as a generic target like the
+    /// other lenders: an allowlisted lending pool would hand an op its whole
+    /// surface (borrow / withdraw) with operator-authored calldata.
+    function test_GenericSequence_SparkLendPool_Refused() public {
+        address spark = address(0x5BA4C);
+        vm.etch(spark, hex"00");
+        vm.startPrank(owner);
+        executor.setAllowedTarget(spark, true);
+        executor.setSparkLendPool(spark);
+        vm.stopPrank();
+        Op memory op = _vaultOp(FLAG_FULL_BALANCE);
+        op.target = spark;
+        _expectRefusedUnderMorpho(op);
     }
 
     /// FLAG_USE_PRODUCED is the third amount source; it is admitted like the
