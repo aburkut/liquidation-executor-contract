@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {ExecutorTest} from "./Executor.t.sol";
 import {Action, AaveV3Action, AaveV2Liquidation, MorphoLiquidation} from "../src/types/SwapTypes.sol";
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
-import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
+import {LiquidationExecutorHarness, HarnessTransient} from "./support/LiquidationExecutorHarness.sol";
 import {Op} from "../src/types/SwapTypes.sol";
 import {MockGenericDex} from "./ExecutorGenericSequence.t.sol";
 
@@ -20,6 +20,8 @@ import {MockGenericDex} from "./ExecutorGenericSequence.t.sol";
 /// `_executeUniV4Leg` would mid-unlock for a native-ETH leg (phase armed, PM
 /// pinned, tokenIn left at its zero default) and proves the callback no
 /// longer bounces off `InvalidCallbackCaller` merely because tokenIn == 0.
+using HarnessTransient for LiquidationExecutorHarness;
+
 contract ExecutorNativeV4Test is ExecutorTest {
     // Storage layout (forge inspect LiquidationExecutor storage-layout):
     //   slot 11 = _activeV4PoolManager (address, offset 0) | _executionPhase (uint8, offset 20)

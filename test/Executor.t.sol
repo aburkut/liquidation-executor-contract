@@ -10,7 +10,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {LiquidationExecutor} from "../src/LiquidationExecutor.sol";
-import {LiquidationExecutorHarness} from "./support/LiquidationExecutorHarness.sol";
+import {LiquidationExecutorHarness, HarnessTransient} from "./support/LiquidationExecutorHarness.sol";
 import {LiquidationExecutorGenesis} from "../src/proxy/LiquidationExecutorGenesis.sol";
 import {ExecutorProxy} from "../src/proxy/ExecutorProxy.sol";
 import {UniswapLib} from "../src/libraries/UniswapLib.sol";
@@ -90,6 +90,8 @@ struct TestBalancerV2Data {
     bytes32 metadata;
     uint256 beneficiaryAndApproveFlag;
 }
+
+using HarnessTransient for LiquidationExecutorHarness;
 
 contract ExecutorTest is Test {
     LiquidationExecutor public executor;
