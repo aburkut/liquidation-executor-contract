@@ -27,6 +27,7 @@ interface IArbExecutorView is IExecutorView {
 interface ILiquidationExecutorView is IExecutorView {
     function aavePool() external view returns (address);
     function aaveV2LendingPool() external view returns (address);
+    function sparkLendPool() external view returns (address);
 }
 
 /// Read-only check of a MINED executor proxy on a live network. It deploys
@@ -53,6 +54,8 @@ contract CheckDeployment is Script {
     address constant AAVE_V3_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
     address constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
     address constant MORPHO_BLUE = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
+    address constant AAVE_V2_POOL = 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9;
+    address constant SPARKLEND_POOL = 0xC13e21B648A5Ee794902342038FF3aDAB66BE987;
     address constant PARASWAP_AUGUSTUS = 0x6A000F20005980200259B80c5102003040001068;
     address constant UNI_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
     address constant UNI_V3_ROUTER = 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45;
@@ -125,13 +128,21 @@ contract CheckDeployment is Script {
             require(exec.allowedTargets(AAVE_V3_POOL), "liquidation: Aave V3 pool must be a target");
             require(exec.allowedTargets(MORPHO_BLUE), "liquidation: Morpho must be a target");
             require(exec.allowedTargets(FluidPools.RSETH_ETH), "liquidation: Fluid rsETH/ETH pool must be a target");
-            require(
-                ILiquidationExecutorView(proxy).aaveV2LendingPool() == address(0),
-                "liquidation: aaveV2LendingPool must be unset"
+            console2.log("ok liquidation allowlist: Aave V3 pool, Morpho and Fluid rsETH/ETH are targets");
+            // The second-tier pools are owner settings (`setAaveV2LendingPool`,
+            // `setSparkLendPool`): unset on a fresh deploy, set once the owner
+            // enables the protocol. Either way only ONE address is acceptable,
+            // and a set pool must also be a target or every plan for it
+            // reverts with TargetNotAllowed.
+            _checkPoolSetting(
+                exec, "aaveV2LendingPool", ILiquidationExecutorView(proxy).aaveV2LendingPool(), AAVE_V2_POOL
             );
-            console2.log(
-                "ok liquidation allowlist: Aave V3 pool, Morpho and Fluid rsETH/ETH are targets, Aave V2 pool unset"
-            );
+            // An implementation from before protocol 4 has no getter.
+            try ILiquidationExecutorView(proxy).sparkLendPool() returns (address spark) {
+                _checkPoolSetting(exec, "sparkLendPool", spark, SPARKLEND_POOL);
+            } catch {
+                console2.log("-- sparkLendPool: no getter (implementation before protocol 4)");
+            }
         }
 
         console2.log(
@@ -140,5 +151,15 @@ contract CheckDeployment is Script {
                 : "CheckDeployment: all checks passed for liquidation proxy",
             proxy
         );
+    }
+
+    function _checkPoolSetting(IExecutorView exec, string memory name, address got, address expected) internal view {
+        if (got == address(0)) {
+            console2.log(string.concat("ok ", name, ": unset"));
+            return;
+        }
+        require(got == expected, string.concat("liquidation: ", name, " is set to an unknown address"));
+        require(exec.allowedTargets(got), string.concat("liquidation: ", name, " is set but not a target"));
+        console2.log(string.concat("ok ", name, ": set and a target"), got);
     }
 }
